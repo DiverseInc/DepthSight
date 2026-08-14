@@ -1,1 +1,41 @@
+{
+    email support@diverseinc.net
+    admin off
+}
 
+http://depthsight.diverseinc.net {
+    # API endpoints and documentation layers
+    handle /docs* {
+        reverse_proxy api:8000
+    }
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+    handle /openapi.json {
+        reverse_proxy api:8000
+    }
+
+    # High-frequency market WebSocket streams
+    handle /ws* {
+        reverse_proxy websocket:8765
+    }
+
+    # Mobile Progressive Web App paths
+    handle /pwa/* {
+        reverse_proxy pwa:80
+    }
+
+    # Share and metadata rendering
+    handle /render-shared/* {
+        reverse_proxy api:8000
+    }
+
+    # Core React frontend dashboard (all other paths)
+    handle {
+        reverse_proxy frontend:80
+    }
+
+    log {
+        output file /var/log/caddy/access.log
+    }
+}
