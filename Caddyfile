@@ -1,36 +1,34 @@
 {
-    # Global options
-    email {$EMAIL}
+    email support@diverseinc.net
     admin off
 }
 
-# The {$DOMAIN} can be an IP or a real domain
-{$DOMAIN} {
-    # API (Using handle to preserve /api path)
-    handle /api/* {
-        reverse_proxy api:8000
+http://depthsight.diverseinc.net {
+    # Reverse proxy for API documentation and FastAPI backend REST layers
+    reverse_proxy /docs* depthsight-api:8000
+    reverse_proxy /api* depthsight-api:8000
+    reverse_proxy /openapi.json depthsight-api:8000
+
+    # Reverse proxy for high-throughput live market WebSocket streams
+    reverse_proxy /ws* depthsight-websocket:8765
+
+    # Reverse proxy for the Mobile Progressive Web App path endpoints
+    reverse_proxy /pwa* depthsight-pwa:80
+
+    # Fallback reverse proxy routing for the core React web dashboard interface
+    reverse_proxy * depthsight-frontend:80
+
+    # Standard security and header tuning options
+    header {
+        # Protect against cross-origin clickjacking vulnerabilities
+        X-Frame-Options "DENY"
+        # Enable basic browser cross-site scripting filtering rules
+        X-XSS-Protection "1; mode=block"
+        # Prevent content MIME-type sniffing exploit mechanics
+        X-Content-Type-Options "nosniff"
     }
 
-    # WebSockets
-    handle /ws* {
-        reverse_proxy websocket:8765
-    }
-
-    # PWA
-    handle /pwa/* {
-        reverse_proxy pwa:80
-    }
-
-    # OG Images / Share
-    handle /render-shared/* {
-        reverse_proxy api:8000
-    }
-
-    # Frontend (Everything else)
-    handle {
-        reverse_proxy frontend:80
-    }
-
+    # Production log capturing parameters
     log {
         output file /var/log/caddy/access.log
     }
