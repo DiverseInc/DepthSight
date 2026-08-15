@@ -861,18 +861,42 @@ const CommunityHub = () => {
 	// Initial fetch functions
 	const fetchVerified = React.useCallback(() => {
 		setLoadingVerified(true);
-		fetch(`${hubApiUrl}/strategies`)
+		// Prefer the deployment's own /api/v1/strategy-templates endpoint
+		// (curated, always reachable on self-hosted). Fall back to the central
+		// hub if the local endpoint returns nothing (federated deployments).
+		fetch(`/api/v1/strategy-templates`, { credentials: "include" })
 			.then((res) => {
 				if (!res.ok) throw new Error();
 				return res.json();
 			})
-			.then((data) => {
-				setVerifiedStrategies(data);
-				setLoadingVerified(false);
+			.then((json) => {
+				const list = Array.isArray(json) ? json : json?.data ?? [];
+				// Map local shape (configData) to the rendering shape
+				// (strategy_json) so the existing UI code keeps working.
+				const normalized = list.map((t: any) => ({
+					id: t.id,
+					slug: t.slug,
+					name: t.name,
+					description: t.description,
+					archetype: t.archetype,
+					strategy_json: t.configData ?? t.config_data,
+					risk_profile: t.riskProfile ?? t.risk_profile,
+					tier_required: t.tierRequired ?? t.tier_required ?? "free",
+				}));
+				if (normalized.length > 0) {
+					setVerifiedStrategies(normalized);
+					setLoadingVerified(false);
+					return;
+				}
+				// Local empty → try the central hub (federated deployments)
+				return fetch(`${hubApiUrl}/strategies`)
+					.then((r) => (r.ok ? r.json() : []))
+					.then((hubList) => setVerifiedStrategies(Array.isArray(hubList) ? hubList : []))
+					.catch(() => setVerifiedStrategies([]))
+					.finally(() => setLoadingVerified(false));
 			})
 			.catch(() => {
-				// Hub is unreachable (CORS or 404) on self-hosted deployments.
-				// Empty state is shown via the loading=false below; no toast.
+				// Both local and hub unreachable — empty state only.
 				setLoadingVerified(false);
 			});
 	}, [t, hubApiUrl]);

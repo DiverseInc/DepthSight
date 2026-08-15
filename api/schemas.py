@@ -579,6 +579,27 @@ class AppConfig(BaseModel):
     )
 
 
+class StrategyTemplate(BaseModel):
+    """A curated, verified strategy template shown on the Discovery Hub."""
+
+    id: str
+    slug: str
+    name: str
+    description: Optional[str] = None
+    archetype: str
+    config_data: Dict[str, Any]
+    risk_profile: Dict[str, Any]
+    tier_required: str = "free"
+    sort_order: int = 100
+    is_active: bool = True
+
+    model_config = ConfigDict(
+        from_attributes=True,
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+
 # --- Task Schemas ---
 class BacktestRunRequest(BaseModel):
     name: Optional[str] = None

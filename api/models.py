@@ -240,6 +240,39 @@ class AppConfig(Base):
     user = relationship("User", back_populates="config", lazy="selectin")
 
 
+class StrategyTemplate(Base):
+    """
+    Curated, verified strategy templates that surface on the Discovery Hub's
+    'Verified Templates' tab. Populated on first API startup with the six
+    built-in archetypes; admins can add more later via a CRUD endpoint.
+
+    Replaces the previous CORS-blocked external call to app.depthsight.pro
+    on self-hosted deployments — verified templates now come from the
+    deployment's own database.
+    """
+
+    __tablename__ = "strategy_templates"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    slug = Column(String, unique=True, index=True, nullable=False)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    archetype = Column(String, nullable=False, index=True)
+    # The actual config block(s) that the strategy editor will pre-populate
+    # when a user clicks 'Use this template'.
+    config_data = Column(JSON, nullable=False)
+    # Recommended risk settings for the template.
+    risk_profile = Column(JSON, nullable=False)
+    # 'free' | 'pro' | 'premium' — minimum plan required to deploy this template.
+    tier_required = Column(String, default="free", nullable=False)
+    # Display order (lower = first).
+    sort_order = Column(Integer, default=100, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class StrategyConfig(Base):
     __tablename__ = "strategy_configs"
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))

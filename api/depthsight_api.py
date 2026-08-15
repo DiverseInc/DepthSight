@@ -133,6 +133,7 @@ from .routes.payments import payments_router
 from .routes.webhooks import webhooks_router
 from .routes.admin import admin_router
 from .routes.discovery import discovery_router
+from .routes.strategy_templates import templates_router
 from .routes.account import (  # noqa: F401
     account_router,
     get_account_status,
@@ -1374,6 +1375,20 @@ async def lifespan(app: FastAPI):
 
         asyncio.create_task(run_sync_loop_wrapper())
 
+    # Seed verified strategy templates (idempotent — only runs once ever)
+    try:
+        from .database import SessionLocal
+        async with SessionLocal() as seed_db:
+            created = await crud.seed_default_strategy_templates(seed_db)
+            if created > 0:
+                logger.info(
+                    f"Seeded {created} default strategy templates on first start."
+                )
+            else:
+                logger.debug("Strategy templates already present, no seed needed.")
+    except Exception as seed_err:
+        logger.warning(f"Could not seed default strategy templates: {seed_err}")
+
     # Pre-load Oracle model for this worker to ensure deterministic behavior
     try:
         from .simulation_router import get_oracle
@@ -1575,6 +1590,7 @@ app.add_middleware(
 api_router = APIRouter(prefix="/api/v1", tags=["v1"])
 
 api_router.include_router(hft_router)
+api_router.include_router(templates_router)
 
 
 redis_api_client = redis.Redis(

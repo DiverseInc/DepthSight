@@ -4064,3 +4064,197 @@ async def get_hub_news_comments(
     )
     result = await db.execute(stmt)
     return list(result.scalars().all())
+
+
+# --- StrategyTemplate CRUD ---
+
+async def list_strategy_templates(db, active_only=True):
+    stmt = select(models.StrategyTemplate)
+    if active_only:
+        stmt = stmt.filter(models.StrategyTemplate.is_active.is_(True))
+    stmt = stmt.order_by(
+        models.StrategyTemplate.sort_order.asc(),
+        models.StrategyTemplate.name.asc(),
+    )
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_strategy_template_by_slug(db, slug):
+    result = await db.execute(
+        select(models.StrategyTemplate).filter(
+            models.StrategyTemplate.slug == slug
+        )
+    )
+    return result.scalars().first()
+
+
+async def upsert_strategy_template(
+    db,
+    slug,
+    name,
+    description,
+    archetype,
+    config_data,
+    risk_profile,
+    tier_required="free",
+    sort_order=100,
+    is_active=True,
+):
+    existing = await get_strategy_template_by_slug(db, slug)
+    if existing is not None:
+        existing.name = name
+        existing.description = description
+        existing.archetype = archetype
+        existing.config_data = config_data
+        existing.risk_profile = risk_profile
+        existing.tier_required = tier_required
+        existing.sort_order = sort_order
+        existing.is_active = is_active
+        return existing
+
+    db_template = models.StrategyTemplate(
+        slug=slug,
+        name=name,
+        description=description,
+        archetype=archetype,
+        config_data=config_data,
+        risk_profile=risk_profile,
+        tier_required=tier_required,
+        sort_order=sort_order,
+        is_active=is_active,
+    )
+    db.add(db_template)
+    await db.flush()
+    return db_template
+
+
+async def seed_default_strategy_templates(db):
+    """Idempotent: inserts the 6 built-in archetypes if they don't exist.
+    Returns the number of NEW templates created (0 on subsequent runs)."""
+    templates = [
+        {
+            "slug": "rsi-breakout-v2",
+            "name": "RSI Breakout v2",
+            "description": "Classic momentum strategy: enter long when RSI crosses above the overbought threshold from below, exit on mean reversion. Works best in trending markets.",
+            "archetype": "rsi_breakout",
+            "tier_required": "free",
+            "sort_order": 10,
+            "config_data": {
+                "timeframe": "1h",
+                "symbol": "BTCUSDT",
+                "blocks": [
+                    {"id": "rsi_entry", "type": "indicator", "indicator": "RSI", "period": 14, "condition": "crosses_above", "threshold": 55},
+                    {"id": "rsi_exit", "type": "indicator", "indicator": "RSI", "period": 14, "condition": "crosses_above", "threshold": 75, "action": "close_position"},
+                ],
+            },
+            "risk_profile": {"stopLossPercent": 2.0, "takeProfitPercent": 4.0, "maxConcurrentTrades": 1, "riskPerTradePercent": 0.5},
+        },
+        {
+            "slug": "ema-50-200-golden-cross",
+            "name": "EMA 50/200 Golden Cross",
+            "description": "Long-term trend follower. Buys when the 50-period EMA crosses above the 200-period EMA (the Golden Cross), sells on the Death Cross. Low frequency, high conviction.",
+            "archetype": "ma_crossover",
+            "tier_required": "free",
+            "sort_order": 20,
+            "config_data": {
+                "timeframe": "4h",
+                "symbol": "BTCUSDT",
+                "blocks": [
+                    {"id": "golden_cross", "type": "indicator", "indicator": "EMA", "fast_period": 50, "slow_period": 200, "condition": "crosses_above", "action": "open_long"},
+                    {"id": "death_cross", "type": "indicator", "indicator": "EMA", "fast_period": 50, "slow_period": 200, "condition": "crosses_below", "action": "close_position"},
+                ],
+            },
+            "risk_profile": {"stopLossPercent": 5.0, "takeProfitPercent": 15.0, "maxConcurrentTrades": 1, "riskPerTradePercent": 1.0},
+        },
+        {
+            "slug": "bollinger-mean-reversion",
+            "name": "Bollinger Mean Reversion",
+            "description": "Range-bound strategy. Buys when price touches the lower band, exits at the middle band. Best in choppy, sideways markets.",
+            "archetype": "mean_reversion",
+            "tier_required": "pro",
+            "sort_order": 30,
+            "config_data": {
+                "timeframe": "15m",
+                "symbol": "ETHUSDT",
+                "blocks": [
+                    {"id": "bb_entry", "type": "indicator", "indicator": "BB", "period": 20, "std_dev": 2.0, "condition": "touches_lower", "action": "open_long"},
+                    {"id": "bb_exit", "type": "indicator", "indicator": "BB", "period": 20, "std_dev": 2.0, "condition": "reaches_middle", "action": "close_position"},
+                ],
+            },
+            "risk_profile": {"stopLossPercent": 1.5, "takeProfitPercent": 2.5, "maxConcurrentTrades": 2, "riskPerTradePercent": 0.5},
+        },
+        {
+            "slug": "grid-dca-btc-range",
+            "name": "Grid DCA — BTC range",
+            "description": "DCA into BTC with a grid of buy orders. Accumulates during ranging markets, takes profit at the top of each grid cell. Best for long-term holders who want automated accumulation.",
+            "archetype": "grid_dca",
+            "tier_required": "pro",
+            "sort_order": 40,
+            "config_data": {
+                "timeframe": "1h",
+                "symbol": "BTCUSDT",
+                "blocks": [
+                    {"id": "grid_buy", "type": "grid", "lower_price": 60000, "upper_price": 70000, "grid_levels": 10, "amount_per_grid": 100, "side": "buy"},
+                    {"id": "grid_sell", "type": "grid", "lower_price": 60000, "upper_price": 70000, "grid_levels": 10, "amount_per_grid": 100, "side": "sell"},
+                ],
+            },
+            "risk_profile": {"stopLossPercent": 15.0, "takeProfitPercent": 5.0, "maxConcurrentTrades": 10, "riskPerTradePercent": 0.3},
+        },
+        {
+            "slug": "orderbook-imbalance-scalper",
+            "name": "Order Book Imbalance Scalper",
+            "description": "High-frequency scalper. Enters when order book bid/ask imbalance exceeds a threshold (more buyers than sellers). Tight stops, fast exits. Requires active management.",
+            "archetype": "scalping",
+            "tier_required": "premium",
+            "sort_order": 50,
+            "config_data": {
+                "timeframe": "5m",
+                "symbol": "BTCUSDT",
+                "blocks": [
+                    {"id": "obi_entry", "type": "orderbook", "metric": "imbalance", "threshold": 0.65, "depth_levels": 10, "action": "open_long"},
+                    {"id": "obi_exit", "type": "orderbook", "metric": "imbalance", "threshold": 0.50, "action": "close_position"},
+                ],
+            },
+            "risk_profile": {"stopLossPercent": 0.5, "takeProfitPercent": 0.8, "maxConcurrentTrades": 3, "riskPerTradePercent": 0.3},
+        },
+        {
+            "slug": "ml-confirmed-trend",
+            "name": "ML-Confirmed Trend",
+            "description": "Combines a 50/200 EMA trend filter with a trained ML model confirming the entry direction. The ML model is trained on your own trade history in the ML Core page.",
+            "archetype": "ml_confirmed",
+            "tier_required": "premium",
+            "sort_order": 60,
+            "config_data": {
+                "timeframe": "1h",
+                "symbol": "BTCUSDT",
+                "use_ml_confirmation": True,
+                "blocks": [
+                    {"id": "trend_filter", "type": "indicator", "indicator": "EMA", "fast_period": 50, "slow_period": 200, "condition": "fast_above_slow"},
+                    {"id": "ml_confirm", "type": "ml_model", "model_id": "user_trained", "min_confidence": 0.7, "action": "open_long"},
+                ],
+            },
+            "risk_profile": {"stopLossPercent": 2.5, "takeProfitPercent": 6.0, "maxConcurrentTrades": 1, "riskPerTradePercent": 1.0},
+        },
+    ]
+
+    created_count = 0
+    for t in templates:
+        existing = await get_strategy_template_by_slug(db, t["slug"])
+        if existing is None:
+            await upsert_strategy_template(
+                db,
+                slug=t["slug"],
+                name=t["name"],
+                description=t["description"],
+                archetype=t["archetype"],
+                config_data=t["config_data"],
+                risk_profile=t["risk_profile"],
+                tier_required=t["tier_required"],
+                sort_order=t["sort_order"],
+            )
+            created_count += 1
+    if created_count > 0:
+        await db.commit()
+    return created_count
+
