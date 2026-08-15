@@ -14,7 +14,7 @@ from ..database import get_db
 logger = logging.getLogger(__name__)
 
 community_router = APIRouter(
-    prefix="/api/v1/community",
+    prefix="/community",
     tags=["Community Content"],
     dependencies=[Depends(get_current_user)],
 )

@@ -14,7 +14,6 @@ from ..database import get_db
 logger = logging.getLogger(__name__)
 
 templates_router = APIRouter(
-    prefix="/api/v1",
     tags=["Strategy Templates"],
     dependencies=[Depends(get_current_user)],
 )
