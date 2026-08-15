@@ -8,6 +8,7 @@ import { BreedingLab } from "@/components/genome/BreedingLab";
 import { EvolutionTree } from "@/components/genome/EvolutionTree";
 import { GeneDetailsModal } from "@/components/genome/GeneDetailsModal";
 import { PageLayout } from "@/components/layout/PageLayout";
+import { PageEmptyState } from "@/components/shared/PageEmptyState";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -261,14 +262,32 @@ const LaboratoryPage: React.FC = () => {
 									))}
 								</div>
 							) : filteredGenes.length === 0 ? (
-								<Alert>
-									<Sparkles className="h-4 w-4" />
-									<AlertDescription>
-										{searchQuery || rarityFilter !== "ALL"
-											? t("no_genes_filtered_message")
-											: t("no_genes_discovered_message")}
-									</AlertDescription>
-								</Alert>
+								<PageEmptyState
+									icon={Sparkles}
+									title={t("no_genes_title", "No genes discovered yet")}
+									description={
+										searchQuery || rarityFilter !== "ALL"
+											? t(
+													"no_genes_filtered_message",
+													"No genes match the current filters. Try clearing them to see all discoveries.",
+												)
+											: t(
+													"no_genes_discovered_message",
+													"Genes are strategy parameters discovered by the Genetic Command Center. Run a genetic evolution to find new ones.",
+												)
+									}
+									actions={
+										searchQuery || rarityFilter !== "ALL"
+											? []
+											: [
+													{
+														label: "Open Genetic Command Center",
+														href: "/discovery",
+														primary: true,
+													},
+												]
+									}
+								/>
 							) : (
 								<div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
 									{filteredGenes.map((userGene) => {

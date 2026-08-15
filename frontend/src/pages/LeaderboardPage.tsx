@@ -20,6 +20,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { PageLayout } from "@/components/layout/PageLayout";
 import { AppLoader } from "@/components/shared/AppLoader";
+import { PageEmptyState } from "@/components/shared/PageEmptyState";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -687,14 +688,19 @@ const LeaderboardPage = () => {
 										))
 									) : leaderboard?.length === 0 ? (
 										<TableRow>
-											<TableCell
-												colSpan={6}
-												className="h-[200px] text-center text-muted-foreground"
-											>
-												<div className="flex flex-col items-center gap-2">
-													<Users className="h-10 w-10 opacity-20 mb-2" />
-													<p className="font-medium">{t("noData")}</p>
-												</div>
+											<TableCell colSpan={6} className="p-0">
+												<PageEmptyState
+													icon={Trophy}
+													title={t("noDataTitle", "No leaderboard entries yet")}
+													description={t(
+														"noDataDescription",
+														"Traders who close at least 10 backtests appear here. Run a few backtests to claim your spot.",
+													)}
+													actions={[
+														{ label: "Browse templates", href: "/hub", primary: true },
+														{ label: "Run a backtest", href: "/strategies" },
+													]}
+												/>
 											</TableCell>
 										</TableRow>
 									) : null}

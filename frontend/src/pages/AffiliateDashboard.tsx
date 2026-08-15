@@ -1,10 +1,11 @@
 // src/pages/AffiliateDashboard.tsx
 
-import { Copy, Link as LinkIcon, Loader2 } from "lucide-react";
+import { Copy, Link as LinkIcon, Loader2, Users } from "lucide-react";
 import type React from "react";
 import { useState } from "react";
 import { Controller, useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
+import { PageEmptyState } from "@/components/shared/PageEmptyState";
 import { Pagination } from "@/components/shared/Pagination";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -289,6 +290,24 @@ const AffiliateDashboard: React.FC = () => {
 													</TableCell>
 												</TableRow>
 											))
+										: referralsData?.referrals &&
+											  referralsData.referrals.length === 0 ? (
+											<TableRow>
+												<TableCell colSpan={3} className="p-0">
+													<PageEmptyState
+														icon={Users}
+														title={t("referralsTable.emptyTitle", "No referrals yet")}
+														description={t(
+															"referralsTable.emptyDescription",
+															"Share your referral code to earn 20% recurring commission on every paying user you bring in.",
+														)}
+														actions={[
+															{ label: "Copy referral link", href: "?copy=1", primary: true },
+														]}
+													/>
+												</TableCell>
+											</TableRow>
+										)
 										: referralsData?.referrals.map(
 												(referral: AffiliateReferral) => (
 													<TableRow key={referral.id}>
