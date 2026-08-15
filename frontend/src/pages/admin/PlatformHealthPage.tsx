@@ -142,7 +142,11 @@ const PlatformHealthPage: React.FC = () => {
 							{getStatusIcon(overallStatus)}
 							<div>
 								<CardTitle className="text-2xl">System Status</CardTitle>
-								<CardDescription>All systems {overallStatus}</CardDescription>
+								<CardDescription>
+									{overallStatus === "unknown"
+										? "Checking system health..."
+										: `All systems ${overallStatus}`}
+								</CardDescription>
 							</div>
 						</div>
 						{getStatusBadge(overallStatus)}
@@ -151,7 +155,21 @@ const PlatformHealthPage: React.FC = () => {
 			</Card>
 
 			<div className="grid gap-4 md:grid-cols-2">
-				{healthChecks.map((check) => (
+				{healthChecks.length === 0 ? (
+					<Card className="md:col-span-2">
+						<CardContent className="py-12 px-6 text-center">
+							<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
+								<Activity className="h-6 w-6 text-primary" />
+							</div>
+							<p className="text-sm font-medium mb-1">No health checks reported yet</p>
+							<p className="text-xs text-muted-foreground max-w-md mx-auto">
+								Each component (API, database, task queue, etc.) reports its status
+								periodically. They'll appear here as the checks complete.
+							</p>
+						</div>
+					</Card>
+				) : (
+					healthChecks.map((check) => (
 					<Card key={check.name}>
 						<CardHeader>
 							<div className="flex items-center justify-between">
@@ -174,7 +192,8 @@ const PlatformHealthPage: React.FC = () => {
 							</div>
 						</CardContent>
 					</Card>
-				))}
+				))
+			)}
 			</div>
 
 			<Card>
@@ -221,9 +240,14 @@ const PlatformHealthPage: React.FC = () => {
 							</div>
 						</div>
 					) : (
-						<div className="text-center py-12">
-							<p className="text-muted-foreground">
-								Could not load system metrics.
+						<div className="py-12 px-6 text-center">
+							<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-muted mb-3">
+								<Activity className="h-6 w-6 text-muted-foreground" />
+							</div>
+							<p className="text-sm font-medium mb-1">System metrics unavailable</p>
+							<p className="text-xs text-muted-foreground max-w-md mx-auto">
+								The metrics endpoint didn't return data. The platform is still running — only
+								the telemetry feed is paused. Check <code className="px-1.5 py-0.5 rounded bg-muted">docker compose logs api</code> if it persists.
 							</p>
 						</div>
 					)}

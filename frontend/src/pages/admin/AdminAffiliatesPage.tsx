@@ -1,5 +1,6 @@
 // src/pages/admin/AdminAffiliatesPage.tsx
 
+import { Users } from "lucide-react";
 import type React from "react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -67,8 +68,28 @@ const AdminAffiliatesPage: React.FC = () => {
 											</TableCell>
 										</TableRow>
 									))
+								: !affiliatesData?.users?.length ? (
+									<TableRow>
+										<TableCell colSpan={7} className="p-0">
+											<div className="py-16 px-6 text-center">
+												<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
+													<Users className="h-6 w-6 text-primary" />
+												</div>
+												<p className="text-sm font-medium mb-1">No affiliates yet</p>
+												<p className="text-xs text-muted-foreground max-w-md mx-auto">
+													Affiliates appear here when users refer others via their referral code.
+													The seed script creates one demo referral so you can see the layout.
+												</p>
+												<p className="text-xs text-primary mt-3 font-mono">
+													bash scripts/seed_demo_data.py
+												</p>
+											</div>
+										</TableCell>
+									</TableRow>
+								)
 								: // Use affiliatesData.users.map
-									affiliatesData?.users.map((affiliate: AdminUser) => (
+									affiliatesData?.users?.length ? (
+									affiliatesData.users.map((affiliate: AdminUser) => (
 										<TableRow key={affiliate.id}>
 											<TableCell>{affiliate.id}</TableCell>
 											<TableCell>{affiliate.username}</TableCell>
