@@ -589,7 +589,7 @@ export default function Settings() {
 									</TableRow>
 								</TableHeader>
 								<TableBody>
-									{config.apiKeys.map((key) => {
+									{config.apiKeys?.map((key) => {
 										const isCurrentlyTesting = testingApiKeyId === key.id;
 										const isCurrentlyDeleting =
 											isDeletingApiKey && apiKeyToDelete?.id === key.id;
@@ -720,7 +720,7 @@ export default function Settings() {
 									<div className="p-2 border rounded-md min-h-[200px] max-h-[400px] overflow-y-auto">
 										{symbols.length > 0 ? (
 											<div className="flex flex-wrap gap-2">
-												{symbols.map((symbolItem) => (
+												{symbols?.map((symbolItem) => (
 													<div
 														key={symbolItem}
 														className="flex items-center gap-1 bg-secondary py-1 pl-3 pr-1 rounded-full"
@@ -762,7 +762,7 @@ export default function Settings() {
 									<h4 className="font-semibold">
 										{t("dataSources.statusPanelTitle")}
 									</h4>
-									{config.dataSources?.statuses.map((status) => (
+									{config.dataSources?.statuses?.map((status) => (
 										<div
 											key={status.name}
 											className="space-y-2 text-sm p-2 border-b"

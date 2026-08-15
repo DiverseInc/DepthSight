@@ -149,7 +149,7 @@ async def create_oauth_user(
         ),
         notifications=default_notifications.model_dump(by_alias=True),
         exchange_settings=default_exchange_settings.model_dump(by_alias=True),
-        data_sources={"symbols": []},
+        data_sources={"symbols": [], "statuses": []},
     )
     db.add(db_config)
 
@@ -1339,6 +1339,9 @@ async def create_default_config_for_existing_user(
     default_exchange_settings = schemas.ExchangeSettings(
         binance=schemas.ExchangePlatformSettings(enabled=False, api_key_name=""),
     )
+    # data_sources must include `statuses: []` so the Settings page's
+    # `config.dataSources?.statuses.map(...)` doesn't crash with
+    # "Cannot read properties of undefined" on freshly-created configs.
     db_config = models.AppConfig(
         user_id=user_id,
         risk_management=default_risk_management.model_dump(by_alias=True),
@@ -1347,7 +1350,7 @@ async def create_default_config_for_existing_user(
         ),
         notifications=default_notifications.model_dump(by_alias=True),
         exchange_settings=default_exchange_settings.model_dump(by_alias=True),
-        data_sources={"symbols": []},
+        data_sources={"symbols": [], "statuses": []},
     )
     db.add(db_config)
     await db.flush()
