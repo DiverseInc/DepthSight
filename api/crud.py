@@ -4289,8 +4289,6 @@ from datetime import datetime, timezone, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import models
-
 
 async def list_hub_news(db, limit=20):
     result = await db.execute(
