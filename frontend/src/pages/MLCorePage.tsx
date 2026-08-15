@@ -32,6 +32,7 @@ import { ModelQualityReport } from "@/components/models/ModelQualityReport";
 import { TrainingProgressCharts } from "@/components/models/TrainingProgressCharts";
 import { AppLoader } from "@/components/shared/AppLoader";
 import { ConfirmationModal } from "@/components/shared/ConfirmationModal";
+import { PageEmptyState } from "@/components/shared/PageEmptyState";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -293,15 +294,21 @@ const DatasetModule: React.FC = () => {
 										<Skeleton key={i} className="h-16 w-full" />
 									))
 								) : datasets.length === 0 ? (
-									<div className="text-center py-12 text-muted-foreground">
-										<Database className="w-12 h-12 mx-auto mb-4 opacity-20" />
-										<p>
-											{t(
-												"tasksTable.noTasks",
-												"No datasets yet. Create your first dataset.",
-											)}
-										</p>
-									</div>
+									<PageEmptyState
+										icon={Database}
+										title={t(
+											"datasets.emptyTitle",
+											"No datasets yet",
+										)}
+										description={t(
+											"datasets.emptyDescription",
+											"ML Core trains a model on your trade history, then uses it to filter strategy entries. Create a dataset to get started.",
+										)}
+										actions={[
+											{ label: "Create dataset", href: "?action=create", primary: true },
+											{ label: "Learn more", href: "/hub" },
+										]}
+									/>
 								) : (
 									datasets.map((dataset) => (
 										<div

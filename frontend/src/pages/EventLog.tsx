@@ -6,14 +6,17 @@ import {
 	Loader2,
 	Pause,
 	Play,
+	ScrollText,
 	Search,
 	Terminal,
 	Trash2,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 
 import { PageLayout } from "@/components/layout/PageLayout";
+import { PageEmptyState } from "@/components/shared/PageEmptyState";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -258,9 +261,18 @@ export default function EventLog() {
 						{t("loadingHistory")}
 					</div>
 				) : filteredLogs.length === 0 ? (
-					<div className="flex items-center justify-center h-full text-muted-foreground">
-						{t("noLogs")}
-					</div>
+					<PageEmptyState
+						icon={ScrollText}
+						title={t("noLogsTitle", "No events yet")}
+						description={t(
+							"noLogsDescription",
+							"System events, strategy actions, and trade events appear here. Start a strategy or trigger a backtest to see events flow in.",
+						)}
+						actions={[
+							{ label: "Go to Strategies", href: "/strategies", primary: true },
+							{ label: "Browse templates", href: "/hub" },
+						]}
+					/>
 				) : (
 					<div className="space-y-1">
 						{filteredLogs.map((log) => (

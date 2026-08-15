@@ -16,6 +16,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import { PageLayout } from "@/components/layout/PageLayout";
 import { LaunchTaskForm } from "@/components/research/LaunchTaskForm";
 import { ConfirmationModal } from "@/components/shared/ConfirmationModal";
+import { PageEmptyState } from "@/components/shared/PageEmptyState";
 import { SimulationTab } from "@/components/simulation";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -331,9 +332,18 @@ export default function Research() {
 										</Alert>
 									)}
 									{!isLoading && !isError && allRuns.length === 0 && (
-										<div className="text-center text-muted-foreground py-8">
-											{t("table.noTasks")}
-										</div>
+										<PageEmptyState
+											icon={FlaskConical}
+											title={t("table.noTasksTitle", "No research tasks yet")}
+											description={t(
+												"table.noTasksDescription",
+												"Backtests and optimizations will appear here. Run one from a strategy to get started.",
+											)}
+											actions={[
+												{ label: "Browse templates", href: "/hub", primary: true },
+												{ label: "Go to Strategies", href: "/strategies" },
+											]}
+										/>
 									)}
 									{!isLoading && !isError && allRuns.length > 0 && (
 										<Table>
