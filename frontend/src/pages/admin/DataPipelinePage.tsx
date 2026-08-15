@@ -518,9 +518,18 @@ const DataPipelinePage: React.FC = () => {
                   <tbody>
                     {storageData.length === 0 ? (
                       <tr>
-                        <td colSpan={6} className="p-8 text-center text-muted-foreground">
-                          <HardDrive className="h-10 w-10 mx-auto mb-2 opacity-20" />
-                          No data found in storage. Start a pipeline to download data.
+                        <td colSpan={6} className="p-0">
+                          <div className="py-16 px-6 text-center">
+                            <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
+                              <HardDrive className="h-6 w-6 text-primary" />
+                            </div>
+                            <p className="text-sm font-medium mb-1">No historical data downloaded yet</p>
+                            <p className="text-xs text-muted-foreground max-w-md mx-auto">
+                              Go to the <span className="font-medium">Config</span> tab, pick your symbols and date range,
+                              and hit <span className="font-medium">Run Pipeline</span>. Downloaded klines and trade data
+                              will appear here.
+                            </p>
+                          </div>
                         </td>
                       </tr>
                     ) : (
@@ -613,9 +622,13 @@ const DataPipelinePage: React.FC = () => {
                     {logs ? (
                       <pre className="whitespace-pre-wrap leading-relaxed">{logs}</pre>
                     ) : (
-                      <div className="h-full flex flex-col items-center justify-center text-zinc-700 space-y-4">
-                        <TerminalIcon className="h-12 w-12 opacity-10" />
-                        <p className="text-sm">No active pipeline logs available.</p>
+                      <div className="h-full flex flex-col items-center justify-center text-zinc-600 space-y-3">
+                        <TerminalIcon className="h-10 w-10 opacity-30" />
+                        <p className="text-sm font-medium text-zinc-400">No pipeline output yet</p>
+                        <p className="text-xs text-zinc-600 max-w-md text-center px-6">
+                          Logs from your data pipeline runs will stream here in real time.
+                          Run a pipeline from the Config tab to see output.
+                        </p>
                       </div>
                     )}
                     <div ref={terminalEndRef} />
