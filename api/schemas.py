@@ -579,27 +579,6 @@ class AppConfig(BaseModel):
     )
 
 
-class StrategyTemplate(BaseModel):
-    """A curated, verified strategy template shown on the Discovery Hub."""
-
-    id: str
-    slug: str
-    name: str
-    description: Optional[str] = None
-    archetype: str
-    config_data: Dict[str, Any]
-    risk_profile: Dict[str, Any]
-    tier_required: str = "free"
-    sort_order: int = 100
-    is_active: bool = True
-
-    model_config = ConfigDict(
-        from_attributes=True,
-        alias_generator=to_camel,
-        populate_by_name=True,
-    )
-
-
 # --- Task Schemas ---
 class BacktestRunRequest(BaseModel):
     name: Optional[str] = None
@@ -1825,9 +1804,29 @@ class AgentMemory(AgentMemoryBase):
 # --- StrategyConfig Schemas ---
 # 1. New schema for describing a strategy template (for "Library")
 class StrategyTemplate(BaseModel):
+    """A curated, verified strategy template shown on the Discovery Hub.
+
+    NOTE: This is the Pydantic response schema for the local strategy-templates
+    feature added in 2026-08-15. It lives in the same module as an older,
+    unused stub of the same name further down (line ~1827 in earlier versions).
+    If you see a duplicate, delete the dead stub — this is the canonical one.
+    """
+    id: str
+    slug: str
     name: str
-    description: str
-    default_params: Dict[str, Any]
+    description: Optional[str] = None
+    archetype: str
+    config_data: Dict[str, Any]
+    risk_profile: Dict[str, Any]
+    tier_required: str = "free"
+    sort_order: int = 100
+    is_active: bool = True
+
+    model_config = ConfigDict(
+        from_attributes=True,
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
 
 
 # 2. Update existing StrategyConfig schemas
