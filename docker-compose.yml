@@ -287,8 +287,34 @@ services:
       - "host.docker.internal:host-gateway"
     restart: always
 
+  # ------------------------------------------------------------------
+  # Ops sidecar: daily pg_dump + 5-min smoke test
+  # Build with: docker compose build ops
+  # ------------------------------------------------------------------
+  ops:
+    build: ./ops
+    container_name: depthsight_ops
+    env_file: .env
+    environment:
+      - POSTGRES_HOST=postgres
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://depthsight.diverseinc.net}
+    volumes:
+      - backups:/backups
+      - ops_state:/opt/ops/state
+      # Mount .env so the smoke test can sanity-check it (catches the
+      # Elestio .env corruption regression automatically)
+      - ./.env:/opt/depthsight/.env:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+    restart: always
+
 volumes:
   postgres_data:
   redis_data:
   caddy_data:
   caddy_config:
+  backups:
+  ops_state:

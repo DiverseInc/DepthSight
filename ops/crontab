@@ -1,0 +1,11 @@
+# supercronic crontab
+# Format: m h dom mon dow command
+#
+# 5-minute smoke test - alerts on failure
+*/5 * * * * /opt/ops/smoke-test.sh
+
+# Daily backup at 02:30 UTC (off-peak)
+30 2 * * * /opt/ops/backup.sh
+
+# Weekly: prune old alerts (>14 days old)
+0 3 * * 0 find /opt/ops/state -type f -mtime +14 -delete
