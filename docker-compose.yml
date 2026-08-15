@@ -275,7 +275,7 @@ services:
       - DOMAIN=${DOMAIN:-localhost}
       - EMAIL=${ADMIN_EMAIL:-admin@depthsight.pro}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
+      - ./caddy.config:/etc/caddy/Caddyfile
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
