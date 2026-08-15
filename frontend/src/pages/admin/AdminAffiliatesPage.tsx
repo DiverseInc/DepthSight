@@ -33,6 +33,71 @@ const AdminAffiliatesPage: React.FC = () => {
 			currency: "USD",
 		}).format(amount);
 
+	const renderTableBody = () => {
+		if (isLoadingAffiliates) {
+			return [...Array(5)].map((_, i) => (
+				<TableRow key={i}>
+					<TableCell colSpan={7}>
+						<Skeleton className="h-8 w-full" />
+					</TableCell>
+				</TableRow>
+			));
+		}
+
+		if (!affiliatesData?.users?.length) {
+			return (
+				<TableRow>
+					<TableCell colSpan={7} className="p-0">
+						<div className="py-16 px-6 text-center">
+							<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
+								<Users className="h-6 w-6 text-primary" />
+							</div>
+							<p className="text-sm font-medium mb-1">No affiliates yet</p>
+							<p className="text-xs text-muted-foreground max-w-md mx-auto">
+								Affiliates appear here when users refer others via their
+								referral code. The seed script creates one demo referral so you
+								can see the layout.
+							</p>
+							<p className="text-xs text-primary mt-3 font-mono">
+								bash scripts/seed_demo_data.py
+							</p>
+						</div>
+					</TableCell>
+				</TableRow>
+			);
+		}
+
+		return affiliatesData.users.map((affiliate: AdminUser) => (
+			<TableRow key={affiliate.id}>
+				<TableCell>{affiliate.id}</TableCell>
+				<TableCell>{affiliate.username}</TableCell>
+				<TableCell>
+					{(affiliate.affiliateCommissionRate || 0) * 100}%
+				</TableCell>
+				<TableCell>{affiliate.stats?.referralCount ?? 0}</TableCell>
+				<TableCell>{affiliate.stats?.payingReferralCount ?? 0}</TableCell>
+				<TableCell>
+					{formatCurrency(affiliate.stats?.totalEarnings ?? 0)}
+					{(affiliate.stats?.pendingEarnings ?? 0) > 0 && (
+						<span className="text-muted-foreground ml-2 text-sm">
+							({formatCurrency(affiliate.stats?.pendingEarnings ?? 0)}{" "}
+							pending)
+						</span>
+					)}
+				</TableCell>
+				<TableCell>
+					<Button
+						variant="outline"
+						size="sm"
+						onClick={() => navigate(`/admin/affiliates/${affiliate.id}`)}
+					>
+						Details
+					</Button>
+				</TableCell>
+			</TableRow>
+		));
+	};
+
 	return (
 		<div className="space-y-6">
 			<div>
@@ -59,81 +124,11 @@ const AdminAffiliatesPage: React.FC = () => {
 								<TableHead>Actions</TableHead>
 							</TableRow>
 						</TableHeader>
-						<TableBody>
-							{isLoadingAffiliates
-								? [...Array(5)].map((_, i) => (
-										<TableRow key={i}>
-											<TableCell colSpan={7}>
-												<Skeleton className="h-8 w-full" />
-											</TableCell>
-										</TableRow>
-									))
-								: !affiliatesData?.users?.length ? (
-									<TableRow>
-										<TableCell colSpan={7} className="p-0">
-											<div className="py-16 px-6 text-center">
-												<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
-													<Users className="h-6 w-6 text-primary" />
-												</div>
-												<p className="text-sm font-medium mb-1">No affiliates yet</p>
-												<p className="text-xs text-muted-foreground max-w-md mx-auto">
-													Affiliates appear here when users refer others via their referral code.
-													The seed script creates one demo referral so you can see the layout.
-												</p>
-												<p className="text-xs text-primary mt-3 font-mono">
-													bash scripts/seed_demo_data.py
-												</p>
-											</div>
-										</TableCell>
-									</TableRow>
-								)
-								: // Use affiliatesData.users.map
-									affiliatesData?.users?.length ? (
-									affiliatesData.users.map((affiliate: AdminUser) => (
-										<TableRow key={affiliate.id}>
-											<TableCell>{affiliate.id}</TableCell>
-											<TableCell>{affiliate.username}</TableCell>
-											{/* Use correct fields */}
-											<TableCell>
-												{(affiliate.affiliateCommissionRate || 0) * 100}%
-											</TableCell>
-											<TableCell>
-												{affiliate.stats?.referralCount ?? 0}
-											</TableCell>
-											<TableCell>
-												{affiliate.stats?.payingReferralCount ?? 0}
-											</TableCell>
-											<TableCell>
-												{formatCurrency(affiliate.stats?.totalEarnings ?? 0)}
-												{(affiliate.stats?.pendingEarnings ?? 0) > 0 && (
-													<span className="text-muted-foreground ml-2 text-sm">
-														(
-														{formatCurrency(
-															affiliate.stats?.pendingEarnings ?? 0,
-														)}{" "}
-														pending)
-													</span>
-												)}
-											</TableCell>
-											<TableCell>
-												<Button
-													variant="outline"
-													size="sm"
-													onClick={() =>
-														navigate(`/admin/affiliates/${affiliate.id}`)
-													}
-												>
-													Details
-												</Button>
-											</TableCell>
-										</TableRow>
-									))}
-						</TableBody>
+						<TableBody>{renderTableBody()}</TableBody>
 					</Table>
 				</CardContent>
 			</Card>
 
-			{/* Pass correct props to pagination */}
 			{affiliatesData && affiliatesData.total > 10 && (
 				<Pagination
 					currentPage={page}

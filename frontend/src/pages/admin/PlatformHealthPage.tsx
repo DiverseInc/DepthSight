@@ -116,6 +116,52 @@ const PlatformHealthPage: React.FC = () => {
 		}
 	};
 
+	const renderHealthChecks = () => {
+		if (healthChecks.length === 0) {
+			return (
+				<Card className="md:col-span-2">
+					<CardContent className="py-12 px-6 text-center">
+						<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
+							<Activity className="h-6 w-6 text-primary" />
+						</div>
+						<p className="text-sm font-medium mb-1">
+							No health checks reported yet
+						</p>
+						<p className="text-xs text-muted-foreground max-w-md mx-auto">
+							Each component (API, database, task queue, etc.) reports its
+							status periodically. They'll appear here as the checks complete.
+						</p>
+					</CardContent>
+				</Card>
+			);
+		}
+
+		return healthChecks.map((check) => (
+			<Card key={check.name}>
+				<CardHeader>
+					<div className="flex items-center justify-between">
+						<div className="flex items-center gap-3">
+							<div className="p-2 rounded-lg bg-muted">{check.icon}</div>
+							<div>
+								<CardTitle className="text-lg">{check.name}</CardTitle>
+								<CardDescription className="text-xs">
+									{check.description}
+								</CardDescription>
+							</div>
+						</div>
+						{getStatusBadge(check.status)}
+					</div>
+				</CardHeader>
+				<CardContent>
+					<div className="flex items-center gap-2 text-sm text-muted-foreground">
+						<Clock className="h-4 w-4" />
+						<span>Response time: {check.responseTime}</span>
+					</div>
+				</CardContent>
+			</Card>
+		));
+	};
+
 	const overallStatus = systemStatus?.status.toLowerCase() || "unknown";
 
 	if (isLoadingStatus) {
@@ -155,45 +201,7 @@ const PlatformHealthPage: React.FC = () => {
 			</Card>
 
 			<div className="grid gap-4 md:grid-cols-2">
-				{healthChecks.length === 0 ? (
-					<Card className="md:col-span-2">
-						<CardContent className="py-12 px-6 text-center">
-							<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
-								<Activity className="h-6 w-6 text-primary" />
-							</div>
-							<p className="text-sm font-medium mb-1">No health checks reported yet</p>
-							<p className="text-xs text-muted-foreground max-w-md mx-auto">
-								Each component (API, database, task queue, etc.) reports its status
-								periodically. They'll appear here as the checks complete.
-							</p>
-						</div>
-					</Card>
-				) : (
-					healthChecks.map((check) => (
-					<Card key={check.name}>
-						<CardHeader>
-							<div className="flex items-center justify-between">
-								<div className="flex items-center gap-3">
-									<div className="p-2 rounded-lg bg-muted">{check.icon}</div>
-									<div>
-										<CardTitle className="text-lg">{check.name}</CardTitle>
-										<CardDescription className="text-xs">
-											{check.description}
-										</CardDescription>
-									</div>
-								</div>
-								{getStatusBadge(check.status)}
-							</div>
-						</CardHeader>
-						<CardContent>
-							<div className="flex items-center gap-2 text-sm text-muted-foreground">
-								<Clock className="h-4 w-4" />
-								<span>Response time: {check.responseTime}</span>
-							</div>
-						</CardContent>
-					</Card>
-				))
-			)}
+				{renderHealthChecks()}
 			</div>
 
 			<Card>
@@ -244,10 +252,16 @@ const PlatformHealthPage: React.FC = () => {
 							<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-muted mb-3">
 								<Activity className="h-6 w-6 text-muted-foreground" />
 							</div>
-							<p className="text-sm font-medium mb-1">System metrics unavailable</p>
+							<p className="text-sm font-medium mb-1">
+								System metrics unavailable
+							</p>
 							<p className="text-xs text-muted-foreground max-w-md mx-auto">
-								The metrics endpoint didn't return data. The platform is still running — only
-								the telemetry feed is paused. Check <code className="px-1.5 py-0.5 rounded bg-muted">docker compose logs api</code> if it persists.
+								The metrics endpoint didn't return data. The platform is still
+								running — only the telemetry feed is paused. Check{" "}
+								<code className="px-1.5 py-0.5 rounded bg-muted">
+									docker compose logs api
+								</code>{" "}
+								if it persists.
 							</p>
 						</div>
 					)}
