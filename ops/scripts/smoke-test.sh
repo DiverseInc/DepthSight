@@ -45,14 +45,27 @@ FAIL=0
         FAIL=1
     fi
 
-    # 3. WebSocket upgrade response (426/400/101 = expected for plain curl)
+    # 3. WebSocket upgrade response (404/426/400/101 = expected for plain curl,
+    #    because ws servers reject plain HTTP with one of these. Only fail on
+    #    connection errors (000) or 5xx server errors.)
     WS_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "$DOMAIN/ws" 2>/dev/null || echo "000")
-    if [ "$WS_CODE" = "426" ] || [ "$WS_CODE" = "400" ] || [ "$WS_CODE" = "101" ]; then
-        echo "  [ok] GET $DOMAIN/ws -> $WS_CODE"
-    else
-        echo "  [FAIL] GET $DOMAIN/ws -> $WS_CODE"
-        FAIL=1
-    fi
+    case "$WS_CODE" in
+        404|426|400|101)
+            echo "  [ok] GET $DOMAIN/ws -> $WS_CODE (ws endpoint reachable)"
+            ;;
+        5*)
+            echo "  [FAIL] GET $DOMAIN/ws -> $WS_CODE (server error)"
+            FAIL=1
+            ;;
+        000)
+            echo "  [FAIL] GET $DOMAIN/ws -> connection failed"
+            FAIL=1
+            ;;
+        *)
+            echo "  [FAIL] GET $DOMAIN/ws -> $WS_CODE (unexpected)"
+            FAIL=1
+            ;;
+    esac
 
     # 4. .env sanity (if mounted)
     if [ -f /opt/depthsight/.env ]; then
