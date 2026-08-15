@@ -1,6 +1,7 @@
 // src/pages/Positions.tsx
 
 import {
+	Activity,
 	AlertTriangle,
 	Briefcase,
 	LineChart,
@@ -8,10 +9,12 @@ import {
 	Pencil,
 	PlusCircle,
 	Siren,
+	TrendingUp,
 } from "lucide-react";
 import type React from "react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 
 // --- UI & Layout Components ---
 import { PageLayout } from "@/components/layout/PageLayout";
@@ -430,11 +433,31 @@ export default function Positions() {
 								positions.length === 0 &&
 								!isError ? (
 								<TableRow>
-									<TableCell
-										colSpan={11}
-										className="h-24 text-center text-muted-foreground"
-									>
-										{t("noActivePositions")}
+									<TableCell colSpan={11} className="p-0">
+										<div className="py-16 px-6 text-center">
+											<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
+												<Activity className="h-6 w-6 text-primary" />
+											</div>
+											<p className="text-sm font-medium mb-1">
+												{t("noActivePositions", "No open positions")}
+											</p>
+											<p className="text-xs text-muted-foreground max-w-md mx-auto">
+												Once a strategy opens a trade, it shows up here in real
+												time. Start one from the Strategies page to see it in
+												action.
+											</p>
+											<Button
+												asChild
+												variant="outline"
+												size="sm"
+												className="mt-4"
+											>
+												<Link to="/strategies">
+													<TrendingUp className="mr-2 h-3.5 w-3.5" />
+													Go to Strategies
+												</Link>
+											</Button>
+										</div>
 									</TableCell>
 								</TableRow>
 							) : (
