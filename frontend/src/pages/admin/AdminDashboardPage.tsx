@@ -2,7 +2,12 @@
 
 import {
 	Activity,
+	CheckCircle2,
+	Circle,
+	Copy,
 	ListChecks,
+	Mail,
+	Rocket,
 	TrendingUp,
 	UserPlus,
 	Users,
@@ -79,6 +84,116 @@ const getDeterministicColor = (str: string) => {
 	return `hsl(${hue}, 70%, 60%)`;
 };
 
+const OnboardingChecklist = ({ hasUsers }: { hasUsers: boolean }) => {
+	const items = [
+		{
+			done: true,
+			label: "Platform deployed",
+			detail: "All 12 services running, ops sidecar monitoring",
+		},
+		{
+			done: hasUsers,
+			label: "First investor onboarded",
+			detail: "Register a user at /register, or use the invite flow",
+		},
+		{
+			done: false,
+			label: "SMTP configured (password reset emails)",
+			detail: "Set SMTP_* in .env and set EMAIL_CONFIRMATION_ENABLED=true",
+		},
+		{
+			done: false,
+			label: "AI provider key set (Co-Pilot functional)",
+			detail: "QWEN_API_KEY or OPENROUTER_API_KEY in .env",
+		},
+		{
+			done: false,
+			label: "Slack/Telegram alerts wired to ops sidecar",
+			detail: "Ship /opt/ops/state/alert to a webhook so you hear about issues",
+		},
+		{
+			done: false,
+			label: "Custom domain + branding",
+			detail: "Update VITE_* in frontend/.env.production + pwa/.env.production",
+		},
+	];
+
+	const completed = items.filter((i) => i.done).length;
+	const pct = Math.round((completed / items.length) * 100);
+
+	return (
+		<Card>
+			<CardHeader>
+				<div className="flex items-start justify-between gap-4">
+					<div>
+						<CardTitle className="flex items-center gap-2">
+							<Rocket className="h-5 w-5 text-primary" />
+							Launch checklist
+						</CardTitle>
+						<CardDescription>
+							You're {completed} of {items.length} steps into your launch. Tick these off and you're investor-ready.
+						</CardDescription>
+					</div>
+					<div className="text-right shrink-0">
+						<div className="text-3xl font-bold text-primary">{pct}%</div>
+						<p className="text-xs text-muted-foreground">complete</p>
+					</div>
+				</div>
+			</CardHeader>
+			<CardContent>
+				<div className="space-y-3">
+					{items.map((item) => (
+						<div
+							key={item.label}
+							className="flex items-start gap-3 p-3 rounded-lg border bg-card hover:bg-muted/30 transition-colors"
+						>
+							{item.done ? (
+								<CheckCircle2 className="h-5 w-5 text-green-600 mt-0.5 shrink-0" />
+							) : (
+								<Circle className="h-5 w-5 text-muted-foreground/40 mt-0.5 shrink-0" />
+							)}
+							<div className="min-w-0">
+								<p
+									className={
+										"text-sm font-medium " +
+										(item.done ? "line-through text-muted-foreground" : "")
+									}
+								>
+									{item.label}
+								</p>
+								<p className="text-xs text-muted-foreground">{item.detail}</p>
+							</div>
+						</div>
+					))}
+				</div>
+			</CardContent>
+		</Card>
+	);
+};
+
+const EmptyState = ({
+	icon: Icon,
+	title,
+	hint,
+	cta,
+}: {
+	icon: React.ComponentType<{ className?: string }>;
+	title: string;
+	hint: string;
+	cta?: string;
+}) => (
+	<div className="py-12 px-6 text-center">
+		<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
+			<Icon className="h-6 w-6 text-primary" />
+		</div>
+		<p className="text-sm font-medium mb-1">{title}</p>
+		<p className="text-xs text-muted-foreground max-w-sm mx-auto">{hint}</p>
+		{cta && (
+			<p className="text-xs text-primary mt-2 font-medium">{cta}</p>
+		)}
+	</div>
+);
+
 const AdminDashboardPage: React.FC = () => {
 	const { data: stats, isLoading: isLoadingStats } = useAdminDashboardStats();
 	const { data: usersData, isLoading: isLoadingUsers } = useAdminGetUsers(
@@ -115,6 +230,10 @@ const AdminDashboardPage: React.FC = () => {
 					Overview of platform statistics and metrics
 				</p>
 			</div>
+
+			{!isLoadingUsers && totalUsers <= 1 && (
+				<OnboardingChecklist hasUsers={totalUsers > 1} />
+			)}
 
 			<div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
 				<StatCard
@@ -194,11 +313,12 @@ const AdminDashboardPage: React.FC = () => {
 								</BarChart>
 							</ChartContainer>
 						) : (
-							<div className="h-[300px] flex items-center justify-center">
-								<p className="text-sm text-muted-foreground">
-									No task data available
-								</p>
-							</div>
+							<EmptyState
+								icon={ListChecks}
+								title="No tasks run yet"
+								hint="Tasks appear here as users run backtests, deploy strategies, and trigger AI workflows."
+								cta="Seed demo data → scripts/seed_demo_data.py"
+							/>
 						)}
 					</CardContent>
 				</Card>
@@ -291,9 +411,11 @@ const AdminDashboardPage: React.FC = () => {
 								))}
 						</div>
 					) : (
-						<div className="py-12 text-center">
-							<p className="text-muted-foreground">No task data available</p>
-						</div>
+						<EmptyState
+							icon={ListChecks}
+							title="No task activity yet"
+							hint="When users run backtests, deploy strategies, or trigger AI workflows, they'll show up here."
+						/>
 					)}
 				</CardContent>
 			</Card>

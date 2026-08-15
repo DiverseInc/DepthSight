@@ -98,7 +98,25 @@ const AdminUsersPage: React.FC = () => {
 									</TableCell>
 								</TableRow>
 							))
-						: data?.users.map((user) => (
+						: data && data.users.length === 0 ? (
+							<TableRow>
+								<TableCell colSpan={6} className="p-0">
+									<div className="py-16 px-6 text-center">
+										<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
+											<Users className="h-6 w-6 text-primary" />
+										</div>
+										<p className="text-sm font-medium mb-1">No users yet</p>
+										<p className="text-xs text-muted-foreground max-w-md mx-auto">
+											When someone registers at <code className="px-1.5 py-0.5 rounded bg-muted">/register</code> they'll appear here.
+											Want a populated view for your first investor demo? Run the seed script.
+										</p>
+										<p className="text-xs text-primary mt-3 font-mono">
+											bash scripts/seed_demo_data.py
+										</p>
+									</div>
+								</TableCell>
+							</TableRow>
+						) : data?.users.map((user) => (
 								<TableRow key={user.id}>
 									<TableCell>{user.id}</TableCell>
 									<TableCell>{user.username}</TableCell>
