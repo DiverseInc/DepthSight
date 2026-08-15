@@ -21,7 +21,9 @@ RUN curl -fsSL "https://github.com/aptible/supercronic/releases/download/${SUPER
 
 COPY crontab /etc/crontab
 COPY scripts/ /opt/ops/
-RUN chmod +x /opt/ops/*.sh \
+# Strip CRLF line endings (Windows -> Linux CRLF breaks shebangs and cron parsers)
+RUN find /opt/ops /etc/crontab -type f \( -name '*.sh' -o -name 'crontab' \) -exec sed -i 's/\r$//' {} + \
+    && chmod +x /opt/ops/*.sh \
     && mkdir -p /opt/ops/state /backups
 
 # Run in foreground (PID 1) so docker can manage the lifecycle
