@@ -9,6 +9,7 @@ import { SystemStatus } from "@/components/dashboard/SystemStatus";
 import { TopStrategiesTable } from "@/components/dashboard/TopStrategiesTable";
 import { TotalPnl } from "@/components/dashboard/TotalPnl";
 import { WelcomeBanner } from "@/components/dashboard/WelcomeBanner";
+import { XpLevelCard } from "@/components/dashboard/XpLevelCard";
 import { PageLayout } from "@/components/layout/PageLayout";
 
 const Index = () => {
@@ -18,6 +19,7 @@ const Index = () => {
 		<PageLayout title={t("pageTitle")} icon={Home}>
 			<div className="space-y-6">
 				<WelcomeBanner />
+				<XpLevelCard />
 				<PortfolioOverviewWidget />
 				<div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
 					<div className="lg:col-span-2">
