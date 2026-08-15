@@ -1,10 +1,11 @@
 // src/pages/Analytics.tsx
 
 import { subDays } from "date-fns";
-import { BarChart, TrendingUp, WandSparkles } from "lucide-react";
+import { BarChart, BarChart3, TrendingUp, WandSparkles } from "lucide-react";
 import { useMemo, useState } from "react";
 import type { DateRange } from "react-day-picker"; // Added missing import
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router-dom";
 import { AdvancedStatCard } from "@/components/analytics/AdvancedStatCard";
 import { AnalyticsFilters } from "@/components/analytics/AnalyticsFilters";
 import { DayOfWeekPnlChart } from "@/components/analytics/DayOfWeekPnlChart";
@@ -523,6 +524,27 @@ export default function Analytics() {
 								colorClass="bg-blue-500"
 								subValue={t("overview.tradedVolume", "Total traded")}
 							/>
+						</div>
+					) : !isLoading ? (
+						<div className="mb-6">
+							<div className="rounded-lg border border-dashed border-border/60 bg-muted/20 py-12 px-6 text-center">
+								<div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-primary/10 mb-3">
+									<BarChart3 className="h-6 w-6 text-primary" />
+								</div>
+								<p className="text-sm font-medium mb-1">
+									{t("noTradesYet", "No trade history yet")}
+								</p>
+								<p className="text-xs text-muted-foreground max-w-md mx-auto">
+									Once your strategies start executing, performance metrics,
+									equity curve, and trade breakdowns will appear here.
+								</p>
+								<Button asChild variant="outline" size="sm" className="mt-4">
+									<Link to="/strategies">
+										<TrendingUp className="mr-2 h-3.5 w-3.5" />
+										Go to Strategies
+									</Link>
+								</Button>
+							</div>
 						</div>
 					) : null}
 
