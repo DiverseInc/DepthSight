@@ -871,12 +871,8 @@ const CommunityHub = () => {
 				setLoadingVerified(false);
 			})
 			.catch(() => {
-				toast.error(
-					t(
-						"community:verified.loadFailed",
-						"Failed to load verified templates",
-					),
-				);
+				// Hub is unreachable (CORS or 404) on self-hosted deployments.
+				// Empty state is shown via the loading=false below; no toast.
 				setLoadingVerified(false);
 			});
 	}, [t, hubApiUrl]);
@@ -893,7 +889,7 @@ const CommunityHub = () => {
 				setLoadingNews(false);
 			})
 			.catch(() => {
-				toast.error(t("community:news.loadFailed", "Failed to load hub news"));
+				// Hub is unreachable (CORS or 404) on self-hosted deployments.
 				setLoadingNews(false);
 			});
 	}, [t, hubApiUrl]);
@@ -910,9 +906,7 @@ const CommunityHub = () => {
 				setLoadingShared(false);
 			})
 			.catch(() => {
-				toast.error(
-					t("community:community.loadFailed", "Failed to load community ideas"),
-				);
+				// Hub is unreachable (CORS or 404) on self-hosted deployments.
 				setLoadingShared(false);
 			});
 	}, [t, hubApiUrl]);
@@ -929,9 +923,7 @@ const CommunityHub = () => {
 				setLoadingDiscussions(false);
 			})
 			.catch(() => {
-				toast.error(
-					t("community:discussion.loadFailed", "Failed to load discussions"),
-				);
+				// Hub is unreachable (CORS or 404) on self-hosted deployments.
 				setLoadingDiscussions(false);
 			});
 	}, [t, hubApiUrl]);
