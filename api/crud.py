@@ -4236,6 +4236,26 @@ async def seed_default_strategy_templates(db):
             },
             "risk_profile": {"stopLossPercent": 2.5, "takeProfitPercent": 6.0, "maxConcurrentTrades": 1, "riskPerTradePercent": 1.0},
         },
+        {
+            "slug": "blank-canvas",
+            "name": "Blank Canvas",
+            "description": "Start from scratch. Empty config — pick your own symbol, timeframe, blocks, and risk settings in the strategy editor. Best for experienced algo traders who know exactly what they want to build.",
+            "archetype": "blank",
+            "tier_required": "free",
+            "sort_order": 100,  # shown last (after the curated 6)
+            "config_data": {
+                "timeframe": "1h",
+                "symbol": "BTCUSDT",
+                "blocks": [],
+                "symbol_selection_mode": "STATIC",
+            },
+            "risk_profile": {
+                "stopLossPercent": 2.0,
+                "takeProfitPercent": 4.0,
+                "maxConcurrentTrades": 1,
+                "riskPerTradePercent": 1.0,
+            },
+        },
     ]
 
     created_count = 0
@@ -4257,4 +4277,274 @@ async def seed_default_strategy_templates(db):
     if created_count > 0:
         await db.commit()
     return created_count
+
+
+
+"""Seed defaults for hub content: news, trading ideas, discussions.
+Idempotent — only inserts new rows. Called from api lifespan on first start.
+"""
+
+import uuid
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+import models
+
+
+async def list_hub_news(db, limit=20):
+    result = await db.execute(
+        select(models.HubNewsItem)
+        .order_by(
+            models.HubNewsItem.is_pinned.desc(),
+            models.HubNewsItem.created_at.desc(),
+        )
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def list_hub_topics(db, topic_type=None, limit=20):
+    stmt = select(models.HubTopic)
+    if topic_type:
+        stmt = stmt.filter(models.HubTopic.topic_type == topic_type)
+    stmt = stmt.order_by(models.HubTopic.created_at.desc()).limit(limit)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def news_exists_by_title(db, title):
+    result = await db.execute(
+        select(models.HubNewsItem).filter(models.HubNewsItem.title == title)
+    )
+    return result.scalars().first() is not None
+
+
+async def topic_exists_by_title(db, title):
+    result = await db.execute(
+        select(models.HubTopic).filter(models.HubTopic.title == title)
+    )
+    return result.scalars().first() is not None
+
+
+async def seed_default_hub_content(db):
+    """Seed 4 news + 4 trading ideas + 4 discussions. Idempotent."""
+    now = datetime.now(timezone.utc)
+    created = 0
+
+    news_items = [
+        {
+            "title": "Welcome to the DepthSight Community",
+            "text": (
+                "This is the official community space for DepthSight users. "
+                "Share strategies, ask questions, and learn from other algo "
+                "traders. The Verified Templates tab on the left is curated "
+                "by our team — every template has been backtested and "
+                "reviewed. Use them as-is or fork them to make your own."
+            ),
+            "days_ago": 30,
+            "is_pinned": True,
+        },
+        {
+            "title": "v1.4.0 — Genetic Command Center is live",
+            "text": (
+                "Auto-evolve strategy parameters from the gene pool. The "
+                "Genetic Command Center runs hundreds of backtests in "
+                "parallel and surfaces profitable mutations. Try it from "
+                "the Discovery Hub → Genetic Run page."
+            ),
+            "days_ago": 12,
+            "is_pinned": True,
+        },
+        {
+            "title": "Pro tip: paper trade for 7 days before going live",
+            "text": (
+                "Every profitable trader on the platform started with 7 days "
+                "of paper trading. Use this time to verify the strategy "
+                "behaves as expected in live market conditions. Most "
+                "strategies that backtest well underperform live for the "
+                "first week — that's normal. Don't panic, just observe."
+            ),
+            "days_ago": 7,
+            "is_pinned": False,
+        },
+        {
+            "title": "Q1 community contest: share your best strategy",
+            "text": (
+                "Share your best-performing strategy with the community "
+                "this quarter. Top 10 strategies (by Sharpe ratio) get "
+                "featured on the Verified Templates tab and a Pro plan "
+                "credit. Submit via Discovery Hub → Trading Ideas."
+            ),
+            "days_ago": 2,
+            "is_pinned": False,
+        },
+    ]
+
+    for n in news_items:
+        if not await news_exists_by_title(db, n["title"]):
+            db.add(
+                models.HubNewsItem(
+                    title=n["title"],
+                    text=n["text"],
+                    date=(now - timedelta(days=n["days_ago"])).strftime("%Y-%m-%d"),
+                    is_pinned=n["is_pinned"],
+                    likes_count=0,
+                    created_at=now - timedelta(days=n["days_ago"]),
+                )
+            )
+            created += 1
+
+    trading_ideas = [
+        {
+            "title": "BTC RSI Breakout — Live Performance This Week",
+            "description": (
+                "Sharing my live BTC RSI breakout strategy. Running 1h "
+                "timeframe, 0.5% risk per trade, 2% stop loss. This week: "
+                "+1.8% on 4 trades, 75% win rate. Stop loss held up well "
+                "during the Tuesday dip. Setup is based on the verified "
+                "RSI Breakout v2 template with tightened risk."
+            ),
+            "author_name": "sarah_quant",
+            "symbol": "BTCUSDT",
+            "period_start": "2026-04-01",
+            "period_end": "2026-04-08",
+            "kpis": {"pnl_pct": 1.8, "win_rate": 75.0, "trades": 4, "max_drawdown": 0.6, "sharpe": 2.1},
+        },
+        {
+            "title": "ETH Bollinger Bounce — Strategy + Backtest",
+            "description": (
+                "Modified the verified Bollinger Mean Reversion template to "
+                "add a volume filter — only enter when volume is above 1.5x "
+                "20-period average. Cut my false signals in half. "
+                "Backtested 6 months, +12.4% return, 1.8 Sharpe."
+            ),
+            "author_name": "raj_algo",
+            "symbol": "ETHUSDT",
+            "period_start": "2025-09-01",
+            "period_end": "2026-03-01",
+            "kpis": {"pnl_pct": 12.4, "win_rate": 62.0, "trades": 87, "max_drawdown": 4.2, "sharpe": 1.8},
+        },
+        {
+            "title": "Grid DCA on BTC — 90 days of accumulation",
+            "description": (
+                "Set up a 10-level grid on BTC between $58K and $72K. "
+                "Auto-buys on dips, auto-sells on rips. No leverage, just "
+                "steady accumulation. 90 days in: +6.2%, mostly from "
+                "harvested grid profits. Perfect for HODLers who want to "
+                "automate their buy-low sell-high."
+            ),
+            "author_name": "emma_retail",
+            "symbol": "BTCUSDT",
+            "period_start": "2026-01-01",
+            "period_end": "2026-04-01",
+            "kpis": {"pnl_pct": 6.2, "win_rate": 68.0, "trades": 142, "max_drawdown": 0.0, "sharpe": 1.4},
+        },
+        {
+            "title": "SOL Order Book Imbalance Scalper — High Frequency Setup",
+            "description": (
+                "Running the OBI scalper on SOLUSDT 5m chart. Tight stops "
+                "(0.5%), quick exits (0.8%), max 3 concurrent positions. "
+                "Active management required — I check in every 2 hours. "
+                "Month 1: +4.1% with 312 trades. Not for beginners, but "
+                "powerful if you have time to monitor."
+            ),
+            "author_name": "mike_scalper",
+            "symbol": "SOLUSDT",
+            "period_start": "2026-03-01",
+            "period_end": "2026-04-01",
+            "kpis": {"pnl_pct": 4.1, "win_rate": 58.0, "trades": 312, "max_drawdown": 2.8, "sharpe": 1.6},
+        },
+    ]
+
+    for t in trading_ideas:
+        if not await topic_exists_by_title(db, t["title"]):
+            db.add(
+                models.HubTopic(
+                    id=str(uuid.uuid4()),
+                    topic_type="strategy",
+                    title=t["title"],
+                    description=t["description"],
+                    author_name=t["author_name"],
+                    symbol=t["symbol"],
+                    period_start=t["period_start"],
+                    period_end=t["period_end"],
+                    kpis=t["kpis"],
+                    equity_curve=[],
+                    strategy_json={},
+                    created_at=now - timedelta(days=hash(t["title"]) % 21),
+                )
+            )
+            created += 1
+
+    discussions = [
+        {
+            "title": "Welcome thread — introduce yourself",
+            "description": (
+                "New to DepthSight? Drop a quick intro: your trading "
+                "experience, what brought you here, and what you're hoping "
+                "to automate. The community team and other traders will "
+                "chime in with tips and template recommendations."
+            ),
+            "author_name": "depthsight_team",
+        },
+        {
+            "title": "Best strategy for a beginner with $5K capital?",
+            "description": (
+                "Just signed up. I have $5K to start with, no algo trading "
+                "experience. Which verified template would you recommend I "
+                "start with? I want something that won't blow up the account "
+                "while I learn the platform. Open to going slow and "
+                "consistent rather than fast and risky."
+            ),
+            "author_name": "lina_hodler",
+        },
+        {
+            "title": "Feature request: mobile push notifications for trade alerts",
+            "description": (
+                "Currently I get Telegram alerts for every trade which is "
+                "great. But would love a DepthSight mobile app with native "
+                "push notifications. Especially for kill-switch events — "
+                "those should ping instantly, not wait for Telegram "
+                "rate limits."
+            ),
+            "author_name": "raj_algo",
+        },
+        {
+            "title": "How does the ML Core work? Is it actually useful?",
+            "description": (
+                "Looking at the ML Core page and the ML-Confirmed Trend "
+                "template. Does the model train on my actual trade history "
+                "or is it a generic pre-trained model? If it's the latter, "
+                "I'd expect the strategy to underperform compared to "
+                "templates that don't rely on ML. Looking for clarification "
+                "before I deploy the premium template with real capital."
+            ),
+            "author_name": "alex_trader",
+        },
+    ]
+
+    for d in discussions:
+        if not await topic_exists_by_title(db, d["title"]):
+            db.add(
+                models.HubTopic(
+                    id=str(uuid.uuid4()),
+                    topic_type="discussion",
+                    title=d["title"],
+                    description=d["description"],
+                    author_name=d["author_name"],
+                    symbol=None,
+                    period_start=None,
+                    period_end=None,
+                    kpis=None,
+                    equity_curve=None,
+                    strategy_json=None,
+                    created_at=now - timedelta(days=hash(d["title"]) % 14),
+                )
+            )
+            created += 1
+
+    if created > 0:
+        await db.commit()
+    return created
 

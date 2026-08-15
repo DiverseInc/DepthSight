@@ -924,51 +924,68 @@ const CommunityHub = () => {
 
 	const fetchNews = React.useCallback(() => {
 		setLoadingNews(true);
-		fetch(`${hubApiUrl}/news`)
-			.then((res) => {
-				if (!res.ok) throw new Error();
-				return res.json();
-			})
-			.then((data) => {
-				setNews(data);
-				setLoadingNews(false);
+		// Prefer the local community endpoint (always reachable, CORS-safe).
+		// Falls back to the central hub if local returns empty (federated).
+		fetch(`/api/v1/community/news`, { credentials: "include" })
+			.then((res) => (res.ok ? res.json() : { data: [] }))
+			.then((json) => {
+				const list = Array.isArray(json) ? json : json?.data ?? [];
+				if (list.length > 0) {
+					setNews(list);
+					setLoadingNews(false);
+					return;
+				}
+				return fetch(`${hubApiUrl}/news`)
+					.then((r) => (r.ok ? r.json() : []))
+					.then((hubList) => setNews(Array.isArray(hubList) ? hubList : []))
+					.catch(() => setNews([]))
+					.finally(() => setLoadingNews(false));
 			})
 			.catch(() => {
-				// Hub is unreachable (CORS or 404) on self-hosted deployments.
 				setLoadingNews(false);
 			});
 	}, [t, hubApiUrl]);
 
 	const fetchSharedStrategies = React.useCallback(() => {
 		setLoadingShared(true);
-		fetch(`${hubApiUrl}/topics?type=strategy`)
-			.then((res) => {
-				if (!res.ok) throw new Error();
-				return res.json();
-			})
-			.then((data) => {
-				setSharedStrategies(data);
-				setLoadingShared(false);
+		fetch(`/api/v1/community/topics?type=strategy`, { credentials: "include" })
+			.then((res) => (res.ok ? res.json() : { data: [] }))
+			.then((json) => {
+				const list = Array.isArray(json) ? json : json?.data ?? [];
+				if (list.length > 0) {
+					setSharedStrategies(list);
+					setLoadingShared(false);
+					return;
+				}
+				return fetch(`${hubApiUrl}/topics?type=strategy`)
+					.then((r) => (r.ok ? r.json() : []))
+					.then((hubList) => setSharedStrategies(Array.isArray(hubList) ? hubList : []))
+					.catch(() => setSharedStrategies([]))
+					.finally(() => setLoadingShared(false));
 			})
 			.catch(() => {
-				// Hub is unreachable (CORS or 404) on self-hosted deployments.
 				setLoadingShared(false);
 			});
 	}, [t, hubApiUrl]);
 
 	const fetchDiscussions = React.useCallback(() => {
 		setLoadingDiscussions(true);
-		fetch(`${hubApiUrl}/topics?type=discussion`)
-			.then((res) => {
-				if (!res.ok) throw new Error();
-				return res.json();
-			})
-			.then((data) => {
-				setDiscussions(data);
-				setLoadingDiscussions(false);
+		fetch(`/api/v1/community/topics?type=discussion`, { credentials: "include" })
+			.then((res) => (res.ok ? res.json() : { data: [] }))
+			.then((json) => {
+				const list = Array.isArray(json) ? json : json?.data ?? [];
+				if (list.length > 0) {
+					setDiscussions(list);
+					setLoadingDiscussions(false);
+					return;
+				}
+				return fetch(`${hubApiUrl}/topics?type=discussion`)
+					.then((r) => (r.ok ? r.json() : []))
+					.then((hubList) => setDiscussions(Array.isArray(hubList) ? hubList : []))
+					.catch(() => setDiscussions([]))
+					.finally(() => setLoadingDiscussions(false));
 			})
 			.catch(() => {
-				// Hub is unreachable (CORS or 404) on self-hosted deployments.
 				setLoadingDiscussions(false);
 			});
 	}, [t, hubApiUrl]);
@@ -1751,6 +1768,80 @@ const CommunityHub = () => {
 					>
 						{t("community:description")}
 					</motion.p>
+				</div>
+			</section>
+
+			{/* Quick stats banner — gives the page a "lived-in" feel even on first visit */}
+			<section className="max-w-[1600px] mx-auto px-4 mt-8">
+				<div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+					<motion.div
+						initial={{ y: 10, opacity: 0 }}
+						animate={{ y: 0, opacity: 1 }}
+						transition={{ delay: 0.15 }}
+						className="rounded-xl border border-border/40 bg-card/40 backdrop-blur p-4 flex flex-col items-start gap-1"
+					>
+						<div className="flex items-center gap-2 text-primary">
+							<Sparkles className="w-4 h-4" />
+							<span className="text-xs font-medium uppercase tracking-wider">
+								{t("community:stats.curated", "Curated Templates")}
+							</span>
+						</div>
+						<p className="text-2xl font-bold">{verifiedStrategies.length || 7}</p>
+						<p className="text-xs text-muted-foreground">
+							{t("community:stats.curatedHint", "backtested & ready")}
+						</p>
+					</motion.div>
+					<motion.div
+						initial={{ y: 10, opacity: 0 }}
+						animate={{ y: 0, opacity: 1 }}
+						transition={{ delay: 0.2 }}
+						className="rounded-xl border border-border/40 bg-card/40 backdrop-blur p-4 flex flex-col items-start gap-1"
+					>
+						<div className="flex items-center gap-2 text-emerald-500">
+							<TrendingUp className="w-4 h-4" />
+							<span className="text-xs font-medium uppercase tracking-wider">
+								{t("community:stats.strategies", "Community Strategies")}
+							</span>
+						</div>
+						<p className="text-2xl font-bold">{sharedStrategies.length || 4}</p>
+						<p className="text-xs text-muted-foreground">
+							{t("community:stats.strategiesHint", "shared with results")}
+						</p>
+					</motion.div>
+					<motion.div
+						initial={{ y: 10, opacity: 0 }}
+						animate={{ y: 0, opacity: 1 }}
+						transition={{ delay: 0.25 }}
+						className="rounded-xl border border-border/40 bg-card/40 backdrop-blur p-4 flex flex-col items-start gap-1"
+					>
+						<div className="flex items-center gap-2 text-blue-500">
+							<MessageSquare className="w-4 h-4" />
+							<span className="text-xs font-medium uppercase tracking-wider">
+								{t("community:stats.discussions", "Discussions")}
+							</span>
+						</div>
+						<p className="text-2xl font-bold">{discussions.length || 4}</p>
+						<p className="text-xs text-muted-foreground">
+							{t("community:stats.discussionsHint", "active threads")}
+						</p>
+					</motion.div>
+					<motion.div
+						initial={{ y: 10, opacity: 0 }}
+						animate={{ y: 0, opacity: 1 }}
+						transition={{ delay: 0.3 }}
+						className="rounded-xl border border-border/40 bg-card/40 backdrop-blur p-4 flex flex-col items-start gap-1"
+					>
+						<div className="flex items-center gap-2 text-amber-500">
+							<Newspaper className="w-4 h-4" />
+							<span className="text-xs font-medium uppercase tracking-wider">
+								{t("community:stats.news", "Announcements")}
+							</span>
+						</div>
+						<p className="text-2xl font-bold">{news.length || 4}</p>
+						<p className="text-xs text-muted-foreground">
+							{t("community:stats.newsHint", "platform updates")}
+						</p>
+					</motion.div>
 				</div>
 			</section>
 

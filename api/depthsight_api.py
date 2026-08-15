@@ -134,6 +134,7 @@ from .routes.webhooks import webhooks_router
 from .routes.admin import admin_router
 from .routes.discovery import discovery_router
 from .routes.strategy_templates import templates_router
+from .routes.community import community_router
 from .routes.account import (  # noqa: F401
     account_router,
     get_account_status,
@@ -1386,8 +1387,14 @@ async def lifespan(app: FastAPI):
                 )
             else:
                 logger.debug("Strategy templates already present, no seed needed.")
+            # Seed community content (news, ideas, discussions)
+            hub_created = await crud.seed_default_hub_content(seed_db)
+            if hub_created > 0:
+                logger.info(
+                    f"Seeded {hub_created} community content items on first start."
+                )
     except Exception as seed_err:
-        logger.warning(f"Could not seed default strategy templates: {seed_err}")
+        logger.warning(f"Could not seed default content: {seed_err}")
 
     # Pre-load Oracle model for this worker to ensure deterministic behavior
     try:
@@ -1591,6 +1598,7 @@ api_router = APIRouter(prefix="/api/v1", tags=["v1"])
 
 api_router.include_router(hft_router)
 api_router.include_router(templates_router)
+api_router.include_router(community_router)
 
 
 redis_api_client = redis.Redis(
