@@ -111,6 +111,48 @@ async def create_oauth_user(
     )
     db.add(db_user)
     await db.flush()
+
+    # Create default AppConfig for OAuth users too.
+    # Without this, GET /api/v1/config returns 404 and the Engine Room
+    # page shows "Configuration for user <name> not found."
+    # (Regular registration creates this in create_user; OAuth skipped it.)
+    default_risk_management = schemas.RiskManagementSettings(
+        maxDrawdown=10.0,
+        maxConsecutiveLosses=10,
+        maxConcurrentTrades=5,
+        stopLossEnabled=True,
+        defaultStopLossPercent=2.0,
+        riskPerTradePercent=1.0,
+    )
+    default_backtest_risk_management = schemas.BacktestRiskManagementSettings(
+        maxDrawdown=10.0,
+        dailyMaxLossPercent=5.0,
+        maxConsecutiveLosses=10,
+        maxConcurrentTrades=5,
+        stopLossEnabled=True,
+        defaultStopLossPercent=2.0,
+    )
+    default_notifications = schemas.NotificationSettings(
+        emailEnabled=security.EMAIL_CONFIRMATION_ENABLED,
+        telegramEnabled=False,
+        telegramChatId=None,
+        shareTelemetry=False,
+    )
+    default_exchange_settings = schemas.ExchangeSettings(
+        binance=schemas.ExchangePlatformSettings(enabled=False, api_key_name=""),
+    )
+    db_config = models.AppConfig(
+        user_id=db_user.id,
+        risk_management=default_risk_management.model_dump(by_alias=True),
+        backtest_risk_management=default_backtest_risk_management.model_dump(
+            by_alias=True
+        ),
+        notifications=default_notifications.model_dump(by_alias=True),
+        exchange_settings=default_exchange_settings.model_dump(by_alias=True),
+        data_sources={"symbols": []},
+    )
+    db.add(db_config)
+
     return db_user
 
 
@@ -1257,6 +1299,61 @@ async def get_user_bonuses(
 
 
 # --- Config CRUD ---
+async def create_default_config_for_existing_user(
+    db: AsyncSession, user_id: int
+) -> models.AppConfig:
+    """
+    Idempotent helper to create a default AppConfig for a user that doesn't
+    have one (e.g. a legacy Google OAuth signup that predates the fix to
+    create_oauth_user). Safe to call multiple times — checks for an existing
+    row first.
+    """
+    existing = await db.execute(
+        select(models.AppConfig).filter(models.AppConfig.user_id == user_id)
+    )
+    if existing.scalars().first() is not None:
+        return existing.scalars().first()
+
+    default_risk_management = schemas.RiskManagementSettings(
+        maxDrawdown=10.0,
+        maxConsecutiveLosses=10,
+        maxConcurrentTrades=5,
+        stopLossEnabled=True,
+        defaultStopLossPercent=2.0,
+        riskPerTradePercent=1.0,
+    )
+    default_backtest_risk_management = schemas.BacktestRiskManagementSettings(
+        maxDrawdown=10.0,
+        dailyMaxLossPercent=5.0,
+        maxConsecutiveLosses=10,
+        maxConcurrentTrades=5,
+        stopLossEnabled=True,
+        defaultStopLossPercent=2.0,
+    )
+    default_notifications = schemas.NotificationSettings(
+        emailEnabled=security.EMAIL_CONFIRMATION_ENABLED,
+        telegramEnabled=False,
+        telegramChatId=None,
+        shareTelemetry=False,
+    )
+    default_exchange_settings = schemas.ExchangeSettings(
+        binance=schemas.ExchangePlatformSettings(enabled=False, api_key_name=""),
+    )
+    db_config = models.AppConfig(
+        user_id=user_id,
+        risk_management=default_risk_management.model_dump(by_alias=True),
+        backtest_risk_management=default_backtest_risk_management.model_dump(
+            by_alias=True
+        ),
+        notifications=default_notifications.model_dump(by_alias=True),
+        exchange_settings=default_exchange_settings.model_dump(by_alias=True),
+        data_sources={"symbols": []},
+    )
+    db.add(db_config)
+    await db.flush()
+    return db_config
+
+
 async def get_config(db: AsyncSession, user_id: int) -> Optional[schemas.AppConfig]:
     # 1. Get primary configuration
     config_result = await db.execute(

@@ -50,13 +50,32 @@ async def get_config_endpoint(
     )
     config = await crud.get_config(db, user_id=current_user.id)
     if not config:
+        # Auto-recover: if a user (typically from an older Google OAuth signup
+        # before create_oauth_user created the AppConfig) has no config, build
+        # one on demand. Prevents the "Engine Room / Configuration for user X
+        # not found" 404 that would otherwise brick the page.
         logger.warning(
-            f"AppConfig for user '{current_user.username}' (ID: {current_user.id}) not found."
+            f"AppConfig for user '{current_user.username}' (ID: {current_user.id}) "
+            f"not found — creating default config on demand."
         )
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Configuration for user {current_user.username} not found.",
-        )
+        try:
+            await crud.create_default_config_for_existing_user(
+                db, user_id=current_user.id
+            )
+            await db.commit()
+        except Exception as e:
+            logger.error(f"Failed to auto-create AppConfig for user {current_user.id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create default configuration.",
+            )
+        config = await crud.get_config(db, user_id=current_user.id)
+        if not config:
+            # Should not happen, but defensive
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to retrieve configuration after auto-create.",
+            )
     return {"data": config}
 
 
