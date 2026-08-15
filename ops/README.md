@@ -9,10 +9,9 @@ A small container that runs two scheduled jobs:
 
 ## How it works
 
-- Built from `ops/Dockerfile` (alpine + supercronic + postgresql-client + docker-cli).
-- Runs `supercronic` in the foreground (PID 1) — Docker can manage the lifecycle
-  cleanly without a detached cron daemon.
-- Reads schedule from `ops/crontab`.
+- Built from `ops/Dockerfile` (alpine + bash + postgresql-client + curl + jq).
+- Runs a simple bash scheduler loop (`ops/loop.sh`) in the foreground as PID 1.
+- The loop checks the time every 30s and runs jobs when their schedule matches.
 - Scripts in `ops/scripts/`.
 
 ## Deploy
@@ -56,7 +55,7 @@ Add a 1-min cron in `ops/crontab` to ship alerts to your channel of choice.
 
 ## Files
 
-- `Dockerfile` — alpine + supercronic + postgresql-client
-- `crontab` — the schedule
+- `Dockerfile` — alpine + bash + postgresql-client
+- `loop.sh` — the scheduler (runs as PID 1)
 - `scripts/smoke-test.sh` — runs the smoke checks, writes alert on failure
 - `scripts/backup.sh` — pg_dump + retention

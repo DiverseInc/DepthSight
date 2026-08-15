@@ -1,30 +1,21 @@
 FROM alpine:3.19
 
-# supercronic = cron daemon designed for containers (no daemonization, foreground)
-# postgresql-client = for pg_dump
-# bash curl jq = for the smoke test wrapper
-# docker-cli = for inspecting the running stack
+# Minimal deps - just bash + postgresql client + curl + jq
 RUN apk add --no-cache \
         bash \
         postgresql15-client \
         curl \
         jq \
-        docker-cli \
-        dcron \
-    && rm -rf /var/cache/apk/*
-
-# Install supercronic (small cron that runs in foreground)
-ARG SUPERCRONIC_VERSION=v0.2.33
-RUN curl -fsSL "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-amd64" \
-        -o /usr/local/bin/supercronic \
-    && chmod +x /usr/local/bin/supercronic
-
-COPY crontab /etc/crontab
-COPY scripts/ /opt/ops/
-# Strip CRLF line endings (Windows -> Linux CRLF breaks shebangs and cron parsers)
-RUN find /opt/ops /etc/crontab -type f \( -name '*.sh' -o -name 'crontab' \) -exec sed -i 's/\r$//' {} + \
-    && chmod +x /opt/ops/*.sh \
+    && rm -rf /var/cache/apk/* \
     && mkdir -p /opt/ops/state /backups
 
-# Run in foreground (PID 1) so docker can manage the lifecycle
-CMD ["supercronic", "/etc/crontab"]
+COPY scripts/ /opt/ops/
+COPY loop.sh /opt/ops/loop.sh
+
+# Strip CRLF line endings (Windows -> Linux CRLF breaks shebangs and cron parsers)
+# Then chmod +x every script we copied
+RUN find /opt/ops -type f -name '*.sh' -exec sed -i 's/\r$//' {} + \
+    && chmod +x /opt/ops/*.sh
+
+# Run the scheduler loop in the foreground
+CMD ["bash", "/opt/ops/loop.sh"]
