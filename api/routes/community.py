@@ -1,5 +1,9 @@
 """Local community content endpoints — News, Trading Ideas, Discussions.
 Replaces the central hub calls on self-hosted deployments.
+
+These endpoints are PUBLIC (no auth required) so the Hub can be browsed by
+unauthenticated visitors. Write actions (post, like, comment) are added
+separately and require auth.
 """
 import logging
 from typing import Optional
@@ -7,16 +11,16 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, models, schemas
-from ..auth import get_current_user
+from .. import crud
 from ..database import get_db
 
 logger = logging.getLogger(__name__)
 
+# Public router — no auth dependency, so the Hub page works for unauthenticated
+# visitors and avoids a 401 when the frontend calls without an Authorization header.
 community_router = APIRouter(
     prefix="/community",
     tags=["Community Content"],
-    dependencies=[Depends(get_current_user)],
 )
 
 
@@ -24,7 +28,6 @@ community_router = APIRouter(
 async def list_news(
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
 ):
     """List platform news / announcements / changelog posts."""
     items = await crud.list_hub_news(db, limit=limit)
@@ -49,7 +52,6 @@ async def list_topics(
     type: Optional[str] = Query(None, description="'strategy' or 'discussion'"),
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
 ):
     """List community topics — trading ideas (type=strategy) or discussions."""
     if type and type not in ("strategy", "discussion"):

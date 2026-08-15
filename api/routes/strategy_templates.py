@@ -2,20 +2,24 @@
 StrategyTemplate routes — curated verified strategy templates surfaced on
 the Discovery Hub's "Verified Templates" tab. Replaces the previous
 CORS-blocked external call to app.depthsight.pro on self-hosted deployments.
+
+These endpoints are PUBLIC (no auth required) so the Hub can be browsed by
+unauthenticated visitors. The "Use Template" import flow (separate POST
+endpoint, when added) will require auth.
 """
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, models, schemas
-from ..auth import get_current_user
+from .. import crud, schemas
 from ..database import get_db
 
 logger = logging.getLogger(__name__)
 
+# Public router — no auth dependency, so the Hub page works for unauthenticated
+# visitors and avoids a 401 when the frontend calls without an Authorization header.
 templates_router = APIRouter(
     tags=["Strategy Templates"],
-    dependencies=[Depends(get_current_user)],
 )
 
 
@@ -26,16 +30,14 @@ templates_router = APIRouter(
 )
 async def list_strategy_templates(
     db: AsyncSession = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
 ):
     """
     Returns the 6 built-in strategy archetypes (RSI Breakout, EMA 50/200,
     Bollinger Mean Reversion, Grid DCA, Order Book Imbalance Scalper,
     ML-Confirmed Trend) plus any admin-added templates.
 
-    The list is filtered by is_active=True. All authenticated users can
-    read templates; tier_required is a hint to the UI to gate the "Use
-    this template" button.
+    The list is filtered by is_active=True. Public — no auth required.
+    tier_required is a hint to the UI to gate the "Use this template" button.
     """
     templates = await crud.list_strategy_templates(db, active_only=True)
     return {
@@ -53,7 +55,6 @@ async def list_strategy_templates(
 async def get_strategy_template(
     slug: str,
     db: AsyncSession = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
 ):
     template = await crud.get_strategy_template_by_slug(db, slug)
     if not template or not template.is_active:
