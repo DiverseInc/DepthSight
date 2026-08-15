@@ -10,6 +10,7 @@ import {
 	Cpu,
 	Download,
 	Globe,
+	Lock,
 	MessageSquare,
 	Network,
 	Newspaper,
@@ -65,7 +66,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/context/AuthContext";
-import { useSaveStrategyConfig } from "@/lib/api";
+import { useSaveStrategyConfig, useUpdateConfig } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 interface NewsItem {
@@ -568,15 +569,35 @@ const CommunityHub = () => {
 	const isRu = i18n.language.startsWith("ru");
 	const navigate = useNavigate();
 	const saveConfig = useSaveStrategyConfig();
+	const updateConfig = useUpdateConfig();
 	const { user } = useAuth();
 	const hubApiUrl =
 		import.meta.env.VITE_HUB_API_URL || "https://app.depthsight.pro/api/v1/hub";
 
+	// Tier hierarchy: free < standard < pro < premium.
+	// Used to gate which verified templates the user can import.
+	const TIER_ORDINAL: Record<string, number> = {
+		free: 0,
+		standard: 1,
+		pro: 2,
+		premium: 3,
+	};
+	const userTier = user?.plan ? TIER_ORDINAL[user.plan] ?? 0 : 0;
+	const canUseTemplate = (requiredTier: string) =>
+		userTier >= (TIER_ORDINAL[requiredTier] ?? 0);
+
 	// State
 	const [activeTab, setActiveTab] = useState("verified");
-	const [verifiedStrategies, setVerifiedStrategies] = useState<
-		HubTopicResponse[]
-	>([]);
+	// A local template extends HubTopicResponse with the curated-template
+	// fields (tier_required, risk_profile) we attach to the normalized
+	// response from /api/v1/strategy-templates.
+	type LocalTemplate = HubTopicResponse & {
+		tier_required?: string;
+		risk_profile?: Record<string, unknown>;
+	};
+	const [verifiedStrategies, setVerifiedStrategies] = useState<LocalTemplate[]>(
+		[],
+	);
 	const [news, setNews] = useState<NewsItem[]>([]);
 	const [sharedStrategies, setSharedStrategies] = useState<HubTopicResponse[]>(
 		[],
@@ -1009,6 +1030,7 @@ const CommunityHub = () => {
 		name: string,
 		description: string,
 		config: Record<string, unknown>,
+		riskProfile?: Record<string, unknown>,
 	) => {
 		if (!config) {
 			toast.error(
@@ -1032,8 +1054,16 @@ const CommunityHub = () => {
 				(config.foundation_weights as Record<string, unknown>) || null,
 		};
 
-		saveConfig.mutate(payload, {
+		saveConfig.mutate(payload as any, {
 			onSuccess: (data) => {
+				// If the template includes a recommended risk profile,
+				// apply it to the user's AppConfig so the strategy
+				// starts with the template's intended risk settings.
+				if (riskProfile && Object.keys(riskProfile).length > 0) {
+					updateConfig.mutate({
+						risk_management: riskProfile as any,
+					} as any);
+				}
 				toast.success(
 					t(
 						"community:detailedView.importSuccess",
@@ -1880,25 +1910,41 @@ const CommunityHub = () => {
 																)}
 														</CardContent>
 														<CardFooter className="pt-2 border-t border-border/10 bg-black/10 flex gap-2">
-															<Button
-																className="flex-1 gap-2 text-xs h-8"
-																variant="secondary"
-																onClick={(e) => {
-																	e.stopPropagation();
-																	handleImport(
-																		getTopicTitle(strategy, t),
-																		strategy.description,
-																		strategy.strategy_json,
-																	);
-																}}
-																disabled={saveConfig.isPending}
-															>
-																<Download className="w-3.5 h-3.5" />
-																{t(
-																	"community:verified.importConfig",
-																	"Import Configuration",
-																)}
-															</Button>
+															{canUseTemplate(strategy.tier_required ?? "free") ? (
+																<Button
+																	className="flex-1 gap-2 text-xs h-8"
+																	variant="secondary"
+																	onClick={(e) => {
+																		e.stopPropagation();
+																		handleImport(
+																			getTopicTitle(strategy, t),
+																			strategy.description,
+																			strategy.strategy_json ?? {},
+																			strategy.risk_profile ?? {},
+																		);
+																	}}
+																	disabled={saveConfig.isPending}
+																>
+																	<Download className="w-3.5 h-3.5" />
+																	{t(
+																		"community:verified.importConfig",
+																		"Use Template",
+																	)}
+																</Button>
+															) : (
+																<Button
+																	className="flex-1 gap-2 text-xs h-8"
+																	variant="outline"
+																	disabled
+																	title={`Requires ${strategy.tier_required ?? "higher"} plan`}
+																>
+																	<Lock className="w-3.5 h-3.5" />
+																	{t(
+																		"community:verified.upgradeRequired",
+																		`Upgrade to ${strategy.tier_required ?? "Pro"}`,
+																	)}
+																</Button>
+															)}
 															{adminKey && strategy.id !== undefined && (
 																<Button
 																	variant="outline"
