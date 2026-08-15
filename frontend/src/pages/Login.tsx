@@ -44,6 +44,10 @@ type LoginFormValues = z.infer<ReturnType<typeof loginSchema>>;
 const DEMO_USERNAME = "alex_trader";
 const DEMO_PASSWORD = "DemoPassword123!";
 
+// Google OAuth client id from Vite env. If not configured, we hide the
+// Google button entirely instead of rendering a broken OAuth flow.
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+
 // Hook for the login API request
 const useLoginMutation = () => {
 	const { login } = useAuth();
@@ -251,33 +255,39 @@ export default function LoginPage() {
 							</form>
 						</Form>
 
-						<div className="relative my-5">
-							<div className="absolute inset-0 flex items-center">
-								<span className="w-full border-t" />
-							</div>
-							<div className="relative flex justify-center text-xs uppercase">
-								<span className="bg-card px-2 text-muted-foreground">
-									{t("common:or") || "Or"}
-								</span>
-							</div>
-						</div>
+						{GOOGLE_CLIENT_ID && (
+							<>
+								<div className="relative my-5">
+									<div className="absolute inset-0 flex items-center">
+										<span className="w-full border-t" />
+									</div>
+									<div className="relative flex justify-center text-xs uppercase">
+										<span className="bg-card px-2 text-muted-foreground">
+											{t("common:or") || "Or"}
+										</span>
+									</div>
+								</div>
 
-						<div className="flex justify-center w-full my-2">
-							<GoogleLogin
-								onSuccess={(credentialResponse) => {
-									if (credentialResponse.credential) {
-										googleLoginMutation.mutate(credentialResponse.credential);
-									}
-								}}
-								onError={() => {
-									toast({
-										variant: "destructive",
-										title: t("toastFailureTitle"),
-										description: "Google Login Failed",
-									});
-								}}
-							/>
-						</div>
+								<div className="flex justify-center w-full my-2">
+									<GoogleLogin
+										onSuccess={(credentialResponse) => {
+											if (credentialResponse.credential) {
+												googleLoginMutation.mutate(
+													credentialResponse.credential,
+												);
+											}
+										}}
+										onError={() => {
+											toast({
+												variant: "destructive",
+												title: t("toastFailureTitle"),
+												description: "Google Login Failed",
+											});
+										}}
+									/>
+								</div>
+							</>
+						)}
 
 						<div className="mt-5 text-center text-sm text-muted-foreground">
 							{t("noAccount")}{" "}

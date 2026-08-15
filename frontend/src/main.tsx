@@ -12,13 +12,18 @@ const googleClientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 const rootElement = document.getElementById("root")!;
 if (!rootElement.innerHTML) {
 	const root = ReactDOM.createRoot(rootElement);
+	// Skip the GoogleOAuthProvider wrapper when no client id is configured
+	// so a click on a stray Google button can't trigger a broken OAuth flow.
+	const appTree = googleClientId ? (
+		<GoogleOAuthProvider clientId={googleClientId}>
+			<App />
+		</GoogleOAuthProvider>
+	) : (
+		<App />
+	);
 	root.render(
 		<React.StrictMode>
-			<HelmetProvider>
-				<GoogleOAuthProvider clientId={googleClientId}>
-					<App />
-				</GoogleOAuthProvider>
-			</HelmetProvider>
+			<HelmetProvider>{appTree}</HelmetProvider>
 		</React.StrictMode>,
 	);
 }
