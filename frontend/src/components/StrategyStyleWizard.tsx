@@ -114,19 +114,30 @@ const EXPERIENCE_OPTIONS: Array<{
     { value: "experienced", label: "Experienced", description: "I trade and write strategies already." },
 ];
 
-const HORIZON_TO_IDEA_STYLES: Record<TimeHorizon, ReadonlyArray<string>> = {
-    scalping: ["Scalping", "Day Trading"],
-    day: ["Day Trading", "Scalping"],
-    swing: ["Swing", "Trend"],
-    position: ["Position", "Trend", "Defensive"],
+// Horizon → { primary, secondary } styles. Primary is the user's intent;
+// secondary is a stretch pick (e.g. a Day Trading user might also like a
+// 5m VWAP scalp). Weighting the two tiers separately prevents the
+// 5-recommendation list from being 80% one style.
+const HORIZON_STYLES: Record<
+    TimeHorizon,
+    { primary: string; secondary: string[] }
+> = {
+    scalping: { primary: "Scalping", secondary: ["Day Trading"] },
+    day: { primary: "Day Trading", secondary: ["Scalping"] },
+    swing: { primary: "Swing", secondary: ["Trend", "Day Trading"] },
+    position: { primary: "Position", secondary: ["Trend", "Defensive"] },
 };
 
 function scoreIdea(idea: StrategyIdea, ans: Answers): number {
     if (!ans.horizon || !ans.risk || !ans.style) return 0;
     let score = 0;
 
-    // Horizon match
-    if (HORIZON_TO_IDEA_STYLES[ans.horizon].includes(idea.style)) score += 4;
+    // Horizon match (primary = +5, secondary = +2).  Without the split,
+    // a "Day" answer would let Scalping tie with Day Trading and produce
+    // a Scalping-heavy list.
+    const horizon = HORIZON_STYLES[ans.horizon];
+    if (idea.style === horizon.primary) score += 5;
+    else if (horizon.secondary.includes(idea.style)) score += 2;
 
     // Risk match
     const riskMatch: Record<RiskTolerance, number> = { low: 0, medium: 1, high: 2 };
