@@ -135,6 +135,7 @@ from .routes.admin import admin_router
 from .routes.discovery import discovery_router
 from .routes.strategy_templates import templates_router
 from .routes.community import community_router
+from .routes.stats import router as stats_router
 from .routes.account import (  # noqa: F401
     account_router,
     get_account_status,
@@ -1599,6 +1600,7 @@ api_router = APIRouter(prefix="/api/v1", tags=["v1"])
 api_router.include_router(hft_router)
 api_router.include_router(templates_router)
 api_router.include_router(community_router)
+api_router.include_router(stats_router)
 
 
 redis_api_client = redis.Redis(

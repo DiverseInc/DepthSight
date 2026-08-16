@@ -4,6 +4,7 @@ import { Home } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { ActivePositionsTable } from "@/components/dashboard/ActivePositionsTable";
 import { LiveEventFeed } from "@/components/dashboard/LiveEventFeed";
+import { PlatformStatsStrip } from "@/components/dashboard/PlatformStatsStrip";
 import { PortfolioOverviewWidget } from "@/components/dashboard/PortfolioOverviewWidget";
 import { SystemStatus } from "@/components/dashboard/SystemStatus";
 import { TopStrategiesTable } from "@/components/dashboard/TopStrategiesTable";
@@ -19,6 +20,7 @@ const Index = () => {
 		<PageLayout title={t("pageTitle")} icon={Home}>
 			<div className="space-y-6">
 				<WelcomeBanner />
+				<PlatformStatsStrip />
 				<XpLevelCard />
 				<PortfolioOverviewWidget />
 				<div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
