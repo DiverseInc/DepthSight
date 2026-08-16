@@ -10,6 +10,7 @@ import { SystemStatus } from "@/components/dashboard/SystemStatus";
 import { TopStrategiesTable } from "@/components/dashboard/TopStrategiesTable";
 import { TotalPnl } from "@/components/dashboard/TotalPnl";
 import { WelcomeBanner } from "@/components/dashboard/WelcomeBanner";
+import { WizardLauncherCard } from "@/components/dashboard/WizardLauncherCard";
 import { XpLevelCard } from "@/components/dashboard/XpLevelCard";
 import { PageLayout } from "@/components/layout/PageLayout";
 
@@ -20,6 +21,7 @@ const Index = () => {
 		<PageLayout title={t("pageTitle")} icon={Home}>
 			<div className="space-y-6">
 				<WelcomeBanner />
+				<WizardLauncherCard />
 				<PlatformStatsStrip />
 				<XpLevelCard />
 				<PortfolioOverviewWidget />

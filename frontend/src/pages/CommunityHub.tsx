@@ -67,6 +67,14 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/context/AuthContext";
 import { useSaveStrategyConfig, useUpdateConfig } from "@/lib/api";
+import {
+	ALL_RISKS,
+	ALL_STYLES,
+	STRATEGY_IDEAS,
+	type RiskLevel,
+	type StrategyIdea,
+	type StrategyStyle,
+} from "@/lib/strategyIdeas";
 import { cn } from "@/lib/utils";
 
 interface NewsItem {
@@ -563,6 +571,200 @@ const NetworkMap: React.FC<{
 	}, [activeNodes, isRu, t, geoData]);
 
 	return <canvas ref={canvasRef} className="block w-full" />;
+};
+
+// ── Strategy Ideas tab (curated, static library of 27 strategies) ─────
+interface StrategyIdeasTabProps {
+	onCopyPrompt: (idea: StrategyIdea) => void;
+	onOpenInEditor: (idea: StrategyIdea) => void;
+}
+
+const STRATEGY_IDEA_BG: Record<StrategyStyle, string> = {
+	"Day Trading":
+		"bg-blue-500/10 text-blue-700 dark:text-blue-300 border-blue-500/20",
+	Swing:
+		"bg-purple-500/10 text-purple-700 dark:text-purple-300 border-purple-500/20",
+	Position:
+		"bg-indigo-500/10 text-indigo-700 dark:text-indigo-300 border-indigo-500/20",
+	Scalping:
+		"bg-orange-500/10 text-orange-700 dark:text-orange-300 border-orange-500/20",
+	"Mean Reversion":
+		"bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 border-cyan-500/20",
+	Trend:
+		"bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/20",
+	Defensive:
+		"bg-slate-500/10 text-slate-700 dark:text-slate-300 border-slate-500/20",
+};
+
+const RISK_BG: Record<RiskLevel, string> = {
+	Low: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/20",
+	Medium: "bg-amber-500/10 text-amber-700 dark:text-amber-300 border-amber-500/20",
+	High: "bg-rose-500/10 text-rose-700 dark:text-rose-300 border-rose-500/20",
+};
+
+const StrategyIdeasTab: React.FC<StrategyIdeasTabProps> = ({
+	onCopyPrompt,
+	onOpenInEditor,
+}) => {
+	const { t } = useTranslation(["navigation", "common", "community"]);
+	const [styleFilter, setStyleFilter] = useState<StrategyStyle | "All">("All");
+	const [riskFilter, setRiskFilter] = useState<RiskLevel | "All">("All");
+	const [query, setQuery] = useState("");
+
+	const filtered = STRATEGY_IDEAS.filter((idea) => {
+		if (styleFilter !== "All" && idea.style !== styleFilter) return false;
+		if (riskFilter !== "All" && idea.risk !== riskFilter) return false;
+		if (query.trim()) {
+			const q = query.toLowerCase();
+			const haystack = `${idea.title} ${idea.summary} ${idea.bestFor} ${idea.tags.join(" ")}`.toLowerCase();
+			if (!haystack.includes(q)) return false;
+		}
+		return true;
+	});
+
+	return (
+		<TabsContent value="ideas" className="mt-6 space-y-4">
+			<div className="flex flex-col gap-3">
+				<div className="flex items-center gap-2 flex-wrap">
+					<BookOpen className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+					<h3 className="text-sm font-semibold text-foreground">
+						{t("community:ideas.title", "Strategy Ideas Library")}
+					</h3>
+					<span className="text-xs text-muted-foreground">
+						{STRATEGY_IDEAS.length} curated recipes
+					</span>
+				</div>
+				<p className="text-xs text-muted-foreground">
+					{t(
+						"community:ideas.subtitle",
+						"Pick a recipe, copy the prompt, and paste it into the AI Co-pilot. Each one is a working starting point you can tune.",
+					)}
+				</p>
+				<Input
+					placeholder={t("community:ideas.search", "Search ideas…")}
+					value={query}
+					onChange={(e) => setQuery(e.target.value)}
+					className="max-w-md"
+				/>
+				<div className="flex flex-wrap gap-1.5">
+					<Button
+						size="sm"
+						variant={styleFilter === "All" ? "default" : "outline"}
+						className="h-7 text-xs"
+						onClick={() => setStyleFilter("All")}
+					>
+						All styles
+					</Button>
+					{ALL_STYLES.map((s) => (
+						<Button
+							key={s}
+							size="sm"
+							variant={styleFilter === s ? "default" : "outline"}
+							className="h-7 text-xs"
+							onClick={() => setStyleFilter(s)}
+						>
+							{s}
+						</Button>
+					))}
+				</div>
+				<div className="flex flex-wrap gap-1.5">
+					<Button
+						size="sm"
+						variant={riskFilter === "All" ? "secondary" : "ghost"}
+						className="h-7 text-xs"
+						onClick={() => setRiskFilter("All")}
+					>
+						Any risk
+					</Button>
+					{ALL_RISKS.map((r) => (
+						<Button
+							key={r}
+							size="sm"
+							variant={riskFilter === r ? "secondary" : "ghost"}
+							className="h-7 text-xs"
+							onClick={() => setRiskFilter(r)}
+						>
+							{r} risk
+						</Button>
+					))}
+				</div>
+			</div>
+
+			{filtered.length === 0 ? (
+				<div className="text-center py-16 bg-card/20 rounded-2xl border border-dashed border-border/40">
+					<BookOpen className="w-8 h-8 mx-auto text-muted-foreground mb-2" />
+					<p className="text-muted-foreground text-sm">
+						No strategies match those filters. Try widening your search.
+					</p>
+				</div>
+			) : (
+				<div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+					{filtered.map((idea) => (
+						<Card
+							key={idea.id}
+							className="bg-card/40 border-border/40 hover:border-indigo-500/40 transition-colors"
+						>
+							<CardHeader className="pb-2">
+								<div className="flex items-start justify-between gap-2">
+									<CardTitle className="text-base leading-tight">
+										{idea.title}
+									</CardTitle>
+									<Badge
+										variant="outline"
+										className={cn("text-[10px] shrink-0", RISK_BG[idea.risk])}
+									>
+										{idea.risk}
+									</Badge>
+								</div>
+								<div className="flex flex-wrap items-center gap-1.5 pt-1">
+									<Badge
+										variant="outline"
+										className={cn(
+											"text-[10px] font-medium",
+											STRATEGY_IDEA_BG[idea.style],
+										)}
+									>
+										{idea.style}
+									</Badge>
+									<Badge variant="outline" className="text-[10px]">
+										<Clock className="w-2.5 h-2.5 mr-1" />
+										{idea.timeframe}
+									</Badge>
+								</div>
+							</CardHeader>
+							<CardContent className="space-y-2 pb-3">
+								<p className="text-xs text-muted-foreground leading-relaxed line-clamp-3">
+									{idea.summary}
+								</p>
+								<div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+									<Sparkles className="w-3 h-3" />
+									<span className="line-clamp-1">Best for: {idea.bestFor}</span>
+								</div>
+							</CardContent>
+							<CardFooter className="pt-0 gap-2">
+								<Button
+									size="sm"
+									variant="outline"
+									className="h-8 text-xs flex-1"
+									onClick={() => onCopyPrompt(idea)}
+								>
+									Copy prompt
+								</Button>
+								<Button
+									size="sm"
+									className="h-8 text-xs flex-1 bg-indigo-600 hover:bg-indigo-700"
+									onClick={() => onOpenInEditor(idea)}
+								>
+									<Sparkles className="w-3 h-3 mr-1" />
+									Use in Co-pilot
+								</Button>
+							</CardFooter>
+						</Card>
+					))}
+				</div>
+			)}
+		</TabsContent>
+	);
 };
 
 const CommunityHub = () => {
@@ -1887,6 +2089,13 @@ const CommunityHub = () => {
 									{t("community:tabs.community", "Trading Ideas")}
 								</TabsTrigger>
 								<TabsTrigger
+									value="ideas"
+									className="gap-2 text-xs md:text-sm"
+								>
+									<BookOpen className="w-3.5 h-3.5" />
+									{t("community:tabs.ideas", "Strategy Ideas")}
+								</TabsTrigger>
+								<TabsTrigger
 									value="discussion"
 									className="gap-2 text-xs md:text-sm"
 								>
@@ -2375,6 +2584,29 @@ const CommunityHub = () => {
 								</div>
 							)}
 						</TabsContent>
+
+						{/* Strategy Ideas Tab (curated, static) */}
+						<StrategyIdeasTab
+							onCopyPrompt={(idea) => {
+								navigator.clipboard.writeText(idea.prompt);
+								toast.success(
+									t(
+										"community:ideas.promptCopied",
+										"Prompt copied! Open the AI Co-pilot and paste it.",
+									),
+									{
+										action: {
+											label: t("community:ideas.openEditor", "Open editor"),
+											onClick: () => navigate("/editor"),
+										},
+									},
+								);
+							}}
+							onOpenInEditor={(idea) => {
+								navigator.clipboard.writeText(idea.prompt);
+								navigate("/editor");
+							}}
+						/>
 
 						{/* Discussions Tab */}
 						<TabsContent value="discussion" className="mt-6">

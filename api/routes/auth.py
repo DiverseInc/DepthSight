@@ -17,6 +17,64 @@ from ..gamification import check_and_grant_retroactive_achievements
 logger = logging.getLogger(__name__)
 
 
+# --- Welcome email helper (non-blocking) -----------------------------------
+def _send_welcome_email(user) -> None:
+    """
+    Send the post-signup welcome email.
+
+    Best-effort: any SMTP / config failure is logged and swallowed so it
+    never blocks the auth flow. The user has already been created and can
+    log in even if their welcome email fails to send.
+
+    Email body is built from WELCOME_EMAIL_TEMPLATE (env-overridable) so
+    operators can rebrand without code changes. A sensible default that
+    mirrors `DepthSight - Client Onboarding Materials.md` §1 is provided.
+    """
+    from ..email_utils import send_email
+
+    frontend_url = os.getenv("FRONTEND_BASE_URL", "https://depthsight.diverseinc.net")
+    first_name = (
+        (user.full_name.split(" ")[0] if getattr(user, "full_name", None) else None)
+        or user.username
+    )
+
+    subject = "Welcome to DepthSight — your first trade in 10 minutes"
+    body = os.getenv(
+        "WELCOME_EMAIL_TEMPLATE",
+        (
+            "<html><body style=\"font-family:-apple-system,Segoe UI,Roboto,Helvetica,"
+            "Arial,sans-serif;color:#0f172a;max-width:600px;margin:0 auto;\">"
+            f"<h2 style=\"color:#3730a3;\">Welcome to DepthSight, {first_name}!</h2>"
+            "<p>Automated crypto trading, built for people who want results, not configuration.</p>"
+            "<p>Here's your fast path to your first trade:</p>"
+            "<ol>"
+            f"<li><b>Log in</b> at <a href=\"{frontend_url}/login\">{frontend_url}/login</a></li>"
+            "<li>Open the <b>Hub</b> in the sidebar and pick a strategy (RSI Breakout v2 is the most popular)</li>"
+            "<li>Click <b>Use Template</b> &mdash; the strategy loads in your editor</li>"
+            "<li>Try the <b>AI Co-pilot</b>: type a strategy idea, hit Generate</li>"
+            "<li>Set mode to <b>Paper</b> and click Start (10K fake USDT, no real money)</li>"
+            "<li>Connect your exchange (Settings &rarr; API Keys) when you're ready</li>"
+            "</ol>"
+            "<p>The whole flow takes about 10 minutes. Reply to this email if you get stuck &mdash; "
+            "I read every one.</p>"
+            "<p style=\"color:#64748b;font-size:12px;margin-top:24px;\">"
+            "Demo account if you want to poke around first: "
+            "<code>alex_trader</code> / <code>DemoPassword123!</code></p>"
+            "</body></html>"
+        ),
+    )
+
+    try:
+        send_email(user.email, subject, body)
+        logger.info(f"Welcome email sent to {user.email}")
+    except Exception as e:
+        # Non-blocking: log and move on. User is already created.
+        logger.warning(
+            f"Welcome email NOT sent to {user.email}: {type(e).__name__}: {e}. "
+            "(SMTP likely not configured; user can still log in.)"
+        )
+
+
 # Rate limiting fallback
 def get_limit_value(val: str) -> str:
     return val
@@ -315,6 +373,8 @@ async def register_user(
                 db, referrer_id=referred_by_user_id, referred_id=new_user.id
             )
         await db.commit()
+        # Best-effort welcome email (non-blocking)
+        _send_welcome_email(new_user)
         return {
             "data": {
                 "message": "Registration successful. You can now log in.",
@@ -414,6 +474,9 @@ async def confirm_email(token: str, db: AsyncSession = Depends(get_db)):
         await db.commit()
         await db.refresh(user)
         logger.info(f"User account activated successfully for: {email}")
+        # Welcome email only on the activation transition (not on every
+        # resend / re-click of the confirmation link).
+        _send_welcome_email(user)
 
     # Create token and return complete login response
     access_token_expires = timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
