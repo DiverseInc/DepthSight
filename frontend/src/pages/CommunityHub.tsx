@@ -845,7 +845,20 @@ const CommunityHub = () => {
 
 	const [activeNodes, setActiveNodes] = useState<HubNodeResponse[]>([]);
 
+	// Federation is opt-in. The default hubApiUrl points at the official
+	// depthsight.pro hub, which is CORS-blocked on self-hosted deployments —
+	// leaving the fetch in place would spam the console with ERR_FAILED
+	// every 30s. Only fetch when the deployment explicitly opts in.
+	const hubEnabled =
+		import.meta.env.VITE_HUB_ENABLED === "true" ||
+		(import.meta.env.VITE_HUB_ENABLED === undefined &&
+			hubApiUrl.includes("app.depthsight.pro"));
+
 	const fetchActiveNodes = React.useCallback(() => {
+		if (!hubEnabled) {
+			setActiveNodes([]);
+			return;
+		}
 		fetch(`${hubApiUrl}/nodes`)
 			.then((res) => {
 				if (!res.ok) throw new Error();
@@ -855,21 +868,22 @@ const CommunityHub = () => {
 				if (Array.isArray(data)) {
 					setActiveNodes(data);
 				} else {
-					console.error("Fetched active nodes data is not an array:", data);
+					console.warn("Fetched active nodes data is not an array:", data);
 					setActiveNodes([]);
 				}
 			})
 			.catch((e) => {
-				console.error("Failed to fetch active nodes", e);
+				console.warn("Failed to fetch active nodes", e);
 				setActiveNodes([]);
 			});
-	}, [hubApiUrl]);
+	}, [hubApiUrl, hubEnabled]);
 
 	useEffect(() => {
 		fetchActiveNodes();
+		if (!hubEnabled) return;
 		const interval = setInterval(fetchActiveNodes, 30000);
 		return () => clearInterval(interval);
-	}, [fetchActiveNodes]);
+	}, [fetchActiveNodes, hubEnabled]);
 
 	const avgLatency = React.useMemo(() => {
 		const nonMaster = activeNodes.filter((n) => !n.is_master);
