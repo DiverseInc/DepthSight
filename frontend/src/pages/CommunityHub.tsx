@@ -160,15 +160,17 @@ const getTopicTitle = (
 	topic: HubTopicResponse,
 	t: (key: string, options?: unknown) => string,
 ): string => {
-	if (topic.topic_type !== "strategy") return topic.title;
+	// Local strategy templates (from /api/v1/strategy-templates) are normalized
+	// to set `name` (not `title`) and have no `topic_type`. Fall back to `name`
+	// so the imported strategy has a non-empty name on POST /strategies/config.
+	const fallbackName =
+		topic.name || t("community:verified.sharedStrategy", "Shared Strategy");
+	if (topic.topic_type !== "strategy") return topic.title || fallbackName;
 	if (topic.title && topic.title !== "VisualBuilderStrategy")
 		return topic.title;
 
 	const strategy = topic.strategy_json as Record<string, unknown>;
-	if (!strategy)
-		return (
-			topic.title || t("community:verified.sharedStrategy", "Shared Strategy")
-		);
+	if (!strategy) return fallbackName;
 
 	const params = (strategy.parameters || strategy) as Record<string, unknown>;
 	const config = (strategy.config || strategy) as Record<string, unknown>;
@@ -176,8 +178,7 @@ const getTopicTitle = (
 		(params.name as string) ||
 		(params.strategy_display_name as string) ||
 		(config.name as string) ||
-		topic.title ||
-		t("community:verified.sharedStrategy", "Shared Strategy")
+		fallbackName
 	);
 };
 
@@ -3230,7 +3231,7 @@ const CommunityHub = () => {
 													className="h-8 gap-2 text-xs"
 													onClick={() =>
 														handleImport(
-															selectedTopic.title,
+															getTopicTitle(selectedTopic, t),
 															selectedTopic.description,
 															selectedTopic.strategy_json,
 														)
