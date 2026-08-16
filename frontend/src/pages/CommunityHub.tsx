@@ -164,6 +164,25 @@ const MiniEquityChart: React.FC<{ data: [number, number][] }> = ({ data }) => {
 	);
 };
 
+// Compute Risk:Reward ratio from a strategy's risk_profile.
+// Returns a string like "1:2" (risk 1 unit to make 2) or null if the
+// fields are missing or zero. Used to display R/R on verified template cards.
+const getRiskReward = (
+	riskProfile: Record<string, unknown> | null | undefined,
+): string | null => {
+	if (!riskProfile) return null;
+	const stop = Number(riskProfile.stopLossPercent ?? riskProfile.stop_loss_percent);
+	const target = Number(riskProfile.takeProfitPercent ?? riskProfile.take_profit_percent);
+	if (!Number.isFinite(stop) || !Number.isFinite(target) || stop <= 0 || target <= 0) {
+		return null;
+	}
+	const ratio = target / stop;
+	// Round to 1 decimal; if it's a clean integer, drop the decimal.
+	const rounded = Math.round(ratio * 10) / 10;
+	const display = Number.isInteger(rounded) ? `${rounded}` : rounded.toFixed(1);
+	return `1:${display}`;
+};
+
 const getTopicTitle = (
 	topic: HubTopicResponse,
 	t: (key: string, options?: unknown) => string,
@@ -2208,6 +2227,25 @@ const CommunityHub = () => {
 															</CardDescription>
 														</CardHeader>
 														<CardContent className="pb-2">
+															{(() => {
+																const rr = getRiskReward(
+																	strategy.risk_profile,
+																);
+																return rr ? (
+																	<div className="flex items-center gap-1.5 pt-2">
+																		<Badge
+																			variant="outline"
+																			className="text-[10px] px-1.5 py-0 font-mono border-indigo-500/30 text-indigo-600 dark:text-indigo-300 bg-indigo-500/5"
+																			title="Risk:Reward ratio (target / stop)"
+																		>
+																			R:R {rr}
+																		</Badge>
+																		<span className="text-[10px] text-muted-foreground">
+																			planned payoff
+																		</span>
+																	</div>
+																) : null;
+															})()}
 															{strategy.tags &&
 																Array.isArray(strategy.tags) &&
 																strategy.tags.length > 0 && (
