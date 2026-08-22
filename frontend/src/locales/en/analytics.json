@@ -54,6 +54,7 @@
 			"entryPrice": "Entry Price",
 			"exitPrice": "Exit Price",
 			"netPnl": "Net PnL",
+			"rMultiple": "R-Mult",
 			"mfp": "MFP",
 			"mfl": "MFL",
 			"exitReason": "Exit Reason"

@@ -152,6 +152,9 @@ export interface TradeData {
 	max_floating_profit?: number; // MFP - Maximum floating profit in USD
 	max_floating_loss?: number; // MFL - Maximum floating loss in USD
 
+	// Realized R-Multiplier: pnl_usd / initial_risk_usd. Positive = winner (e.g. 2.0 = 2× risk)
+	r_multiplier?: number;
+
 	// Decision trace for foundation analysis (works for visual and genetic strategies)
 	signal_details_json?: Record<string, unknown>;
 	exchange?: string;

@@ -140,6 +140,12 @@ export const LiveTradeHistoryTable: React.FC<LiveTradeHistoryTableProps> = ({
 								</TableHead>
 								<TableHead
 									className="px-4 py-4 text-right"
+									title="Realized R-Multiplier: pnl / initial_risk (e.g. 2.0R = 2× risk profit)"
+								>
+									{t("tradeHistory.headers.rMultiple", "R-Mult")}
+								</TableHead>
+								<TableHead
+									className="px-4 py-4 text-right"
 									title="Max Floating Profit"
 								>
 									{t("tradeHistory.headers.mfp", "MFP")}
@@ -207,6 +213,24 @@ export const LiveTradeHistoryTable: React.FC<LiveTradeHistoryTableProps> = ({
 												{realizedPnl >= 0 ? "+" : ""}
 												{realizedPnl.toFixed(2)}
 											</TableCell>
+											<TableCell className="px-4 py-4 text-right font-mono text-sm font-bold">
+												{trade.r_multiplier != null ? (
+													<span
+														className={
+															trade.r_multiplier >= 2
+																? "text-profit"
+																: trade.r_multiplier >= 0
+																	? "text-foreground"
+																	: "text-loss"
+														}
+													>
+														{trade.r_multiplier >= 0 ? "+" : ""}
+														{trade.r_multiplier.toFixed(2)}R
+													</span>
+												) : (
+													<span className="text-muted-foreground">-</span>
+												)}
+											</TableCell>
 											<TableCell className="px-4 py-4 text-right font-mono text-sm text-profit">
 												{trade.max_floating_profit != null
 													? `+${trade.max_floating_profit.toFixed(2)}`
@@ -237,7 +261,7 @@ export const LiveTradeHistoryTable: React.FC<LiveTradeHistoryTableProps> = ({
 							) : (
 								<TableRow>
 									<TableCell
-										colSpan={11}
+										colSpan={12}
 										className="text-center text-muted-foreground py-8"
 									>
 										{t("tradeHistory.noSearchResults")} "{searchSymbol}"
