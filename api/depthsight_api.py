@@ -1379,8 +1379,8 @@ async def lifespan(app: FastAPI):
 
     # Seed verified strategy templates (idempotent — only runs once ever)
     try:
-        from .database import SessionLocal
-        async with SessionLocal() as seed_db:
+        from .database import AsyncSessionLocal
+        async with AsyncSessionLocal() as seed_db:
             created = await crud.seed_default_strategy_templates(seed_db)
             if created > 0:
                 logger.info(
