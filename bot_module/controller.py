@@ -8767,6 +8767,18 @@ class TradingController:
                             * position_to_process_copy.initial_quantity
                         )
 
+                    # Realized R-Multiplier: pnl_usd / initial_risk_usd
+                    # Positive = winner (e.g. 2.0 means 2× risk profit), negative = loser, 0 = breakeven
+                    r_multiplier_val = None
+                    if (
+                        actual_trade_risk_usd_val is not None
+                        and actual_trade_risk_usd_val > 1e-9
+                        and position_to_process_copy.pnl is not None
+                    ):
+                        r_multiplier_val = (
+                            position_to_process_copy.pnl / actual_trade_risk_usd_val
+                        )
+
                     # Details of grounds and signal
                     foundation_details_from_signal = {}
                     signal_specific_details = {}
@@ -8814,6 +8826,7 @@ class TradingController:
                         "initial_risk_usd_planned": position_to_process_copy.initial_risk_usd_planned,
                         "actual_trade_risk_usd": actual_trade_risk_usd_val,
                         "rr_ratio_prices": rr_ratio_prices_val,
+                        "r_multiplier": r_multiplier_val,
                         "trade_duration_sec": duration_s,
                         "exit_reason": reason,
                         "foundation_total_weight": position_to_process_copy.signal_details.get(
@@ -8891,6 +8904,8 @@ class TradingController:
                     # Maximum floating profit and loss during the trade
                     "max_floating_profit": position_to_process_copy.max_floating_profit,
                     "max_floating_loss": position_to_process_copy.max_floating_loss,
+                    # Realized R-Multiplier: pnl_usd / initial_risk_usd
+                    "r_multiplier": r_multiplier_val,
                     # API key ID for multi-account tracking
                     "api_key_id": self.api_key_id,
                 }

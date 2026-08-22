@@ -708,6 +708,8 @@ class Trade(BaseModel):
     # Maximum floating profit and loss during the trade
     max_floating_profit: Optional[float] = None  # MFE - Maximum floating profit in USD
     max_floating_loss: Optional[float] = None  # MAE - Maximum floating loss in USD
+    # Realized R-Multiplier: pnl_usd / initial_risk_usd. Positive = winner, negative = loser
+    r_multiplier: Optional[float] = None
     # Decision trace for foundation analysis (works for visual and genetic strategies)
     signal_details_json: Optional[Dict[str, Any]] = None
     exchange: Optional[str] = None

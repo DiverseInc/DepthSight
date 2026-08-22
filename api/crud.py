@@ -1793,6 +1793,8 @@ async def create_trade(
         # Maximum floating profit and loss during the trade
         max_floating_profit=trade_data.get("max_floating_profit"),
         max_floating_loss=trade_data.get("max_floating_loss"),
+        # Realized R-Multiplier: pnl_usd / initial_risk_usd
+        r_multiplier=trade_data.get("r_multiplier"),
     )
 
     try:

@@ -404,6 +404,9 @@ class Trade(Base):
         Float, nullable=True
     )  # MFL - Maximum floating loss in USD
 
+    # Realized R-Multiplier: pnl_usd / initial_risk_usd. Positive = winner, negative = loser, 0 = breakeven
+    r_multiplier = Column(Float, nullable=True)
+
     strategy_config = relationship("StrategyConfig")
     api_key = relationship("ApiKey", lazy="selectin")
 

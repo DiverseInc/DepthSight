@@ -85,6 +85,7 @@ class TradeLogger:
         "initial_risk_usd_planned",
         "actual_trade_risk_usd",
         "rr_ratio_prices",
+        "r_multiplier",
         "trade_duration_sec",
         "exit_reason",
         "foundation_total_weight",
