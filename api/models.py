@@ -268,6 +268,11 @@ class StrategyTemplate(Base):
     # Display order (lower = first).
     sort_order = Column(Integer, default=100, nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
+    # Seed version (integer) of the row, used by the lifespan seeder to detect
+    # when built-in templates have been updated and need to be re-applied.
+    # Bump SEED_VERSION in api/crud.py when changing any of the 7 built-in
+    # templates below.
+    seed_version = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

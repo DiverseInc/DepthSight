@@ -4102,6 +4102,7 @@ async def upsert_strategy_template(
     tier_required="free",
     sort_order=100,
     is_active=True,
+    seed_version=0,
 ):
     existing = await get_strategy_template_by_slug(db, slug)
     if existing is not None:
@@ -4113,6 +4114,7 @@ async def upsert_strategy_template(
         existing.tier_required = tier_required
         existing.sort_order = sort_order
         existing.is_active = is_active
+        existing.seed_version = seed_version
         return existing
 
     db_template = models.StrategyTemplate(
@@ -4125,6 +4127,7 @@ async def upsert_strategy_template(
         tier_required=tier_required,
         sort_order=sort_order,
         is_active=is_active,
+        seed_version=seed_version,
     )
     db.add(db_template)
     await db.flush()
@@ -4132,8 +4135,18 @@ async def upsert_strategy_template(
 
 
 async def seed_default_strategy_templates(db):
-    """Idempotent: inserts the 6 built-in archetypes if they don't exist.
-    Returns the number of NEW templates created (0 on subsequent runs)."""
+    """Idempotent: inserts the 6 built-in archetypes if they don't exist,
+    and refreshes them if SEED_VERSION has been bumped since the row was last
+    written. Returns the number of NEW templates created (refreshes are NOT
+    counted as new — they happen silently).
+
+    Bump SEED_VERSION whenever you change any of the 7 built-in templates below
+    (config_data, risk_profile, tier_required, or sort_order). The next api
+    restart will refresh the affected rows in place. name and description
+    changes also trigger a refresh — keep them under SEED_VERSION control so
+    investor-facing copy stays consistent.
+    """
+    SEED_VERSION = 1  # bumped on 2026-08-22 when adding per-template risk values
     templates = [
         {
             "slug": "rsi-breakout-v2",
@@ -4261,9 +4274,11 @@ async def seed_default_strategy_templates(db):
     ]
 
     created_count = 0
+    refreshed_count = 0
     for t in templates:
         existing = await get_strategy_template_by_slug(db, t["slug"])
         if existing is None:
+            # New template — insert with the current SEED_VERSION.
             await upsert_strategy_template(
                 db,
                 slug=t["slug"],
@@ -4274,10 +4289,32 @@ async def seed_default_strategy_templates(db):
                 risk_profile=t["risk_profile"],
                 tier_required=t["tier_required"],
                 sort_order=t["sort_order"],
+                seed_version=SEED_VERSION,
             )
             created_count += 1
-    if created_count > 0:
+        elif existing.seed_version < SEED_VERSION:
+            # Existing row is stale — refresh it in place. This is the
+            # primary defense against stale-DB bit-rot when the seed code
+            # changes but the slug already exists. Admin edits to
+            # individual fields (e.g. tier_required via the admin panel)
+            # should bump seed_version manually if they want them preserved.
+            existing.name = t["name"]
+            existing.description = t["description"]
+            existing.archetype = t["archetype"]
+            existing.config_data = t["config_data"]
+            existing.risk_profile = t["risk_profile"]
+            existing.tier_required = t["tier_required"]
+            existing.sort_order = t["sort_order"]
+            existing.seed_version = SEED_VERSION
+            refreshed_count += 1
+    if created_count > 0 or refreshed_count > 0:
         await db.commit()
+    if refreshed_count > 0:
+        # Surface refreshes at INFO so operators see them in logs.
+        import logging
+        logging.getLogger(__name__).info(
+            f"Refreshed {refreshed_count} strategy templates to SEED_VERSION={SEED_VERSION}"
+        )
     return created_count
 
 
