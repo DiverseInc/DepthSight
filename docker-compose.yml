@@ -222,33 +222,38 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  slack_agent:
-    build: .
-    container_name: depthsight_slack_agent
-    command: python -m slack_agent.app
-    env_file: .env
-    environment:
-      - DEPTHSIGHT_API_URL=${DEPTHSIGHT_API_URL:-http://api:8000/api/v1}
-      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
-      - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
-      - API_KEY_SECRET=${API_KEY_SECRET}
-      - DEPTHSIGHT_JWT_TOKEN=${DEPTHSIGHT_JWT_TOKEN:-}
-      - MCP_MEMORY_HOST=mcp-memory
-      - MCP_MEMORY_PORT=8100
-      - REDIS_HOST=redis
-      - REDIS_USERNAME=celery
-      - REDIS_PASSWORD=${REDIS_CELERY_PASSWORD:-${REDIS_PASSWORD}}
-    depends_on:
-      api:
-        condition: service_started
-      mcp-memory:
-        condition: service_started
-    restart: on-failure
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "5"
+  # slack_agent: DISABLED 2026-08-22 — no Slack tokens configured (SLACK_BOT_TOKEN/
+  # SLACK_APP_TOKEN blank), causing a crash/restart loop (restart: on-failure).
+  # Re-enable by uncommenting this block AND setting real tokens in .env, then
+  # `docker compose up -d` (full recreate so env_file re-reads).
+  #
+  # slack_agent:
+  #   build: .
+  #   container_name: depthsight_slack_agent
+  #   command: python -m slack_agent.app
+  #   env_file: .env
+  #   environment:
+  #     - DEPTHSIGHT_API_URL=${DEPTHSIGHT_API_URL:-http://127.0.0.1:8000/api/v1}
+  #     - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+  #     - SLACK_APP_TOKEN=${SLACK_APP_TOKEN}
+  #     - API_KEY_SECRET=${API_KEY_SECRET}
+  #     - DEPTHSIGHT_JWT_TOKEN=${DEPTHSIGHT_JWT_TOKEN:-}
+  #     - MCP_MEMORY_HOST=mcp-memory
+  #     - MCP_MEMORY_PORT=8100
+  #     - REDIS_HOST=redis
+  #     - REDIS_USERNAME=celery
+  #     - REDIS_PASSWORD=${REDIS_CELERY_PASSWORD:-${REDIS_PASSWORD}}
+  #   depends_on:
+  #     api:
+  #       condition: service_started
+  #     mcp-memory:
+  #       condition: service_started
+  #   restart: on-failure
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "10m"
+  #       max-file: "5"
 
   frontend:
     build:
