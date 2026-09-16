@@ -616,6 +616,16 @@ def _get_openrouter_model_name() -> str:
     return f"google/{google_model}"
 
 
+def _get_openrouter_fallback_model_name() -> str:
+    """Optional second-tier model tried after the primary fails on 429/5xx.
+
+    Set OPENROUTER_FALLBACK_MODEL to a different-vendor `:free` slug so a
+    single-vendor rate-limit outage doesn't take down Co-Pilot. Empty string
+    disables the fallback (default).
+    """
+    return os.getenv("OPENROUTER_FALLBACK_MODEL", "").strip()
+
+
 def _get_qwen_model_name() -> str:
     return os.getenv("QWEN_MODEL", "qwen-max").strip()
 
@@ -952,49 +962,98 @@ async def _call_openrouter_api(
     if not openrouter_api_key:
         raise ConnectionError("OPENROUTER_API_KEY is not configured.")
 
-    model_name = model_name or _get_openrouter_model_name()
-    if not model_name:
+    primary_model = model_name or _get_openrouter_model_name()
+    if not primary_model:
         raise ConnectionError("OPENROUTER_MODEL is not configured.")
 
     timeout_seconds = float(
         os.getenv("OPENROUTER_TIMEOUT_SECONDS", str(DEFAULT_OPENROUTER_TIMEOUT_SECONDS))
     )
-    payload: Dict[str, Any] = {
-        "model": model_name,
-        "messages": messages,
-    }
-    if response_format:
-        payload["response_format"] = response_format
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-
     openrouter_url = (
         os.getenv("OPENROUTER_API_URL", DEFAULT_OPENROUTER_URL).strip()
         or DEFAULT_OPENROUTER_URL
     )
-    try:
-        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-            response = await client.post(
-                openrouter_url,
-                headers=_build_openrouter_headers(),
-                json=payload,
-            )
-            response.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        response_body = e.response.text
-        logger.error(
-            f"OpenRouter request failed with status {e.response.status_code}: {response_body}"
-        )
-        raise ConnectionError(
-            f"OpenRouter request failed with status {e.response.status_code}: {response_body}"
-        ) from e
-    except httpx.RequestError as e:
-        logger.error(f"OpenRouter request error: {e}")
-        raise ConnectionError(f"OpenRouter request failed: {e}") from e
+    fallback_model = _get_openrouter_fallback_model_name()
 
-    return _extract_openrouter_response_text(
-        response.json(), require_complete=require_complete
-    )
+    # Retry the primary, then fall back once to OPENROUTER_FALLBACK_MODEL.
+    # Both legs use the same exponential backoff on 429/5xx, mirroring the
+    # Qwen caller below so behavior is consistent across providers.
+    max_retries = 3
+    models_to_try = [primary_model]
+    if fallback_model and fallback_model != primary_model:
+        models_to_try.append(fallback_model)
+
+    last_status_error: Optional[ConnectionError] = None
+
+    for current_model in models_to_try:
+        is_fallback = current_model != primary_model
+        for attempt in range(max_retries):
+            payload: Dict[str, Any] = {
+                "model": current_model,
+                "messages": messages,
+            }
+            if response_format:
+                payload["response_format"] = response_format
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
+
+            try:
+                async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                    response = await client.post(
+                        openrouter_url,
+                        headers=_build_openrouter_headers(),
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                return _extract_openrouter_response_text(
+                    response.json(), require_complete=require_complete
+                )
+            except httpx.HTTPStatusError as e:
+                status_code = e.response.status_code
+                response_body = e.response.text
+                is_retryable = status_code == 429 or status_code >= 500
+                if is_retryable and attempt < max_retries - 1:
+                    backoff = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(
+                        f"OpenRouter[{current_model}] status {status_code} "
+                        f"(attempt {attempt + 1}/{max_retries}). Retrying in {backoff}s..."
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                last_status_error = ConnectionError(
+                    f"OpenRouter[{current_model}] failed with status {status_code}: {response_body}"
+                )
+                logger.error(str(last_status_error))
+                break  # exhausted retries on this model
+            except (httpx.RequestError, httpx.TimeoutException) as e:
+                if attempt < max_retries - 1:
+                    backoff = 2 ** attempt
+                    logger.warning(
+                        f"OpenRouter[{current_model}] request error "
+                        f"(attempt {attempt + 1}/{max_retries}): {e}. Retrying in {backoff}s..."
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+                logger.error(
+                    f"OpenRouter[{current_model}] request error after {max_retries} attempts: {e}"
+                )
+                last_status_error = ConnectionError(
+                    f"OpenRouter[{current_model}] request failed: {e}"
+                )
+                break  # exhausted retries on this model
+
+        if is_fallback:
+            # Already tried the fallback; nothing left.
+            break
+        if last_status_error is not None and fallback_model:
+            logger.warning(
+                f"OpenRouter primary {primary_model} failed; "
+                f"swapping to fallback {fallback_model}"
+            )
+
+    if last_status_error is not None:
+        raise last_status_error
+    raise ConnectionError("OpenRouter request failed for unknown reason")
 
 
 async def _generate_openrouter_json_response(
