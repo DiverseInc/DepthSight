@@ -62,6 +62,10 @@ class MarketDataService:
         self._stream_subscribers: Dict[str, Set[str]] = defaultdict(set)
         self._stream_specs: Dict[str, Dict[str, Any]] = {}
         self._stop_event = asyncio.Event()
+        # Default exchange for subscribe/unsubscribe commands that don't
+        # include an explicit exchange_id. Set from MARKET_DATA_DEFAULT_EXCHANGE
+        # env var in start(); defaults to "binance" for backward compat.
+        self.default_exchange: str = "binance"
 
     def _get_consumer(self, exchange_id: str) -> DataConsumer:
         """Dynamically creates or retrieves a DataConsumer for the specified exchange."""
@@ -114,6 +118,7 @@ class MarketDataService:
         # from many Elestio server IPs (HTTP 451), so set MARKET_DATA_DEFAULT_EXCHANGE=okx
         # or another reachable exchange in .env to get candle flow.
         default_exchange = os.environ.get("MARKET_DATA_DEFAULT_EXCHANGE", "binance").lower()
+        self.default_exchange = default_exchange
         self._get_consumer(default_exchange)
 
         await self.pubsub.subscribe(config.MARKET_DATA_REDIS_COMMAND_CHANNEL)
@@ -221,7 +226,7 @@ class MarketDataService:
             data_type_key = spec.get("data_type_key") or command.get("data_type_key")
             symbol = spec.get("symbol") or command.get("symbol")
             market_type = spec.get("market_type") or command.get("market_type")
-            exchange_id = spec.get("exchange_id") or "binance"
+            exchange_id = spec.get("exchange_id") or self.default_exchange
 
             consumer = self._get_consumer(exchange_id)
 
@@ -276,7 +281,7 @@ class MarketDataService:
             self._stream_subscribers.pop(stream_key, None)
             self._stream_specs.pop(stream_key, None)
 
-            exchange_id = spec.get("exchange_id") or "binance"
+            exchange_id = spec.get("exchange_id") or self.default_exchange
             consumer = self._get_consumer(exchange_id)
 
             await consumer.remove_subscription(
@@ -328,7 +333,7 @@ class MarketDataService:
         data_type_key = str(spec.get("data_type_key") or "")
         symbol = str(spec.get("symbol") or "").upper()
         market_type = spec.get("market_type")
-        exchange_id = spec.get("exchange_id") or "binance"
+        exchange_id = spec.get("exchange_id") or self.default_exchange
         if not stream_key or not data_type_key or not symbol:
             return False
 
@@ -430,7 +435,7 @@ class MarketDataService:
                 "data_type_key": command.get("data_type_key"),
                 "symbol": command.get("symbol"),
                 "market_type": command.get("market_type"),
-                "exchange_id": command.get("exchange_id") or "binance",
+                "exchange_id": command.get("exchange_id") or self.default_exchange,
             }
         ]
 
