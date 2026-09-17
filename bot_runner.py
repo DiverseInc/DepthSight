@@ -371,12 +371,118 @@ async def _initialize_user_controllers(
             shard_id,
             num_workers,
         )
+        # No live API keys — spawn a paper-only controller so paper-mode
+        # strategies can still be processed. Idempotent: skips if one exists.
+        if user.id not in user_controllers or None not in user_controllers.get(
+            user.id, {}
+        ):
+            await _initialize_paper_controller_for_user(
+                user, db, session, redis_client, telegram_notifier_instance
+            )
         return
 
     for api_key_obj in active_keys:
         await _initialize_controller_for_key(
             user, api_key_obj, db, session, redis_client, telegram_notifier_instance
         )
+
+
+async def _initialize_paper_controller_for_user(
+    user, db, session, redis_client, telegram_notifier_instance
+):
+    """
+    Spawns a paper-only TradingController for a user that has no live API keys.
+    The controller can receive and process paper-mode START_STRATEGY commands
+    using PaperTradingExecutor + DataConsumer (no live exchange executor).
+
+    Stored at user_controllers[user.id][None] — using None as the api_key_id
+    sentinel so it doesn't collide with real key-id keys.
+    """
+    global user_controllers
+
+    if user.id in user_controllers and None in user_controllers[user.id]:
+        logger.warning(
+            f"Paper controller for user {user.username} (ID: {user.id}) already exists. Skipping."
+        )
+        return False
+
+    token = None
+    try:
+        token = user_id_context.set(user.id)
+        logger.info(
+            f"--- Initializing paper-only controller for user: {user.username} (ID: {user.id}) ---"
+        )
+
+        # DataConsumer in redis mode (market data via MarketDataService).
+        # No live executor — paper mode uses data_consumer for candles.
+        data_consumer = DataConsumer(
+            loop=asyncio.get_running_loop(),
+            executor=None,
+            event_queue=None,
+            market_data_mode=getattr(config, "MARKET_DATA_FANOUT_MODE", "redis"),
+        )
+
+        # PaperTradingExecutor — no exchange API key needed.
+        paper_executor = PaperTradingExecutor(
+            user_id=user.id,
+            db_session=db,
+            data_consumer=data_consumer,
+            redis_client=redis_client,
+        )
+        await paper_executor.initialize_equity_tracking()
+
+        # Load user config for RiskManager.
+        user_app_config = await crud.get_config(db, user_id=user.id)
+        user_settings = user_app_config.model_dump() if user_app_config else {}
+
+        # RiskManager without a live executor.
+        user_risk_manager = RiskManager(
+            executor=None,
+            paper_executor=paper_executor,
+            user_id=user.id,
+            db_session=db,
+            user_settings=user_settings,
+            api_key_name="paper",
+        )
+        await user_risk_manager.initialize()
+
+        if telegram_notifier_instance:
+            user_risk_manager.telegram_notifier = telegram_notifier_instance
+            user_risk_manager.loop_from_controller = asyncio.get_running_loop()
+
+        # TradingController with api_key_id=None — accepts paper-mode commands.
+        user_controller = TradingController(
+            loop=asyncio.get_running_loop(),
+            data_consumer=data_consumer,
+            live_executor=None,
+            paper_executor=paper_executor,
+            risk_manager=user_risk_manager,
+            user_id=user.id,
+            api_key_id=None,
+            telegram_notifier=telegram_notifier_instance,
+            market_executors={},
+            api_key_name="paper",
+        )
+
+        await user_controller.start()
+
+        if user.id not in user_controllers:
+            user_controllers[user.id] = {}
+        user_controllers[user.id][None] = user_controller
+        logger.info(
+            f"Paper controller for user '{user.username}' (ID: {user.id}) started successfully."
+        )
+        return True
+
+    except Exception as e_paper_init:
+        logger.error(
+            f"Failed to initialize paper controller for user {user.username} (ID: {user.id}): {e_paper_init}",
+            exc_info=True,
+        )
+        return False
+    finally:
+        if token:
+            user_id_context.reset(token)
 
 
 async def _initialize_controller_for_key(
