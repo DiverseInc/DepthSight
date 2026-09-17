@@ -1809,7 +1809,16 @@ class CcxtExecutor:
     def _to_legacy_symbol(symbol: Optional[str]) -> str:
         if not symbol:
             return ""
-        return symbol.replace("/", "").replace(":USDT", "").replace(":USDC", "").upper()
+        s = symbol.replace("/", "").replace(":USDT", "").replace(":USDC", "").upper()
+        # Handle OKX-native format: "BTC-USDT-SWAP" or "BTC-USDT" -> "BTCUSDT".
+        # Some ccxt OKX paths return native IDs instead of unified symbols; without
+        # this normalization, valid_symbols ends up {"BTC-USDT-SWAP", ...} and a
+        # Binance-format strategy symbol (BTCUSDT) fails the DataSubEnsure check.
+        if "-USDT-SWAP" in s:
+            s = s.replace("-USDT-SWAP", "")
+        elif s.endswith("-USDT"):
+            s = s[:-5]
+        return s
 
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:
