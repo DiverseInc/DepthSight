@@ -9,6 +9,7 @@ from collections import defaultdict
 from typing import Any, Dict, Optional, Set
 
 import aiohttp
+import os
 import redis.asyncio as redis_asyncio
 
 from bot_module import config
@@ -108,8 +109,12 @@ class MarketDataService:
         await self.redis.ping()
         self.pubsub = self.redis.pubsub()
 
-        # Initialize default consumer (Binance)
-        self._get_consumer("binance")
+        # Initialize default consumer (configurable via MARKET_DATA_DEFAULT_EXCHANGE
+        # env var; defaults to "binance" for backward compat). Binance is geo-blocked
+        # from many Elestio server IPs (HTTP 451), so set MARKET_DATA_DEFAULT_EXCHANGE=okx
+        # or another reachable exchange in .env to get candle flow.
+        default_exchange = os.environ.get("MARKET_DATA_DEFAULT_EXCHANGE", "binance").lower()
+        self._get_consumer(default_exchange)
 
         await self.pubsub.subscribe(config.MARKET_DATA_REDIS_COMMAND_CHANNEL)
         logger.info(
