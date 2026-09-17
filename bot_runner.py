@@ -294,6 +294,19 @@ async def run_bot(shard_id: int = 0, num_workers: int = 1):
                 user, api_key_obj, db, session, redis_client, telegram_notifier
             )
 
+        # Spawn paper-only controllers for users (including paper-only users
+        # with no live API keys like diverseinc). Idempotent — skips if a
+        # paper controller already exists. Without this, paper-mode
+        # START_STRATEGY commands for users without API keys are silently
+        # dropped at the controller's user_id check.
+        for user in users:
+            if user.id not in user_controllers or None not in user_controllers.get(
+                user.id, {}
+            ):
+                await _initialize_paper_controller_for_user(
+                    user, db, session, redis_client, telegram_notifier
+                )
+
         # 4. Start the command listener and wait for shutdown
         logger.info(
             "Bot runner initialized with %s active controllers across %s users on shard %s.",
