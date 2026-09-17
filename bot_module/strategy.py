@@ -2104,7 +2104,12 @@ def _adapt_tp_to_orderbook(
 class BaseStrategy:
     NAME = "BaseStrategy"
     description = "Base class for all strategies."
-    enabled: bool = False
+    # NOTE: Do NOT declare `enabled: bool = False` at the class level.
+    # `BaseStrategy.__init__` calls `self._get_param("enabled", True)`, and
+    # `_get_param`'s third fallback reads `getattr(self, "enabled", None)` —
+    # a class-level False would be returned (since `False is not None`) and
+    # the True default would never be used, leaving every strategy
+    # disabled. Keep this attribute None at the class level.
     candle_timeframe: Optional[str] = None
     entry_timeframe: Optional[str] = None
     trend_timeframe: Optional[str] = None
