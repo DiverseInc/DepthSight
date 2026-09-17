@@ -399,37 +399,41 @@ async def start_strategy_instance(
                 status_code=404,
                 detail="API key not found or you don't have permission.",
             )
+    elif mode == "live":
+        raise HTTPException(
+            status_code=400, detail="API key must be specified for live trading."
+        )
     else:
-        if mode == "live":
-            raise HTTPException(
-                status_code=400, detail="API key must be specified for live trading."
-            )
+        # Paper trading: optionally use an active API key for market data routing,
+        # but don't require one. PaperTradingExecutor uses data_consumer for prices.
         active_keys = await crud.get_active_api_keys_for_user(db, current_user.id)
-        if not active_keys:
-            raise HTTPException(
-                status_code=400,
-                detail="You need at least one active API key to run paper trading.",
-            )
-        request.api_key_id = active_keys[0].id
-        api_key = active_keys[0]
+        if active_keys:
+            request.api_key_id = active_keys[0].id
+            api_key = active_keys[0]
+        else:
+            request.api_key_id = None
+            api_key = None
 
     # --- Live/Paper Trading Permission Checks ---
-    user_plan = plans_config.get_plan(current_user.plan)
-    limits = user_plan.get("limits", {})
-    if "allow_real_trading" not in user_plan.get("permissions", []):
-        allow_free_bybit = limits.get("allow_free_bybit_trading", False)
-        if allow_free_bybit:
-            # Check if the API key being used is Bybit
-            if not api_key or api_key.exchange.lower() != "bybit":
+    # Paper trading has no plan-level restriction: it doesn't move real money.
+    # Plan / Bybit-only checks only apply when actually trading on an exchange.
+    if mode != "paper":
+        user_plan = plans_config.get_plan(current_user.plan)
+        limits = user_plan.get("limits", {})
+        if "allow_real_trading" not in user_plan.get("permissions", []):
+            allow_free_bybit = limits.get("allow_free_bybit_trading", False)
+            if allow_free_bybit:
+                # Check if the API key being used is Bybit
+                if not api_key or api_key.exchange.lower() != "bybit":
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="Trading on your plan is only allowed using Bybit API keys.",
+                    )
+            else:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Trading on your plan is only allowed using Bybit API keys.",
+                    detail=f"Your current plan ({current_user.plan}) does not allow trading.",
                 )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Your current plan ({current_user.plan}) does not allow trading.",
-            )
 
     await _enforce_live_strategy_limit(
         user=current_user,
