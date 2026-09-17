@@ -55,7 +55,14 @@ fi
 echo -e "${BLUE}[*] Sanitizing file endings (CRLF -> LF)...${NC}"
 find . -type f -name "*.sh" -exec sed -i 's/\r$//' {} +
 find . -type f -name "Caddyfile" -exec sed -i 's/\r$//' {} +
-find . -type f -name ".env*" -exec sed -i 's/\r$//' {} +
+# CRLF sanitization for .env: only the canonical filenames, NOT a broad glob.
+# A previous `find -name ".env*"` once matched a literal ".env\r" file that
+# Elestio's first deploy created from a CRLF template, leaving a stale shadow
+# that any later .env* glob could clobber the live file with. See git history
+# of this file and ops/scripts/smoke-test.sh for the regression watchdog.
+for f in .env .env.example .env.local .env.production; do
+    [ -f "$f" ] && sed -i 's/\r$//' "$f"
+done
 find . -type f -name "Dockerfile*" -exec sed -i 's/\r$//' {} +
 
 # 3. Initial System Setup
