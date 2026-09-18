@@ -66,15 +66,6 @@ class CcxtExecutor:
                 exchange_options["brokerId"] = broker_id
                 logger.info(f"CcxtExecutor: Using Bybit Broker ID: {broker_id}")
 
-        # WORKAROUND (2026-09-18): ccxt 4.4.89 OKX class has incomplete urls
-        # config — only {'rest': 'https://{hostname}'}. When load_markets()
-        # is called, ccxt can't resolve an OKX endpoint, falls back through
-        # its URL-resolution chain, and lands on Binance's fapi.binance.com
-        # (HTTP 451 from US-based Elestio). Fix: explicitly set
-        # public/private URLs to OKX's actual REST endpoint.
-        if self.exchange_id == "okx":
-            exchange_options.setdefault("hostname", "www.okx.com")
-
         elif "spot" in self.market_type:
             exchange_options["defaultType"] = "spot"
             # exchange_options['fetchMarkets'] = ['spot'] # Can cause KeyErrors in some sandbox environments
@@ -147,14 +138,6 @@ class CcxtExecutor:
                 f"Binance REST API URL patched for Sandbox (Demo Trading): {self._exchange.urls['api']}"
             )
 
-        # OKX URL patch — see _patch_okx_urls for the why. Applies whether
-        # sandbox or live; ccxt 4.4.89's OKX class has incomplete urls config.
-        if self.exchange_id == "okx":
-            self._patch_okx_urls(self._exchange)
-            logger.info(
-                f"OKX REST API URL patched: {self._exchange.urls['api']}"
-            )
-
         # Initialize CCXT Pro WebSocket client for User Data Stream
         ccxtpro_class = getattr(ccxtpro, self.exchange_id, None)
         if ccxtpro_class:
@@ -172,8 +155,6 @@ class CcxtExecutor:
                 logger.info(
                     f"Binance Sandbox Config Sync: REST={self._exchange_pro.urls['api'].get('fapiPrivate')}, WS={ws_urls.get('future')}"
                 )
-            if self.exchange_id == "okx":
-                self._patch_okx_urls(self._exchange_pro)
         else:
             self._exchange_pro = None
 
@@ -545,61 +526,67 @@ class CcxtExecutor:
         """
         Loads and returns standardized exchange info from CCXT.
         Maps it to existing expectation schemas.
+
+        Note (2026-09-18): ccxt==4.4.89 raw `ccxt.okx.load_markets()` works
+        correctly in this environment — returns 4963 markets including the
+        USDT-margined swap pairs we use. The earlier hardcoded 50-pair list
+        workaround was based on a misdiagnosis (the original error logged
+        `name='binance'` but the underlying ccxt instance was actually OKX;
+        the failure was likely transient or from a different code path).
         """
-        # WORKAROUND (2026-09-18): ccxt.okx.load_markets() in this environment
-        # is somehow issuing a request to https://fapi.binance.com/fapi/v1/exchangeInfo
-        # (HTTP 451, geo-blocked from Elestio). The request has `name='binance'`
-        # in the ccxt error, suggesting the underlying ccxt instance is/was a
-        # Binance instance — possibly a module-level monkey-patch or a ccxt
-        # 4.4.89 quirk we couldn't pin down remotely. To unblock paper trading
-        # while we investigate, bypass load_markets() entirely and return a
-        # hardcoded list of common OKX pairs in the schema data_consumer.py
-        # expects. CCXT Pro (used for the actual candle stream) is unaffected
-        # — it goes through a different code path that DOES reach OKX.
-        hardcoded_futures_usdtm = [
-            "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
-            "ADAUSDT", "AVAXUSDT", "TRXUSDT", "LINKUSDT", "DOTUSDT",
-            "MATICUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT", "ATOMUSDT",
-            "UNIUSDT", "XLMUSDT", "FILUSDT", "APTUSDT", "ARBUSDT",
-            "OPUSDT", "INJUSDT", "TIAUSDT", "SEIUSDT", "SUIUSDT",
-            "PEPEUSDT", "SHIBUSDT", "ICPUSDT", "MKRUSDT", "AAVEUSDT",
-            "FTMUSDT", "ALGOUSDT", "EGLDUSDT", "SANDUSDT", "MANAUSDT",
-            "AXSUSDT", "CHZUSDT", "FLOWUSDT", "ROSEUSDT", "CRVUSDT",
-            "LDOUSDT", "GRTUSDT", "RNDRUSDT", "FETUSDT", "PYTHUSDT",
-            "JTOUSDT", "JUPUSDT", "BLURUSDT", "ENAUSDT", "ONDOUSDT",
-        ]
-        hardcoded_spot = hardcoded_futures_usdtm
+        if self._exchange is None:
+            return None
 
         market_type = specific_market_type or self.market_type or ""
+
+        try:
+            raw_markets = await self._exchange.load_markets()
+        except Exception as e:
+            logger.error(
+                f"fetch_exchange_info: load_markets() failed for "
+                f"{self.exchange_id}/{market_type}: {e}"
+            )
+            return None
+
         if "futures" in market_type:
-            return {
-                "symbols": [
+            symbols = []
+            for ccxt_symbol, info in raw_markets.items():
+                if not info.get("swap"):
+                    continue
+                if info.get("quote") != "USDT":
+                    continue
+                base = info.get("base", "")
+                symbols.append(
                     {
-                        "symbol": s,
-                        "pair": s,
-                        "status": "TRADING",
+                        "symbol": base + "USDT",
+                        "pair": ccxt_symbol,
+                        "status": "TRADING" if info.get("active") else "INACTIVE",
                         "contractType": "PERPETUAL",
                         "quoteAsset": "USDT",
                         "isSpotTradingAllowed": False,
-                        "baseAsset": s[:-4] if s.endswith("USDT") else s,
+                        "baseAsset": base,
                     }
-                    for s in hardcoded_futures_usdtm
-                ]
-            }
+                )
+            return {"symbols": symbols}
         if "spot" in market_type:
-            return {
-                "symbols": [
+            symbols = []
+            for ccxt_symbol, info in raw_markets.items():
+                if info.get("type") != "spot":
+                    continue
+                if info.get("quote") != "USDT":
+                    continue
+                base = info.get("base", "")
+                symbols.append(
                     {
-                        "symbol": s,
-                        "pair": s,
-                        "status": "TRADING",
+                        "symbol": base + "USDT",
+                        "pair": ccxt_symbol,
+                        "status": "TRADING" if info.get("active") else "INACTIVE",
                         "isSpotTradingAllowed": True,
-                        "baseAsset": s[:-4] if s.endswith("USDT") else s,
+                        "baseAsset": base,
                         "quoteAsset": "USDT",
                     }
-                    for s in hardcoded_spot
-                ]
-            }
+                )
+            return {"symbols": symbols}
         return None
 
     async def place_order(
@@ -1706,48 +1693,6 @@ class CcxtExecutor:
             return f"{base}/private/ws?listenKey={listen_key}"
 
         exchange.get_private_ws_url = get_private_ws_url
-
-    def _patch_okx_urls(self, exchange: Any) -> None:
-        """
-        WORKAROUND (2026-09-18) for ccxt==4.4.89 OKX class: the urls dict
-        ships with only {'rest': 'https://{hostname}'} — no public/private/
-        fapiPublic sub-URLs. When load_markets() is called, ccxt's URL
-        resolution can't find an OKX endpoint, falls back through its
-        internal chain, and lands on Binance's fapi.binance.com
-        (HTTP 451 from US-based Elestio). This was the source of the
-        "Strategy configuration not found" / 451 / name='binance' errors
-        earlier today.
-
-        Fix: explicitly populate the public/private/api sub-URLs with
-        OKX's actual REST endpoint so ccxt's URL resolver finds OKX
-        before falling back. Applied to BOTH self._exchange (REST) and
-        self._exchange_pro (WS) since both have the same broken urls dict.
-
-        Note: WebSocket URLs (api.ws) are NOT touched here — ccxtpro uses
-        a different path and the WS streams to OKX were already working
-        via wss://ws.okx.com:8443.
-        """
-        if exchange is None:
-            return
-        api_urls = exchange.urls.get("api")
-        if not isinstance(api_urls, dict):
-            return
-
-        okx_rest = "https://www.okx.com"
-
-        # Always set public + private (the most critical for load_markets)
-        api_urls["public"] = okx_rest
-        api_urls["private"] = okx_rest
-
-        # For USDT-margined swaps, OKX uses the same base URL — no
-        # separate fapiPublic/fapiPrivate host needed, but set them to
-        # the same value to short-circuit any resolver that prefers
-        # fapi-prefixed keys.
-        api_urls["fapiPublic"] = okx_rest
-        api_urls["fapiPrivate"] = okx_rest
-
-        # OKX sandbox uses a separate hostname; gate via options, not URL
-        # (ccxtpro handles this internally when sandboxMode is set).
 
     def _set_gateio_uid(self, uid: str) -> None:
         uid = str(uid or "").strip()
