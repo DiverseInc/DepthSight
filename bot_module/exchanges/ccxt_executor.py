@@ -527,9 +527,61 @@ class CcxtExecutor:
         Loads and returns standardized exchange info from CCXT.
         Maps it to existing expectation schemas.
         """
-        try:
-            markets = await self._exchange.load_markets(reload=force_update)
-            symbols_list = []
+        # WORKAROUND (2026-09-18): ccxt.okx.load_markets() in this environment
+        # is somehow issuing a request to https://fapi.binance.com/fapi/v1/exchangeInfo
+        # (HTTP 451, geo-blocked from Elestio). The request has `name='binance'`
+        # in the ccxt error, suggesting the underlying ccxt instance is/was a
+        # Binance instance — possibly a module-level monkey-patch or a ccxt
+        # 4.4.89 quirk we couldn't pin down remotely. To unblock paper trading
+        # while we investigate, bypass load_markets() entirely and return a
+        # hardcoded list of common OKX pairs in the schema data_consumer.py
+        # expects. CCXT Pro (used for the actual candle stream) is unaffected
+        # — it goes through a different code path that DOES reach OKX.
+        hardcoded_futures_usdtm = [
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+            "ADAUSDT", "AVAXUSDT", "TRXUSDT", "LINKUSDT", "DOTUSDT",
+            "MATICUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT", "ATOMUSDT",
+            "UNIUSDT", "XLMUSDT", "FILUSDT", "APTUSDT", "ARBUSDT",
+            "OPUSDT", "INJUSDT", "TIAUSDT", "SEIUSDT", "SUIUSDT",
+            "PEPEUSDT", "SHIBUSDT", "ICPUSDT", "MKRUSDT", "AAVEUSDT",
+            "FTMUSDT", "ALGOUSDT", "EGLDUSDT", "SANDUSDT", "MANAUSDT",
+            "AXSUSDT", "CHZUSDT", "FLOWUSDT", "ROSEUSDT", "CRVUSDT",
+            "LDOUSDT", "GRTUSDT", "RNDRUSDT", "FETUSDT", "PYTHUSDT",
+            "JTOUSDT", "JUPUSDT", "BLURUSDT", "ENAUSDT", "ONDOUSDT",
+        ]
+        hardcoded_spot = hardcoded_futures_usdtm
+
+        market_type = specific_market_type or self.market_type or ""
+        if "futures" in market_type:
+            return {
+                "symbols": [
+                    {
+                        "symbol": s,
+                        "pair": s,
+                        "status": "TRADING",
+                        "contractType": "PERPETUAL",
+                        "quoteAsset": "USDT",
+                        "isSpotTradingAllowed": False,
+                        "baseAsset": s[:-4] if s.endswith("USDT") else s,
+                    }
+                    for s in hardcoded_futures_usdtm
+                ]
+            }
+        if "spot" in market_type:
+            return {
+                "symbols": [
+                    {
+                        "symbol": s,
+                        "pair": s,
+                        "status": "TRADING",
+                        "isSpotTradingAllowed": True,
+                        "baseAsset": s[:-4] if s.endswith("USDT") else s,
+                        "quoteAsset": "USDT",
+                    }
+                    for s in hardcoded_spot
+                ]
+            }
+        return None
 
             for m_id, m_data in markets.items():
                 # Filter symbols based on specific_market_type or current executor market_type
