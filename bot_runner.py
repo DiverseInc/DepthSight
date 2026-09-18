@@ -19,7 +19,7 @@ import json
 import aiohttp
 from aiohttp import ThreadedResolver
 import multiprocessing
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 # --- Local Imports ---
 from bot_module import config
@@ -464,6 +464,34 @@ async def _initialize_paper_controller_for_user(
             user_risk_manager.loop_from_controller = asyncio.get_running_loop()
 
         # TradingController with api_key_id=None — accepts paper-mode commands.
+        # For paper mode, the controller has no live executor for order placement,
+        # but the data consumer STILL needs executors to fetch market data — these
+        # determine the `exchange_id` baked into the Redis subscribe spec. Without
+        # them, `_executor_for_market("futures_usdtm")` returns None and the bot
+        # defaults to "binance" (line 1087 data_consumer.py), which makes market_data
+        # spin up a fresh Binance consumer that 451s on REST history and never
+        # schedules the WS task. Create OKX executors so the bot's subscribe
+        # command carries `exchange_id="okx"` and matches the market_data default.
+        from bot_module.exchanges import create_exchange_executor
+
+        market_default_exchange = os.environ.get(
+            "MARKET_DATA_DEFAULT_EXCHANGE", "okx"
+        ).lower()
+        market_executors_for_data_consumer: Dict[str, Any] = {}
+        for mt in ("futures_usdtm", "spot"):
+            try:
+                market_executors_for_data_consumer[mt] = create_exchange_executor(
+                    exchange=market_default_exchange,
+                    api_key="",
+                    api_secret="",
+                    session=session,
+                    market_type=mt,
+                )
+            except Exception as market_exec_e:
+                logger.warning(
+                    f"Could not create {market_default_exchange} {mt} executor for paper controller's data consumer: {market_exec_e}"
+                )
+
         user_controller = TradingController(
             loop=asyncio.get_running_loop(),
             data_consumer=data_consumer,
@@ -473,7 +501,7 @@ async def _initialize_paper_controller_for_user(
             user_id=user.id,
             api_key_id=None,
             telegram_notifier=telegram_notifier_instance,
-            market_executors={},
+            market_executors=market_executors_for_data_consumer,
             api_key_name="paper",
         )
 
