@@ -2,12 +2,16 @@
 
 import {
 	Activity,
+	AlertTriangle,
 	CheckCircle2,
 	Circle,
+	Clock,
 	Copy,
 	ListChecks,
 	Mail,
+	Play,
 	Rocket,
+	Server,
 	TrendingUp,
 	UserPlus,
 	Users,
@@ -15,6 +19,7 @@ import {
 import React from "react";
 import { Link } from "react-router-dom";
 import { Bar, BarChart, CartesianGrid, Cell, XAxis, YAxis } from "recharts";
+import { Badge } from "@/components/ui/badge";
 import {
 	Card,
 	CardContent,
@@ -31,7 +36,10 @@ import { Skeleton } from "@/components/ui/skeleton";
 import {
 	useAdminAffiliates,
 	useAdminDashboardStats,
+	useAdminErrorLogs,
 	useAdminGetUsers,
+	useAdminSystemMetrics,
+	useStrategies,
 } from "@/lib/api";
 import type { AdminUser } from "@/types/api";
 
@@ -208,6 +216,18 @@ const AdminDashboardPage: React.FC = () => {
 		useAdminGetUsers(1, 20, undefined, undefined);
 	const { data: affiliatesData, isLoading: isLoadingAffiliates } =
 		useAdminAffiliates(1, 1);
+	const { data: liveStrategies, isLoading: isLoadingLive } = useStrategies({
+		mode: "live",
+	});
+	const { data: paperStrategies, isLoading: isLoadingPaper } = useStrategies({
+		mode: "paper",
+	});
+	const { data: sysMetrics, isLoading: isLoadingMetrics } =
+		useAdminSystemMetrics();
+	const { data: recentErrors, isLoading: isLoadingErrors } = useAdminErrorLogs(
+		10,
+		"ERROR",
+	);
 
 	const recentUsers = React.useMemo<AdminUser[]>(() => {
 		if (!recentUsersData?.users) return [];
@@ -294,6 +314,236 @@ const AdminDashboardPage: React.FC = () => {
 					isLoading={isLoadingAffiliates}
 					description="Affiliates with referrals"
 				/>
+			</div>
+
+			{/* === Live Running Strategies / Service Health / Recent Activity === */}
+			<div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+				{/* Live Running Strategies */}
+				<Card>
+					<CardHeader>
+						<CardTitle className="flex items-center gap-2">
+							<Play className="h-5 w-5 text-emerald-500" />
+							Live Running Strategies
+						</CardTitle>
+						<CardDescription>
+							Paper + live instances currently subscribed to market data
+						</CardDescription>
+					</CardHeader>
+					<CardContent>
+						{isLoadingLive || isLoadingPaper ? (
+							<div className="space-y-2">
+								{[...Array(3)].map((_, i) => (
+									<Skeleton key={i} className="h-12 w-full" />
+								))}
+							</div>
+						) : (
+							(() => {
+								const allRunning = [
+									...(liveStrategies || []),
+									...(paperStrategies || []),
+								].filter((s) => s.status?.toLowerCase() !== "stopped");
+								if (allRunning.length === 0) {
+									return (
+										<EmptyState
+											icon={Play}
+											title="No running strategies"
+											hint="Start a paper or live strategy to see it tracked here."
+										/>
+									);
+								}
+								return (
+									<div className="space-y-2">
+										{allRunning.slice(0, 8).map((s) => {
+											const sym =
+												s.symbol ||
+												(s as { symbols?: string[] }).symbols?.[0] ||
+												"—";
+											const status = s.status?.toLowerCase() || "unknown";
+											const statusClass =
+												status === "running" || status === "in_position"
+													? "bg-emerald-500 text-white"
+													: status === "error" || status === "failed"
+														? "bg-red-500 text-white"
+														: "bg-slate-400 text-white";
+											return (
+												<div
+													key={s.id}
+													className="flex items-center justify-between gap-2 p-2 rounded-md border bg-card/40"
+												>
+													<div className="min-w-0 flex-1">
+														<p className="text-sm font-medium truncate">
+															{s.name}
+														</p>
+														<p className="text-xs text-muted-foreground font-mono">
+															{sym}
+														</p>
+													</div>
+													<div className="flex items-center gap-1 shrink-0">
+														<Badge
+															variant={
+																s.mode === "live"
+																	? "destructive"
+																	: "secondary"
+															}
+															className="text-[10px]"
+														>
+															{s.mode?.toUpperCase() || "PAPER"}
+														</Badge>
+														<Badge className={`text-[10px] ${statusClass}`}>
+															{status.toUpperCase()}
+														</Badge>
+													</div>
+												</div>
+											);
+										})}
+									</div>
+								);
+							})()
+						)}
+					</CardContent>
+				</Card>
+
+				{/* Service Health */}
+				<Card>
+					<CardHeader>
+						<CardTitle className="flex items-center gap-2">
+							<Server className="h-5 w-5 text-blue-500" />
+							Platform Health
+						</CardTitle>
+						<CardDescription>System metrics, last 30 days</CardDescription>
+					</CardHeader>
+					<CardContent>
+						{isLoadingMetrics ? (
+							<div className="space-y-3">
+								{[...Array(4)].map((_, i) => (
+									<Skeleton key={i} className="h-8 w-full" />
+								))}
+							</div>
+						) : sysMetrics ? (
+							<div className="space-y-3">
+								<div className="flex items-center justify-between py-1.5 border-b">
+									<span className="text-sm font-medium">Uptime (30d)</span>
+									<span
+										className={`text-sm font-bold ${sysMetrics.uptime_30_days_percent >= 99 ? "text-emerald-600" : sysMetrics.uptime_30_days_percent >= 95 ? "text-amber-600" : "text-red-600"}`}
+									>
+										{sysMetrics.uptime_30_days_percent.toFixed(2)}%
+									</span>
+								</div>
+								<div className="flex items-center justify-between py-1.5 border-b">
+									<span className="text-sm font-medium">Avg response</span>
+									<span className="text-sm text-muted-foreground">
+										{sysMetrics.average_response_time_ms.toFixed(0)} ms
+									</span>
+								</div>
+								<div className="flex items-center justify-between py-1.5 border-b">
+									<span className="text-sm font-medium">Requests (24h)</span>
+									<span className="text-sm text-muted-foreground">
+										{sysMetrics.total_requests_24h.toLocaleString()}
+									</span>
+								</div>
+								<div className="flex items-center justify-between py-1.5">
+									<span className="text-sm font-medium">Error rate (24h)</span>
+									<span
+										className={`text-sm font-bold ${sysMetrics.error_rate_24h < 1 ? "text-emerald-600" : sysMetrics.error_rate_24h < 5 ? "text-amber-600" : "text-red-600"}`}
+									>
+										{sysMetrics.error_rate_24h.toFixed(2)}%
+									</span>
+								</div>
+							</div>
+						) : (
+							<EmptyState
+								icon={Server}
+								title="Metrics unavailable"
+								hint="The metrics endpoint didn't return data. Check the api container."
+							/>
+						)}
+					</CardContent>
+				</Card>
+
+				{/* Recent Activity Feed */}
+				<Card>
+					<CardHeader>
+						<CardTitle className="flex items-center gap-2">
+							<Clock className="h-5 w-5 text-purple-500" />
+							Recent Activity
+						</CardTitle>
+						<CardDescription>
+							Last {recentErrors?.length ?? 0} errors + recent signups
+						</CardDescription>
+					</CardHeader>
+					<CardContent>
+						{isLoadingErrors && isLoadingRecentUsers ? (
+							<div className="space-y-2">
+								{[...Array(4)].map((_, i) => (
+									<Skeleton key={i} className="h-10 w-full" />
+								))}
+							</div>
+						) : (() => {
+							type ActivityItem = {
+								kind: "error" | "signup";
+								at: string;
+								label: string;
+								detail: string;
+							};
+							const items: ActivityItem[] = [];
+							(recentErrors || []).slice(0, 8).forEach((e) =>
+								items.push({
+									kind: "error",
+									at: (e as { timestamp?: string }).timestamp ?? "",
+									label: (e as { level?: string }).level ?? "ERROR",
+									detail: (e as { message?: string }).message ?? "",
+								}),
+							);
+							(recentUsersData?.users || []).slice(0, 3).forEach((u) =>
+								items.push({
+									kind: "signup",
+									at: u.createdAt,
+									label: "Signup",
+									detail: u.username,
+								}),
+							);
+							items.sort((a, b) =>
+								new Date(b.at).getTime() - new Date(a.at).getTime(),
+							);
+							if (items.length === 0) {
+								return (
+									<EmptyState
+										icon={Clock}
+										title="No recent activity"
+										hint="Errors and signups will appear here as they happen."
+									/>
+								);
+							}
+							return (
+								<div className="space-y-2 max-h-[260px] overflow-y-auto">
+									{items.slice(0, 8).map((it, i) => (
+										<div
+											key={i}
+											className="flex items-start gap-2 p-2 rounded-md border bg-card/40"
+										>
+											{it.kind === "error" ? (
+												<AlertTriangle className="h-4 w-4 text-red-500 mt-0.5 shrink-0" />
+											) : (
+												<UserPlus className="h-4 w-4 text-green-500 mt-0.5 shrink-0" />
+											)}
+											<div className="min-w-0 flex-1">
+												<p className="text-sm font-medium truncate">
+													{it.label}
+												</p>
+												<p className="text-xs text-muted-foreground truncate">
+													{it.detail}
+												</p>
+											</div>
+											<p className="text-[10px] text-muted-foreground shrink-0">
+												{formatRelativeTime(it.at)}
+											</p>
+										</div>
+									))}
+								</div>
+							);
+						})()}
+					</CardContent>
+				</Card>
 			</div>
 
 			<div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
