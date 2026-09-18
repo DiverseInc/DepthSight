@@ -1805,7 +1805,12 @@ class TradingController:
                 json.dumps(payload, default=str),
             )
         command_user_id = payload.get("user_id")
-        if command_user_id != self.user_id:
+        # Match the str-vs-str comparison used by the other command handlers
+        # in this listener (see CLOSE_POSITION at line 1340, UPDATE_SL_TP at
+        # 1407, EMERGENCY_STOP at 1476). The strict `!=` here silently drops
+        # START_STRATEGY whenever the JSON round-trip yields a different type
+        # than the controller's self.user_id (e.g. "1" vs 1).
+        if str(command_user_id) != str(self.user_id):
             return  # Not for this user's controller
 
         # If the command specifies an api_key_id, only the matching controller should process it.
