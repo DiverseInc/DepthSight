@@ -1810,14 +1810,16 @@ class CcxtExecutor:
         if not symbol:
             return ""
         s = symbol.replace("/", "").replace(":USDT", "").replace(":USDC", "").upper()
-        # Handle OKX-native format: "BTC-USDT-SWAP" or "BTC-USDT" -> "BTCUSDT".
-        # Some ccxt OKX paths return native IDs instead of unified symbols; without
-        # this normalization, valid_symbols ends up {"BTC-USDT-SWAP", ...} and a
-        # Binance-format strategy symbol (BTCUSDT) fails the DataSubEnsure check.
-        if "-USDT-SWAP" in s:
-            s = s.replace("-USDT-SWAP", "")
-        elif s.endswith("-USDT"):
-            s = s[:-5]
+        # Handle OKX-native format with dashes: "BTC-USDT" -> "BTCUSDT",
+        # "BTC-USDT-SWAP" -> "BTCUSDT". Some ccxt OKX paths return native
+        # instrument IDs instead of unified symbols. Without this normalization,
+        # valid_symbols ends up as {"BTC", "ETH", ...} (just the base asset)
+        # because the previous attempt stripped "-USDT-SWAP" (10 chars) and
+        # "-USDT" (5 chars) entirely, leaving just the base. Strategy configs
+        # send Binance-format symbols (BTCUSDT) which then fail DataSubEnsure.
+        s = s.replace("-", "")
+        if s.endswith("SWAP"):
+            s = s[:-4]
         return s
 
     @staticmethod
