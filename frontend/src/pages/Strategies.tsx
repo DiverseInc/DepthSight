@@ -12,6 +12,7 @@ import {
 	Play,
 	Plus,
 	Search,
+	Sparkles,
 	Square,
 	Trash2,
 	TrendingDown,
@@ -367,12 +368,36 @@ const EmptyState = () => {
 					"Create your first trading strategy to start automating your trading.",
 				)}
 			</p>
-			<Button asChild size="lg" className="bg-primary hover:bg-primary/90">
-				<Link to="/editor">
-					<Plus className="h-4 w-4 mr-2" />
-					{t("createButton", "Create")}
-				</Link>
-			</Button>
+			<div className="flex flex-col sm:flex-row gap-3 items-center">
+				<Button
+					size="lg"
+					className="bg-indigo-600 hover:bg-indigo-700"
+					onClick={() => {
+						try {
+							localStorage.removeItem("depthsight_wizard_answers");
+							localStorage.removeItem("depthsight_wizard_dismissed");
+						} catch {
+							/* localStorage unavailable */
+						}
+						window.location.href = "/";
+					}}
+				>
+					<Sparkles className="h-4 w-4 mr-2" />
+					Take the 60-second quiz
+				</Button>
+				<Button asChild size="lg" variant="outline">
+					<Link to="/hub">
+						<FlaskConical className="h-4 w-4 mr-2" />
+						Browse templates
+					</Link>
+				</Button>
+				<Button asChild size="lg" className="bg-primary hover:bg-primary/90">
+					<Link to="/editor">
+						<Plus className="h-4 w-4 mr-2" />
+						{t("createButton", "Create")}
+					</Link>
+				</Button>
+			</div>
 		</div>
 	);
 };

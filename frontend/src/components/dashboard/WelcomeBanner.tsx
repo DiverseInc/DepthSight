@@ -122,7 +122,7 @@ export const WelcomeBanner = () => {
 					<QuickAction
 						icon={Wallet}
 						title="Connect an exchange"
-						description="Add Binance or Bybit API keys with one click."
+						description="Add Binance, Bybit, or OKX API keys with one click."
 						href="/settings"
 						tone="success"
 					/>

@@ -11,10 +11,12 @@ import {
 	Database,
 	Key,
 	Plus,
+	RefreshCw,
 	Save,
 	Send,
 	Settings as SettingsIcon,
 	Shield,
+	Sparkles,
 	Loader2 as SpinnerIcon,
 	RefreshCcwDot as TestIcon,
 	Trash2,
@@ -517,6 +519,39 @@ export default function Settings() {
 
 	return (
 		<PageLayout title={t("pageTitle")} icon={SettingsIcon}>
+			<Card className="mb-6">
+				<CardHeader>
+					<CardTitle className="flex items-center gap-2">
+						<Sparkles className="h-5 w-5 text-indigo-500" />
+						Onboarding
+					</CardTitle>
+					<CardDescription>
+						Need help getting started? Re-take the 60-second strategy quiz
+						and we'll recommend 3-5 strategies matched to your style.
+					</CardDescription>
+				</CardHeader>
+				<CardContent>
+					<Button
+						variant="outline"
+						onClick={() => {
+							try {
+								localStorage.removeItem("depthsight_wizard_answers");
+								localStorage.removeItem("depthsight_wizard_dismissed");
+							} catch {
+								/* localStorage unavailable */
+							}
+							toast({
+								title: "Onboarding wizard reset",
+								description:
+									"Head back to the Dashboard to retake the quiz.",
+							});
+						}}
+					>
+						<RefreshCw className="h-4 w-4 mr-2" />
+						Re-take onboarding quiz
+					</Button>
+				</CardContent>
+			</Card>
 			<Tabs defaultValue="api-keys" className="w-full">
 				<TabsList className="grid w-full grid-cols-2 md:grid-cols-4">
 					<TabsTrigger value="api-keys">

@@ -2,8 +2,10 @@
  * WizardLauncherCard
  * ───────────────────
  * Dashboard card that launches the Strategy Style Wizard.
- * Shown to logged-in users who haven't completed the wizard yet.
- * Hides once `depthsight_wizard_answers` is in localStorage.
+ * Always visible on the Dashboard — once completed, the CTA switches to
+ * "Re-take quiz" so users can refresh their strategy recommendations.
+ * The dismiss button clears for the session only (next page load brings
+ * the card back) so users can't permanently lose access to the wizard.
  */
 import { useEffect, useState } from "react";
 import { Sparkles, X } from "lucide-react";
@@ -11,21 +13,19 @@ import { Button } from "@/components/ui/button";
 import { StrategyStyleWizard } from "@/components/StrategyStyleWizard";
 
 const STORAGE_KEY = "depthsight_wizard_answers";
-const DISMISS_KEY = "depthsight_wizard_dismissed";
 
 export const WizardLauncherCard = () => {
     const [open, setOpen] = useState(false);
-    const [visible, setVisible] = useState(false);
+    const [completed, setCompleted] = useState(false);
+    const [dismissed, setDismissed] = useState(false);
 
     useEffect(() => {
-        const completed = localStorage.getItem(STORAGE_KEY);
-        const dismissed = localStorage.getItem(DISMISS_KEY);
-        if (!completed && !dismissed) {
-            setVisible(true);
-        }
+        setCompleted(!!localStorage.getItem(STORAGE_KEY));
     }, []);
 
-    if (!visible) return null;
+    if (dismissed) return null;
+
+    const isCompleted = completed;
 
     return (
         <>
@@ -35,11 +35,14 @@ export const WizardLauncherCard = () => {
                 </div>
                 <div className="flex-1 min-w-0">
                     <h3 className="font-semibold text-base text-foreground">
-                        Find your trading style
+                        {isCompleted
+                            ? "Refresh your strategy picks"
+                            : "Find your trading style"}
                     </h3>
                     <p className="text-sm text-muted-foreground mt-0.5">
-                        4 quick questions and we'll match you with 3-5 strategies
-                        from our library. Takes about 60 seconds.
+                        {isCompleted
+                            ? "Re-take the quiz to see new recommendations matched to your style."
+                            : "4 quick questions and we'll match you with 3-5 strategies from our library. Takes about 60 seconds."}
                     </p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
@@ -49,16 +52,13 @@ export const WizardLauncherCard = () => {
                         className="bg-indigo-600 hover:bg-indigo-700"
                     >
                         <Sparkles className="w-3.5 h-3.5 mr-1.5" />
-                        Start quiz
+                        {isCompleted ? "Re-take quiz" : "Start quiz"}
                     </Button>
                     <Button
                         variant="ghost"
                         size="icon"
                         className="h-8 w-8"
-                        onClick={() => {
-                            localStorage.setItem(DISMISS_KEY, "1");
-                            setVisible(false);
-                        }}
+                        onClick={() => setDismissed(true)}
                         aria-label="Dismiss"
                     >
                         <X className="w-4 h-4" />
@@ -68,7 +68,7 @@ export const WizardLauncherCard = () => {
             <StrategyStyleWizard
                 open={open}
                 onOpenChange={setOpen}
-                onComplete={() => setVisible(false)}
+                onComplete={() => setCompleted(true)}
             />
         </>
     );
