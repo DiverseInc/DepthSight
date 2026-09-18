@@ -66,6 +66,15 @@ class CcxtExecutor:
                 exchange_options["brokerId"] = broker_id
                 logger.info(f"CcxtExecutor: Using Bybit Broker ID: {broker_id}")
 
+        # WORKAROUND (2026-09-18): ccxt 4.4.89 OKX class has incomplete urls
+        # config — only {'rest': 'https://{hostname}'}. When load_markets()
+        # is called, ccxt can't resolve an OKX endpoint, falls back through
+        # its URL-resolution chain, and lands on Binance's fapi.binance.com
+        # (HTTP 451 from US-based Elestio). Fix: explicitly set
+        # public/private URLs to OKX's actual REST endpoint.
+        if self.exchange_id == "okx":
+            exchange_options.setdefault("hostname", "www.okx.com")
+
         elif "spot" in self.market_type:
             exchange_options["defaultType"] = "spot"
             # exchange_options['fetchMarkets'] = ['spot'] # Can cause KeyErrors in some sandbox environments
@@ -138,6 +147,14 @@ class CcxtExecutor:
                 f"Binance REST API URL patched for Sandbox (Demo Trading): {self._exchange.urls['api']}"
             )
 
+        # OKX URL patch — see _patch_okx_urls for the why. Applies whether
+        # sandbox or live; ccxt 4.4.89's OKX class has incomplete urls config.
+        if self.exchange_id == "okx":
+            self._patch_okx_urls(self._exchange)
+            logger.info(
+                f"OKX REST API URL patched: {self._exchange.urls['api']}"
+            )
+
         # Initialize CCXT Pro WebSocket client for User Data Stream
         ccxtpro_class = getattr(ccxtpro, self.exchange_id, None)
         if ccxtpro_class:
@@ -155,6 +172,8 @@ class CcxtExecutor:
                 logger.info(
                     f"Binance Sandbox Config Sync: REST={self._exchange_pro.urls['api'].get('fapiPrivate')}, WS={ws_urls.get('future')}"
                 )
+            if self.exchange_id == "okx":
+                self._patch_okx_urls(self._exchange_pro)
         else:
             self._exchange_pro = None
 
@@ -1687,6 +1706,48 @@ class CcxtExecutor:
             return f"{base}/private/ws?listenKey={listen_key}"
 
         exchange.get_private_ws_url = get_private_ws_url
+
+    def _patch_okx_urls(self, exchange: Any) -> None:
+        """
+        WORKAROUND (2026-09-18) for ccxt==4.4.89 OKX class: the urls dict
+        ships with only {'rest': 'https://{hostname}'} — no public/private/
+        fapiPublic sub-URLs. When load_markets() is called, ccxt's URL
+        resolution can't find an OKX endpoint, falls back through its
+        internal chain, and lands on Binance's fapi.binance.com
+        (HTTP 451 from US-based Elestio). This was the source of the
+        "Strategy configuration not found" / 451 / name='binance' errors
+        earlier today.
+
+        Fix: explicitly populate the public/private/api sub-URLs with
+        OKX's actual REST endpoint so ccxt's URL resolver finds OKX
+        before falling back. Applied to BOTH self._exchange (REST) and
+        self._exchange_pro (WS) since both have the same broken urls dict.
+
+        Note: WebSocket URLs (api.ws) are NOT touched here — ccxtpro uses
+        a different path and the WS streams to OKX were already working
+        via wss://ws.okx.com:8443.
+        """
+        if exchange is None:
+            return
+        api_urls = exchange.urls.get("api")
+        if not isinstance(api_urls, dict):
+            return
+
+        okx_rest = "https://www.okx.com"
+
+        # Always set public + private (the most critical for load_markets)
+        api_urls["public"] = okx_rest
+        api_urls["private"] = okx_rest
+
+        # For USDT-margined swaps, OKX uses the same base URL — no
+        # separate fapiPublic/fapiPrivate host needed, but set them to
+        # the same value to short-circuit any resolver that prefers
+        # fapi-prefixed keys.
+        api_urls["fapiPublic"] = okx_rest
+        api_urls["fapiPrivate"] = okx_rest
+
+        # OKX sandbox uses a separate hostname; gate via options, not URL
+        # (ccxtpro handles this internally when sandboxMode is set).
 
     def _set_gateio_uid(self, uid: str) -> None:
         uid = str(uid or "").strip()
