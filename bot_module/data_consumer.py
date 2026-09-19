@@ -1030,9 +1030,9 @@ class DataConsumer:
                             s_data.get("status") == "TRADING"
                             and s_data.get("contractType") == "PERPETUAL"
                             and s_data.get("quoteAsset") == "USDT"
-                            and "pair" in s_data
+                            and "symbol" in s_data
                         ):
-                            new_symbols_set.add(s_data["pair"])
+                            new_symbols_set.add(s_data["symbol"])
 
                 self._valid_symbols_cache[market_type_to_fetch] = new_symbols_set
                 self._valid_symbols_cache_last_update[market_type_to_fetch] = (
