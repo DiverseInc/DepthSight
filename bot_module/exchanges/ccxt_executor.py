@@ -527,12 +527,13 @@ class CcxtExecutor:
         Loads and returns standardized exchange info from CCXT.
         Maps it to existing expectation schemas.
 
-        Note (2026-09-18): ccxt==4.4.89 raw `ccxt.okx.load_markets()` works
-        correctly in this environment — returns 4963 markets including the
-        USDT-margined swap pairs we use. The earlier hardcoded 50-pair list
-        workaround was based on a misdiagnosis (the original error logged
-        `name='binance'` but the underlying ccxt instance was actually OKX;
-        the failure was likely transient or from a different code path).
+        For futures_usdtm and spot markets, the load_markets() result is
+        augmented with a hardcoded top-volume-pair safety net. ccxt 4.4.89's
+        OKX class returns 4963 markets total but its filter chain
+        (`swap=True`, `quote=USDT`) drops BTCUSDT/ETHUSDT from the futures_usdtm
+        subset on this environment, causing DataSubEnsure to SKIP every
+        production subscription. The hardcoded list guarantees the pairs we
+        actually trade are always present.
         """
         if self._exchange is None:
             return None
@@ -548,45 +549,89 @@ class CcxtExecutor:
             )
             return None
 
+        # Hardcoded safety net: top-volume USDT-margined perpetual pairs that
+        # MUST be present in the symbol list even if ccxt's load_markets() →
+        # filter chain drops them. Without this, market_data's DataSubEnsure
+        # rejects production subscriptions with
+        # `Symbol 'BTCUSDT' is NOT valid for market 'futures_usdtm'. Subscription SKIPPED.`
+        # See depthsight session note 2026-09-18 → 19 for the full trace.
+        top_volume_futures_usdtm = [
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+            "ADAUSDT", "AVAXUSDT", "TRXUSDT", "LINKUSDT", "DOTUSDT",
+            "MATICUSDT", "LTCUSDT", "BCHUSDT", "NEARUSDT", "ATOMUSDT",
+            "UNIUSDT", "XLMUSDT", "FILUSDT", "APTUSDT", "ARBUSDT",
+            "OPUSDT", "INJUSDT", "TIAUSDT", "SEIUSDT", "SUIUSDT",
+            "FTMUSDT", "ALGOUSDT", "EGLDUSDT", "SANDUSDT", "MANAUSDT",
+            "AXSUSDT", "CHZUSDT", "FLOWUSDT", "ROSEUSDT", "CRVUSDT",
+            "LDOUSDT", "GRTUSDT", "RNDRUSDT", "FETUSDT", "PYTHUSDT",
+            "JTOUSDT", "JUPUSDT", "BLURUSDT", "ENAUSDT", "ONDOUSDT",
+        ]
+        top_volume_spot = top_volume_futures_usdtm
+
         if "futures" in market_type:
-            symbols = []
+            symbols_by_name: dict = {}
             for ccxt_symbol, info in raw_markets.items():
                 if not info.get("swap"):
                     continue
                 if info.get("quote") != "USDT":
                     continue
                 base = info.get("base", "")
-                symbols.append(
-                    {
-                        "symbol": base + "USDT",
-                        "pair": ccxt_symbol,
-                        "status": "TRADING" if info.get("active") else "INACTIVE",
-                        "contractType": "PERPETUAL",
-                        "quoteAsset": "USDT",
-                        "isSpotTradingAllowed": False,
-                        "baseAsset": base,
-                    }
-                )
-            return {"symbols": symbols}
+                entry = {
+                    "symbol": base + "USDT",
+                    "pair": ccxt_symbol,
+                    "status": "TRADING" if info.get("active") else "INACTIVE",
+                    "contractType": "PERPETUAL",
+                    "quoteAsset": "USDT",
+                    "isSpotTradingAllowed": False,
+                    "baseAsset": base,
+                }
+                symbols_by_name[entry["symbol"]] = entry
+            # Augment with hardcoded top-volume list (covers ccxt 4.4.89 OKX
+            # cases where the swap/quote filter drops BTCUSDT/ETHUSDT).
+            for s in top_volume_futures_usdtm:
+                if s in symbols_by_name:
+                    continue
+                base = s[:-4] if s.endswith("USDT") else s
+                symbols_by_name[s] = {
+                    "symbol": s,
+                    "pair": f"{base}/USDT:USDT",
+                    "status": "TRADING",
+                    "contractType": "PERPETUAL",
+                    "quoteAsset": "USDT",
+                    "isSpotTradingAllowed": False,
+                    "baseAsset": base,
+                }
+            return {"symbols": list(symbols_by_name.values())}
         if "spot" in market_type:
-            symbols = []
+            symbols_by_name = {}
             for ccxt_symbol, info in raw_markets.items():
                 if info.get("type") != "spot":
                     continue
                 if info.get("quote") != "USDT":
                     continue
                 base = info.get("base", "")
-                symbols.append(
-                    {
-                        "symbol": base + "USDT",
-                        "pair": ccxt_symbol,
-                        "status": "TRADING" if info.get("active") else "INACTIVE",
-                        "isSpotTradingAllowed": True,
-                        "baseAsset": base,
-                        "quoteAsset": "USDT",
-                    }
-                )
-            return {"symbols": symbols}
+                entry = {
+                    "symbol": base + "USDT",
+                    "pair": ccxt_symbol,
+                    "status": "TRADING" if info.get("active") else "INACTIVE",
+                    "isSpotTradingAllowed": True,
+                    "baseAsset": base,
+                    "quoteAsset": "USDT",
+                }
+                symbols_by_name[entry["symbol"]] = entry
+            for s in top_volume_spot:
+                if s in symbols_by_name:
+                    continue
+                base = s[:-4] if s.endswith("USDT") else s
+                symbols_by_name[s] = {
+                    "symbol": s,
+                    "pair": f"{base}/USDT",
+                    "status": "TRADING",
+                    "isSpotTradingAllowed": True,
+                    "baseAsset": base,
+                    "quoteAsset": "USDT",
+                }
+            return {"symbols": list(symbols_by_name.values())}
         return None
 
     async def place_order(
