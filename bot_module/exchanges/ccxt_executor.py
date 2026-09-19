@@ -1604,6 +1604,20 @@ class CcxtExecutor:
             )
             return None
 
+        # Gate on credentials: paper mode typically has no API key/secret
+        # configured, in which case ccxt.pro watch_orders() throws
+        # `AuthenticationError: okx requires "apiKey" credential` every few
+        # seconds, drowning the logs. Skip the listener entirely if creds are
+        # missing — REST polling and reconciliation remain the fallback.
+        if not (self.api_key and self.api_secret):
+            logger.info(
+                "CCXT Pro UserData Stream disabled for %s: no API credentials "
+                "configured (paper mode or unconfigured exchange). REST polling "
+                "and reconciliation remain active.",
+                self.exchange_id,
+            )
+            return None
+
         self._user_data_running = True
 
         # Gate.io requires UID for private websocket subscriptions
