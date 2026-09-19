@@ -1670,6 +1670,26 @@ class CcxtExecutor:
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
+                    # Auth errors are non-recoverable — credentials are missing or
+                    # invalid and retrying just spams the logs. Log once and stop
+                    # the listener; the controller's other executors and REST
+                    # polling/reconciliation remain the fallback. The outer gate
+                    # at the top of start_user_data_stream catches the empty-creds
+                    # case; this catches the wrong/invalid-creds case.
+                    err_str = str(e)
+                    if (
+                        "AuthenticationError" in type(e).__name__
+                        or "requires" in err_str
+                        or "API key doesn't exist" in err_str
+                        or "Invalid API" in err_str
+                    ):
+                        logger.warning(
+                            "CCXT Pro UserData Stream for %s disabled after auth "
+                            "error: %s. REST polling/reconciliation remain active.",
+                            self.exchange_id,
+                            err_str,
+                        )
+                        break
                     logger.error(
                         f"Error in CCXT Pro UserData listener for {self.exchange_id}: {e}",
                         exc_info=True,
