@@ -275,7 +275,8 @@ services:
     image: caddy:2.7-alpine
     container_name: depthsight_caddy
     ports:
-      - "8080:80"
+      - "80:80"
+      - "443:443"
     environment:
       - DOMAIN=${DOMAIN:-localhost}
       - EMAIL=${ADMIN_EMAIL:-admin@depthsight.pro}
