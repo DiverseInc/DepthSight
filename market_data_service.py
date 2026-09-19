@@ -56,6 +56,12 @@ class MarketDataService:
 
     def __init__(self) -> None:
         self.redis: Optional[redis_asyncio.Redis] = None
+        # Separate connection for the commands pubsub subscription. The commands
+        # channel only fires on strategy start/stop, so silence is NORMAL — a
+        # silence-based watchdog here would tear down the subscription every 30s
+        # and miss commands delivered during the gap. The events publisher uses
+        # `self.redis`; reconnecting commands must NOT touch it.
+        self.commands_redis: Optional[redis_asyncio.Redis] = None
         self.pubsub: Optional[Any] = None
         self.consumers: Dict[str, DataConsumer] = {}
         self.session: Optional[aiohttp.ClientSession] = None
@@ -111,7 +117,18 @@ class MarketDataService:
             decode_responses=True,
         )
         await self.redis.ping()
-        self.pubsub = self.redis.pubsub()
+        # Dedicated connection for the commands subscription. See __init__ for
+        # why this is separate from self.redis (the events publisher).
+        self.commands_redis = redis_asyncio.Redis(
+            host=config.MARKET_REDIS_HOST,
+            port=config.MARKET_REDIS_PORT,
+            db=config.MARKET_REDIS_DB,
+            username=config.REDIS_USERNAME,
+            password=config.REDIS_PASSWORD,
+            decode_responses=True,
+        )
+        await self.commands_redis.ping()
+        self.pubsub = self.commands_redis.pubsub()
 
         # Initialize default consumer (configurable via MARKET_DATA_DEFAULT_EXCHANGE
         # env var; defaults to "binance" for backward compat). Binance is geo-blocked
@@ -149,33 +166,44 @@ class MarketDataService:
 
         if self.redis:
             await self.redis.close()
+        if self.commands_redis:
+            await self.commands_redis.close()
         if self.session:
             await self.session.close()
 
     async def run(self) -> None:
         await self.start()
-        last_msg_time = time.monotonic()
-        watchdog_timeout = getattr(config, "MDS_PUBSUB_WATCHDOG_SECONDS", 30)
         try:
             while not self._stop_event.is_set():
                 if not self.pubsub:
                     await asyncio.sleep(0.1)
                     continue
-                message = await self.pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=1.0
-                )
+                try:
+                    message = await self.pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=1.0
+                    )
+                except (
+                    redis_asyncio.ConnectionError,
+                    redis_asyncio.TimeoutError,
+                    ConnectionResetError,
+                    OSError,
+                ) as exc:
+                    # Commands channel only sees traffic on strategy start/stop,
+                    # so silence is NORMAL — never trigger a reconnect on silence.
+                    # Reconnect only on a real connection-level error so we don't
+                    # tear down a healthy subscription every 30s (which was the
+                    # old watchdog bug: it killed commands delivered during the
+                    # gap and disrupted the events publisher on the same connection).
+                    logger.warning(
+                        "Commands pubsub connection error (%s) — reconnecting...",
+                        exc,
+                    )
+                    await self._reconnect_pubsub()
+                    continue
                 if message and message.get("type") == "message":
-                    last_msg_time = time.monotonic()
                     raw = message.get("data")
                     payload = json.loads(raw) if isinstance(raw, str) else raw
                     await self._handle_command(payload)
-                elif time.monotonic() - last_msg_time > watchdog_timeout:
-                    logger.warning(
-                        "Pubsub watchdog timeout (%ss) — no messages. Reconnecting...",
-                        watchdog_timeout,
-                    )
-                    await self._reconnect_pubsub()
-                    last_msg_time = time.monotonic()
         finally:
             await self.stop()
 
@@ -186,7 +214,9 @@ class MarketDataService:
                 await self.pubsub.close()
         except Exception:
             logger.debug("Error closing stale pubsub.", exc_info=True)
-        self.pubsub = self.redis.pubsub()
+        # Reconnect on the dedicated commands connection so the events publisher
+        # on `self.redis` is unaffected.
+        self.pubsub = self.commands_redis.pubsub()
         await self.pubsub.subscribe(config.MARKET_DATA_REDIS_COMMAND_CHANNEL)
         logger.info(
             "Pubsub reconnected and re-subscribed to %s.",
