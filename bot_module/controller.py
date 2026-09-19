@@ -1029,6 +1029,13 @@ class TradingController:
 
         await self._load_runtime_state()
 
+        # Auto-rehydrate: re-publish START_STRATEGY for any strategy that was
+        # running before this bot died. The API persists running state to
+        # Redis (running_strategies:{user_id} set + running_strategy_payload:*
+        # hash) at start time; we read those here and replay them. Idempotent:
+        # _handle_start_strategy_command silently skips already-running instances.
+        await self._rehydrate_running_strategies_from_redis()
+
         # Synchronization with the exchange (picking up "lost" positions and removing closed ones)
         await self._reconcile_positions_with_exchange()
 
@@ -2980,6 +2987,65 @@ class TradingController:
         except Exception as e:
             logger.error(
                 f"{log_prefix} Failed to save runtime state: {e}", exc_info=True
+            )
+
+    async def _rehydrate_running_strategies_from_redis(self):
+        """
+        On bot startup, read running_strategies:{user_id} from Redis and
+        re-publish START_STRATEGY for each persisted instance. Idempotent —
+        _handle_start_strategy_command skips already-running instances.
+
+        Stored by the API at /api/v1/strategies start time:
+            running_strategies:{user_id}            -> SET of config_ids
+            running_strategy_payload:{user_id}:{id} -> full START_STRATEGY payload (JSON)
+
+        Cleared by the API at /api/v1/strategies DELETE time (stop).
+        """
+        log_prefix = "[RehydrateRunningStrategies]"
+        if not self.redis_client:
+            logger.warning(
+                f"{log_prefix} No redis_client available; skipping rehydrate. "
+                f"Strategies owned by user_id={self.user_id} will need manual "
+                f"POST /api/v1/strategies to recover after this restart."
+            )
+            return
+        try:
+            config_ids = await self.redis_client.smembers(
+                f"running_strategies:{self.user_id}"
+            )
+            if not config_ids:
+                logger.info(
+                    f"{log_prefix} No running strategies to rehydrate for user {self.user_id}."
+                )
+                return
+            logger.info(
+                f"{log_prefix} Rehydrating {len(config_ids)} strategy instance(s) "
+                f"for user {self.user_id}: {list(config_ids)}"
+            )
+            for config_id in config_ids:
+                # Redis returns bytes in some clients; coerce to str.
+                if isinstance(config_id, bytes):
+                    config_id = config_id.decode("utf-8")
+                payload_raw = await self.redis_client.get(
+                    f"running_strategy_payload:{self.user_id}:{config_id}"
+                )
+                if not payload_raw:
+                    logger.warning(
+                        f"{log_prefix} config_id={config_id} in SET but no payload "
+                        f"cached. Skipping (cannot replay without full payload)."
+                    )
+                    continue
+                if isinstance(payload_raw, bytes):
+                    payload_raw = payload_raw.decode("utf-8")
+                payload = json.loads(payload_raw)
+                logger.info(
+                    f"{log_prefix} Replaying START_STRATEGY for config_id={config_id}."
+                )
+                await self._handle_start_strategy_command(payload)
+        except Exception as e:
+            logger.error(
+                f"{log_prefix} Rehydrate failed for user {self.user_id}: {e}",
+                exc_info=True,
             )
 
     async def _load_runtime_state(self):

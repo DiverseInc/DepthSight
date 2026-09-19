@@ -128,7 +128,7 @@ from .routes.support import admin_support_router, support_router
 from .routes.users import users_extra_router
 from bot_module import data_loader
 from .hft_router import router as hft_router
-from .routes.auth import auth_router
+from .routes.auth import auth_router, auth_root_router
 from .routes.payments import payments_router
 from .routes.webhooks import webhooks_router
 from .routes.admin import admin_router
@@ -1601,6 +1601,9 @@ api_router.include_router(hft_router)
 api_router.include_router(templates_router)
 api_router.include_router(community_router)
 api_router.include_router(stats_router)
+# Wire up the dead /api/v1/auth/token route (login_for_access_token in auth.py).
+# Without this, /api/v1/auth/token returns 404 even though the handler exists.
+api_router.include_router(auth_root_router)
 
 
 redis_api_client = redis.Redis(

@@ -304,6 +304,16 @@ class StrategyConfig(Base):
     generation = Column(Integer, default=1, nullable=False, server_default="1")
     source_mutation = Column(String, nullable=True)
 
+    # Auto-rehydrate support: persisted "is this strategy currently running" flag.
+    # Updated by /api/v1/strategies start/stop endpoints. Queried at bot startup
+    # (controller.py: _rehydrate_running_strategies_from_redis) to re-publish
+    # START_STRATEGY for any strategy that was running before the bot died.
+    is_running = Column(
+        Boolean, default=False, nullable=False, server_default="false"
+    )
+    run_mode = Column(String(16), nullable=True)
+    run_started_at = Column(DateTime(timezone=True), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

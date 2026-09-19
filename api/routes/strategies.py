@@ -4,6 +4,7 @@ from typing import List, Optional
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import update
 
 from .. import crud, models, schemas, ai_assistant
 from ..auth import get_current_user
@@ -509,6 +510,41 @@ async def start_strategy_instance(
             status_code=503, detail="Failed to send start strategy command to the bot."
         )
 
+    # 6. Persist running state so the bot can self-rehydrate on restart
+    #    (controller.py:_rehydrate_running_strategies_from_redis).
+    try:
+        await db.execute(
+            update(models.StrategyConfig)
+            .where(
+                models.StrategyConfig.id == config_id,
+                models.StrategyConfig.user_id == current_user.id,
+            )
+            .values(
+                is_running=True,
+                run_mode=mode,
+                run_started_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.commit()
+        # Cache the full payload in Redis too so the bot can replay START_STRATEGY
+        # without a DB round-trip on startup.
+        await redis_client.sadd(
+            f"running_strategies:{current_user.id}", config_id
+        )
+        await redis_client.set(
+            f"running_strategy_payload:{current_user.id}:{config_id}",
+            json.dumps(payload, default=str),
+        )
+    except Exception as e:
+        # Persistence failure shouldn't fail the user-facing call — START_STRATEGY
+        # already went through. Just log so we know auto-rehydrate won't work
+        # for this strategy until next manual start.
+        logger.warning(
+            f"Failed to persist running state for {config_id}: {e}. "
+            f"Auto-rehydrate on bot restart will not recover this strategy.",
+            exc_info=True,
+        )
+
     return {
         "data": {
             "message": f"START_STRATEGY command sent for config {config_id}.",
@@ -526,6 +562,7 @@ async def stop_strategy_instance(
     instance_id: str,
     redis_client: redis.Redis = Depends(get_redis_client),
     current_user: models.User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Stops running strategy instance by sending command to the bot.
@@ -560,6 +597,31 @@ async def stop_strategy_instance(
         )
         raise HTTPException(
             status_code=503, detail="Failed to send stop strategy command to the bot."
+        )
+
+    # Clear persisted running state so auto-rehydrate on next bot restart
+    # doesn't replay a stopped strategy.
+    try:
+        await db.execute(
+            update(models.StrategyConfig)
+            .where(
+                models.StrategyConfig.id == instance_id,
+                models.StrategyConfig.user_id == current_user.id,
+            )
+            .values(is_running=False, run_mode=None, run_started_at=None)
+        )
+        await db.commit()
+        await redis_client.srem(
+            f"running_strategies:{current_user.id}", instance_id
+        )
+        await redis_client.delete(
+            f"running_strategy_payload:{current_user.id}:{instance_id}"
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to clear running state for {instance_id}: {e}. "
+            f"Auto-rehydrate on next bot restart may replay this strategy.",
+            exc_info=True,
         )
 
     return {
