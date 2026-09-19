@@ -2991,60 +2991,97 @@ class TradingController:
 
     async def _rehydrate_running_strategies_from_redis(self):
         """
-        On bot startup, read running_strategies:{user_id} from Redis and
-        re-publish START_STRATEGY for each persisted instance. Idempotent —
-        _handle_start_strategy_command skips already-running instances.
-
-        Stored by the API at /api/v1/strategies start time:
+        On bot startup, scan ALL running_strategies:* keys (not just self.user_id)
+        and re-publish each persisted START_STRATEGY via the bot's Redis
+        commands channel. The existing command-listener loop in this controller
+        picks them up and routes to whichever controller matches the payload's
+        user_id (silently drops mismatches). Stored by the API at
+        /api/v1/strategies start time:
             running_strategies:{user_id}            -> SET of config_ids
             running_strategy_payload:{user_id}:{id} -> full START_STRATEGY payload (JSON)
 
         Cleared by the API at /api/v1/strategies DELETE time (stop).
+
+        Why pubsub and not direct call to _handle_start_strategy_command:
+        this controller may not own the target user (e.g. admin controller
+        rehydrating alex_trader's strategies). The command-listener path is
+        user-agnostic and routes by payload.user_id to the correct controller.
         """
         log_prefix = "[RehydrateRunningStrategies]"
         if not self.redis_client:
             logger.warning(
-                f"{log_prefix} No redis_client available; skipping rehydrate. "
-                f"Strategies owned by user_id={self.user_id} will need manual "
-                f"POST /api/v1/strategies to recover after this restart."
+                f"{log_prefix} No redis_client available; skipping rehydrate."
             )
             return
         try:
-            config_ids = await self.redis_client.smembers(
-                f"running_strategies:{self.user_id}"
-            )
-            if not config_ids:
+            # Use SCAN to avoid blocking on large keyspaces. KEYS would also
+            # work in practice but SCAN is the recommended pattern.
+            keys = []
+            async for k in self.redis_client.scan_iter(match="running_strategies:*", count=100):
+                keys.append(k)
+            # Strip any user_id that's literally "user_id" (the key prefix itself
+            # wouldn't end with that, but defensive — and parse user_id from key).
+            user_keys = []
+            for k in keys:
+                if isinstance(k, bytes):
+                    k = k.decode("utf-8")
+                if not k.startswith("running_strategies:"):
+                    continue
+                tail = k.split("running_strategies:", 1)[1]
+                if not tail or ":" in tail:
+                    # nested keys like running_strategies:user_id:api_key_id are
+                    # not our rehydrate targets — only the bare running_strategies:{user_id}
+                    continue
+                try:
+                    int(tail)
+                except ValueError:
+                    continue
+                user_keys.append((k, tail))
+            if not user_keys:
                 logger.info(
-                    f"{log_prefix} No running strategies to rehydrate for user {self.user_id}."
+                    f"{log_prefix} No running_strategies:* keys in Redis, nothing to rehydrate."
                 )
                 return
-            logger.info(
-                f"{log_prefix} Rehydrating {len(config_ids)} strategy instance(s) "
-                f"for user {self.user_id}: {list(config_ids)}"
+            redis_command_channel = getattr(
+                __import__("bot_module.config", fromlist=["REDIS_COMMAND_CHANNEL"]),
+                "REDIS_COMMAND_CHANNEL",
+                "depthsight:commands",
             )
-            for config_id in config_ids:
-                # Redis returns bytes in some clients; coerce to str.
-                if isinstance(config_id, bytes):
-                    config_id = config_id.decode("utf-8")
-                payload_raw = await self.redis_client.get(
-                    f"running_strategy_payload:{self.user_id}:{config_id}"
-                )
-                if not payload_raw:
-                    logger.warning(
-                        f"{log_prefix} config_id={config_id} in SET but no payload "
-                        f"cached. Skipping (cannot replay without full payload)."
+            total_published = 0
+            for set_key, user_id_str in user_keys:
+                config_ids = await self.redis_client.smembers(set_key)
+                for cid in config_ids:
+                    if isinstance(cid, bytes):
+                        cid = cid.decode("utf-8")
+                    payload_raw = await self.redis_client.get(
+                        f"running_strategy_payload:{user_id_str}:{cid}"
                     )
-                    continue
-                if isinstance(payload_raw, bytes):
-                    payload_raw = payload_raw.decode("utf-8")
-                payload = json.loads(payload_raw)
-                logger.info(
-                    f"{log_prefix} Replaying START_STRATEGY for config_id={config_id}."
-                )
-                await self._handle_start_strategy_command(payload)
+                    if not payload_raw:
+                        logger.warning(
+                            f"{log_prefix} user_id={user_id_str} config_id={cid} "
+                            f"in SET but no payload cached. Skipping."
+                        )
+                        continue
+                    if isinstance(payload_raw, bytes):
+                        payload_raw = payload_raw.decode("utf-8")
+                    payload = json.loads(payload_raw)
+                    command = {"command": "START_STRATEGY", "payload": payload}
+                    await self.redis_client.publish(
+                        redis_command_channel,
+                        json.dumps(command, default=str),
+                    )
+                    total_published += 1
+                    logger.info(
+                        f"{log_prefix} Re-published START_STRATEGY for "
+                        f"user_id={user_id_str} config_id={cid} via {redis_command_channel}."
+                    )
+            logger.info(
+                f"{log_prefix} Rehydrate complete. Published {total_published} "
+                f"START_STRATEGY command(s) across {len(user_keys)} user(s)."
+            )
         except Exception as e:
             logger.error(
-                f"{log_prefix} Rehydrate failed for user {self.user_id}: {e}",
+                f"{log_prefix} Rehydrate failed: {e}",
                 exc_info=True,
             )
 

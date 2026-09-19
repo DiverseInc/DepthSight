@@ -96,7 +96,7 @@ auth_router = APIRouter(
 auth_root_router = APIRouter(tags=["Auth"])
 
 
-@auth_root_router.post("/token", response_model=schemas.LoginResponse)
+@auth_root_router.post("/auth/token", response_model=schemas.LoginResponse)
 @limiter.limit(get_limit_value("5/hour"))
 # Login brute-force attack protection
 async def login_for_access_token(
