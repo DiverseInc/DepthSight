@@ -690,9 +690,17 @@ class DataConsumer:
         exchange_id = (
             getattr(executor, "exchange_id", "binance") if executor else "binance"
         )
-        if getattr(executor, "sandbox", False):
-            if not exchange_id.endswith("_testnet"):
-                exchange_id = f"{exchange_id}_testnet"
+        # FIX 2026-09-20: only rename to *_testnet when the executor has real
+        # credentials (sandbox=True AND api_key present). Paper-mode executors
+        # (sandbox=True but no api_key) keep the mainnet exchange_id so public
+        # market-data WS endpoints work — OKX testnet streams go silent after
+        # backfill, breaking candle flow for paper strategies.
+        if (
+            getattr(executor, "sandbox", False)
+            and getattr(executor, "api_key", None)
+            and not exchange_id.endswith("_testnet")
+        ):
+            exchange_id = f"{exchange_id}_testnet"
         cache_key = _kline_cache_key(
             symbol, timeframe, exchange_id, market_type or self._effective_market_type()
         )
@@ -914,9 +922,13 @@ class DataConsumer:
         exchange_id = (
             getattr(executor, "exchange_id", "binance") if executor else "binance"
         )
-        if getattr(executor, "sandbox", False):
-            if not exchange_id.endswith("_testnet"):
-                exchange_id = f"{exchange_id}_testnet"
+        # FIX 2026-09-20: only rename to *_testnet when sandbox+api_key both present.
+        if (
+            getattr(executor, "sandbox", False)
+            and getattr(executor, "api_key", None)
+            and not exchange_id.endswith("_testnet")
+        ):
+            exchange_id = f"{exchange_id}_testnet"
 
         trade_deque = _global_agg_trade_deques.get(
             _trade_cache_key(
@@ -1088,9 +1100,12 @@ class DataConsumer:
                 if executor_for_market
                 else "binance"
             )
-            if getattr(
-                executor_for_market, "sandbox", False
-            ) and not exchange_id.endswith("_testnet"):
+            # FIX 2026-09-20: only rename to *_testnet when sandbox+api_key both present.
+            if (
+                getattr(executor_for_market, "sandbox", False)
+                and getattr(executor_for_market, "api_key", None)
+                and not exchange_id.endswith("_testnet")
+            ):
                 exchange_id = f"{exchange_id}_testnet"
 
             if data_type_key == "depth":
@@ -1740,9 +1755,13 @@ class DataConsumer:
                 if executor_for_market
                 else "binance"
             )
-            if getattr(executor_for_market, "sandbox", False):
-                if not exchange_id.endswith("_testnet"):
-                    exchange_id = f"{exchange_id}_testnet"
+            # FIX 2026-09-20: only rename to *_testnet when sandbox+api_key both present.
+            if (
+                getattr(executor_for_market, "sandbox", False)
+                and getattr(executor_for_market, "api_key", None)
+                and not exchange_id.endswith("_testnet")
+            ):
+                exchange_id = f"{exchange_id}_testnet"
             is_binance = exchange_id.startswith("binance")
             valid_symbols = await self._get_valid_symbols_from_exchange_info(
                 market_type_sub
@@ -2136,9 +2155,13 @@ class DataConsumer:
                     if executor_for_market
                     else "binance"
                 )
-                if getattr(executor_for_market, "sandbox", False):
-                    if not exchange_id.endswith("_testnet"):
-                        exchange_id = f"{exchange_id}_testnet"
+                # FIX 2026-09-20: only rename to *_testnet when sandbox+api_key both present.
+                if (
+                    getattr(executor_for_market, "sandbox", False)
+                    and getattr(executor_for_market, "api_key", None)
+                    and not exchange_id.endswith("_testnet")
+                ):
+                    exchange_id = f"{exchange_id}_testnet"
                 is_binance = exchange_id.startswith("binance")
                 if not is_binance and hasattr(executor_for_market, "fetch_ohlcv"):
                     since_ms = int(start_dt.timestamp() * 1000)
@@ -2473,9 +2496,13 @@ class DataConsumer:
                 if executor_for_mkt
                 else "binance"
             )
-            if getattr(executor_for_mkt, "sandbox", False):
-                if not mkt_exchange_id.endswith("_testnet"):
-                    mkt_exchange_id = f"{mkt_exchange_id}_testnet"
+            # FIX 2026-09-20: only rename to *_testnet when sandbox+api_key both present.
+            if (
+                getattr(executor_for_mkt, "sandbox", False)
+                and getattr(executor_for_mkt, "api_key", None)
+                and not mkt_exchange_id.endswith("_testnet")
+            ):
+                mkt_exchange_id = f"{mkt_exchange_id}_testnet"
             cache_key = _kline_cache_key(
                 uc_symbol, timeframe, mkt_exchange_id, target_market_type
             )
