@@ -291,6 +291,12 @@ MARKET_DATA_REDIS_SNAPSHOT_TTL_SECONDS = int(
 MARKET_DATA_REDIS_SNAPSHOT_WAIT_SECONDS = float(
     os.environ.get("MARKET_DATA_REDIS_SNAPSHOT_WAIT_SECONDS", 5.0)
 )
+# Status channel: market_data publishes {"event": "ready", "ts": ...} here on
+# startup AND after every pubsub reconnect. bot DataConsumers listen and re-emit
+# their local subs so candles survive a market_data-only restart.
+MARKET_DATA_REDIS_STATUS_CHANNEL = os.environ.get(
+    "MARKET_DATA_REDIS_STATUS_CHANNEL", "depthsight:market_data:status"
+)
 
 logger.info(
     f"Redis configured: Host={REDIS_HOST}, Port={REDIS_PORT}, Main DB={REDIS_DB}, User={REDIS_USERNAME or 'default'}, Auth={'Yes' if REDIS_PASSWORD else 'No'}"

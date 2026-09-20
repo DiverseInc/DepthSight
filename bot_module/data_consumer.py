@@ -1177,6 +1177,29 @@ class DataConsumer:
                         e,
                         exc_info=True,
                     )
+                # FIX 2026-09-20: subscribe to the market_data status channel so we
+                # can detect (re)start of market_data and re-emit our local subs.
+                # Idempotent — same listener reads both event channels (per stream)
+                # and the status channel from the same pubsub connection.
+                try:
+                    status_ch = getattr(
+                        config,
+                        "MARKET_DATA_REDIS_STATUS_CHANNEL",
+                        "depthsight:market_data:status",
+                    )
+                    await self._redis_market_pubsub.subscribe(status_ch)
+                    logger.info(
+                        "[RedisMarketData:%s] subscribed to status channel=%s",
+                        self._market_data_subscriber_id,
+                        status_ch,
+                    )
+                except Exception as sub_e:
+                    logger.error(
+                        "[RedisMarketData:%s] status channel subscribe FAILED: %s",
+                        self._market_data_subscriber_id,
+                        sub_e,
+                        exc_info=True,
+                    )
             if (
                 self._redis_market_listener_task is None
                 or self._redis_market_listener_task.done()
@@ -1264,6 +1287,7 @@ class DataConsumer:
                                 self._redis_market_pubsub = (
                                     self._redis_market_client.pubsub()
                                 )
+                                # Re-subscribe to per-stream event channels
                                 for sk in list(self._redis_market_stream_keys):
                                     ch = _market_data_redis_event_channel(sk)
                                     try:
@@ -1275,6 +1299,23 @@ class DataConsumer:
                                             sk,
                                             sub_e,
                                         )
+                                # FIX 2026-09-20: also re-subscribe to the
+                                # market_data status channel so we catch the
+                                # next READY announcement (and rehydrate subs)
+                                # after market_data comes back online.
+                                try:
+                                    status_ch = getattr(
+                                        config,
+                                        "MARKET_DATA_REDIS_STATUS_CHANNEL",
+                                        "depthsight:market_data:status",
+                                    )
+                                    await self._redis_market_pubsub.subscribe(status_ch)
+                                except Exception as sub_e:
+                                    logger.error(
+                                        "%s reconnect status channel subscribe failed: %s",
+                                        log_prefix,
+                                        sub_e,
+                                    )
                             logger.info("%s reconnect attempt finished.", log_prefix)
                             pubsub_broken_since = 0
                             had_subscriptions = False
@@ -1318,6 +1359,12 @@ class DataConsumer:
     async def _handle_redis_market_payload(self, message: Dict[str, Any]) -> None:
         if not isinstance(message, dict):
             return
+        # FIX 2026-09-20: handle market_data "ready" announcements from the
+        # status channel. Re-emits all our local subs so candles survive a
+        # market_data-only restart without requiring a bot restart.
+        if message.get("event") == "ready":
+            await self._rehydrate_market_data_subscriptions(reason=str(message.get("reason") or "ready"))
+            return
         if message.get("type") == "indicator_update":
             await self._apply_pair_state_update(message)
             return
@@ -1342,6 +1389,61 @@ class DataConsumer:
             message.get("payload"),
             market_type=message.get("market_type"),
             exchange_id=message.get("exchange_id") or "binance",
+        )
+
+    async def _rehydrate_market_data_subscriptions(self, reason: str = "ready") -> None:
+        """Re-publish every locally-known stream spec to market_data after it
+        announces READY (initial start OR pubsub reconnect). Idempotent:
+        market_data uses ref counts and ignores duplicate subs.
+
+        No-op if we have no local subs yet (cold-start path is handled by
+        controller.py's `_rehydrate_running_strategies_from_redis` which
+        drives fresh SUBSCRIBE commands via the normal flow).
+        """
+        log_prefix = f"[RedisMarketData:{self._market_data_subscriber_id}]"
+        async with self._redis_market_lock:
+            specs = list(self._redis_market_stream_specs.values())
+        if not specs:
+            logger.info(
+                "%s market_data READY (%s); no local subs to rehydrate (cold-start handled by controller rehydrate).",
+                log_prefix,
+                reason,
+            )
+            return
+        # Group specs by (data_type_key, symbol, market_type, needs_companion_orderbook)
+        # to mirror how `_ensure_subscription_via_redis` batches subs.
+        grouped: Dict[Tuple[str, str, str, int], List[Dict[str, Any]]] = {}
+        for spec in specs:
+            dk = str(spec.get("data_type_key") or "")
+            sym = str(spec.get("symbol") or "").upper()
+            mt = _normalize_market_type_for_cache(
+                spec.get("market_type") or self._effective_market_type()
+            )
+            ncob = int(bool(spec.get("needs_companion_orderbook", False)))
+            key = (dk, sym, mt, ncob)
+            grouped.setdefault(key, []).append(spec)
+        for (dk, sym, mt, ncob), group_specs in grouped.items():
+            await self._publish_market_data_command(
+                {
+                    "type": "subscribe",
+                    "subscriber_id": self._market_data_subscriber_id,
+                    "subscription_key": f"{dk}:{sym}:{mt}:{ncob}",
+                    "data_type_key": dk,
+                    "symbol": sym,
+                    "market_type": mt,
+                    "required_metrics": [],
+                    "needs_companion_orderbook": bool(ncob),
+                    "stream_keys": group_specs,
+                    "rehydrate": True,
+                    "rehydrate_reason": reason,
+                }
+            )
+        logger.info(
+            "%s market_data READY (%s); re-emitted %d subscribe command(s) across %d group(s).",
+            log_prefix,
+            reason,
+            len(grouped),
+            len(specs),
         )
 
     async def _apply_pair_state_update(self, message: Dict[str, Any]) -> bool:

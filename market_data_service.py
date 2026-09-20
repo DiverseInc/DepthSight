@@ -44,6 +44,12 @@ def _event_channel(stream_key: str) -> str:
     )
 
 
+def _status_channel() -> str:
+    return getattr(
+        config, "MARKET_DATA_REDIS_STATUS_CHANNEL", "depthsight:market_data:status"
+    )
+
+
 class MarketDataService:
     """
     Central market-data fan-out service.
@@ -143,6 +149,33 @@ class MarketDataService:
             "MarketDataService listening on %s",
             config.MARKET_DATA_REDIS_COMMAND_CHANNEL,
         )
+        # FIX 2026-09-20: announce readiness on the status channel so bot
+        # DataConsumers can re-emit their local stream subs after our
+        # (re)start. Without this, a market_data-only restart leaves bot's
+        # _redis_market_stream_specs populated but our in-memory subscription
+        # registry cleared, so no candles flow until bot also restarts.
+        await self._announce_ready(reason="startup")
+
+    async def _announce_ready(self, reason: str) -> None:
+        if not self.redis:
+            logger.warning("Cannot announce ready: redis client missing.")
+            return
+        try:
+            await self.redis.publish(
+                _status_channel(),
+                json.dumps({"event": "ready", "reason": reason, "ts": time.time()}),
+            )
+            logger.info(
+                "Announced READY on %s (reason=%s)",
+                _status_channel(),
+                reason,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to publish READY status on %s: %s",
+                _status_channel(),
+                exc,
+            )
 
     async def stop(self) -> None:
         self._stop_event.set()
@@ -222,6 +255,10 @@ class MarketDataService:
             "Pubsub reconnected and re-subscribed to %s.",
             config.MARKET_DATA_REDIS_COMMAND_CHANNEL,
         )
+        # FIX 2026-09-20: after reconnect, bot's local subs still point at us
+        # but our in-memory registry was rebuilt empty. Re-announce ready so
+        # each bot DataConsumer re-emits its stream_keys.
+        await self._announce_ready(reason="pubsub_reconnect")
 
     async def _handle_command(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
