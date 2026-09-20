@@ -9,6 +9,7 @@ import { PortfolioOverviewWidget } from "@/components/dashboard/PortfolioOvervie
 import { SystemStatus } from "@/components/dashboard/SystemStatus";
 import { TopStrategiesTable } from "@/components/dashboard/TopStrategiesTable";
 import { TotalPnl } from "@/components/dashboard/TotalPnl";
+import { TradingModeBadge } from "@/components/dashboard/TradingModeBadge";
 import { WelcomeBanner } from "@/components/dashboard/WelcomeBanner";
 import { WizardLauncherCard } from "@/components/dashboard/WizardLauncherCard";
 import { XpLevelCard } from "@/components/dashboard/XpLevelCard";
@@ -20,6 +21,7 @@ const Index = () => {
 	return (
 		<PageLayout title={t("pageTitle")} icon={Home}>
 			<div className="space-y-6">
+				<TradingModeBadge />
 				<WelcomeBanner />
 				<WizardLauncherCard />
 				<PlatformStatsStrip />
