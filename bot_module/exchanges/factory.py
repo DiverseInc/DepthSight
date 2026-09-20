@@ -70,8 +70,18 @@ def create_exchange_executor(
     # Detect testnet from suffix or global config
     from bot_module import config
 
-    is_testnet = exchange_id.endswith("_testnet") or (
+    _env_is_testnet = (
         getattr(config, "ACTIVE_TRADING_ENVIRONMENT", "mainnet") == "testnet"
+    )
+    _exchange_suffix_is_testnet = exchange_id.endswith("_testnet")
+    # FIX 2026-09-20: paper-mode data consumers (no API credentials) must default to
+    # sandbox=False even when the env or exchange-id suffix suggests testnet. Public
+    # market-data WS endpoints (kline/trade/depth) work fine on mainnet without
+    # auth, and OKX testnet streams go silent after the initial backfill (no live
+    # ticks for paper strategies). Real testnet users — who always pass API keys —
+    # see no behavior change; they still get sandbox=True.
+    is_testnet = bool(api_key and api_secret) and (
+        _env_is_testnet or _exchange_suffix_is_testnet
     )
 
     # Strip testnet suffix for mapping and CCXT
