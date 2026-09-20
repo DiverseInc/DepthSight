@@ -1029,6 +1029,32 @@ class TradingController:
 
         await self._load_runtime_state()
 
+        # FIX 2026-09-19: Start the command listener BEFORE rehydrate.
+        #
+        # Why: each controller's _rehydrate_running_strategies_from_redis()
+        # publishes START_STRATEGY commands via depthsight:commands. With controllers
+        # initialized sequentially (await loop in bot_runner.run_bot), each controller's
+        # rehydrate runs BEFORE its own _redis_command_listener subscribes to the
+        # channel. Pub/sub has at-most-once delivery — if no listener is subscribed, the
+        # message is dropped. Other controllers' listeners filter by
+        # `str(command_user_id) != str(self.user_id)` (controller.py handler at line ~1820)
+        # and silently return, so a controller whose own listener isn't ready has no way
+        # to recover its own rehydrate from peers. Late-starting users (paper-only users
+        # like diverseinc, processed AFTER live users in the paper-controller loop)
+        # dropped their own rehydrate every time the bot restarted.
+        self._redis_listener_task = self.loop.create_task(
+            self._redis_command_listener(), name="RedisCommandListener"
+        )
+        # Starting HFT event listener (also pulled up so it's ready before any
+        # commands could need it during the rehydrate window).
+        self._redis_hft_listener_task = self.loop.create_task(
+            self._redis_hft_event_listener(), name="RedisHftEventListener"
+        )
+        # Brief yield so the listeners complete pubsub.subscribe() before we publish.
+        # redis-py subscribe() returns within a few ms on a healthy Redis, but 1.0s
+        # gives a comfortable margin across hiccups.
+        await asyncio.sleep(1.0)
+
         # Auto-rehydrate: re-publish START_STRATEGY for any strategy that was
         # running before this bot died. The API persists running state to
         # Redis (running_strategies:{user_id} set + running_strategy_payload:*
@@ -1059,14 +1085,6 @@ class TradingController:
             started_executor_ids.add(executor_identity)
             if hasattr(stream_executor, "start_user_data_stream"):
                 await stream_executor.start_user_data_stream(self._handle_order_update)
-
-        self._redis_listener_task = self.loop.create_task(
-            self._redis_command_listener(), name="RedisCommandListener"
-        )
-        # Starting HFT event listener
-        self._redis_hft_listener_task = self.loop.create_task(
-            self._redis_hft_event_listener(), name="RedisHftEventListener"
-        )
 
         await self._update_market_info_cache()
         self._market_info_update_task = self.loop.create_task(
