@@ -4064,8 +4064,61 @@ class DataConsumer:
         prev_last_candle_data = None
         is_first_batch = True
 
+        # FIX 2026-09-20: WS-silence watchdog. ccxt.pro's watch_ohlcv can
+        # return an empty list (or hang past the wait_for timeout) when the
+        # underlying WS has died silently — e.g. OKX closing the socket
+        # after the historical backfill completes without raising. The outer
+        # while loop will retry, but if ccxt keeps returning empty in a tight
+        # loop, candles stop flowing with no diagnostic trace. Track the
+        # last time we received any data and force-close the client if
+        # we've been silent past the threshold for this timeframe. The outer
+        # `while self._running` then re-enters the try block, ccxt opens a
+        # fresh WS, and candles resume.
+        import re as _re
+        last_data_at = time.monotonic()
+        silence_threshold_s = 90  # default for non-kline streams
+        if data_type_key.startswith("kline_"):
+            tf_match = _re.match(r"kline_(\d+)([mh])$", data_type_key)
+            if tf_match:
+                n = int(tf_match.group(1))
+                unit = tf_match.group(2)
+                interval_s = n * 60 if unit == "m" else n * 3600
+                # 1.5× candle interval, min 90s. 1m → 90s, 15m → 1350s,
+                # 1h → 5400s, 4h → 21600s.
+                silence_threshold_s = max(90, int(interval_s * 1.5))
+
         while self._running:
             try:
+                # FIX 2026-09-20: silence-watchdog check. If we've been silent
+                # for more than `silence_threshold_s`, force-close the WS so
+                # ccxt opens a fresh one on the next watch_ohlcv call. This
+                # catches the "OKX WS dies silently after backfill" bug
+                # where watch_ohlcv returns empty in a tight loop with no
+                # diagnostic trace.
+                now_mono = time.monotonic()
+                if now_mono - last_data_at > silence_threshold_s:
+                    logger.warning(
+                        "%s Silent for %.0fs (threshold=%ds); force-closing WS to trigger reconnect.",
+                        log_prefix,
+                        now_mono - last_data_at,
+                        silence_threshold_s,
+                    )
+                    try:
+                        await ccxt_pro_client.close()
+                    except Exception as close_exc:
+                        logger.debug(
+                            "%s ccxt close() raised (ignored): %s",
+                            log_prefix,
+                            close_exc,
+                        )
+                    last_data_at = time.monotonic()
+                    await asyncio.sleep(5)
+                    # Check stream is still relevant before retrying
+                    async with _global_ws_registry_lock:
+                        if stream_id not in _global_ws_registry:
+                            break
+                    continue
+
                 if data_type_key.startswith("kline_"):
                     timeframe = data_type_key.split("_", 1)[1]
                     # watch_ohlcv returns an array of arrays: [[timestamp, open, high, low, close, volume], ...]
@@ -4074,6 +4127,7 @@ class DataConsumer:
                         timeout=30.0,
                     )
                     if ohlcv_list:
+                        last_data_at = time.monotonic()
                         logger.info(
                             f"{log_prefix} Received {len(ohlcv_list)} candles from {ccxt_symbol}, "
                             f"last_ts={ohlcv_list[-1][0]}"
@@ -4159,6 +4213,7 @@ class DataConsumer:
                     # watch_trades returns a list of trade dictionaries
                     trades = await ccxt_pro_client.watch_trades(ccxt_symbol)
                     if trades:
+                        last_data_at = time.monotonic()
                         for trade in trades:
                             # Reformat to Binance payload
                             payload = {
@@ -4180,6 +4235,7 @@ class DataConsumer:
                         ccxt_symbol, limit
                     )
                     if orderbook:
+                        last_data_at = time.monotonic()
                         # Reformat to Binance payload
                         payload = {
                             "e": "depthUpdate",
