@@ -4095,10 +4095,19 @@ class DataConsumer:
                 # catches the "OKX WS dies silently after backfill" bug
                 # where watch_ohlcv returns empty in a tight loop with no
                 # diagnostic trace.
+                #
+                # FIX 2026-09-20 v2: also break out of the loop and pop
+                # ourselves from _global_ws_registry. Just calling close()
+                # leaves a half-open socket for some streams (openInterest,
+                # ETH klines on OKX ccxt 4.4.89) — the next watch_ohlcv call
+                # also goes silent and the watchdog fires again every 90s
+                # in a tight loop. Mimicking the natural ref_count=0 exit
+                # path (line 4271 below) lets the controller's
+                # DataSubEnsure path create a fresh task from scratch.
                 now_mono = time.monotonic()
                 if now_mono - last_data_at > silence_threshold_s:
                     logger.warning(
-                        "%s Silent for %.0fs (threshold=%ds); force-closing WS to trigger reconnect.",
+                        "%s Silent for %.0fs (threshold=%ds); force-closing WS and tearing down task to trigger fresh resubscribe.",
                         log_prefix,
                         now_mono - last_data_at,
                         silence_threshold_s,
@@ -4111,13 +4120,11 @@ class DataConsumer:
                             log_prefix,
                             close_exc,
                         )
-                    last_data_at = time.monotonic()
-                    await asyncio.sleep(5)
-                    # Check stream is still relevant before retrying
-                    async with _global_ws_registry_lock:
-                        if stream_id not in _global_ws_registry:
-                            break
-                    continue
+                    # Break out of the while loop; the post-loop cleanup
+                    # at line 4271 pops our registry entry, and the
+                    # controller's _ensure_subscription_via_redis path
+                    # will see the missing task and spawn a fresh one.
+                    break
 
                 if data_type_key.startswith("kline_"):
                     timeframe = data_type_key.split("_", 1)[1]
