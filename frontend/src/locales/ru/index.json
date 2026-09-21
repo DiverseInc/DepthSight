@@ -36,7 +36,9 @@
 		"colMark": "Цена маркировки",
 		"colPnlUsd": "PnL ($)",
 		"colPnlPercent": "PnL (%)",
-		"noPositions": "Нет активных позиций.",
+		"noPositions": "Активных позиций пока нет.",
+		"noPositionsHint": "Запустите стратегию — позиция появится здесь, как только откроется.",
+		"startStrategy": "Запустить стратегию",
 		"noOpenPositions": "Нет открытых позиций.",
 		"colStrategy": "Стратегия",
 		"colUnrealizedPnlUsd": "Нереализ. PnL ($)",
@@ -61,7 +63,9 @@
 		"colStatus": "Статус",
 		"colPnl": "PnL",
 		"colRuntime": "Время работы",
-		"noData": "Нет данных о производительности стратегий.",
+		"noData": "Пока нет данных по стратегиям.",
+		"noDataHint": "Загляните в Discovery Hub — там есть готовые шаблоны, или соберите свою.",
+		"exploreDiscovery": "Открыть Discovery Hub",
 		"errors": {
 			"loadFailed": "Ошибка загрузки лучших стратегий"
 		},

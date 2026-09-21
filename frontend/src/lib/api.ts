@@ -479,7 +479,17 @@ export const usePortfolioStatus = (params?: {
 			}
 			return apiClient<PortfolioData>(`/portfolio?${queryParams.toString()}`);
 		},
-		staleTime: Infinity,
+		// FIX 2026-09-20: real-time PnL. Before this the dashboard's PnL
+		// chart and KPI numbers only updated on window-focus, so users
+		// staring at the page saw stale equity for minutes at a time. Now
+		// it polls every 5s (same cadence as the rest of the dashboard),
+		// stays fresh on focus, and never serves cached data from before
+		// the current user logged in (staleTime: 0 + gcTime: 0).
+		refetchInterval: 5000,
+		staleTime: 0,
+		gcTime: 0,
+		refetchOnMount: "always",
+		refetchOnWindowFocus: true,
 	});
 export const usePositions = (options?: {
 	refetchInterval?: number | false;
@@ -505,8 +515,12 @@ export const usePositions = (options?: {
 			options?.marketType,
 		),
 		queryFn: () => apiClient<PositionData[]>(`/positions?${params.toString()}`),
-		staleTime: 5000, // Consider data fresh for 5 seconds
-		refetchInterval: options?.refetchInterval,
+		// FIX 2026-09-20: real-time positions. Default to 5s polling so the
+		// dashboard's ActivePositionsTable updates without manual refresh.
+		// Callers can override by passing refetchInterval.
+		staleTime: 5000,
+		refetchInterval: options?.refetchInterval ?? 5000,
+		refetchOnWindowFocus: true,
 	});
 };
 export const useConfig = () =>

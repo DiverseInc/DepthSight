@@ -1,12 +1,13 @@
 import { formatDistanceToNow } from "date-fns";
 import { enUS, ru } from "date-fns/locale";
-import { AlertTriangle, TrendingUp } from "lucide-react";
+import { AlertTriangle, Sparkles, TrendingUp } from "lucide-react";
 import type React from "react";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
 	Card,
 	CardContent,
@@ -139,11 +140,21 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 							))
 						) : topStrategies.length === 0 ? (
 							<TableRow>
-								<TableCell
-									colSpan={5}
-									className="h-24 text-center text-muted-foreground"
-								>
-									{t("index:topStrategies.noData")}
+								<TableCell colSpan={5} className="h-32 text-center">
+									<div className="flex flex-col items-center justify-center gap-2 py-4">
+										<Sparkles className="w-8 h-8 text-muted-foreground/50" />
+										<p className="text-sm font-medium text-foreground">
+											{t("index:topStrategies.noData")}
+										</p>
+										<p className="text-xs text-muted-foreground max-w-xs">
+											{t("index:topStrategies.noDataHint")}
+										</p>
+										<Button asChild variant="outline" size="sm" className="mt-1">
+											<Link to="/discovery">
+												{t("index:topStrategies.exploreDiscovery")}
+											</Link>
+										</Button>
+									</div>
 								</TableCell>
 							</TableRow>
 						) : (

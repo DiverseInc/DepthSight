@@ -1,11 +1,12 @@
 // frontend/src/components/dashboard/ActivePositionsTable.tsx
 
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, Wallet } from "lucide-react";
 import type React from "react";
 import { useTranslation } from "react-i18next"; // Import useTranslation
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
 	Card,
 	CardContent,
@@ -102,11 +103,21 @@ export const ActivePositionsTable: React.FC = () => {
 							))
 						) : positions.length === 0 ? (
 							<TableRow>
-								<TableCell
-									colSpan={7}
-									className="h-24 text-center text-muted-foreground"
-								>
-									{t("index:activePositions.noPositions")}
+								<TableCell colSpan={7} className="h-32 text-center">
+									<div className="flex flex-col items-center justify-center gap-2 py-4">
+										<Wallet className="w-8 h-8 text-muted-foreground/50" />
+										<p className="text-sm font-medium text-foreground">
+											{t("index:activePositions.noPositions")}
+										</p>
+										<p className="text-xs text-muted-foreground max-w-xs">
+											{t("index:activePositions.noPositionsHint")}
+										</p>
+										<Button asChild variant="outline" size="sm" className="mt-1">
+											<Link to="/strategies">
+												{t("index:activePositions.startStrategy")}
+											</Link>
+										</Button>
+									</div>
 								</TableCell>
 							</TableRow>
 						) : (

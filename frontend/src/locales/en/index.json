@@ -36,7 +36,9 @@
 		"colMark": "Mark Price",
 		"colPnlUsd": "PnL ($)",
 		"colPnlPercent": "PnL (%)",
-		"noPositions": "No active positions.",
+		"noPositions": "No active positions yet.",
+		"noPositionsHint": "Start a strategy and it'll appear here once it opens a position.",
+		"startStrategy": "Start a strategy",
 		"noOpenPositions": "No open positions.",
 		"colStrategy": "Strategy",
 		"colUnrealizedPnlUsd": "Unrealized PnL ($)",
@@ -61,7 +63,9 @@
 		"colStatus": "Status",
 		"colPnl": "PnL",
 		"colRuntime": "Runtime",
-		"noData": "No strategy performance data available.",
+		"noData": "No strategy performance yet.",
+		"noDataHint": "Browse the Discovery Hub for ready-to-run templates or build your own.",
+		"exploreDiscovery": "Explore Discovery Hub",
 		"errors": {
 			"loadFailed": "Error loading top strategies"
 		},
