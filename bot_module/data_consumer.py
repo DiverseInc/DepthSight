@@ -257,6 +257,13 @@ class DataConsumer:
         self._redis_market_stream_specs: Dict[str, Dict[str, Any]] = {}
         self._redis_market_lock = asyncio.Lock()
 
+        # FIX 2026-09-20: dedicated heartbeat client used by _update_local_cache
+        # to write candle-flow health keys for the dashboard. Separate from
+        # self._redis_market_client (which is only initialized in Redis-fanout
+        # mode) so heartbeats work in both Redis-fanout and legacy-direct modes.
+        self._heartbeat_redis_client: Optional[Any] = None
+        self._heartbeat_redis_lock = asyncio.Lock()
+
         # Old caches and states (some will be replaced)
         self._active_pairs_from_main_app: List[
             Dict[str, Any]
@@ -1696,6 +1703,14 @@ class DataConsumer:
             logger.info(
                 "[RedisMarketData] added stream_key to local set: %s", stream_key
             )
+            # FIX 2026-09-20: mirror the local set into a global Redis SET so
+            # the candle-health API can list currently-active streams. Best-effort
+            # and fire-and-forget — never block the WS loop on this.
+            self.loop.create_task(
+                self._track_active_stream_in_redis(
+                    stream_key, add=True
+                )
+            )
 
             # Load historical kline data from exchange REST API for cache priming
             dk = spec.get("data_type_key", data_type_key)
@@ -1757,6 +1772,12 @@ class DataConsumer:
                 self._redis_market_stream_specs.pop(stream_key, None)
             removed_specs.append(spec)
             logger.info("[RedisMarketData] unsubscribed locally from %s", stream_key)
+            # FIX 2026-09-20: remove from the global active-streams SET.
+            self.loop.create_task(
+                self._track_active_stream_in_redis(
+                    stream_key, add=False
+                )
+            )
 
         if removed_specs:
             first = removed_specs[0]
@@ -3514,6 +3535,128 @@ class DataConsumer:
             "asks": sorted(aggregated_asks, key=lambda x: x["percentage"]),
         }
 
+    # ------------------------------------------------------------------ #
+    # FIX 2026-09-20: candle-flow heartbeat writer                       #
+    #                                                                    #
+    # Called from _update_local_cache on every kline receive. Writes a    #
+    # short-TTL Redis key tagged by (exchange, market_type, symbol,      #
+    # timeframe). The /api/v1/market-data/candle-health endpoint reads   #
+    # these to surface a per-stream GREEN/YELLOW/RED dot on the dashboard.#
+    # ------------------------------------------------------------------ #
+    async def _get_heartbeat_redis_client(self) -> Any:
+        if self._heartbeat_redis_client is not None:
+            return self._heartbeat_redis_client
+        async with self._heartbeat_redis_lock:
+            if self._heartbeat_redis_client is not None:
+                return self._heartbeat_redis_client
+            try:
+                from bot_module.config import (
+                    REDIS_HOST,
+                    REDIS_PORT,
+                    REDIS_DB,
+                    REDIS_PASSWORD,
+                )
+
+                auth = (
+                    f":{REDIS_PASSWORD}@"
+                    if REDIS_PASSWORD
+                    else ""
+                )
+                url = f"redis://{auth}{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+                self._heartbeat_redis_client = redis_asyncio.Redis.from_url(
+                    url,
+                    decode_responses=True,
+                    socket_connect_timeout=2,
+                    socket_timeout=2,
+                )
+                # Quick liveness check; if it fails, log and return None
+                # so we don't keep retrying on every candle (which would
+                # amplify latency into the WS loop).
+                try:
+                    await asyncio.wait_for(
+                        self._heartbeat_redis_client.ping(),
+                        timeout=2.0,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[CandleHeartbeat] Redis ping failed at startup, "
+                        f"heartbeats disabled: {e}"
+                    )
+                    self._heartbeat_redis_client = None
+                    return None
+                return self._heartbeat_redis_client
+            except Exception as e:
+                logger.warning(
+                    f"[CandleHeartbeat] Could not create heartbeat client: {e}"
+                )
+                self._heartbeat_redis_client = None
+                return None
+
+    async def _write_candle_heartbeat(
+        self,
+        exchange_id: str,
+        market_type: Optional[str],
+        uc_symbol: str,
+        timeframe: str,
+    ) -> None:
+        """Fire-and-forget write of a candle-flow heartbeat key.
+
+        Key format: market_data:candle_received:{exchange}:{market_type}:{uc_symbol}:{timeframe}
+        Value: epoch milliseconds (as a decimal string)
+        TTL: MARKET_DATA_CANDLE_HEALTH_TTL_SECONDS (default 600s).
+        """
+        try:
+            from bot_module.config import (
+                MARKET_DATA_CANDLE_HEALTH_KEY_PREFIX,
+                MARKET_DATA_CANDLE_HEALTH_TTL_SECONDS,
+            )
+
+            effective_market_type = (
+                market_type or self._effective_market_type() or "unknown"
+            )
+            key = (
+                f"{MARKET_DATA_CANDLE_HEALTH_KEY_PREFIX}:"
+                f"{exchange_id}:{effective_market_type}:{uc_symbol}:{timeframe}"
+            )
+            client = await self._get_heartbeat_redis_client()
+            if client is None:
+                return
+            now_ms = int(time.time() * 1000)
+            await client.set(key, str(now_ms), ex=MARKET_DATA_CANDLE_HEALTH_TTL_SECONDS)
+        except Exception as e:
+            # Heartbeats are best-effort — never let them break the candle
+            # pipeline. Just log at debug level so we don't spam logs.
+            logger.debug(
+                f"[CandleHeartbeat] Write failed for "
+                f"{exchange_id}:{market_type}:{uc_symbol}:{timeframe}: {e}"
+            )
+
+    async def _track_active_stream_in_redis(
+        self, stream_key: str, add: bool
+    ) -> None:
+        """Best-effort mirror of local `_redis_market_stream_keys` into a
+        Redis SET so the candle-health API can enumerate active streams.
+
+        Called fire-and-forget from subscribe (add=True) and unsubscribe
+        (add=False). Errors are silently logged at debug — never block the
+        WS loop on this.
+        """
+        try:
+            from bot_module.config import MARKET_DATA_ACTIVE_STREAMS_SET_KEY
+
+            client = await self._get_heartbeat_redis_client()
+            if client is None:
+                return
+            if add:
+                await client.sadd(MARKET_DATA_ACTIVE_STREAMS_SET_KEY, stream_key)
+            else:
+                await client.srem(MARKET_DATA_ACTIVE_STREAMS_SET_KEY, stream_key)
+        except Exception as e:
+            logger.debug(
+                f"[ActiveStreamsSet] {'SADD' if add else 'SREM'} failed for "
+                f"{stream_key}: {e}"
+            )
+
     async def _update_local_cache(
         self,
         data_type_key: str,
@@ -3563,6 +3706,22 @@ class DataConsumer:
                             kline_cache_deque[-1] = candle_tuple
                         else:
                             kline_cache_deque.append(candle_tuple)
+
+                        # FIX 2026-09-20: write candle-flow heartbeat so the
+                        # /api/v1/market-data/candle-health endpoint can show
+                        # users which streams are receiving data. Fire-and-forget
+                        # so the WS loop doesn't block on Redis latency.
+                        # Fire on BOTH open and closed candles — if the stream
+                        # is alive, we'll see at least one update per timeframe.
+                        self.loop.create_task(
+                            self._write_candle_heartbeat(
+                                exchange_id=exchange_id,
+                                market_type=market_type
+                                or self._effective_market_type(),
+                                uc_symbol=uc_symbol,
+                                timeframe=timeframe,
+                            )
+                        )
                         _global_kline_df_cache[cache_key] = (
                             _upsert_kline_dataframe_cache(
                                 _global_kline_df_cache.get(cache_key), candle_tuple

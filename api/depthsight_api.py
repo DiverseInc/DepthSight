@@ -133,6 +133,7 @@ from .routes.payments import payments_router
 from .routes.webhooks import webhooks_router
 from .routes.admin import admin_router
 from .routes.discovery import discovery_router
+from .routes.market_data_health import router as market_data_health_router
 from .routes.strategy_templates import templates_router
 from .routes.community import community_router
 from .routes.stats import router as stats_router
@@ -2238,6 +2239,7 @@ include_application_routers(
         diagnostics_router,
         tasks_router,
         gamification_router,
+        market_data_health_router,
     ),
     is_central_hub=IS_CENTRAL_HUB,
     logger=logger,

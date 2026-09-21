@@ -64,6 +64,33 @@ export interface StrategyData {
 	symbols?: string[];
 }
 
+// FIX 2026-09-20: candle-flow health endpoint shapes. Each entry describes
+// a single (exchange, market_type, symbol, timeframe) stream that the bot
+// has subscribed to, plus the most recent heartbeat observed. `status` is
+// the derived field used by the dashboard:
+//   "live"   → last candle within 1.5x timeframe
+//   "stale"  → last candle within 5x timeframe
+//   "silent" → last candle older than 5x timeframe
+//   "unknown"→ subscription exists but no heartbeat yet
+export type CandleHealthStatus = "live" | "stale" | "silent" | "unknown";
+
+export interface CandleHealthEntry {
+	strategy_id?: string | null;
+	strategy_name?: string | null;
+	exchange: string;
+	market_type: string;
+	symbol: string;
+	timeframe: string;
+	last_candle_ts_ms?: number | null;
+	seconds_since_last_candle?: number | null;
+	status: CandleHealthStatus;
+}
+
+export interface CandleHealthResponse {
+	streams: CandleHealthEntry[];
+	evaluated_at_ms: number;
+}
+
 // We import types from the editor to ensure their full consistency
 import type {
 	ActionBlock,

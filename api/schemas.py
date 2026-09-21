@@ -2669,6 +2669,51 @@ class SystemMetrics(BaseModel):
     error_rate_24h: float
 
 
+# FIX 2026-09-20: candle-flow health endpoint schemas.
+# Each entry describes a single (exchange, market_type, symbol, timeframe)
+# stream the user is subscribed to, plus the last time we observed a candle
+# for it. `status` is a derived field used by the dashboard's status dot:
+#   "live"   → heartbeat < 1.5x timeframe
+#   "stale"  → heartbeat < 5x timeframe but > 1.5x timeframe
+#   "silent" → no heartbeat, or older than 5x timeframe
+#   "unknown"→ no running strategy references this stream
+class CandleHealthEntry(BaseModel):
+    strategy_id: Optional[str] = Field(
+        None, description="Strategy that owns this subscription, if known."
+    )
+    strategy_name: Optional[str] = Field(
+        None, description="Display name of the owning strategy."
+    )
+    exchange: str = Field(..., json_schema_extra={"example": "okx"})
+    market_type: str = Field(
+        ..., json_schema_extra={"example": "futures_usdtm"}
+    )
+    symbol: str = Field(..., json_schema_extra={"example": "BTCUSDT"})
+    timeframe: str = Field(..., json_schema_extra={"example": "15m"})
+    last_candle_ts_ms: Optional[int] = Field(
+        None,
+        description=(
+            "Epoch milliseconds of the most recent candle for this stream. "
+            "Null if no heartbeat has been observed yet."
+        ),
+    )
+    seconds_since_last_candle: Optional[float] = Field(
+        None,
+        description="Computed on the server as now_ms - last_candle_ts_ms / 1000.",
+    )
+    status: str = Field(
+        ...,
+        json_schema_extra={"example": "live", "enum": ["live", "stale", "silent", "unknown"]},
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CandleHealthResponse(BaseModel):
+    streams: List[CandleHealthEntry]
+    evaluated_at_ms: int
+
+
 class SymbolPayload(BaseModel):
     symbol: str
 

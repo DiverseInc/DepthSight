@@ -36,3 +36,7 @@ gcp_key.json
 .vscode/
 docker-compose.legacy.yml
 .agent/
+
+# Local backups created before risky edits (.bak-YYYY-MM-DD-HHMM suffix)
+*.bak-*
+.scratch/

@@ -298,6 +298,28 @@ MARKET_DATA_REDIS_STATUS_CHANNEL = os.environ.get(
     "MARKET_DATA_REDIS_STATUS_CHANNEL", "depthsight:market_data:status"
 )
 
+# FIX 2026-09-20: candle-flow health key prefix. data_consumer._update_local_cache
+# writes a Redis key `market_data:candle_received:{exchange}:{market_type}:{uc_symbol}:{timeframe}`
+# on every kline receive (closed OR open tick), value = epoch-ms, TTL 600s.
+# The `/api/v1/market-data/candle-health` endpoint reads these keys to surface
+# per-stream health on the dashboard, so users can see at a glance whether
+# candles are flowing for each of their strategies.
+MARKET_DATA_CANDLE_HEALTH_KEY_PREFIX = os.environ.get(
+    "MARKET_DATA_CANDLE_HEALTH_KEY_PREFIX", "market_data:candle_received"
+)
+MARKET_DATA_CANDLE_HEALTH_TTL_SECONDS = int(
+    os.environ.get("MARKET_DATA_CANDLE_HEALTH_TTL_SECONDS", 600)
+)
+# FIX 2026-09-20: global SET of currently-active market-data stream keys. The
+# data_consumer adds/removes entries on local subscribe/unsubscribe. The
+# /api/v1/market-data/candle-health endpoint reads this set so it can show
+# all active streams globally even before any heartbeat has been observed
+# (heartbeat keys have TTL=600s, so a fresh subscription would look "unknown"
+# without this set).
+MARKET_DATA_ACTIVE_STREAMS_SET_KEY = os.environ.get(
+    "MARKET_DATA_ACTIVE_STREAMS_SET_KEY", "market_data:active_streams"
+)
+
 logger.info(
     f"Redis configured: Host={REDIS_HOST}, Port={REDIS_PORT}, Main DB={REDIS_DB}, User={REDIS_USERNAME or 'default'}, Auth={'Yes' if REDIS_PASSWORD else 'No'}"
 )

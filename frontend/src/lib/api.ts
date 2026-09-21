@@ -26,6 +26,7 @@ import type {
 	BEAnalysisStats,
 	BEScatterDataResponse,
 	BinanceKline,
+	CandleHealthResponse,
 	DashboardStats,
 	DatasetRunCreate,
 	DatasetRunResponse,
@@ -771,6 +772,39 @@ export const useStrategies = (params?: {
 		queryFn: () =>
 			apiClient<StrategyData[]>(`/strategies?${queryParams.toString()}`),
 		refetchInterval: 5000,
+		// FIX 2026-09-20: force a fresh fetch on every mount instead of serving
+		// cached data from before login. Combined with `authScopedQueryKey`
+		// (which already scopes by user-token-hash), this guarantees the
+		// strategy count badge on the dashboard reflects the actually-logged-in
+		// user's strategies on first paint, not stale state from a prior session.
+		staleTime: 0,
+		gcTime: 0,
+		refetchOnMount: "always",
+		refetchOnWindowFocus: true,
+	});
+};
+
+// FIX 2026-09-20: candle-flow health. Polls the
+// /api/v1/market-data/candle-health endpoint to learn whether the bot is
+// actively receiving candles for each of the user's streams. The dashboard
+// renders a per-stream GREEN/YELLOW/RED dot from this.
+export const useCandleHealth = (params?: { mode?: "live" | "paper" }) => {
+	const mode = params?.mode || "paper";
+	return useQuery<CandleHealthResponse, Error>({
+		queryKey: authScopedQueryKey("candleHealth", mode),
+		queryFn: () =>
+			apiClient<CandleHealthResponse>(
+				`/market-data/candle-health?mode=${mode}`
+			),
+		// Poll at 5s — heartbeat keys update on every kline receive so a 5s
+		// poll catches stale/silent transitions promptly without spamming the
+		// API. Also re-fetch on window-focus so a user coming back from
+		// another tab sees fresh status.
+		refetchInterval: 5000,
+		staleTime: 0,
+		gcTime: 0,
+		refetchOnMount: "always",
+		refetchOnWindowFocus: true,
 	});
 };
 // Retrieves a single strategy configuration. The returned data type has been updated.

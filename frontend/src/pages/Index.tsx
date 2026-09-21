@@ -3,6 +3,7 @@
 import { Home } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { ActivePositionsTable } from "@/components/dashboard/ActivePositionsTable";
+import { CandleFlowIndicator } from "@/components/dashboard/CandleFlowIndicator";
 import { LiveEventFeed } from "@/components/dashboard/LiveEventFeed";
 import { PlatformStatsStrip } from "@/components/dashboard/PlatformStatsStrip";
 import { PortfolioOverviewWidget } from "@/components/dashboard/PortfolioOverviewWidget";
@@ -22,6 +23,10 @@ const Index = () => {
 		<PageLayout title={t("pageTitle")} icon={Home}>
 			<div className="space-y-6">
 				<TradingModeBadge />
+				{/* FIX 2026-09-20: per-stream candle-flow indicator. Sits right
+					under the trading-mode badge so the user sees "what mode am I
+					in" and "is data flowing for that mode" together. */}
+				<CandleFlowIndicator />
 				<WelcomeBanner />
 				<WizardLauncherCard />
 				<PlatformStatsStrip />
