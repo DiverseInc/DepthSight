@@ -99,8 +99,8 @@ export const CandleFlowIndicator = () => {
 					: "relative overflow-hidden border-emerald-500/30 bg-gradient-to-br from-emerald-500/5 via-card/40 to-card/40"
 			}
 		>
-			<CardContent className="relative px-4 py-3">
-				<div className="flex items-center justify-between gap-3 flex-wrap">
+			<CardContent className="relative px-3 py-3 sm:px-4">
+				<div className="flex items-center justify-between gap-2 sm:gap-3 flex-wrap">
 					<div className="flex items-center gap-3 min-w-0">
 						<Badge
 							variant="outline"

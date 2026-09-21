@@ -21,25 +21,26 @@ const Index = () => {
 
 	return (
 		<PageLayout title={t("pageTitle")} icon={Home}>
-			<div className="space-y-6">
+			{/* FIX 2026-09-21: mobile-responsive spacing. `space-y-4 sm:space-y-6`
+				gives tighter vertical rhythm on phones (avoids cards looking
+				disconnected) and `gap-4 sm:gap-6` on grids keeps the layout
+				breathable without overflowing narrow viewports. */}
+			<div className="space-y-4 sm:space-y-6">
 				<TradingModeBadge />
-				{/* FIX 2026-09-20: per-stream candle-flow indicator. Sits right
-					under the trading-mode badge so the user sees "what mode am I
-					in" and "is data flowing for that mode" together. */}
 				<CandleFlowIndicator />
 				<WelcomeBanner />
 				<WizardLauncherCard />
 				<PlatformStatsStrip />
 				<XpLevelCard />
 				<PortfolioOverviewWidget />
-				<div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+				<div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">
 					<div className="lg:col-span-2">
 						<TotalPnl />
 					</div>
 					<SystemStatus />
 				</div>
 				<ActivePositionsTable />
-				<div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+				<div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
 					<TopStrategiesTable />
 					<LiveEventFeed />
 				</div>

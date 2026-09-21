@@ -112,23 +112,31 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 					{t("index:topStrategies.description")}
 				</CardDescription>
 			</CardHeader>
-			<CardContent>
-				<Table>
-					<TableHeader>
-						<TableRow>
-							<TableHead>{t("index:topStrategies.colName")}</TableHead>
-							<TableHead>{t("index:topStrategies.colSymbol")}</TableHead>
-							<TableHead className="text-center">
-								{t("index:topStrategies.colStatus")}
-							</TableHead>
-							<TableHead className="text-right">
-								{t("index:topStrategies.colPnl")}
-							</TableHead>
-							<TableHead className="text-right">
-								{t("index:topStrategies.colRuntime")}
-							</TableHead>
-						</TableRow>
-					</TableHeader>
+			<CardContent className="p-3 sm:p-6">
+				{/* FIX 2026-09-21: mobile-responsive table wrapper. See note in
+					ActivePositionsTable — same pattern, narrower min-width since
+					this table only has 5 columns. */}
+				<div className="overflow-x-auto rounded-md border">
+					<Table className="min-w-[480px]">
+						<TableHeader>
+							<TableRow>
+								<TableHead className="whitespace-nowrap">
+									{t("index:topStrategies.colName")}
+								</TableHead>
+								<TableHead className="whitespace-nowrap">
+									{t("index:topStrategies.colSymbol")}
+								</TableHead>
+								<TableHead className="text-center whitespace-nowrap">
+									{t("index:topStrategies.colStatus")}
+								</TableHead>
+								<TableHead className="text-right whitespace-nowrap">
+									{t("index:topStrategies.colPnl")}
+								</TableHead>
+								<TableHead className="text-right whitespace-nowrap">
+									{t("index:topStrategies.colRuntime")}
+								</TableHead>
+							</TableRow>
+						</TableHeader>
 					<TableBody>
 						{isLoading ? (
 							[...Array(topN)].map((_, i) => (
@@ -189,6 +197,7 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 						)}
 					</TableBody>
 				</Table>
+				</div>
 			</CardContent>
 		</Card>
 	);

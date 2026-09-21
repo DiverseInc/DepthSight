@@ -69,29 +69,40 @@ export const ActivePositionsTable: React.FC = () => {
 					{t("index:activePositions.description")}
 				</CardDescription>
 			</CardHeader>
-			<CardContent>
-				<Table>
-					<TableHeader>
-						<TableRow>
-							<TableHead>{t("index:activePositions.colSymbol")}</TableHead>
-							<TableHead>{t("index:activePositions.colSide")}</TableHead>
-							<TableHead className="text-right">
-								{t("index:activePositions.colSize")}
-							</TableHead>
-							<TableHead className="text-right">
-								{t("index:activePositions.colEntry")}
-							</TableHead>
-							<TableHead className="text-right">
-								{t("index:activePositions.colMark")}
-							</TableHead>
-							<TableHead className="text-right">
-								{t("index:activePositions.colPnlUsd")}
-							</TableHead>
-							<TableHead className="text-right">
-								{t("index:activePositions.colPnlPercent")}
-							</TableHead>
-						</TableRow>
-					</TableHeader>
+			<CardContent className="p-3 sm:p-6">
+				{/* FIX 2026-09-21: mobile-responsive table wrapper. With 7 numeric
+					columns the table exceeds phone widths (375-414px). The
+					`overflow-x-auto` lets the user scroll horizontally inside the
+					card instead of breaking the page layout. `min-w-[640px]`
+					gives a stable scroll width; `whitespace-nowrap` on cells
+					keeps symbols from wrapping mid-row. */}
+				<div className="overflow-x-auto rounded-md border">
+					<Table className="min-w-[640px]">
+						<TableHeader>
+							<TableRow>
+								<TableHead className="whitespace-nowrap">
+									{t("index:activePositions.colSymbol")}
+								</TableHead>
+								<TableHead className="whitespace-nowrap">
+									{t("index:activePositions.colSide")}
+								</TableHead>
+								<TableHead className="text-right whitespace-nowrap">
+									{t("index:activePositions.colSize")}
+								</TableHead>
+								<TableHead className="text-right whitespace-nowrap">
+									{t("index:activePositions.colEntry")}
+								</TableHead>
+								<TableHead className="text-right whitespace-nowrap">
+									{t("index:activePositions.colMark")}
+								</TableHead>
+								<TableHead className="text-right whitespace-nowrap">
+									{t("index:activePositions.colPnlUsd")}
+								</TableHead>
+								<TableHead className="text-right whitespace-nowrap">
+									{t("index:activePositions.colPnlPercent")}
+								</TableHead>
+							</TableRow>
+						</TableHeader>
 					<TableBody>
 						{isLoading ? (
 							[...Array(3)].map((_, i) => (
@@ -162,6 +173,7 @@ export const ActivePositionsTable: React.FC = () => {
 						)}
 					</TableBody>
 				</Table>
+				</div>
 			</CardContent>
 		</Card>
 	);
