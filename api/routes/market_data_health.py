@@ -35,7 +35,7 @@ from bot_module import config as bot_config
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/market-data", tags=["market-data"])
+router = APIRouter(prefix="/api/v1/market-data", tags=["market-data"])
 
 
 # Parses stream_key = "{exchange}:{market_type}:{sym_lowercase}@kline_{tf}"
