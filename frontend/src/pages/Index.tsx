@@ -4,6 +4,7 @@ import { Home } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { ActivePositionsTable } from "@/components/dashboard/ActivePositionsTable";
 import { CandleFlowIndicator } from "@/components/dashboard/CandleFlowIndicator";
+import { FirstTradeCelebration } from "@/components/dashboard/FirstTradeCelebration";
 import { LiveEventFeed } from "@/components/dashboard/LiveEventFeed";
 import { PlatformStatsStrip } from "@/components/dashboard/PlatformStatsStrip";
 import { PortfolioOverviewWidget } from "@/components/dashboard/PortfolioOverviewWidget";
@@ -26,6 +27,12 @@ const Index = () => {
 				disconnected) and `gap-4 sm:gap-6` on grids keeps the layout
 				breathable without overflowing narrow viewports. */}
 			<div className="space-y-4 sm:space-y-6">
+				{/* FIX 2026-09-22: first-trade celebration toast. Renders nothing
+					visible (returns null) — fires a one-time toast when the user
+					has any closed trade in either mode and hasn't been
+					celebrated yet. Mounted above the cards so the toast
+					appears regardless of scroll position. */}
+				<FirstTradeCelebration />
 				<TradingModeBadge />
 				<CandleFlowIndicator />
 				<WelcomeBanner />
