@@ -2091,44 +2091,51 @@ const CommunityHub = () => {
 						onValueChange={setActiveTab}
 						className="w-full"
 					>
-						<div className="flex justify-between items-center border-b border-border/40 pb-2">
-							<TabsList className="bg-muted/50 border border-border/20">
-								<TabsTrigger
-									value="verified"
-									className="gap-2 text-xs md:text-sm"
-								>
-									<Sparkles className="w-3.5 h-3.5" />
-									{t("community:tabs.verified", "Verified Templates")}
-								</TabsTrigger>
-								<TabsTrigger
-									value="community"
-									className="gap-2 text-xs md:text-sm"
-								>
-									<TrendingUp className="w-3.5 h-3.5" />
-									{t("community:tabs.community", "Trading Ideas")}
-								</TabsTrigger>
-								<TabsTrigger
-									value="ideas"
-									className="gap-2 text-xs md:text-sm"
-								>
-									<BookOpen className="w-3.5 h-3.5" />
-									{t("community:tabs.ideas", "Strategy Ideas")}
-								</TabsTrigger>
-								<TabsTrigger
-									value="discussion"
-									className="gap-2 text-xs md:text-sm"
-								>
-									<MessageSquare className="w-3.5 h-3.5" />
-									{t("community:tabs.discussion", "Discussions")}
-								</TabsTrigger>
-								<TabsTrigger
-									value="network"
-									className="gap-2 text-xs md:text-sm"
-								>
-									<Network className="w-3.5 h-3.5" />
-									{t("community:tabs.network", "Network Status")}
-								</TabsTrigger>
-							</TabsList>
+						<div className="flex justify-between items-center gap-2 border-b border-border/40 pb-2">
+							{/* FIX 2026-09-22: 5 tabs overflow on phones (320px wide).
+							    Wrap TabsList in an overflow-x-auto container so it scrolls
+							    horizontally on mobile instead of clipping the rightmost
+							    tabs. min-w-0 lets the wrapper shrink; whitespace-nowrap +
+							    flex-shrink-0 keep each trigger on one line. */}
+							<div className="flex-1 min-w-0 overflow-x-auto overflow-y-hidden">
+								<TabsList className="bg-muted/50 border border-border/20 flex w-max">
+									<TabsTrigger
+										value="verified"
+										className="gap-2 text-xs md:text-sm whitespace-nowrap flex-shrink-0"
+									>
+										<Sparkles className="w-3.5 h-3.5" />
+										{t("community:tabs.verified", "Verified Templates")}
+									</TabsTrigger>
+									<TabsTrigger
+										value="community"
+										className="gap-2 text-xs md:text-sm whitespace-nowrap flex-shrink-0"
+									>
+										<TrendingUp className="w-3.5 h-3.5" />
+										{t("community:tabs.community", "Trading Ideas")}
+									</TabsTrigger>
+									<TabsTrigger
+										value="ideas"
+										className="gap-2 text-xs md:text-sm whitespace-nowrap flex-shrink-0"
+									>
+										<BookOpen className="w-3.5 h-3.5" />
+										{t("community:tabs.ideas", "Strategy Ideas")}
+									</TabsTrigger>
+									<TabsTrigger
+										value="discussion"
+										className="gap-2 text-xs md:text-sm whitespace-nowrap flex-shrink-0"
+									>
+										<MessageSquare className="w-3.5 h-3.5" />
+										{t("community:tabs.discussion", "Discussions")}
+									</TabsTrigger>
+									<TabsTrigger
+										value="network"
+										className="gap-2 text-xs md:text-sm whitespace-nowrap flex-shrink-0"
+									>
+										<Network className="w-3.5 h-3.5" />
+										{t("community:tabs.network", "Network Status")}
+									</TabsTrigger>
+								</TabsList>
+							</div>
 
 							<div className="flex items-center gap-2">
 								<Button
