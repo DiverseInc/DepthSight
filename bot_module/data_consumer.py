@@ -3550,21 +3550,26 @@ class DataConsumer:
             if self._heartbeat_redis_client is not None:
                 return self._heartbeat_redis_client
             try:
+                # FIX 2026-09-22: heartbeat keys (market_data:candle_received:*,
+                # market_data:active_streams) live in MARKET redis, not APP redis.
+                # Also: redis-py's from_url() defaults to user='default' when the URL
+                # has no username component, and our ACL has 'default' OFF. So we must
+                # pass username= explicitly via the kwarg form (matches how
+                # _redis_market_client at line 1158 is constructed and works).
                 from bot_module.config import (
-                    REDIS_HOST,
-                    REDIS_PORT,
-                    REDIS_DB,
+                    MARKET_REDIS_HOST,
+                    MARKET_REDIS_PORT,
+                    MARKET_REDIS_DB,
+                    REDIS_USERNAME,
                     REDIS_PASSWORD,
                 )
 
-                auth = (
-                    f":{REDIS_PASSWORD}@"
-                    if REDIS_PASSWORD
-                    else ""
-                )
-                url = f"redis://{auth}{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
-                self._heartbeat_redis_client = redis_asyncio.Redis.from_url(
-                    url,
+                self._heartbeat_redis_client = redis_asyncio.Redis(
+                    host=MARKET_REDIS_HOST,
+                    port=MARKET_REDIS_PORT,
+                    db=MARKET_REDIS_DB,
+                    username=REDIS_USERNAME,
+                    password=REDIS_PASSWORD,
                     decode_responses=True,
                     socket_connect_timeout=2,
                     socket_timeout=2,
