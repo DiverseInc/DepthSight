@@ -167,12 +167,16 @@ export const AppHeader = () => {
 				</Link>
 			</div>
 
-			{/* FIX 2026-09-22: header right column overflowed on phones (Paper
-			    tab was cut off next to Live). Add shrink-0 to the toggle group
-			    so it doesn't compress, and tighten the gap + emoji margin on
-			    mobile so ConnectionStatus + Live/Paper + UserNav fit within
-			    375px. whitespace-nowrap keeps each toggle item on one line. */}
-			<div className="flex shrink-0 justify-end items-center gap-2 sm:gap-4 pr-1">
+			{/* FIX 2026-09-22 (revised): header right column overflowed on phones
+			    (Paper tab was cut off next to Live). The previous shrink-0 +
+			    gap-tightening attempt wasn't enough — measured DOM showed Paper
+			    still at left=372 on a 375px viewport because the connection
+			    status indicator (~80px) + Live/Paper toggle + UserNav + logo
+			    add up to ~415px. Fix: hide ConnectionStatusIndicator on mobile
+			    (info is duplicated in dashboard's System Health panel anyway),
+			    keep the tighter gap + emoji margin for the rest, drop
+			    shrink-0 (it actively prevented the column from adapting). */}
+			<div className="flex justify-end items-center gap-2 sm:gap-4 pr-1 min-w-0">
 				{daysLeft !== null && daysLeft >= 0 && (
 					<div className="flex items-center text-sm mr-1 hidden sm:flex bg-muted/50 px-3 py-1.5 rounded-full border border-border/50 shadow-sm">
 						<span className="text-muted-foreground mr-2 text-xs font-medium">
@@ -192,13 +196,15 @@ export const AppHeader = () => {
 						</span>
 					</div>
 				)}
-				<ConnectionStatusIndicator />
+				<div className="hidden sm:block">
+					<ConnectionStatusIndicator />
+				</div>
 				<ToggleGroup
 					type="single"
 					size="sm"
 					value={mode}
 					onValueChange={handleModeChange}
-					className="bg-background rounded-md p-1 shrink-0"
+					className="bg-background rounded-md p-1"
 				>
 					<ToggleGroupItem
 						value="live"
