@@ -1841,15 +1841,43 @@ class TradingController:
         # If the command specifies an api_key_id, only the matching controller should process it.
         # If api_key_id is not specified (None), ALL controllers for this user will process the command (legacy behavior).
         command_api_key_id = payload.get("api_key_id")
+        command_mode = payload.get("mode", "live")
         import os
 
         logger.info(
-            f"[_handle_start_strategy_command] PID: {os.getpid()}, Controller Key ID: {self.api_key_id}, Command Key ID: {command_api_key_id}"
+            f"[_handle_start_strategy_command] PID: {os.getpid()}, Controller Key ID: {self.api_key_id}, Command Key ID: {command_api_key_id}, Mode: {command_mode}"
         )
 
-        if command_api_key_id is not None and str(command_api_key_id) != str(
+        # FIX 2026-09-22: paper-only controllers (api_key_id is None) accept
+        # paper-mode commands for any api_key_id stored in the payload.
+        #
+        # Why: the API persists `api_key_id = active_keys[0].id` in the
+        # running_strategy_payload:* cache even for paper-mode starts
+        # (strategies.py:411-413 uses the active key purely for market-data
+        # routing, not as a hard filter). If the user later deletes that
+        # active key, the saved payload still carries its id but the bot
+        # restarts with only the paper-only controller (api_key_id=None).
+        # Without this branch, every controller whose key id doesn't match
+        # silently returns — leaving the user's strategies stuck in
+        # "Running, no candles" until someone manually re-issues
+        # START_STRATEGY per config.
+        #
+        # Live mode still requires a key-id match (no change). For paper
+        # mode, the paper-only controller is the canonical handler for
+        # users without an active live key; matching live controllers
+        # (if any exist) accept independently via their own listener.
+        if self.api_key_id is None:
+            # Paper-only controller — accept any paper-mode command for this user.
+            if command_mode != "paper":
+                logger.info(
+                    f"[_handle_start_strategy_command] Paper-only controller skipping non-paper command "
+                    f"(mode={command_mode})."
+                )
+                return
+        elif command_api_key_id is not None and str(command_api_key_id) != str(
             self.api_key_id
         ):
+            # Live controller — must match api_key_id.
             logger.info(
                 f"[_handle_start_strategy_command] Skipping: Command is for api_key_id={command_api_key_id}, "
                 f"but this controller is for api_key_id={self.api_key_id}."
@@ -1953,11 +1981,23 @@ class TradingController:
 
     async def _handle_tv_webhook_signal_command(self, payload: dict):
         command_user_id = payload.get("user_id")
-        if command_user_id != self.user_id:
+        # Match str-vs-str comparison used in _handle_start_strategy_command
+        # (and CLOSE_POSITION/UPDATE_SL_TP/EMERGENCY_STOP). Strict `!=` here
+        # silently drops signals whenever the JSON round-trip yields a
+        # different type than the controller's self.user_id.
+        if str(command_user_id) != str(self.user_id):
             return
 
         command_api_key_id = payload.get("api_key_id")
-        if command_api_key_id is not None and command_api_key_id != self.api_key_id:
+        # FIX 2026-09-22: same pattern as _handle_start_strategy_command.
+        # Paper-only controllers (api_key_id is None) accept TV webhook
+        # signals for paper-mode strategies regardless of any stale
+        # api_key_id carried in the payload. See _handle_start_strategy_command
+        # for the full rationale.
+        if self.api_key_id is None:
+            # Paper-only controller — accept any signal for this user.
+            pass
+        elif command_api_key_id is not None and command_api_key_id != self.api_key_id:
             logger.debug(
                 f"[_handle_tv_webhook_signal_command] Command is for api_key_id={command_api_key_id}, "
                 f"but this controller is for api_key_id={self.api_key_id}. Skipping."
