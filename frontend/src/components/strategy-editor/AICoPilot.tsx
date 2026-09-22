@@ -33,6 +33,12 @@ export const AICoPilot: React.FC<AICoPilotProps> = ({
 		}
 	};
 
+	// FIX 2026-09-22: the placeholders array was only used as gray placeholder
+	// text inside the textarea — never clickable. New users had to copy-paste
+	// or retype each example. Surface them as click-to-fill chips below the
+	// textarea (only when prompt is empty, so they fade out as soon as the
+	// user starts typing). Each chip sets the prompt to the full example,
+	// which is a meaningful prompt the AI can act on.
 	return (
 		<Card className={cn("p-6 w-full", className)}>
 			<div className="text-center mb-4">
@@ -67,7 +73,29 @@ export const AICoPilot: React.FC<AICoPilotProps> = ({
 					{t("ai.generateButton")}
 				</Button>
 			</div>
-			<p className="text-xs text-muted-foreground mt-2 text-center">
+			{Array.isArray(placeholderExamples) && prompt.trim().length === 0 && (
+				<div className="mt-3">
+					<p className="text-xs text-muted-foreground mb-2 text-center">
+						Or try one of these:
+					</p>
+					<div className="flex flex-wrap gap-2 justify-center">
+						{placeholderExamples.map((example: string, i: number) => (
+							<button
+								key={i}
+								type="button"
+								onClick={() => setPrompt(example)}
+								disabled={isGenerating}
+								className="text-xs px-3 py-1.5 rounded-full border border-border/60 bg-card/40 hover:bg-card/80 hover:border-primary/40 text-muted-foreground hover:text-foreground transition-all text-left max-w-full disabled:opacity-50"
+							>
+								{example.length > 60
+									? example.substring(0, 57) + "…"
+									: example}
+							</button>
+						))}
+					</div>
+				</div>
+			)}
+			<p className="text-xs text-muted-foreground mt-3 text-center">
 				{t("ai.shortcutHint")}
 			</p>
 			<p className="text-[10px] text-muted-foreground/50 mt-4 text-center leading-tight">
