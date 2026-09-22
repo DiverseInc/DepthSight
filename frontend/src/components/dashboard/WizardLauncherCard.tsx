@@ -11,6 +11,7 @@ import { useEffect, useState } from "react";
 import { Sparkles, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { StrategyStyleWizard } from "@/components/StrategyStyleWizard";
+import { useStrategies } from "@/lib/api";
 
 const STORAGE_KEY = "depthsight_wizard_answers";
 
@@ -23,7 +24,15 @@ export const WizardLauncherCard = () => {
         setCompleted(!!localStorage.getItem(STORAGE_KEY));
     }, []);
 
-    if (dismissed) return null;
+    // FIX 2026-09-22: auto-hide the launcher once the user has any running
+    // strategy. The wizard's purpose is to help brand-new users pick a
+    // first style — once they've started trading, the card just clutters
+    // the dashboard. Users who want to refresh recommendations can find
+    // them via the Hub (/hub → Strategy Ideas tab) or /strategies page.
+    const { data: runningStrategies } = useStrategies();
+    const hasRunningStrategy = (runningStrategies?.length ?? 0) > 0;
+
+    if (dismissed || hasRunningStrategy) return null;
 
     const isCompleted = completed;
 

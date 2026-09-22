@@ -19,7 +19,7 @@
  */
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowRight, ChevronLeft, ChevronRight, Sparkles, X } from "lucide-react";
+import { ArrowRight, ChevronLeft, ChevronRight, Library, Sparkles, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
     Dialog,
@@ -403,6 +403,21 @@ const ResultsStep: React.FC<{
                     </Button>
                 </div>
             ))}
+            {/* FIX 2026-09-22: most users want to browse all 27 templates rather
+                than commit to one of the top-3-5 picks right away. Footer link
+                gives them that escape hatch — closes the wizard and routes to
+                the Strategy Ideas tab on /hub. */}
+            <button
+                type="button"
+                onClick={() => {
+                    onClose();
+                    navigate("/hub");
+                }}
+                className="mt-2 w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm text-muted-foreground hover:text-foreground rounded-lg border border-dashed border-border/60 hover:border-indigo-300 hover:bg-indigo-50/30 dark:hover:bg-indigo-950/20 transition-all"
+            >
+                <Library className="w-4 h-4" />
+                Browse all {STRATEGY_IDEAS.length} templates in the Hub
+            </button>
         </div>
     );
 };
