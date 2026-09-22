@@ -158,10 +158,16 @@ export const AppHeader = () => {
 				)}
 			</div>
 
-			<div className="flex items-center justify-center">
+			{/* FIX 2026-09-22: BETA version pill was touching the Live toggle on
+			    mobile because the 3-column flex layout collapsed empty col-1,
+			    letting col-2 (logo+BETA) and col-3 (toggles) crowd together.
+			    Hide BETA on mobile — it's version metadata not critical on
+			    small screens — and add a small gap between header columns
+			    so the right cluster has breathing room. */}
+			<div className="flex items-center justify-center gap-2 sm:gap-4">
 				<Link to="/" className="flex items-center space-x-2">
 					<Logo className="h-12" />
-					<Badge variant="secondary" className="mt-[3px]">
+					<Badge variant="secondary" className="mt-[3px] hidden sm:inline-flex">
 						<span className="-translate-y-px inline-block">BETA</span>
 					</Badge>
 				</Link>
