@@ -115,8 +115,14 @@ class PaginatedAdminUsers(BaseModel):
 # --- Token Schemas ---
 class Token(BaseModel):
     access_token: str
-    refresh_token: str
-    token_type: str
+    # FIX 2026-09-22: refresh_token is now optional. The admin impersonate
+    # endpoint (api/routes/admin.py admin_impersonate_user) intentionally
+    # issues short-lived (5-minute) tokens without a refresh token, since
+    # impersonation is a temporary admin action. Previously this raised
+    # Pydantic ValidationError on every "Login As" attempt because refresh
+    # token was required. Regular /api/v1/token login still sets both.
+    refresh_token: str | None = None
+    token_type: str = "bearer"
 
 
 class LoginResponse(BaseModel):
