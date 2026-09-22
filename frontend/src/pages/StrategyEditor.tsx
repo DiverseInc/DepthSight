@@ -56,7 +56,9 @@ import {
 	ResizablePanel,
 	ResizablePanelGroup,
 } from "@/components/ui/resizable";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useToast } from "@/components/ui/use-toast";
+import { useMediaQuery } from "@/hooks/use-media-query";
 // State & API
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -140,6 +142,16 @@ const StrategyEditorPage = () => {
 		unknown
 	> | null>(null);
 	const [showOnboardingModal, setShowOnboardingModal] = useState(false);
+
+	// FIX 2026-09-22: the editor's three-panel horizontal layout (palette
+	// 20% / canvas 55% / config 25%) is unusable on mobile — each panel
+	// gets ~64-80px on a 320px screen, drag handles overlap, content gets
+	// clipped. On mobile we render a tabbed layout (Blocks / Strategy / Launch)
+	// that shows one panel at a time. Desktop layout is untouched.
+	const isMobile = useMediaQuery("(max-width: 768px)");
+	const [mobilePanel, setMobilePanel] = useState<"palette" | "canvas" | "config">(
+		"canvas",
+	);
 	const {
 		start: startOnboarding,
 		end: endOnboarding,
@@ -690,32 +702,65 @@ const StrategyEditorPage = () => {
 			icon={PencilRuler}
 			headerActions={headerActions}
 		>
+			{isMobile && (
+				<Tabs
+					value={mobilePanel}
+					onValueChange={(v) => setMobilePanel(v as typeof mobilePanel)}
+					className="mb-3"
+				>
+					<TabsList className="grid grid-cols-3 w-full">
+						<TabsTrigger value="palette">{t("mobile.tabs.palette", "Blocks")}</TabsTrigger>
+						<TabsTrigger value="canvas">{t("mobile.tabs.canvas", "Strategy")}</TabsTrigger>
+						<TabsTrigger value="config">{t("mobile.tabs.config", "Launch")}</TabsTrigger>
+					</TabsList>
+				</Tabs>
+			)}
 			<DndContext
 				sensors={sensors}
 				onDragStart={handleDragStart}
 				onDragEnd={handleDragEnd}
 				collisionDetection={closestCenter}
 			>
-				<div className="w-full h-full">
-					<ResizablePanelGroup
-						direction="horizontal"
-						className="h-full rounded-lg border bg-card"
-					>
-						<ResizablePanel defaultSize={20} minSize={15} className="h-full">
-							<ComponentPalette
-								value={openPaletteGroups}
-								onValueChange={setOpenPaletteGroups}
-							/>
-						</ResizablePanel>
-						<ResizableHandle withHandle />
-						<ResizablePanel defaultSize={55} minSize={30}>
-							{viewMode === "visual" ? <StrategyCanvas /> : <JsonEditor />}
-						</ResizablePanel>
-						<ResizableHandle withHandle />
-						<ResizablePanel defaultSize={25} minSize={20}>
-							<ConfigAndLaunchPanel isSaving={isSaving} />
-						</ResizablePanel>
-					</ResizablePanelGroup>
+				<div className={isMobile ? "w-full" : "w-full h-full"}>
+					{isMobile ? (
+						<div className="rounded-lg border bg-card min-h-[500px]">
+							{mobilePanel === "palette" && (
+								<ComponentPalette
+									value={openPaletteGroups}
+									onValueChange={setOpenPaletteGroups}
+								/>
+							)}
+							{mobilePanel === "canvas" &&
+								(viewMode === "visual" ? (
+									<StrategyCanvas />
+								) : (
+									<JsonEditor />
+								))}
+							{mobilePanel === "config" && (
+								<ConfigAndLaunchPanel isSaving={isSaving} />
+							)}
+						</div>
+					) : (
+						<ResizablePanelGroup
+							direction="horizontal"
+							className="h-full rounded-lg border bg-card"
+						>
+							<ResizablePanel defaultSize={20} minSize={15} className="h-full">
+								<ComponentPalette
+									value={openPaletteGroups}
+									onValueChange={setOpenPaletteGroups}
+								/>
+							</ResizablePanel>
+							<ResizableHandle withHandle />
+							<ResizablePanel defaultSize={55} minSize={30}>
+								{viewMode === "visual" ? <StrategyCanvas /> : <JsonEditor />}
+							</ResizablePanel>
+							<ResizableHandle withHandle />
+							<ResizablePanel defaultSize={25} minSize={20}>
+								<ConfigAndLaunchPanel isSaving={isSaving} />
+							</ResizablePanel>
+						</ResizablePanelGroup>
+					)}
 				</div>
 				{activeDragItem && (
 					<DragOverlay>
