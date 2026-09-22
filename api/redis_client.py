@@ -42,3 +42,41 @@ async def get_redis_client() -> aioredis.Redis:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Could not establish connection to Redis service.",
         )
+
+
+async def get_market_redis_client() -> aioredis.Redis:
+    """
+    Dependency to get a Redis client for the MARKET data container
+    (`depthsight_redis_market`, service `redis-market`).
+
+    This is separate from `get_redis_client` because the bot writes the
+    candle-flow health state (market_data:active_streams SET and
+    market_data:candle_received:* STRING keys) to this container, while
+    running-strategy state lives in the main app Redis.
+
+    Endpoints that need to read either (like /api/v1/market-data/candle-health)
+    should declare BOTH dependencies and route queries accordingly.
+    """
+    try:
+        redis_password = bot_config.REDIS_PASSWORD
+        redis_client = aioredis.Redis(
+            host=bot_config.MARKET_REDIS_HOST,
+            port=bot_config.MARKET_REDIS_PORT,
+            db=bot_config.MARKET_REDIS_DB,
+            username=bot_config.REDIS_USERNAME,
+            password=redis_password,
+            decode_responses=True,
+        )
+        await redis_client.ping()
+        return redis_client
+    except (
+        redis_exceptions.ConnectionError,
+        redis_exceptions.BusyLoadingError,
+        redis_exceptions.TimeoutError,
+        redis_exceptions.AuthenticationError,
+    ) as e:
+        logger.error(f"Failed to connect to market Redis: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not establish connection to market Redis service.",
+        )

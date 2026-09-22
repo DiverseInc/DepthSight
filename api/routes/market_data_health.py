@@ -30,7 +30,7 @@ from fastapi import APIRouter, Depends, Query
 
 from .. import models, schemas
 from ..dependencies import get_current_user
-from ..redis_client import get_redis_client
+from ..redis_client import get_market_redis_client, get_redis_client
 from bot_module import config as bot_config
 
 logger = logging.getLogger(__name__)
@@ -104,16 +104,24 @@ def _split_symbols(s: str) -> List[str]:
 @router.get("/candle-health", response_model=schemas.CandleHealthResponse)
 async def get_candle_health(
     mode: str = Query("paper", enum=["live", "paper"]),
-    redis_client: redis.Redis = Depends(get_redis_client),
+    app_redis: redis.Redis = Depends(get_redis_client),
+    market_redis: redis.Redis = Depends(get_market_redis_client),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Return candle-flow health for the user's active streams."""
+    """Return candle-flow health for the user's active streams.
+
+    Reads from TWO Redis containers:
+      - market_redis: market_data:active_streams SET + market_data:candle_received:*
+        heartbeat keys (written by the bot's data_consumer candle pipeline).
+      - app_redis: running_strategies:{user_id} SET + per-strategy STRING keys
+        (written by the bot's strategy-start handler).
+    """
     now_ms = int(time.time() * 1000)
     entries: List[schemas.CandleHealthEntry] = []
 
     try:
         # 1. Read the GLOBAL active-streams set to learn what's subscribed.
-        raw_streams = await redis_client.smembers(
+        raw_streams = await market_redis.smembers(
             bot_config.MARKET_DATA_ACTIVE_STREAMS_SET_KEY
         )
         active_streams: List[Dict[str, str]] = []
@@ -134,9 +142,9 @@ async def get_candle_health(
             f"{bot_config.REDIS_STATE_KEY_STRATEGIES}:{current_user.id}"
         )
         pattern = f"{base_strategies_key}:*"
-        keys = await redis_client.keys(pattern)
+        keys = await app_redis.keys(pattern)
         if keys:
-            values = await redis_client.mget(keys)
+            values = await app_redis.mget(keys)
             for raw in values:
                 if not raw:
                     continue
@@ -190,7 +198,7 @@ async def get_candle_health(
                 )
                 for p, _ in relevant
             ]
-            raw_values = await redis_client.mget(redis_keys)
+            raw_values = await market_redis.mget(redis_keys)
             for (parsed, owner), raw in zip(relevant, raw_values):
                 last_ts_ms: Optional[int] = None
                 seconds: Optional[float] = None
