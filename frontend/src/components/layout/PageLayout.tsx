@@ -29,12 +29,14 @@ export const PageLayout: React.FC<PageLayoutProps> = ({
 
 	return (
 		<div className="p-4 sm:p-6 lg:p-8 h-full flex flex-col">
-			<header className="mb-6 flex items-start justify-between flex-shrink-0">
-				<div className="flex items-center gap-3">
+			<header className="mb-6 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between flex-shrink-0">
+				<div className="flex items-center gap-3 min-w-0">
 					{isMobile && <SidebarTrigger />}
-					{Icon && <Icon className="w-7 h-7 text-primary" />}
-					<div>
-						<h1 className="text-2xl font-bold tracking-tight">{title}</h1>
+					{Icon && <Icon className="w-7 h-7 text-primary shrink-0" />}
+					<div className="min-w-0">
+						<h1 className="text-2xl font-bold tracking-tight truncate">
+							{title}
+						</h1>
 						{description && (
 							<div className="text-sm text-muted-foreground mt-1">
 								{description}
@@ -42,7 +44,15 @@ export const PageLayout: React.FC<PageLayoutProps> = ({
 						)}
 					</div>
 				</div>
-				<div className="flex items-center space-x-4">{headerActions}</div>
+				{/* FIX 2026-09-22: header actions row overflows on phones when there
+				    are 4+ buttons (Save / Reset / Import / Export / JSON View on
+				    the Strategy Editor, etc.). Stack below the title on mobile
+				    and let the row scroll horizontally if it still overflows. */}
+				{headerActions && (
+					<div className="flex items-center gap-2 overflow-x-auto pb-2 lg:pb-0 lg:space-x-4 flex-shrink-0 -mx-4 px-4 lg:mx-0 lg:px-0">
+						{headerActions}
+					</div>
+				)}
 			</header>
 			<div className="flex-grow min-h-0">{children}</div>
 			<footer className="mt-8 py-4 text-center text-sm text-muted-foreground border-t">
