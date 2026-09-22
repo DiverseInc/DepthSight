@@ -461,7 +461,17 @@ class MarketDataService:
             }
         elif data_type_key == "open_interest":
             consumer = self._get_consumer(exchange_id)
-            df = await consumer.get_open_interest_history(symbol)
+            try:
+                df = await consumer.get_open_interest(symbol)
+            except AttributeError:
+                # Defensive: DataConsumer.get_open_interest() exists; this catch is a safety
+                # net so a rename upstream doesn't crash every subscribe that includes OI.
+                logger.warning(
+                    "Consumer %s missing get_open_interest; skipping OI snapshot for %s",
+                    type(consumer).__name__,
+                    symbol,
+                )
+                return False
             if df is None or df.empty:
                 return False
             rows = df.reset_index().to_dict(orient="records")
