@@ -30,7 +30,7 @@ from fastapi import APIRouter, Depends, Query
 
 from .. import models, schemas
 from ..dependencies import get_current_user
-from ..redis_client import get_market_redis_client, get_redis_client
+from ..redis_client import get_redis_client
 from bot_module import config as bot_config
 
 logger = logging.getLogger(__name__)
@@ -105,23 +105,27 @@ def _split_symbols(s: str) -> List[str]:
 async def get_candle_health(
     mode: str = Query("paper", enum=["live", "paper"]),
     app_redis: redis.Redis = Depends(get_redis_client),
-    market_redis: redis.Redis = Depends(get_market_redis_client),
     current_user: models.User = Depends(get_current_user),
 ):
     """Return candle-flow health for the user's active streams.
 
-    Reads from TWO Redis containers:
-      - market_redis: market_data:active_streams SET + market_data:candle_received:*
-        heartbeat keys (written by the bot's data_consumer candle pipeline).
-      - app_redis: running_strategies:{user_id} SET + per-strategy STRING keys
+    All Redis state for this endpoint lives in APP redis (single client):
+      - market_data:active_streams SET + market_data:candle_received:* STRING
+        heartbeat keys (written by the bot's heartbeat writer in data_consumer.py).
+      - running_strategies:{user_id} SET + per-strategy STRING keys
         (written by the bot's strategy-start handler).
+
+    The candle-health state was originally placed in a separate market redis
+    container for throughput isolation, but candle-health is the only consumer
+    that crosses both containers — keeping all of this in APP redis removes
+    the cross-container auth complexity.
     """
     now_ms = int(time.time() * 1000)
     entries: List[schemas.CandleHealthEntry] = []
 
     try:
         # 1. Read the GLOBAL active-streams set to learn what's subscribed.
-        raw_streams = await market_redis.smembers(
+        raw_streams = await app_redis.smembers(
             bot_config.MARKET_DATA_ACTIVE_STREAMS_SET_KEY
         )
         active_streams: List[Dict[str, str]] = []
@@ -198,7 +202,7 @@ async def get_candle_health(
                 )
                 for p, _ in relevant
             ]
-            raw_values = await market_redis.mget(redis_keys)
+            raw_values = await app_redis.mget(redis_keys)
             for (parsed, owner), raw in zip(relevant, raw_values):
                 last_ts_ms: Optional[int] = None
                 seconds: Optional[float] = None

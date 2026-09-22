@@ -3550,24 +3550,27 @@ class DataConsumer:
             if self._heartbeat_redis_client is not None:
                 return self._heartbeat_redis_client
             try:
-                # FIX 2026-09-22: heartbeat keys (market_data:candle_received:*,
-                # market_data:active_streams) live in MARKET redis, not APP redis.
+                # FIX 2026-09-22 (rev): heartbeat keys (market_data:candle_received:*,
+                # market_data:active_streams) live in APP redis alongside running_strategies.
+                # The 2-redis split (app vs market) is sound for high-throughput market
+                # streams, but candle-health is the only consumer that crosses both
+                # containers. Keeping heartbeat keys in APP redis lets the API endpoint
+                # use a single Redis client with no cross-container auth to maintain.
                 # Also: redis-py's from_url() defaults to user='default' when the URL
                 # has no username component, and our ACL has 'default' OFF. So we must
-                # pass username= explicitly via the kwarg form (matches how
-                # _redis_market_client at line 1158 is constructed and works).
+                # pass username= explicitly via the kwarg form.
                 from bot_module.config import (
-                    MARKET_REDIS_HOST,
-                    MARKET_REDIS_PORT,
-                    MARKET_REDIS_DB,
+                    REDIS_HOST,
+                    REDIS_PORT,
+                    REDIS_DB,
                     REDIS_USERNAME,
                     REDIS_PASSWORD,
                 )
 
                 self._heartbeat_redis_client = redis_asyncio.Redis(
-                    host=MARKET_REDIS_HOST,
-                    port=MARKET_REDIS_PORT,
-                    db=MARKET_REDIS_DB,
+                    host=REDIS_HOST,
+                    port=REDIS_PORT,
+                    db=REDIS_DB,
                     username=REDIS_USERNAME,
                     password=REDIS_PASSWORD,
                     decode_responses=True,
