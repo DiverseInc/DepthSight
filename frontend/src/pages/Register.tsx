@@ -244,8 +244,9 @@ export default function RegisterPage() {
 	}
 
 	return (
-		<div className="fixed inset-0 flex items-center justify-center bg-background z-50">
-			<Card className="w-full max-w-sm">
+		<div className="fixed inset-0 overflow-y-auto bg-background z-50">
+			<div className="min-h-full w-full max-w-md mx-auto px-4 py-8 sm:py-12 flex items-center justify-center">
+			<Card className="w-full">
 				<CardHeader>
 					<CardTitle className="text-2xl">{t("cardTitle")}</CardTitle>
 					<CardDescription>{t("cardDescription")}</CardDescription>
@@ -416,6 +417,7 @@ export default function RegisterPage() {
 					</div>
 				</CardContent>
 			</Card>
+			</div>
 		</div>
 	);
 }

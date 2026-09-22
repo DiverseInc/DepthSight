@@ -146,18 +146,18 @@ export default function LoginPage() {
 	};
 
 	return (
-		<div className="fixed inset-0 flex items-center justify-center bg-background overflow-hidden z-50">
+		<div className="fixed inset-0 overflow-y-auto bg-background z-50">
 			{/* Subtle radial backdrop using the brand cyan */}
 			<div
 				aria-hidden
-				className="pointer-events-none absolute inset-0 opacity-30"
+				className="pointer-events-none fixed inset-0 opacity-30"
 				style={{
 					background:
 						"radial-gradient(circle at 20% 20%, rgba(0,212,255,0.18), transparent 45%), radial-gradient(circle at 80% 70%, rgba(0,102,255,0.18), transparent 50%)",
 				}}
 			/>
 
-			<div className="relative w-full max-w-md px-4 space-y-6">
+			<div className="relative w-full max-w-md mx-auto px-4 py-8 sm:py-12 space-y-6">
 				{/* Brand header */}
 				<div className="flex flex-col items-center text-center space-y-3">
 					<Logo className="h-12 w-auto" />
