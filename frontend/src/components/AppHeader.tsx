@@ -167,7 +167,12 @@ export const AppHeader = () => {
 				</Link>
 			</div>
 
-			<div className="flex flex-1 justify-end items-center space-x-4">
+			{/* FIX 2026-09-22: header right column overflowed on phones (Paper
+			    tab was cut off next to Live). Add shrink-0 to the toggle group
+			    so it doesn't compress, and tighten the gap + emoji margin on
+			    mobile so ConnectionStatus + Live/Paper + UserNav fit within
+			    375px. whitespace-nowrap keeps each toggle item on one line. */}
+			<div className="flex shrink-0 justify-end items-center gap-2 sm:gap-4 pr-1">
 				{daysLeft !== null && daysLeft >= 0 && (
 					<div className="flex items-center text-sm mr-1 hidden sm:flex bg-muted/50 px-3 py-1.5 rounded-full border border-border/50 shadow-sm">
 						<span className="text-muted-foreground mr-2 text-xs font-medium">
@@ -193,11 +198,12 @@ export const AppHeader = () => {
 					size="sm"
 					value={mode}
 					onValueChange={handleModeChange}
-					className="bg-background rounded-md p-1"
+					className="bg-background rounded-md p-1 shrink-0"
 				>
 					<ToggleGroupItem
 						value="live"
 						aria-label="Live mode"
+						className="whitespace-nowrap"
 						onClick={() => {
 							if (!hasApiKeys) {
 								toast.error("Connect API keys in settings");
@@ -206,10 +212,10 @@ export const AppHeader = () => {
 							}
 						}}
 					>
-						<span className="mr-2">💵</span> Live
+						<span className="mr-1 sm:mr-2">💵</span> Live
 					</ToggleGroupItem>
-					<ToggleGroupItem value="paper" aria-label="Paper mode">
-						<span className="mr-2">📄</span> Paper
+					<ToggleGroupItem value="paper" aria-label="Paper mode" className="whitespace-nowrap">
+						<span className="mr-1 sm:mr-2">📄</span> Paper
 					</ToggleGroupItem>
 				</ToggleGroup>
 				<UserNav />
