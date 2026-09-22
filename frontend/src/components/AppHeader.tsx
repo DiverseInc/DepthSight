@@ -161,12 +161,18 @@ export const AppHeader = () => {
 			{/* FIX 2026-09-22: BETA version pill was touching the Live toggle on
 			    mobile because the 3-column flex layout collapsed empty col-1,
 			    letting col-2 (logo+BETA) and col-3 (toggles) crowd together.
-			    Hide BETA on mobile — it's version metadata not critical on
-			    small screens — and add a small gap between header columns
-			    so the right cluster has breathing room. */}
-			<div className="flex items-center justify-center gap-2 sm:gap-4">
-				<Link to="/" className="flex items-center space-x-2">
-					<Logo className="h-12" />
+			    Two fixes:
+			    1. Hide BETA on mobile — it's version metadata not critical on
+			       small screens — and add a small gap between header columns
+			       so the right cluster has breathing room.
+			    2. Shrink the Logo image from h-12 to h-8 on mobile. At h-12
+			       the SVG plus 'DepthSight' wordmark is ~162px wide and
+			       overflows into the right column. At h-8 the logo is ~80px
+			       wide, fits comfortably with a 2-column gap before the
+			       Live toggle. */}
+			<div className="flex items-center justify-center gap-2 sm:gap-4 min-w-0">
+				<Link to="/" className="flex items-center space-x-2 min-w-0">
+					<Logo className="h-8 sm:h-12" />
 					<Badge variant="secondary" className="mt-[3px] hidden sm:inline-flex">
 						<span className="-translate-y-px inline-block">BETA</span>
 					</Badge>
