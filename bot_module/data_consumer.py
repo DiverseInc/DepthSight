@@ -1709,14 +1709,22 @@ class DataConsumer:
             logger.info(
                 "[RedisMarketData] added stream_key to local set: %s", stream_key
             )
-            # FIX 2026-09-20: mirror the local set into a global Redis SET so
-            # the candle-health API can list currently-active streams. Best-effort
-            # and fire-and-forget — never block the WS loop on this.
-            self.loop.create_task(
-                self._track_active_stream_in_redis(
-                    stream_key, add=True
-                )
-            )
+            # FIX 2026-09-23 (replaces 2026-09-20): the SADD to
+            # market_data:active_streams used to happen here (fire-and-forget)
+            # so candle-health could see the stream immediately. Removed
+            # because it fired BEFORE the OKX WebSocket subscription was
+            # confirmed — a WS subscribe failure (e.g. "Symbol 'BTCUSDT'
+            # is NOT valid for market 'futures_usdtm'") would leave a ghost
+            # entry with no heartbeat, surfacing as ``status: unknown``
+            # forever (until the next bot restart + startup cleanup).
+            #
+            # The SADD now lives in ``_write_candle_heartbeat`` — it only
+            # fires on confirmed candle receive, which means the OKX WS
+            # subscription is actually working. Combined with the
+            # one-shot startup cleanup (``_cleanup_stale_active_streams_on_startup``,
+            # commit 2b3d8b8), this is a self-healing arrangement: the
+            # SADD only ever represents live subscriptions, and any orphans
+            # from before this fix get cleaned on next bot startup.
 
             # Load historical kline data from exchange REST API for cache priming
             dk = spec.get("data_type_key", data_type_key)
@@ -3661,9 +3669,17 @@ class DataConsumer:
         Key format: market_data:candle_received:{exchange}:{market_type}:{uc_symbol}:{timeframe}
         Value: epoch milliseconds (as a decimal string)
         TTL: MARKET_DATA_CANDLE_HEALTH_TTL_SECONDS (default 600s).
+
+        FIX 2026-09-23: also SADDs the canonical stream_key to
+        ``market_data:active_streams`` so candle-health can list it. Doing
+        the SADD here (on confirmed candle receive) instead of in
+        ``_ensure_subscription_via_redis`` (which fires on subscribe intent
+        before the OKX WebSocket subscription has actually started) prevents
+        ghost ``status: unknown`` entries when the WS subscribe fails.
         """
         try:
             from bot_module.config import (
+                MARKET_DATA_ACTIVE_STREAMS_SET_KEY,
                 MARKET_DATA_CANDLE_HEALTH_KEY_PREFIX,
                 MARKET_DATA_CANDLE_HEALTH_TTL_SECONDS,
             )
@@ -3675,11 +3691,24 @@ class DataConsumer:
                 f"{MARKET_DATA_CANDLE_HEALTH_KEY_PREFIX}:"
                 f"{exchange_id}:{effective_market_type}:{uc_symbol}:{timeframe}"
             )
+            # Canonical stream_key format matches _parse_stream_key() in
+            # api/routes/market_data_health.py: "{exchange}:{market_type}:
+            # {symbol_lc}@kline_{tf}". Only kline streams call this writer,
+            # so constructing the kline-shaped key is always correct.
+            stream_key = (
+                f"{exchange_id}:{effective_market_type}:"
+                f"{uc_symbol.lower()}@kline_{timeframe}"
+            )
             client = await self._get_heartbeat_redis_client()
             if client is None:
                 return
             now_ms = int(time.time() * 1000)
-            await client.set(key, str(now_ms), ex=MARKET_DATA_CANDLE_HEALTH_TTL_SECONDS)
+            # Pipeline the SET + SADD so they happen atomically from the
+            # caller's perspective. Either both land or neither does.
+            pipe = client.pipeline()
+            pipe.set(key, str(now_ms), ex=MARKET_DATA_CANDLE_HEALTH_TTL_SECONDS)
+            pipe.sadd(MARKET_DATA_ACTIVE_STREAMS_SET_KEY, stream_key)
+            await pipe.execute()
         except Exception as e:
             # Heartbeats are best-effort — never let them break the candle
             # pipeline. Just log at debug level so we don't spam logs.
