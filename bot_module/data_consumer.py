@@ -1215,6 +1215,12 @@ class DataConsumer:
                     self._redis_market_data_listener(),
                     name=f"RedisMarketDataListener_{self._market_data_subscriber_id}",
                 )
+
+        # FIX 2026-09-23: one-shot stale-stream cleanup on first start. Runs
+        # outside the market lock because it only touches the heartbeat
+        # client. Idempotent via _startup_cleanup_done guard.
+        if not getattr(self, "_startup_cleanup_done", False):
+            await self._cleanup_stale_active_streams_on_startup()
         return True
 
     async def _publish_market_data_command(self, payload: Dict[str, Any]) -> None:
@@ -3707,6 +3713,76 @@ class DataConsumer:
                 f"[ActiveStreamsSet] {'SADD' if add else 'SREM'} failed for "
                 f"{stream_key}: {e}"
             )
+
+    async def _cleanup_stale_active_streams_on_startup(self) -> int:
+        """SREM any market_data:active_streams kline member whose heartbeat
+        key is missing.
+
+        Called once per bot instance on first start (guarded by
+        ``_startup_cleanup_done``). Prevents stale entries from prior
+        incarnations (timeframe config changes, deleted strategies, removed
+        API keys) from lingering as ``status: unknown`` in the candle-health
+        endpoint forever — ``clear_all_subscriptions`` only iterates the
+        in-memory spec dict which is empty after a restart.
+
+        Only kline streams are inspected: non-kline types (openInterest,
+        aggTrade, depth) don't have heartbeat keys and may be legitimately
+        active via other code paths.
+
+        Returns the number of stale entries removed (best-effort, 0 on error).
+        """
+        if getattr(self, "_startup_cleanup_done", False):
+            return 0
+        self._startup_cleanup_done = True
+        try:
+            from bot_module.config import (
+                MARKET_DATA_ACTIVE_STREAMS_SET_KEY,
+                MARKET_DATA_CANDLE_HEALTH_KEY_PREFIX,
+            )
+
+            client = await self._get_heartbeat_redis_client()
+            if client is None:
+                logger.warning(
+                    "[ActiveStreamsCleanup] No heartbeat client; skipping cleanup."
+                )
+                return 0
+            members = await client.smembers(MARKET_DATA_ACTIVE_STREAMS_SET_KEY)
+            if not members:
+                return 0
+            stale: List[str] = []
+            for sk in members:
+                # Only inspect kline streams; other types don't have
+                # heartbeats and are managed via separate code paths.
+                if "@kline_" not in sk:
+                    continue
+                try:
+                    head, _, tail = sk.partition("@kline_")
+                    exchange, market_type, symbol_lc = head.split(":", 2)
+                    timeframe = tail
+                    symbol = symbol_lc.upper()
+                except ValueError:
+                    continue
+                hb_key = (
+                    f"{MARKET_DATA_CANDLE_HEALTH_KEY_PREFIX}:"
+                    f"{exchange}:{market_type}:{symbol}:{timeframe}"
+                )
+                if not await client.exists(hb_key):
+                    stale.append(sk)
+            if not stale:
+                return 0
+            removed = await client.srem(
+                MARKET_DATA_ACTIVE_STREAMS_SET_KEY, *stale
+            )
+            logger.warning(
+                f"[ActiveStreamsCleanup] Removed {removed} stale stream_key(s) "
+                f"on bot startup (no heartbeat key): {stale}"
+            )
+            return int(removed or 0)
+        except Exception as e:
+            logger.warning(
+                f"[ActiveStreamsCleanup] Failed (non-fatal): {e}", exc_info=True
+            )
+            return 0
 
     async def _update_local_cache(
         self,
