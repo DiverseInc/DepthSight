@@ -13,6 +13,7 @@ import {
 } from "react";
 import useBaseWebSocket, { type ReadyState } from "react-use-websocket";
 import { authScopedQueryKey } from "@/lib/queryKeys";
+import { refreshAccessToken } from "@/lib/apiClient";
 import type { LogEntry } from "@/types/api";
 import { useAuth } from "./AuthContext";
 
@@ -103,6 +104,18 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({
 			shouldReconnect: () => true,
 			reconnectInterval: 5000,
 			retryOnError: true,
+			// FIX 2026-09-23: react-use-websocket does not natively refresh JWTs.
+			// The server closes with code 1008 (Policy Violation) on missing or
+			// expired/invalid tokens. On 1008, trigger refreshAccessToken which
+			// will dispatch auth:token-refreshed → AuthContext updates token state
+			// → useMemo reruns with new socketUrl → react-use-websocket reconnects.
+			// Idempotent via apiClient's isRefreshing flag, so repeated close
+			// events during a slow refresh don't queue duplicate refresh calls.
+			onClose: (event) => {
+				if (event?.code === 1008) {
+					void refreshAccessToken();
+				}
+			},
 		},
 		!!socketUrl, // Only connect when socketUrl is fully built with a token
 	);

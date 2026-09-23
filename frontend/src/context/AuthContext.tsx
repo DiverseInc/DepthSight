@@ -56,6 +56,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 		navigate("/login");
 	}, [navigate, queryClient]);
 
+	// FIX 2026-09-23: listen for token refresh events from apiClient. The
+	// apiClient refreshes the JWT during 401 handling AND when WebSocketProvider
+	// triggers refresh on close code 1008. We need to update the React state so
+	// WebSocketProvider's useMemo (which keys on `token`) rebuilds the socketUrl
+	// with the new token, reconnecting the WS automatically.
+	useEffect(() => {
+		const handleTokenRefreshed = (e: Event) => {
+			const detail = (e as CustomEvent<{ token: string }>).detail;
+			if (detail?.token) {
+				setToken(detail.token);
+			}
+		};
+		const handleLogout = () => {
+			logout();
+		};
+		window.addEventListener("auth:token-refreshed", handleTokenRefreshed);
+		window.addEventListener("auth:logout", handleLogout);
+		return () => {
+			window.removeEventListener("auth:token-refreshed", handleTokenRefreshed);
+			window.removeEventListener("auth:logout", handleLogout);
+		};
+	}, [logout]);
+
 	useEffect(() => {
 		const initializeAuth = async () => {
 			const storedToken = localStorage.getItem("authToken");

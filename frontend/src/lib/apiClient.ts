@@ -14,6 +14,81 @@ const onRefreshed = (token: string) => {
 	refreshSubscribers = [];
 };
 
+// FIX 2026-09-23: extract refresh logic into a standalone exported function so
+// the WebSocketProvider can trigger refresh on close code 1008 (policy violation
+// = expired/invalid JWT). Without this, the WS stays disconnected with the
+// expired token because react-use-websocket retries with the same token every
+// 5s forever.
+//
+// Events dispatched:
+//   'auth:token-refreshed' — CustomEvent { detail: { token: string } }
+//   'auth:logout'          — CustomEvent (no detail)
+// These let AuthContext update its React state without apiClient importing it
+// directly (avoids circular import).
+
+export interface RefreshResult {
+	ok: boolean;
+	token?: string;
+}
+
+export const refreshAccessToken = async (): Promise<RefreshResult> => {
+	if (isRefreshing) {
+		// Another caller is already refreshing; queue and let the original
+		// refresh logic notify us via the subscriber pattern below.
+		return new Promise<RefreshResult>((resolve) => {
+			subscribeTokenRefresh((token: string) => {
+				resolve({ ok: true, token });
+			});
+		});
+	}
+
+	const refreshToken = localStorage.getItem("refreshToken");
+	if (!refreshToken) {
+		window.dispatchEvent(new CustomEvent("auth:logout"));
+		return { ok: false };
+	}
+
+	isRefreshing = true;
+	try {
+		const refreshResponse = await fetch(`${API_BASE_URL}/refresh`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ refresh_token: refreshToken }),
+		});
+
+		if (!refreshResponse.ok) {
+			localStorage.removeItem("authToken");
+			localStorage.removeItem("refreshToken");
+			localStorage.removeItem("originalAuthToken");
+			localStorage.removeItem("originalRefreshToken");
+			window.dispatchEvent(new CustomEvent("auth:logout"));
+			return { ok: false };
+		}
+
+		const tokenData = await refreshResponse.json();
+		localStorage.setItem("authToken", tokenData.access_token);
+		if (tokenData.refresh_token) {
+			localStorage.setItem("refreshToken", tokenData.refresh_token);
+		}
+		onRefreshed(tokenData.access_token);
+		window.dispatchEvent(
+			new CustomEvent("auth:token-refreshed", {
+				detail: { token: tokenData.access_token },
+			}),
+		);
+		return { ok: true, token: tokenData.access_token };
+	} catch {
+		localStorage.removeItem("authToken");
+		localStorage.removeItem("refreshToken");
+		localStorage.removeItem("originalAuthToken");
+		localStorage.removeItem("originalRefreshToken");
+		window.dispatchEvent(new CustomEvent("auth:logout"));
+		return { ok: false };
+	} finally {
+		isRefreshing = false;
+	}
+};
+
 export const apiClient = async <T>(
 	endpoint: string,
 	options: RequestInit = {},
@@ -38,47 +113,12 @@ export const apiClient = async <T>(
 	) {
 		const refreshToken = localStorage.getItem("refreshToken");
 		if (refreshToken) {
-			if (!isRefreshing) {
-				isRefreshing = true;
-				try {
-					const refreshResponse = await fetch(`${API_BASE_URL}/refresh`, {
-						method: "POST",
-						headers: {
-							"Content-Type": "application/json",
-						},
-						body: JSON.stringify({ refresh_token: refreshToken }),
-					});
-
-					if (refreshResponse.ok) {
-						const tokenData = await refreshResponse.json();
-						localStorage.setItem("authToken", tokenData.access_token);
-						if (tokenData.refresh_token) {
-							localStorage.setItem("refreshToken", tokenData.refresh_token);
-						}
-						onRefreshed(tokenData.access_token);
-					} else {
-						// Refresh failed
-						localStorage.removeItem("authToken");
-						localStorage.removeItem("refreshToken");
-						localStorage.removeItem("originalAuthToken");
-						localStorage.removeItem("originalRefreshToken");
-						window.location.href = "/login";
-					}
-				} catch {
-					localStorage.removeItem("authToken");
-					localStorage.removeItem("refreshToken");
-					window.location.href = "/login";
-				} finally {
-					isRefreshing = false;
-				}
+			const result = await refreshAccessToken();
+			if (!result.ok || !result.token) {
+				// refreshAccessToken already dispatched auth:logout + cleared
+				// localStorage; AuthContext listener will redirect to /login.
+				throw new Error("Authentication failed");
 			}
-
-			// Wait for the refresh to complete
-			const newAccessToken = await new Promise<string>((resolve) => {
-				subscribeTokenRefresh((token: string) => {
-					resolve(token);
-				});
-			});
 
 			// Retry original request with new token
 			const retryHeaders = new Headers(options.headers);
@@ -87,7 +127,7 @@ export const apiClient = async <T>(
 			if (!options.body || !(options.body instanceof FormData)) {
 				retryHeaders.set("Content-Type", "application/json");
 			}
-			retryHeaders.set("Authorization", `Bearer ${newAccessToken}`);
+			retryHeaders.set("Authorization", `Bearer ${result.token}`);
 			response = await fetch(fullUrl, { ...options, headers: retryHeaders });
 		}
 	}
