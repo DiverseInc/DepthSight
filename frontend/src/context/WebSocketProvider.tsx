@@ -98,45 +98,38 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({
 
 	const socketUrl = useMemo(() => getSocketUrl(authToken), [authToken]);
 
-	// FIX 2026-09-23: track whether the WS ever reached OPEN state. If a close
-	// happens without ever having been OPEN, it's almost certainly a failed
-	// handshake (Starlette maps WS_1008_POLICY_VIOLATION to HTTP 403 BEFORE
-	// websocket.accept() — browser reports this as close code 1006, not 1008).
-	// In that case, trigger refresh. If the connection has been OPEN and then
-	// closed, only refresh on a 1008 (server-side post-handshake policy close).
-	const hasOpenedRef = useRef(false);
-
-	useEffect(() => {
-		if (readyState === 1 /* OPEN */) {
-			hasOpenedRef.current = true;
-		} else if (readyState === 3 /* CLOSED */) {
-			hasOpenedRef.current = false;
-		}
-	}, [readyState]);
-
 	const { lastMessage, readyState, sendMessage } = useBaseWebSocket(
 		socketUrl,
 		{
 			shouldReconnect: () => true,
 			reconnectInterval: 5000,
 			retryOnError: true,
-			// FIX 2026-09-23: trigger JWT refresh on auth-failure closes.
-			// Two cases (see browser verification 2026-09-23):
-			// 1. code === 1008: server accepted the WS, then closed it later
-			//    (token expired mid-session).
-			// 2. code === 1006 (no clean close frame): the server refused the
-			//    WS upgrade with HTTP 403 because the token was already expired
-			//    at connect time. react-use-websocket's onClose still fires
-			//    here, just with 1006 instead of 1008. We disambiguate by
-			//    checking hasOpenedRef: if we never reached OPEN, treat it as
-			//    an auth failure and refresh.
-			// Idempotent via apiClient's isRefreshing flag — repeated closes
-			// during a slow refresh don't queue duplicate API calls.
+			// FIX 2026-09-23 (f269a98, f269a99): trigger JWT refresh on close.
+			//
+			// We refresh on any non-1000 close, not just 1008. The server
+			// (api/websocket_server.py:228,246,258) calls
+			// websocket.close(code=WS_1008_POLICY_VIOLATION) on missing or
+			// expired/invalid tokens. When this close happens BEFORE
+			// websocket.accept() (the common case when the token is already
+			// expired at connect time), Starlette maps the WS close code to
+			// an HTTP status during the upgrade response — WS_1008 → HTTP 403.
+			// The browser never sees a clean WS close frame; it reports the
+			// upgrade failure as HTTP 403 and the WebSocket.close event has
+			// code 1006 (abnormal closure, no status received).
+			//
+			// Treating every non-1000 close as auth-suspect is fine because
+			// apiClient.refreshAccessToken is idempotent — network blips just
+			// return the same token and we reconnect; genuine auth failures
+			// get a fresh token and we reconnect. Repeated closes during a
+			// slow refresh don't queue duplicate API calls (isRefreshing flag
+			// in apiClient.ts).
+			//
+			// Earlier f269a98 used hasOpenedRef to disambiguate 1006 close-
+			// without-ever-OPEN vs 1006-after-OPEN, but that approach caused
+			// a TDZ ReferenceError on page load — reverted here in favor of
+			// the simpler "any non-1000 close" approach.
 			onClose: (event) => {
-				const isAuthFailure =
-					event?.code === 1008 ||
-					(event?.code === 1006 && !hasOpenedRef.current);
-				if (isAuthFailure) {
+				if (event?.code !== 1000) {
 					void refreshAccessToken();
 				}
 			},
