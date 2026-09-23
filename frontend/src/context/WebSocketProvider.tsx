@@ -98,21 +98,45 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({
 
 	const socketUrl = useMemo(() => getSocketUrl(authToken), [authToken]);
 
+	// FIX 2026-09-23: track whether the WS ever reached OPEN state. If a close
+	// happens without ever having been OPEN, it's almost certainly a failed
+	// handshake (Starlette maps WS_1008_POLICY_VIOLATION to HTTP 403 BEFORE
+	// websocket.accept() — browser reports this as close code 1006, not 1008).
+	// In that case, trigger refresh. If the connection has been OPEN and then
+	// closed, only refresh on a 1008 (server-side post-handshake policy close).
+	const hasOpenedRef = useRef(false);
+
+	useEffect(() => {
+		if (readyState === 1 /* OPEN */) {
+			hasOpenedRef.current = true;
+		} else if (readyState === 3 /* CLOSED */) {
+			hasOpenedRef.current = false;
+		}
+	}, [readyState]);
+
 	const { lastMessage, readyState, sendMessage } = useBaseWebSocket(
 		socketUrl,
 		{
 			shouldReconnect: () => true,
 			reconnectInterval: 5000,
 			retryOnError: true,
-			// FIX 2026-09-23: react-use-websocket does not natively refresh JWTs.
-			// The server closes with code 1008 (Policy Violation) on missing or
-			// expired/invalid tokens. On 1008, trigger refreshAccessToken which
-			// will dispatch auth:token-refreshed → AuthContext updates token state
-			// → useMemo reruns with new socketUrl → react-use-websocket reconnects.
-			// Idempotent via apiClient's isRefreshing flag, so repeated close
-			// events during a slow refresh don't queue duplicate refresh calls.
+			// FIX 2026-09-23: trigger JWT refresh on auth-failure closes.
+			// Two cases (see browser verification 2026-09-23):
+			// 1. code === 1008: server accepted the WS, then closed it later
+			//    (token expired mid-session).
+			// 2. code === 1006 (no clean close frame): the server refused the
+			//    WS upgrade with HTTP 403 because the token was already expired
+			//    at connect time. react-use-websocket's onClose still fires
+			//    here, just with 1006 instead of 1008. We disambiguate by
+			//    checking hasOpenedRef: if we never reached OPEN, treat it as
+			//    an auth failure and refresh.
+			// Idempotent via apiClient's isRefreshing flag — repeated closes
+			// during a slow refresh don't queue duplicate API calls.
 			onClose: (event) => {
-				if (event?.code === 1008) {
+				const isAuthFailure =
+					event?.code === 1008 ||
+					(event?.code === 1006 && !hasOpenedRef.current);
+				if (isAuthFailure) {
 					void refreshAccessToken();
 				}
 			},
