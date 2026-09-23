@@ -2896,9 +2896,24 @@ class TradingController:
 
         executor = self.executors.get("live")
         if not executor:
-            logger.warning(
-                f"{log_prefix} Live executor not available. Skipping reconciliation."
-            )
+            # FIX 2026-09-23: downgrade to debug for paper-only controllers
+            # (no API keys → self.api_key_id is None → no live executor by design).
+            # The dashboard "Critical Events" panel surfaces every WARNING, so this
+            # benign message was spamming the user's dashboard. Reconcile does
+            # nothing for paper-only controllers anyway (no positions on an
+            # exchange to reconcile against). Live controllers with a live
+            # executor still go through the same early-return path without a
+            # warning if their executor isn't ready — we keep info-level only on
+            # actual reconciliation attempts.
+            if self.api_key_id is None:
+                logger.debug(
+                    f"{log_prefix} Skipping reconciliation: paper-only controller "
+                    f"(no live executor)."
+                )
+            else:
+                logger.warning(
+                    f"{log_prefix} Live executor not available. Skipping reconciliation."
+                )
             return
         reconcile_market_type = self._normalize_market_type(
             getattr(executor, "market_type", None)
