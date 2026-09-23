@@ -53,7 +53,7 @@ DEFAULT_TRADE_CACHE_SIZE = getattr(
     config, "DEFAULT_TRADE_CACHE_SIZE", 100
 )  # For aggTrade
 BINANCE_WS_RECONNECT_DELAY_BASE = 5  # Seconds
-BINANCE_WS_MAX_RECONNECT_DELAY = 60  # Seconds
+BINANCE_WS_MAX_RECONNECT_DELAY = 300  # Seconds (5 min). FIX 2026-09-23: raised from 60s so stuck-upstream HTTP 525 from Cloudflare (or any persistent connection-refused) doesn't fill the bot logs every minute across many controllers.
 
 # New constants for tape metrics
 TAPE_METRIC_WINDOWS = [5, 10, 30, 60, 120]  # Seconds
@@ -2771,6 +2771,14 @@ class DataConsumer:
 
     async def _main_app_ws_loop(self):
         reconnect_delay = BINANCE_WS_RECONNECT_DELAY_BASE
+        # FIX 2026-09-23: track consecutive failures + last warning timestamp
+        # so HTTP 525 (Cloudflare origin unreachable, retrying won't help) and
+        # other stuck-upstream failures don't flood the bot logs every
+        # reconnect cycle. One warning per failure class, plus a heartbeat
+        # summary every ~5 min so on-call still sees the loop is alive.
+        consecutive_failures = 0
+        last_warn_ts: Dict[str, float] = {}
+        WARN_THROTTLE_SECONDS = 300  # 5 minutes
         logger.info(f"Starting main_app_ws_loop. Connecting to {self._main_app_ws_url}")
         while self._running:
             websocket = None
@@ -2841,6 +2849,9 @@ class DataConsumer:
                     self._main_app_ws = websocket
                     logger.info(f"Connected to main_app_ws at {self._main_app_ws_url}")
                     reconnect_delay = BINANCE_WS_RECONNECT_DELAY_BASE
+                    # FIX 2026-09-23: reset failure state on successful connect
+                    consecutive_failures = 0
+                    last_warn_ts.clear()
                     # No longer sending depth subscriptions upon connection,
                     # since the controller itself will call ensure_subscription,
                     # which will update kline/aggTrade/depth subscriptions directly from Binance.
@@ -2903,12 +2914,14 @@ class DataConsumer:
                 logger.error(
                     f"Invalid URI for MainApp WS: {self._main_app_ws_url}. Loop will pause."
                 )
+                consecutive_failures += 1
             except websockets.exceptions.InvalidStatusCode as e_status:
                 logger.error(
                     f"Main_app_ws connection FAILED with HTTP status {e_status.status_code}. "
                     f"This usually means the URL '{self._main_app_ws_url}' is a regular HTTP endpoint, not a WebSocket. "
                     f"Please check your server and the 'MAIN_APP_WS_URL' config."
                 )
+                consecutive_failures += 1
             except (
                 ConnectionClosed,
                 ConnectionClosedOK,
@@ -2916,9 +2929,24 @@ class DataConsumer:
                 OSError,
                 asyncio.TimeoutError,
             ) as e_conn:
-                logger.warning(
-                    f"Main_app_ws connection error/closed: {type(e_conn).__name__} - {e_conn}"
-                )
+                # FIX 2026-09-23: throttled warning. Without this, a stuck
+                # upstream service (HTTP 525 from Cloudflare, or any
+                # connection-refused storm) floods bot logs every reconnect
+                # cycle — several log lines per second across all bot
+                # containers. Log first occurrence + a heartbeat summary
+                # every WARN_THROTTLE_SECONDS so on-call can still see the
+                # loop is alive but isn't drowned in noise.
+                err_key = type(e_conn).__name__
+                now = asyncio.get_event_loop().time()
+                first_seen = last_warn_ts.get(err_key) is None
+                if first_seen or (now - last_warn_ts[err_key]) >= WARN_THROTTLE_SECONDS:
+                    logger.warning(
+                        f"Main_app_ws {err_key}: {e_conn} "
+                        f"(consecutive_failures={consecutive_failures + 1}, "
+                        f"next retry in {reconnect_delay:.0f}s)"
+                    )
+                    last_warn_ts[err_key] = now
+                consecutive_failures += 1
             except asyncio.CancelledError:
                 logger.info("Main_app_ws_loop cancelled.")
                 break
