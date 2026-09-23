@@ -2713,6 +2713,21 @@ class DataConsumer:
                 channel = _market_data_redis_event_channel(stream_key)
                 if self._redis_market_pubsub:
                     await self._redis_market_pubsub.unsubscribe(channel)
+                # FIX 2026-09-23: SREM from the global market_data:active_streams
+                # SET. The single-stream path at _remove_subscription_via_redis
+                # (line 1777) does this correctly via _track_active_stream_in_redis,
+                # but the bulk-clear path here only published the unsubscribe to
+                # market_data and cleared local dicts — it never SREM'd from the
+                # global SET. This caused leftover entries (e.g. okx_testnet
+                # streams after alex_trader deleted the testnet key) to show up
+                # as `status: unknown` in candle-health forever.
+                #
+                # Await directly (not fire-and-forget) because controller.stop()
+                # is tearing down the data_consumer immediately after; we want
+                # the SET consistent before that happens.
+                await self._track_active_stream_in_redis(
+                    stream_key, add=False
+                )
             self._redis_market_stream_keys.clear()
             self._redis_market_stream_specs.clear()
             return
