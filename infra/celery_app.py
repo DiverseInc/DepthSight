@@ -11,7 +11,7 @@ celery_app = Celery(
     "tasks",
     broker=f"{config.REDIS_URL_BASE}/1",
     backend=f"{config.REDIS_URL_BASE}/2",
-    include=["tasks"],
+    include=["tasks", "api.onboarding_emails"],
 )
 
 celery_app.conf.update(

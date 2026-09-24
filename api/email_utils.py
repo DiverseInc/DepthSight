@@ -1,12 +1,14 @@
-import smtplib
 import os
+import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr
 
+import resend
+
+# --- SMTP fallback (legacy) ----------------------------------------------
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp-pulse.com")
 _smtp_port_raw = os.getenv("SMTP_PORT", "465")
 try:
-    # Cleaning the value of potential garbage (e.g., if a piece of code got into .env)
     if isinstance(_smtp_port_raw, str) and "(" in _smtp_port_raw:
         SMTP_PORT = 465
     else:
@@ -18,20 +20,29 @@ SMTP_USER = os.getenv("SMTP_USER", "allester21212@gmail.com")
 SMTP_SENDER_EMAIL = os.getenv("SMTP_SENDER_EMAIL", "noreply@depthsight.pro")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
+# --- Resend (preferred) ---------------------------------------------------
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+RESEND_FROM_EMAIL = os.getenv(
+    "RESEND_FROM_EMAIL",
+    SMTP_SENDER_EMAIL,  # fall back to the SMTP from-address so we don't break if user only sets one
+)
 
-def send_email(to_email: str, subject: str, html_content: str):
-    """
-    Sends an email via the SMTP server.
 
-    Args:
-        to_email: Receiver's email
-        subject: Subject of the email
-        html_content: HTML content of the email
+def _send_via_resend(to_email: str, subject: str, html_content: str) -> None:
+    """Send via the Resend API. Uses the official `resend` Python client."""
+    resend.api_key = RESEND_API_KEY
+    resend.Emails.send(
+        {
+            "from": formataddr(("DepthSight", RESEND_FROM_EMAIL)),
+            "to": [to_email],
+            "subject": subject,
+            "html": html_content,
+        }
+    )
 
-    Raises:
-        ValueError: If the SMTP password is not configured
-        Exception: Upon email sending error
-    """
+
+def _send_via_smtp(to_email: str, subject: str, html_content: str) -> None:
+    """Legacy SMTP send — used only when RESEND_API_KEY is unset."""
     if not SMTP_PASSWORD or SMTP_PASSWORD == "YOUR_SMTP_PASSWORD":
         print(
             f"ERROR: SMTP password is not configured. Cannot send email to {to_email}"
@@ -63,3 +74,17 @@ def send_email(to_email: str, subject: str, html_content: str):
             f"✗ Unexpected error sending email to {to_email}: {type(e).__name__}: {e}"
         )
         raise
+
+
+def send_email(to_email: str, subject: str, html_content: str):
+    """
+    Send a transactional email. Prefers Resend (when RESEND_API_KEY is set),
+    falls back to legacy SMTP for backwards compatibility.
+
+    Callers don't need to know which transport was used — this is the only
+    public function in the email layer.
+    """
+    if RESEND_API_KEY and RESEND_API_KEY.startswith("re_"):
+        _send_via_resend(to_email, subject, html_content)
+        return
+    _send_via_smtp(to_email, subject, html_content)

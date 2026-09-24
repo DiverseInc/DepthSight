@@ -753,6 +753,33 @@ async def get_user_by_id(db: AsyncSession, user_id: int) -> Optional[models.User
     return result.scalars().first()
 
 
+async def user_has_any_live_strategy(
+    db: AsyncSession, user_id: int
+) -> bool:
+    """
+    True if the user has at least one currently-running LIVE strategy.
+
+    Used by the onboarding email sequence to short-circuit "stay on paper
+    longer" content once a user has graduated to live trading.
+
+    A live strategy = StrategyConfig.is_running AND run_mode='live'.
+    """
+    from sqlalchemy import and_
+
+    result = await db.execute(
+        select(models.StrategyConfig.id)
+        .where(
+            and_(
+                models.StrategyConfig.user_id == user_id,
+                models.StrategyConfig.is_running.is_(True),
+                models.StrategyConfig.run_mode == "live",
+            )
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 async def ensure_user_tradingview_webhook_token(
     db: AsyncSession, user: models.User
 ) -> models.User:

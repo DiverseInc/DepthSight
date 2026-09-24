@@ -75,6 +75,32 @@ def _send_welcome_email(user) -> None:
         )
 
 
+# --- Onboarding sequence scheduler (non-blocking) ------------------------
+def _schedule_onboarding_sequence(user_id: int) -> None:
+    """
+    Queue the 7-email onboarding sequence for this user.
+
+    Best-effort: any Celery/Redis failure is logged and swallowed so it
+    never blocks the auth flow. The user is already created and can log in
+    even if scheduling fails.
+
+    Each email is its own Celery task (`api.onboarding_emails.send_onboarding_email`)
+    scheduled at signup + N days. The task self-skips paper-nag content once
+    the user goes live.
+    """
+    try:
+        from ..onboarding_emails import schedule_onboarding_sequence
+
+        schedule_onboarding_sequence(user_id)
+        logger.info(f"Onboarding sequence scheduled for user {user_id}")
+    except Exception as e:
+        logger.warning(
+            f"Onboarding sequence NOT scheduled for user {user_id}: "
+            f"{type(e).__name__}: {e}. (Celery likely unavailable; "
+            f"user can still log in.)"
+        )
+
+
 # Rate limiting fallback
 def get_limit_value(val: str) -> str:
     return val
@@ -375,6 +401,8 @@ async def register_user(
         await db.commit()
         # Best-effort welcome email (non-blocking)
         _send_welcome_email(new_user)
+        # Best-effort onboarding sequence scheduling (non-blocking)
+        _schedule_onboarding_sequence(new_user.id)
         return {
             "data": {
                 "message": "Registration successful. You can now log in.",
@@ -477,6 +505,8 @@ async def confirm_email(token: str, db: AsyncSession = Depends(get_db)):
         # Welcome email only on the activation transition (not on every
         # resend / re-click of the confirmation link).
         _send_welcome_email(user)
+        # Onboarding sequence scheduled only on the activation transition.
+        _schedule_onboarding_sequence(user.id)
 
     # Create token and return complete login response
     access_token_expires = timedelta(minutes=security.ACCESS_TOKEN_EXPIRE_MINUTES)
