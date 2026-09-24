@@ -53,6 +53,7 @@ import LaboratoryPage from "./pages/LaboratoryPage";
 import LeaderboardPage from "./pages/LeaderboardPage";
 // Page imports that EXIST in this application
 import LoginPage from "./pages/Login";
+import LandingPage from "./pages/LandingPage";
 import MLCorePage from "./pages/MLCorePage";
 import NotFound from "./pages/NotFound";
 import OptimizationViewerPage from "./pages/OptimizationViewerPage";
@@ -123,6 +124,7 @@ function App() {
 										<PortfolioModeProvider>
 											<Routes>
 												<Route element={<PublicLayout />}>
+													<Route path="/welcome" element={<LandingPage />} />
 													<Route path="/login" element={<LoginPage />} />
 													<Route path="/register" element={<RegisterPage />} />
 													<Route
