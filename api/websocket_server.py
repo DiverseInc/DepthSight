@@ -387,5 +387,20 @@ async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(
             del active_listeners[websocket]
 
 
+@app.websocket("/ws/main")
+async def websocket_main_alias(websocket: WebSocket, token: Optional[str] = Query(None)):
+    """
+    Alias for /ws — frontend's WebSocket client connects to /ws/main path.
+
+    Starlette returns 403 (not 404) for any unregistered WebSocket path, which
+    surfaced in the dashboard as ~19h of "WS 403" entries in Critical Events.
+    Adding this alias keeps both /ws and /ws/main working without forcing a
+    frontend rebuild.
+
+    See Linear DIV-10 + WS-403-Patch.md (2026-09-24).
+    """
+    return await websocket_endpoint(websocket, token)
+
+
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8765)
