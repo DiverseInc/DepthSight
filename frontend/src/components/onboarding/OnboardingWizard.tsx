@@ -37,7 +37,10 @@ async function startPaperStrategy(payload: {
   const res = await fetch("/api/v1/onboarding/start-paper-strategy", {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${localStorage.getItem("authToken") || ""}`,
+    },
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
@@ -63,6 +66,14 @@ async function validateOkxKey(payload: {
   const res = await fetch("/api/v1/onboarding/validate-okx-key", {
     method: "POST",
     credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${localStorage.getItem("authToken") || ""}`,
+    },
+    body: JSON.stringify(payload),
+  });
+    method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
@@ -80,6 +91,14 @@ async function validateOkxKey(payload: {
 
 async function convertToLive(payload: { config_id: string }) {
   const res = await fetch("/api/v1/onboarding/convert-to-live", {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${localStorage.getItem("authToken") || ""}`,
+    },
+    body: JSON.stringify(payload),
+  });
     method: "POST",
     credentials: "include",
     headers: { "Content-Type": "application/json" },
