@@ -194,6 +194,7 @@ function App() {
 													</Route>
 
 													<Route element={<ProtectedLayout />}>
+														<Route path="/onboarding" element={<OnboardingPage />} />
 														<Route path="/" element={<Index />} />
 														<Route path="/hub" element={<CommunityHub />} />
 														<Route path="/positions" element={<Positions />} />

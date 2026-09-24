@@ -1504,6 +1504,32 @@ async def get_active_api_keys_for_user(
     return result.scalars().all()
 
 
+async def list_active_api_keys_for_user(
+    db: AsyncSession,
+    user_id: int,
+    exchange: str,
+) -> List[models.ApiKey]:
+    """
+    Return active (is_active=True, status != 'invalid') API keys for a user
+    on a specific exchange, ordered newest-first.
+
+    Used by the onboarding wizard's convert-to-live step to pick which
+    OKX key to attach to a freshly-graduated strategy. If multiple exist,
+    pick index [0] (most recent).
+    """
+    result = await db.execute(
+        select(models.ApiKey)
+        .filter(
+            models.ApiKey.user_id == user_id,
+            models.ApiKey.is_active,
+            models.ApiKey.status != "invalid",
+            models.ApiKey.exchange == exchange,
+        )
+        .order_by(models.ApiKey.id.desc())
+    )
+    return result.scalars().all()
+
+
 async def get_active_api_key_for_user(
     db: AsyncSession, user_id: int
 ) -> Optional[models.ApiKey]:
