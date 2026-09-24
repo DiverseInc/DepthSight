@@ -3,10 +3,17 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { ShieldAlert } from "lucide-react";
 import type React from "react";
+import { useAuth } from "@/context/AuthContext";
 import { usePortfolioMode } from "@/context/PortfolioModeContext";
 
 export const PaperModeBanner: React.FC = () => {
 	const { mode } = usePortfolioMode();
+	const { isAuthenticated } = useAuth();
+
+	// Banner is only relevant to authenticated users. Unauthenticated visitors
+	// (e.g. on the marketing landing page) shouldn't see a "you're in paper
+	// trading mode" message before they've even signed up.
+	if (!isAuthenticated) return null;
 
 	return (
 		<AnimatePresence>
