@@ -11,10 +11,10 @@ import { OnboardingWizard } from "@/components/onboarding/OnboardingWizard";
 import { Button } from "@/components/ui/button";
 
 const Onboarding = () => {
-  const { isAuthenticated, isLoading } = useAuth();
+  const { token, user, isLoading } = useAuth();
 
   if (isLoading) return null;
-  if (!isAuthenticated) {
+  if (!token || !user) {
     return <Navigate to="/login" replace />;
   }
 
