@@ -25,6 +25,7 @@ import { WebSocketProvider } from "@/context/WebSocketProvider";
 import AdminRoute from "./components/auth/AdminRoute";
 import { GeneDiscoveryNotification } from "./components/genome/GeneDiscoveryNotification";
 import OnboardingTutorial from "./components/OnboardingTutorial";
+import OnboardingPage from "./pages/Onboarding";
 import { PaperModeBanner } from "./components/shared/PaperModeBanner";
 import HftDashboardPage from "./features/hft-dashboard/HftDashboardPage";
 import AccountPage from "./pages/Account";
