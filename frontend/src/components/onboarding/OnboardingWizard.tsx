@@ -72,11 +72,6 @@ async function validateOkxKey(payload: {
     },
     body: JSON.stringify(payload),
   });
-    method: "POST",
-    credentials: "include",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.detail || `HTTP ${res.status}`);
