@@ -114,7 +114,7 @@ async def start_paper_strategy(
     """
     # 1. Resolve template
     template = await crud.get_strategy_template_by_slug(db, req.template_slug)
-    if not template or not template.active:
+    if not template or not template.is_active:
         raise HTTPException(
             status_code=404,
             detail=f"Strategy template '{req.template_slug}' not found or inactive",
