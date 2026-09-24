@@ -139,33 +139,31 @@ async def start_paper_strategy(
         db=db, user_id=current_user.id, config_create=config_create
     )
 
-    # 3. Publish START_STRATEGY to bot via Redis pubsub.
-    # Mirrors the existing /api/v1/strategies start flow but bundled with
-    # the config creation. Bot listener is in bot_module/controller.py.
+    # 3. Hand off to the canonical start flow. This builds the full
+    # `{"command": "START_STRATEGY", "payload": {...}}` envelope the bot's
+    # `_handle_start_strategy_command` expects, applies plan/api_key
+    # restrictions, fills in `name`/`description`/`use_ml_confirmation`/etc.,
+    # and publishes to depthsight:commands.
+    from .strategies import start_strategy_instance
+    start_req = schemas.StrategyStartRequest(
+        config_id=db_config.id,
+        mode="paper",
+        symbol_selection_mode="FIXED",
+        symbols=[req.symbol],
+        params=None,
+        api_key_id=None,
+    )
     try:
-        import json as _json
-        from bot_module import config as bot_config
-        command_channel = getattr(
-            bot_config, "REDIS_COMMAND_CHANNEL", "depthsight:commands"
+        await start_strategy_instance(
+            request=start_req,
+            redis_client=await get_redis_client(),
+            current_user=current_user,
+            db=db,
         )
-        redis_client = await get_redis_client()
-        # Start command payload — same shape used by /api/v1/strategies POST
-        cmd_payload = {
-            "action": "START_STRATEGY",
-            "user_id": current_user.id,
-            "config_id": db_config.id,
-            "template_slug": req.template_slug,
-            "symbol": req.symbol,
-            "timeframe": req.timeframe,
-            "mode": "paper",
-            "position_size_pct": req.position_size_pct,
-            "stop_loss_pct": req.stop_loss_pct,
-            "take_profit_pct": req.take_profit_pct,
-            "max_concurrent": req.max_concurrent,
-            "source": "onboarding_wizard",
-        }
-        await redis_client.publish(command_channel, _json.dumps(cmd_payload))
-        status_msg = "queued"  # bot picks it up async; not blocking this response
+        status_msg = "started"
+    except HTTPException as he:
+        # Plan restriction, missing config, etc. Re-raise so the wizard UI shows it.
+        raise he
     except Exception as e:
         logger.warning(
             f"start_paper_strategy: failed to publish START_STRATEGY for user "
