@@ -170,6 +170,108 @@ async def _clear_strategy_runtime_state(
         )
 
 
+async def _rehydrate_all_strategies_globally(redis_client) -> None:
+    """
+    Belt-and-suspenders global rehydrate of every cached strategy payload.
+
+    Scans `running_strategy_payload:*` keys in the bot's main Redis (ACL user=bot)
+    and republishes a START_STRATEGY command for each (user_id, config_id) pair on
+    the shared command channel. Runs once at bot startup, after every per-user
+    controller has finished initializing — so the per-controller command listeners
+    are already subscribed and can route the republished commands to the right
+    user_id via the payload.
+
+    Why a second rehydrate layer on top of controller._rehydrate_running_strategies_from_redis():
+        The per-controller rehydrate is gated on the controller existing. If a
+        user's controller init fails (e.g. transient DB error, race during
+        paper-controller spawn, exchange key validation glitch), their strategies
+        are silently dropped on every bot restart. diverseinc's 2 strategies came
+        back but alex_trader's 3 didn't, even though both users had controllers.
+        The global pass covers that gap: it runs in `run_bot()` itself, so a
+        bot process crash during controller init doesn't block the rehydrate.
+
+    Idempotent: `_handle_start_strategy_command` silently skips already-running
+    instances, so a duplicate publish from per-controller + global is harmless.
+    """
+    log_prefix = "[GlobalRehydrateStrategies]"
+
+    if redis_client is None:
+        logger.warning(f"{log_prefix} No redis_client available; skipping global rehydrate.")
+        return
+
+    try:
+        payload_keys = []
+        async for k in redis_client.scan_iter(
+            match="running_strategy_payload:*", count=100
+        ):
+            payload_keys.append(k)
+
+        if not payload_keys:
+            logger.info(
+                f"{log_prefix} No running_strategy_payload:* keys in Redis; nothing to republish."
+            )
+            return
+
+        total_published = 0
+        skipped_malformed = 0
+        for payload_key in payload_keys:
+            if isinstance(payload_key, bytes):
+                payload_key = payload_key.decode("utf-8")
+
+            # Key shape: running_strategy_payload:{user_id}:{config_id}
+            parts = payload_key.split(":", 2)
+            if len(parts) != 3:
+                logger.warning(
+                    f"{log_prefix} Skipping malformed key (expected "
+                    f"running_strategy_payload:<user_id>:<config_id>): {payload_key}"
+                )
+                skipped_malformed += 1
+                continue
+
+            user_id_str, config_id = parts[1], parts[2]
+            payload_raw = await redis_client.get(payload_key)
+            if not payload_raw:
+                logger.warning(
+                    f"{log_prefix} Empty payload at {payload_key}; skipping."
+                )
+                skipped_malformed += 1
+                continue
+
+            if isinstance(payload_raw, bytes):
+                payload_raw = payload_raw.decode("utf-8")
+
+            try:
+                payload = json.loads(payload_raw)
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    f"{log_prefix} Failed to parse payload JSON at {payload_key}: {exc}; skipping."
+                )
+                skipped_malformed += 1
+                continue
+
+            command = {"command": "START_STRATEGY", "payload": payload}
+            await redis_client.publish(
+                config.REDIS_COMMAND_CHANNEL,
+                json.dumps(command, default=str),
+            )
+            total_published += 1
+            logger.info(
+                f"{log_prefix} Re-published START_STRATEGY for "
+                f"user_id={user_id_str} config_id={config_id} via {config.REDIS_COMMAND_CHANNEL}."
+            )
+
+        logger.info(
+            f"{log_prefix} Global rehydrate complete. Published {total_published} "
+            f"START_STRATEGY command(s); skipped {skipped_malformed} malformed key(s)."
+        )
+    except Exception as exc:
+        # Never let a rehydrate failure kill the bot startup — log and continue.
+        logger.error(
+            f"{log_prefix} Global rehydrate failed: {exc}",
+            exc_info=True,
+        )
+
+
 # --- Signal Handler ---
 def handle_signal(signum, frame):
     logger.warning(f"Received signal {signum}. Initiating shutdown...")
@@ -306,6 +408,15 @@ async def run_bot(shard_id: int = 0, num_workers: int = 1):
                 await _initialize_paper_controller_for_user(
                     user, db, session, redis_client, telegram_notifier
                 )
+
+        # 3.5 Global rehydrate — belt-and-suspenders safety net for the
+        # per-controller rehydrate in controller.py. Runs once, after every
+        # per-user controller has finished initializing (so their command
+        # listeners are already subscribed to depthsight:commands). Re-publishes
+        # a START_STRATEGY command for every cached strategy payload; the
+        # receiving controller silently skips already-running instances, so a
+        # duplicate publish (per-controller + global) is safe.
+        await _rehydrate_all_strategies_globally(redis_client)
 
         # 4. Start the command listener and wait for shutdown
         logger.info(
