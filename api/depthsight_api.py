@@ -1155,7 +1155,7 @@ async def perform_node_hub_sync():
     import time
     from pathlib import Path
 
-    hub_url = os.getenv("FEDERATION_HUB_URL", "https://app.depthsight.pro/api/v1/hub")
+    hub_url = os.getenv("FEDERATION_HUB_URL", "https://depthsight.diverseinc.net/api/v1/hub")
     hub_url = hub_url.rstrip("/")
 
     identity_path = Path("/app/data/node_identity.json")
@@ -1456,8 +1456,8 @@ async def add_security_headers(request: Request, call_next):
         "max-age=31536000; includeSubDomains"
     )
 
-    public_base_url = os.getenv("PUBLIC_BASE_URL", "https://app.depthsight.pro").strip()
-    api_domain = os.getenv("API_DOMAIN", "app.depthsight.pro").strip()
+    public_base_url = os.getenv("PUBLIC_BASE_URL", "https://depthsight.diverseinc.net").strip()
+    api_domain = os.getenv("API_DOMAIN", "depthsight.diverseinc.net").strip()
     ws_protocol = "wss" if public_base_url.startswith("https") else "ws"
     ws_url = f"{ws_protocol}://{api_domain}"
 

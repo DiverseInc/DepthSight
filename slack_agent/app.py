@@ -70,7 +70,7 @@ class DepthSightAPIClient:
     def get_headers(self, email: str) -> dict:
         """Generates trusted headers on behalf of a specific user email, falling back to JWT."""
         headers = {}
-        # Direct JWT Token override (great for testing remote production app.depthsight.pro)
+        # Direct JWT Token override (great for testing remote production depthsight.diverseinc.net)
         jwt_token = os.environ.get("DEPTHSIGHT_JWT_TOKEN", "")
         if jwt_token:
             headers["Authorization"] = f"Bearer {jwt_token}"
@@ -487,7 +487,7 @@ class SlackWebSocketWrapper:
                                         "text": "🖥️ Open in Editor",
                                         "emoji": True,
                                     },
-                                    "url": f"https://app.depthsight.pro/editor/{config_id}",
+                                    "url": f"https://depthsight.diverseinc.net/editor/{config_id}",
                                     "action_id": "button_open_editor",
                                 },
                                 {
@@ -1297,7 +1297,7 @@ async def handle_chat_message(
                                 "text": "🖥️ Open in Editor",
                                 "emoji": True,
                             },
-                            "url": f"https://app.depthsight.pro/editor/{config_id}",
+                            "url": f"https://depthsight.diverseinc.net/editor/{config_id}",
                             "action_id": "button_open_editor",
                         },
                         {

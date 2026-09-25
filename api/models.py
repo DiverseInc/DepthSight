@@ -246,9 +246,9 @@ class StrategyTemplate(Base):
     'Verified Templates' tab. Populated on first API startup with the six
     built-in archetypes; admins can add more later via a CRUD endpoint.
 
-    Replaces the previous CORS-blocked external call to app.depthsight.pro
-    on self-hosted deployments — verified templates now come from the
-    deployment's own database.
+    Replaces the previous CORS-blocked external call to the upstream
+    DepthSight-Pro SaaS at app.depthsight.pro on self-hosted deployments —
+    verified templates now come from the deployment's own database.
     """
 
     __tablename__ = "strategy_templates"

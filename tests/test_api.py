@@ -152,13 +152,13 @@ async def test_get_tradingview_webhook_info_generates_missing_token(
 async def test_get_tradingview_webhook_info_prefers_public_base_url(
     pro_user_client: AsyncClient, pro_user: models.User, monkeypatch
 ):
-    monkeypatch.setenv("PUBLIC_BASE_URL", "https://app.depthsight.pro")
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://depthsight.diverseinc.net")
 
     response = await pro_user_client.get("/api/v1/webhooks/tv-info")
     assert response.status_code == 200
 
     data = response.json()["data"]
-    assert data["url"].startswith("https://app.depthsight.pro/webhooks/tv/")
+    assert data["url"].startswith("https://depthsight.diverseinc.net/webhooks/tv/")
     assert data["url"].endswith(pro_user.tradingview_webhook_token)
 
 

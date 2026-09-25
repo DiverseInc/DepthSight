@@ -124,7 +124,7 @@ async def render_shared_backtest(
         title = f"DepthSight Report: {strategy_name} on {symbol}"
         description = f"Performance: {pnl_str} PNL | Win Rate: {win_rate:.1f}%. View detailed backtest analytics on DepthSight AI Platform."
 
-        host = request.headers.get("host", "app.depthsight.pro")
+        host = request.headers.get("host", "depthsight.diverseinc.net")
         scheme = request.headers.get("x-forwarded-proto", "https")
         abs_base_url = f"{scheme}://{host}"
 

@@ -103,7 +103,7 @@ async def create_payment(
     try:
         bitcart_api_url = os.getenv(
             "BITCART_API_URL"
-        )  # e.g. https://app.depthsight.pro/bitcart-api
+        )  # e.g. https://depthsight.diverseinc.net/bitcart-api
         bitcart_api_key = os.getenv("BITCART_API_KEY")
         bitcart_store_id = os.getenv("BITCART_STORE_ID")
         frontend_url = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")
@@ -120,7 +120,7 @@ async def create_payment(
         }
 
         # Use the actual external API URL for webhooks so Bitcart can reach us
-        api_base_url = os.getenv("API_BASE_URL", "https://app.depthsight.pro/api/v1")
+        api_base_url = os.getenv("API_BASE_URL", "https://depthsight.diverseinc.net/api/v1")
 
         payload = {
             "price": float(price_usd),

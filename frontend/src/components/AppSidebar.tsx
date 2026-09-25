@@ -128,7 +128,7 @@ export function AppSidebar() {
 	React.useEffect(() => {
 		const hubApiUrl =
 			import.meta.env.VITE_HUB_API_URL ||
-			"https://app.depthsight.pro/api/v1/hub";
+			"https://depthsight.diverseinc.net/api/v1/hub";
 		fetch(`${hubApiUrl}/nodes`)
 			.then((res) => {
 				if (!res.ok) throw new Error();

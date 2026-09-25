@@ -794,7 +794,7 @@ const CommunityHub = () => {
 	const updateConfig = useUpdateConfig();
 	const { user } = useAuth();
 	const hubApiUrl =
-		import.meta.env.VITE_HUB_API_URL || "https://app.depthsight.pro/api/v1/hub";
+		import.meta.env.VITE_HUB_API_URL || "https://depthsight.diverseinc.net/api/v1/hub";
 
 	// Tier hierarchy: free < standard < pro < premium.
 	// Used to gate which verified templates the user can import.
@@ -1073,7 +1073,7 @@ const CommunityHub = () => {
 	const hubEnabled =
 		import.meta.env.VITE_HUB_ENABLED === "true" ||
 		(import.meta.env.VITE_HUB_ENABLED === undefined &&
-			hubApiUrl.includes("app.depthsight.pro"));
+			hubApiUrl.includes("depthsight.diverseinc.net"));
 
 	const fetchActiveNodes = React.useCallback(() => {
 		if (!hubEnabled) {

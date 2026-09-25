@@ -1,7 +1,8 @@
 """
 StrategyTemplate routes — curated verified strategy templates surfaced on
 the Discovery Hub's "Verified Templates" tab. Replaces the previous
-CORS-blocked external call to app.depthsight.pro on self-hosted deployments.
+CORS-blocked external call to the upstream DepthSight-Pro SaaS at
+app.depthsight.pro on self-hosted deployments.
 
 These endpoints are PUBLIC (no auth required) so the Hub can be browsed by
 unauthenticated visitors. The "Use Template" import flow (separate POST
