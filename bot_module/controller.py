@@ -12647,9 +12647,20 @@ class TradingController:
     async def _update_market_info_cache(self, force: bool = False):
         log_prefix = "[MarketInfoCache]"
         try:
-            exchange_info = await self.executors["live"].fetch_exchange_info(
-                force_update=force
-            )
+            exchange_info = None
+            live_executor = self.executors.get("live")
+            if live_executor is None:
+                # Paper-only mode (no API key wired) — nothing to cache.
+                # market_executors below may still populate if non-default
+                # market types are configured.
+                logger.debug(
+                    f"{log_prefix} Skipped: no live executor (paper-only mode)."
+                )
+                # fall through to the market_executors loop below
+            else:
+                exchange_info = await live_executor.fetch_exchange_info(
+                    force_update=force
+                )
             if exchange_info and isinstance(exchange_info.get("symbols"), list):
                 new_cache = {}
                 processed_count = 0
