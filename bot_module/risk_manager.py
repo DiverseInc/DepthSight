@@ -1480,24 +1480,26 @@ class RiskManager:
 
         # 2. Maximum position nominal in USD
         #
-        # Deliberately mode-aware. MAX_REAL_POSITION_SIZE_PCT_BALANCE (added in
-        # 474fca3) is the LIVE cap; BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE governs
-        # paper sizing and backtests. The original lookup unconditionally preferred
-        # the REAL constant, so defining it at 0.10 silently applied the live cap to
-        # every paper strategy and every backtest too, shrinking their positions by
-        # ~100x and making previously-saved backtest results impossible to
-        # reproduce. Paper and backtest sizing must keep using the backtest value.
-        if mode == "live":
-            max_pos_size_pct_cfg = getattr(
-                config,
-                "MAX_REAL_POSITION_SIZE_PCT_BALANCE",  # Live-specific cap
-                getattr(config, "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE", 0.50),
-            )
-        else:
+        # Deliberately mode-aware, and deliberately written as "not paper"
+        # rather than "== live". TradingController._executor_for_market_type
+        # (controller.py:786) resolves the executor with `if mode == "paper":
+        # ... else: <live executor>`, i.e. everything that is not "paper"
+        # trades real money. An `if mode == "live"` test here would fail OPEN
+        # in exactly that gap: an unexpected value ("testnet", "LIVE", None)
+        # would select the live executor but silently get the 10.0 backtest
+        # cap. Matching the executor's own fail-direction keeps the cap
+        # fail-closed: only an explicit "paper" gets the backtest cap.
+        if mode == "paper":
             max_pos_size_pct_cfg = getattr(
                 config,
                 "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE",
                 0.50,
+            )
+        else:
+            max_pos_size_pct_cfg = getattr(
+                config,
+                "MAX_REAL_POSITION_SIZE_PCT_BALANCE",  # Live-specific cap
+                getattr(config, "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE", 0.50),
             )
         max_notional_for_position_usd = current_balance_val * max_pos_size_pct_cfg
         logger.debug(
