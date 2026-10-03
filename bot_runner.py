@@ -587,7 +587,7 @@ async def _initialize_paper_controller_for_user(
 
         market_default_exchange = os.environ.get(
             "MARKET_DATA_DEFAULT_EXCHANGE", "okx"
-        ).lower()
+        ).lower().replace("_testnet", "")
         market_executors_for_data_consumer: Dict[str, Any] = {}
         for mt in ("futures_usdtm", "spot"):
             try:

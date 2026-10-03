@@ -2706,11 +2706,17 @@ class FastVectorBacktester:
         min_notional = self.exchange_info.get(
             "min_notional", self.exchange_info.get("minNotional")
         )
+        # Backtester: always use the BACKTEST sizing cap. This must NOT read
+        # MAX_REAL_POSITION_SIZE_PCT_BALANCE — that is the live-trading cap
+        # (0.10 as of 474fca3) and self.config falls back to the global
+        # bot_module.config, so preferring it here would silently tighten every
+        # backtest's position sizing by ~100x and make saved results
+        # irreproducible.
         max_notional_multiplier = self._coerce_float(
             getattr(
                 self.config,
-                "MAX_REAL_POSITION_SIZE_PCT_BALANCE",
-                getattr(self.config, "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE", 0.50),
+                "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE",
+                0.50,
             ),
             0.50,
         )
@@ -2819,11 +2825,13 @@ class FastVectorBacktester:
         if entry_price <= 0 or initial_risk_usd_planned <= 0:
             return 0.0, 0.0, "INVALID_ENTRY_PRICE"
 
+        # Backtester: BACKTEST cap only — see the note on the identical lookup
+        # in the sizing helper above. Must not inherit the live-trading cap.
         max_notional_multiplier = self._coerce_float(
             getattr(
                 self.config,
-                "MAX_REAL_POSITION_SIZE_PCT_BALANCE",
-                getattr(self.config, "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE", 0.50),
+                "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE",
+                0.50,
             ),
             0.50,
         )

@@ -82,6 +82,21 @@ class MarketDataService:
     def _get_consumer(self, exchange_id: str) -> DataConsumer:
         """Dynamically creates or retrieves a DataConsumer for the specified exchange."""
         exchange_id = exchange_id.lower()
+        # This service only ever runs PUBLIC, unauthenticated market data — every
+        # executor below is built with empty credentials. Callers can still hand
+        # us "<exchange>_testnet": bot_module/data_consumer.py appends that suffix
+        # to the subscribe spec whenever the subscriber holds testnet credentials.
+        # Passing it straight through makes create_exchange_executor() raise
+        # (commit 474fca3 added a guard refusing to fall back to mainnet when a
+        # `_testnet` request arrives without credentials), which would silently
+        # kill candle flow for every testnet user.
+        #
+        # Normalize to the mainnet public stream instead. Same reasoning as the
+        # 2026-09-20 paper-mode fix in the factory: we cannot authenticate to
+        # testnet from here, and OKX testnet public streams go quiet after the
+        # initial backfill. Orders are untouched — the bot's trading executor
+        # keeps sandbox=True on the real testnet key.
+        exchange_id = exchange_id.replace("_testnet", "")
         if exchange_id not in self.consumers:
             logger.info("Creating DataConsumer for exchange: %s", exchange_id)
             futures_executor = create_exchange_executor(

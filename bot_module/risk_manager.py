@@ -1479,12 +1479,26 @@ class RiskManager:
             return False, None, initial_base_risk_usd_planned, "ZERO_RISK"
 
         # 2. Maximum position nominal in USD
-        # Use a parameter from config (may be specific to the backtester or live trading)
-        max_pos_size_pct_cfg = getattr(
-            config,
-            "MAX_REAL_POSITION_SIZE_PCT_BALANCE",  # Searching first for real-specific
-            getattr(config, "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE", 0.50),
-        )  # Fallback to backtester one
+        #
+        # Deliberately mode-aware. MAX_REAL_POSITION_SIZE_PCT_BALANCE (added in
+        # 474fca3) is the LIVE cap; BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE governs
+        # paper sizing and backtests. The original lookup unconditionally preferred
+        # the REAL constant, so defining it at 0.10 silently applied the live cap to
+        # every paper strategy and every backtest too, shrinking their positions by
+        # ~100x and making previously-saved backtest results impossible to
+        # reproduce. Paper and backtest sizing must keep using the backtest value.
+        if mode == "live":
+            max_pos_size_pct_cfg = getattr(
+                config,
+                "MAX_REAL_POSITION_SIZE_PCT_BALANCE",  # Live-specific cap
+                getattr(config, "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE", 0.50),
+            )
+        else:
+            max_pos_size_pct_cfg = getattr(
+                config,
+                "BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE",
+                0.50,
+            )
         max_notional_for_position_usd = current_balance_val * max_pos_size_pct_cfg
         logger.debug(
             f"{log_prefix} Max Position Notional (config {max_pos_size_pct_cfg * 100:.2f}% of balance ${current_balance_val:.2f}): ${max_notional_for_position_usd:.2f}"
