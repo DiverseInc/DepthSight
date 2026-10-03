@@ -5,7 +5,7 @@ import logging
 import uuid
 from typing import Dict, Any, Optional, List
 from sqlalchemy.ext.asyncio import AsyncSession
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from bot_module.runtime_dependencies import crud
 from .data_consumer import DataConsumer
@@ -14,7 +14,16 @@ from .execution_simulator import (
     FillType,
 )
 from .strategy import SignalDirection
-from bot_module.config import BACKTEST_COMMISSION_PCT, BACKTEST_SLIPPAGE_PCT
+from bot_module.config import (
+    BACKTEST_COMMISSION_PCT,
+    BACKTEST_SLIPPAGE_PCT,
+    PAPER_ASSUMED_LEVERAGE,
+    PAPER_FUNDING_INTERVAL_HOURS,
+    PAPER_FUNDING_RATE_8H,
+    PAPER_LIQUIDATION_MMR,
+    PAPER_SIMULATE_FUNDING,
+    PAPER_SIMULATE_LIQUIDATION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -224,13 +233,29 @@ class PaperTradingExecutor:
                             else -sim_result.filled_quantity
                         )
 
+                        position_leverage = self._leverage_from_signal_details(
+                            kwargs.get("signal_details")
+                        )
+                        now_ts = datetime.now(timezone.utc)
+
                         if symbol not in self._positions:
                             self._positions[symbol] = {
                                 "quantity": position_change,
                                 "avg_entry_price": sim_result.avg_fill_price,
-                                "entry_timestamp": datetime.now(
-                                    timezone.utc
-                                ),  # Save entry time
+                                "entry_timestamp": now_ts,  # Save entry time
+                                "leverage": position_leverage,
+                                # Funding settles on fixed UTC boundaries. Anchor to the
+                                # entry time; _funding_periods_since() only counts
+                                # boundaries strictly after it, so a position opened at
+                                # 07:59 is not billed a full period for 1 minute of
+                                # exposure.
+                                "last_funding_timestamp": now_ts,
+                                # Carried so a forced close (liquidation) records a
+                                # trade that groups with the normal entry trade.
+                                "strategy_config_id": kwargs.get("strategy_config_id"),
+                                "entry_client_order_id": kwargs.get(
+                                    "entry_client_order_id"
+                                ),
                             }
                         else:
                             old_pos = self._positions[symbol]
@@ -252,9 +277,31 @@ class PaperTradingExecutor:
                                         old_avg_price  # Entry price does not change
                                     )
 
+                                # Carry entry time and leverage forward. The previous
+                                # code rebuilt this dict with only quantity and price,
+                                # silently dropping entry_timestamp on every scale-in
+                                # and reduction — which reset the position's age and
+                                # would also reset funding accounting.
                                 self._positions[symbol] = {
                                     "quantity": new_qty,
                                     "avg_entry_price": new_avg_price,
+                                    "entry_timestamp": old_pos.get(
+                                        "entry_timestamp", now_ts
+                                    ),
+                                    "leverage": old_pos.get(
+                                        "leverage", position_leverage
+                                    ),
+                                    "last_funding_timestamp": old_pos.get(
+                                        "last_funding_timestamp", now_ts
+                                    ),
+                                    "strategy_config_id": old_pos.get(
+                                        "strategy_config_id"
+                                    )
+                                    or kwargs.get("strategy_config_id"),
+                                    "entry_client_order_id": old_pos.get(
+                                        "entry_client_order_id"
+                                    )
+                                    or kwargs.get("entry_client_order_id"),
                                 }
                             else:  # Position is fully closed
                                 del self._positions[symbol]
@@ -487,6 +534,11 @@ class PaperTradingExecutor:
                     else:  # SHORT
                         pnl = (avg_entry_price - current_price) * abs(quantity)
 
+                # Report the REAL liquidation price. This used to be hardcoded "0",
+                # which told the user (and the UI) that a leveraged position had no
+                # liquidation risk when it very much did.
+                liq_price = self._position_liquidation_price(symbol, pos_data)
+
                 positions.append(
                     {
                         "symbol": symbol,
@@ -494,7 +546,10 @@ class PaperTradingExecutor:
                         "entryPrice": str(avg_entry_price),
                         "markPrice": str(current_price) if current_price else "0",
                         "unRealizedProfit": str(pnl),
-                        "liquidationPrice": "0",
+                        "liquidationPrice": (
+                            str(liq_price) if liq_price else "0"
+                        ),
+                        "leverage": str(pos_data.get("leverage") or 1.0),
                     }
                 )
         return positions
@@ -520,11 +575,379 @@ class PaperTradingExecutor:
             )
             return None
 
+    # ------------------------------------------------------------------
+    # Realism: leverage, liquidation and funding
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _leverage_from_signal_details(signal_details: Any) -> float:
+        """
+        Read the leverage a strategy declared, using the SAME key list as
+        TradingController._leverage_for_position so paper and live agree on
+        what "20x" means. Falls back to PAPER_ASSUMED_LEVERAGE.
+
+        Note: the bot never calls set_leverage() anywhere, so on the live path
+        the real leverage is the OKX account default and is invisible to us.
+        PAPER_ASSUMED_LEVERAGE is the honest acknowledgement of that gap.
+        """
+        details = signal_details if isinstance(signal_details, dict) else {}
+        for key in ("leverage", "leverage_x", "leverageX", "leverage_multiplier"):
+            value = details.get(key)
+            if value is None:
+                continue
+            try:
+                lev = float(value)
+            except (TypeError, ValueError):
+                continue
+            if lev > 0:
+                return lev
+        return float(PAPER_ASSUMED_LEVERAGE)
+
+    @staticmethod
+    def liquidation_price_for(
+        entry_price: float, quantity: float, leverage: float, mmr: float
+    ) -> Optional[float]:
+        """
+        Isolated USDT-margined liquidation price for a single position.
+
+        Liquidation happens when equity == maintenance margin, with
+        margin = E*q/lev.
+
+        LONG  (pnl = (P - E)*q):
+            E/lev + P - E = P*mmr
+            P*(1 - mmr)   = E*(1 - 1/lev)
+            P = E*(1 - 1/lev) / (1 - mmr)
+
+        SHORT (pnl = (E - P)*q):
+            E/lev + E - P = P*mmr
+            P*(1 + mmr)   = E*(1 + 1/lev)
+            P = E*(1 + 1/lev) / (1 + mmr)
+
+        Note the denominators DIFFER: for a long the notional GROWS as price
+        moves against you, so the maintenance requirement grows too (1 - mmr);
+        for a short the notional SHRINKS, so it does not (1 + mmr). Using
+        (1 - mmr) for both is the classic slip and it makes a short survive
+        ~1% longer than it really would — i.e. it biases the demo optimistic,
+        which is exactly the failure this whole change exists to remove.
+
+        Returns None at leverage <= 1, where liquidation is not reachable at a
+        sane price — the same "no liquidation price" the exchange reports as 0.
+        Modelling one anyway would invent a liquidation the user would never
+        actually experience.
+        """
+        if entry_price is None or entry_price <= 0:
+            return None
+        if quantity is None or abs(quantity) <= 1e-9:
+            return None
+        if leverage is None or leverage <= 1.0:
+            return None
+        mmr = float(mmr if mmr is not None else 0.0)
+        if mmr < 0.0 or mmr >= 1.0:
+            return None
+        try:
+            inv_lev = 1.0 / float(leverage)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+        if quantity > 0:  # LONG
+            denom = 1.0 - mmr
+            if denom <= 0:
+                return None
+            return entry_price * (1.0 - inv_lev) / denom
+        # SHORT
+        return entry_price * (1.0 + inv_lev) / (1.0 + mmr)
+
+    @staticmethod
+    def _funding_periods_since(
+        t_start: Optional[datetime], t_end: datetime, interval_hours: int = 8
+    ) -> int:
+        """
+        Count funding boundaries strictly after t_start and up to t_end.
+
+        Mirrors count_funding_periods() in the backtesters so a paper run bills
+        the same periods a backtest would. Boundaries are UTC hours where
+        hour % interval_hours == 0.
+        """
+        if t_start is None or t_end is None:
+            return 0
+        if t_start.tzinfo is None:
+            t_start = t_start.replace(tzinfo=timezone.utc)
+        if t_end.tzinfo is None:
+            t_end = t_end.replace(tzinfo=timezone.utc)
+        t_start = t_start.astimezone(timezone.utc)
+        t_end = t_end.astimezone(timezone.utc)
+        if t_end <= t_start:
+            return 0
+        periods = 0
+        cursor = t_start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        while cursor <= t_end:
+            if cursor.hour % interval_hours == 0 and cursor > t_start:
+                periods += 1
+            cursor += timedelta(hours=1)
+        return periods
+
+    def _position_liquidation_price(self, symbol: str, pos: Dict[str, Any]) -> Optional[float]:
+        return self.liquidation_price_for(
+            pos.get("avg_entry_price", 0.0),
+            pos.get("quantity", 0.0),
+            pos.get("leverage") or 0.0,
+            PAPER_LIQUIDATION_MMR,
+        )
+
+    async def check_liquidations(self) -> None:
+        """
+        Liquidate paper positions whose mark price has crossed the liquidation
+        price. Runs on every tick via check_open_orders().
+
+        Before this existed, paper positions reported liquidationPrice "0" and
+        were NEVER liquidated, so a strategy that would be blown out on OKX
+        kept running and booked a profit. That is the single most misleading
+        thing about the old demo.
+        """
+        if not PAPER_SIMULATE_LIQUIDATION:
+            return
+        if not self._positions:
+            return
+
+        for symbol in list(self._positions.keys()):
+            pos = self._positions.get(symbol)
+            if not pos:
+                continue
+            qty = pos.get("quantity", 0.0)
+            if abs(qty) <= 1e-9:
+                continue
+            liq_price = self._position_liquidation_price(symbol, pos)
+            if liq_price is None:
+                continue
+            try:
+                mark = await self.data_consumer.get_latest_price(symbol)
+            except Exception as e:
+                logger.debug(
+                    f"[PaperLiquidation:{symbol}] Could not read mark price: {e}"
+                )
+                continue
+            if not mark or mark <= 0:
+                continue
+            mark = float(mark)
+
+            is_liquidated = (qty > 0 and mark <= liq_price) or (
+                qty < 0 and mark >= liq_price
+            )
+            if not is_liquidated:
+                continue
+
+            entry = pos.get("avg_entry_price", 0.0)
+            logger.critical(
+                f"[PaperLiquidation:{symbol}] LIQUIDATION — mark={mark:.8f} crossed "
+                f"liq={liq_price:.8f} (entry={entry:.8f}, qty={qty}, "
+                f"lev={pos.get('leverage')}). Closing at bankruptcy price."
+            )
+            try:
+                await self._close_position_at(
+                    symbol,
+                    exit_price=liq_price,
+                    reason="PAPER_LIQUIDATION",
+                    exit_type="LIQUIDATION",
+                )
+            except Exception as e:
+                logger.error(
+                    f"[PaperLiquidation:{symbol}] Failed to process liquidation: {e}",
+                    exc_info=True,
+                )
+
+    async def check_funding(self) -> None:
+        """
+        Charge funding on open paper positions for every settlement boundary
+        crossed since the last charge. Longs pay, shorts receive — the same
+        sign convention as calculate_position_funding_pnl() in the backtesters.
+        """
+        if not PAPER_SIMULATE_FUNDING:
+            return
+        if not self._positions:
+            return
+        rate = float(PAPER_FUNDING_RATE_8H or 0.0)
+        if rate == 0.0:
+            return
+
+        now = datetime.now(timezone.utc)
+        total_delta = 0.0
+        charged: List[str] = []
+
+        for symbol in list(self._positions.keys()):
+            pos = self._positions.get(symbol)
+            if not pos:
+                continue
+            qty = pos.get("quantity", 0.0)
+            if abs(qty) <= 1e-9:
+                continue
+            entry = pos.get("avg_entry_price", 0.0) or 0.0
+            if entry <= 0:
+                continue
+
+            since = pos.get("last_funding_timestamp") or pos.get("entry_timestamp")
+            periods = self._funding_periods_since(
+                since, now, PAPER_FUNDING_INTERVAL_HOURS
+            )
+            if periods <= 0:
+                continue
+
+            notional = abs(qty) * entry
+            # Same convention as the backtesters: longs pay (negative), shorts
+            # receive (positive).
+            multiplier = 1.0 if qty < 0 else -1.0
+            funding_pnl = multiplier * periods * notional * rate
+            total_delta += funding_pnl
+            charged.append(f"{symbol} {periods}p {funding_pnl:+.4f}")
+
+            # Advance the anchor so the next tick does not re-bill the same
+            # periods. Advance to the last boundary we just billed.
+            pos["last_funding_timestamp"] = self._last_funding_boundary_before(
+                now, PAPER_FUNDING_INTERVAL_HOURS
+            )
+
+        if not charged:
+            return
+
+        async with self._db_lock:
+            try:
+                await crud.update_paper_wallet_balance(
+                    self.db, self.user_id, "USDT", total_delta
+                )
+                await self.db.commit()
+            except Exception as e:
+                logger.error(
+                    f"[PaperFunding] Failed to apply funding {total_delta:+.4f}: {e}",
+                    exc_info=True,
+                )
+                return
+
+        logger.info(
+            f"[PaperFunding] user={self.user_id} applied {total_delta:+.4f} USDT "
+            f"({rate * 100:.4f}% per {PAPER_FUNDING_INTERVAL_HOURS}h): "
+            + ", ".join(charged)
+        )
+        try:
+            await self._record_equity_point()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _last_funding_boundary_before(
+        moment: datetime, interval_hours: int = 8
+    ) -> datetime:
+        """The most recent funding boundary at or before `moment` (UTC)."""
+        m = moment.astimezone(timezone.utc)
+        boundary = m.replace(minute=0, second=0, microsecond=0)
+        while boundary.hour % interval_hours != 0:
+            boundary -= timedelta(hours=1)
+        return boundary
+
+    async def _close_position_at(
+        self,
+        symbol: str,
+        exit_price: float,
+        reason: str,
+        exit_type: str,
+    ) -> None:
+        """
+        Close a whole paper position at a given price, applying the same
+        balance/trade-recording side effects as a normal market close. Shared
+        by liquidation and (future) other forced closes.
+        """
+        pos = self._positions.get(symbol)
+        if not pos:
+            return
+        qty = pos.get("quantity", 0.0)
+        entry = pos.get("avg_entry_price", 0.0)
+        if abs(qty) <= 1e-9 or entry <= 0:
+            return
+
+        if qty > 0:  # LONG
+            realized_pnl = (exit_price - entry) * abs(qty)
+        else:  # SHORT
+            realized_pnl = (entry - exit_price) * abs(qty)
+
+        commission = exit_price * abs(qty) * BACKTEST_COMMISSION_PCT
+        balance_change = realized_pnl - commission
+
+        async with self._db_lock:
+            try:
+                await crud.update_paper_wallet_balance(
+                    self.db, self.user_id, "USDT", balance_change
+                )
+                await self.db.commit()
+            except Exception as e:
+                logger.error(
+                    f"[PaperClose:{symbol}] Wallet update failed: {e}", exc_info=True
+                )
+                return
+
+            try:
+                trade_data = {
+                    "timestamp_close": datetime.now(timezone.utc),
+                    "timestamp_signal": pos.get("entry_timestamp")
+                    or datetime.now(timezone.utc),
+                    "symbol": symbol,
+                    "strategy_config_id": pos.get("strategy_config_id"),
+                    "direction": "BUY" if qty > 0 else "SELL",
+                    "entry_price": entry,
+                    "exit_price": exit_price,
+                    "pnl": realized_pnl,
+                    "commission": commission,
+                    "exit_reason": reason,
+                    "quantity": abs(qty),
+                    "exit_type": exit_type,
+                    "is_final_exit": True,
+                    "position_entry_id": pos.get("entry_client_order_id"),
+                }
+                new_trade = await crud.create_trade(
+                    self.db,
+                    user_id=self.user_id,
+                    trade_data=trade_data,
+                    trade_mode="PAPER",
+                )
+                await self.db.commit()
+                try:
+                    await self.db.refresh(new_trade)
+                except Exception:
+                    pass
+                logger.critical(
+                    f"[PaperClose:{symbol}] {reason} trade {getattr(new_trade, 'id', '?')} "
+                    f"saved: pnl={realized_pnl:.4f} commission={commission:.4f} "
+                    f"balance_change={balance_change:.4f}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"[PaperClose:{symbol}] Failed to record {reason} trade: {e}",
+                    exc_info=True,
+                )
+
+        del self._positions[symbol]
+
+        try:
+            await self._record_equity_point()
+        except Exception:
+            pass
+
+        # Keep the controller's LivePosition mirror in sync so the dashboard
+        # does not keep showing a position that no longer exists.
+        try:
+            await self._notify_controller_about_fill(
+                symbol, exit_type, "SELL" if qty > 0 else "BUY", abs(qty), exit_price
+            )
+        except Exception as e:
+            logger.debug(
+                f"[PaperClose:{symbol}] Controller notify failed (non-fatal): {e}"
+            )
+
     async def check_open_orders(self):
         """
-        Checks all open SL/TP orders and simulates their execution if the price is reached.
-        This method should be called regularly (e.g., on every tick).
+        Per-tick maintenance for paper positions: liquidation and funding are
+        checked FIRST and unconditionally (a position can be open with no SL/TP
+        orders resting), then resting SL/TP orders are simulated.
         """
+        await self.check_liquidations()
+        await self.check_funding()
+
         if not self._open_orders:
             logger.debug("[PaperOrderCheck] No open orders to check.")
             return

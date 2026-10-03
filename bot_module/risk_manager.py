@@ -1056,10 +1056,35 @@ class RiskManager:
 
                                     return False
             except Exception as e:
-                logger.error(
-                    f"[Blacklist:{symbol}] Error checking blacklist: {e}", exc_info=True
+                # FAIL CLOSED. This used to log and fall through to
+                # `return True` — i.e. a transient DB error (connection reset,
+                # timeout, pool exhaustion) silently disabled the user's
+                # blacklist, which is precisely the control a user arms after a
+                # bad trade. A risk control that switches itself off when the
+                # database hiccups is not a risk control.
+                #
+                # Blocking here only gates NEW ENTRIES: both call sites
+                # (controller._process_signal and assess_signal) are entry
+                # paths, so existing positions can still be closed and their
+                # stops still managed. Recovery is automatic — this re-queries
+                # on every signal, so the first call after the DB heals allows
+                # trading again.
+                logger.critical(
+                    f"[Blacklist:{symbol}] Error checking blacklist: {e}. "
+                    f"FAILING CLOSED — new entries for this symbol are blocked "
+                    f"until the blacklist query succeeds. Existing positions are "
+                    f"NOT affected and can still be closed.",
+                    exc_info=True,
                 )
-                # In case of an error, allow trading so as not to block the bot's operation
+                try:
+                    await self._notify_blacklist(
+                        symbol,
+                        f"Blacklist check failed (DB error) — new entries blocked: {e}",
+                        None,
+                    )
+                except Exception:
+                    pass
+                return False
 
         return True
 

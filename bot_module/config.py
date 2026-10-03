@@ -503,9 +503,25 @@ BE_SL_OFFSET_TICKS = 2  # Offset towards profit (e.g., 1-2 ticks)
 BE_MOVE_RETRY_DELAY_SECONDS = 10  # Retry
 
 # Position check interval without stop-loss (in seconds)
-CONTROLLER_MISSING_SL_CHECK_INTERVAL_SECONDS = 60
+#
+# This is NOT the protection window. The real worst-case time a position can sit
+# unprotected is:
+#
+#     SL_PLACEMENT_GRACE_PERIOD_SECONDS + MISSING_SL_CHECK_INTERVAL_SECONDS
+#
+# because the watchdog only force-closes a missing-SL position once the grace
+# period has passed AND the watchdog happens to run. With the old values
+# (20s grace + 60s interval) that was up to 80 seconds, not the 20 the grace
+# period suggests — a 4x understatement of the naked-position window.
+#
+# Kept deliberately small. The watchdog only walks in-memory active positions
+# under a lock and makes no exchange calls unless it actually needs to close
+# something, so a tight interval is nearly free.
+CONTROLLER_MISSING_SL_CHECK_INTERVAL_SECONDS = 5
 # Time in seconds after opening a position during which SL placement is expected.
 # If SL is not set after this time, the position will be closed.
+# Combined with the check interval above, the worst-case unprotected window is
+# ~25 seconds.
 CONTROLLER_SL_PLACEMENT_GRACE_PERIOD_SECONDS = 20  # 20 seconds should be enough
 
 # Slippage in ticks for the limit price of SPOT STOP_LOSS_LIMIT orders relative to the stopPrice.
@@ -1197,6 +1213,47 @@ BACKTEST_COMMISSION_PCT = 0.0006
 BACKTEST_SLIPPAGE_PCT = 0.0005
 # Funding rate per 8 hours (0.0001 for 0.01%)
 BACKTEST_FUNDING_RATE_8H = 0.0001
+# --- Paper trading realism: liquidation + funding --------------------------------
+#
+# Paper trading used to model neither liquidation nor funding. Paper positions
+# reported liquidationPrice "0" and were never liquidated, and no funding was
+# ever charged. Both omissions systematically OVERSTATE results — worst for
+# leveraged strategies, which is exactly what a prospective user is most
+# excited to try. A demo that cannot fail the way the real thing fails is not
+# a demo.
+#
+# PAPER_FUNDING_RATE_8H is derived from the backtest value on purpose: a paper
+# run must agree with the backtest the user just ran, or the two disagree about
+# the same strategy and both become untrustworthy.
+
+# Leverage assumed for a paper position when the strategy does not declare one.
+#
+# The bot never calls set_leverage() anywhere — the live path inherits whatever
+# the OKX account default happens to be. We therefore cannot know the real
+# number, and 1.0 is the honest choice: it means we only ever synthesize a
+# liquidation for a strategy that explicitly asked for leverage, rather than
+# inventing liquidations the user would never actually experience.
+PAPER_ASSUMED_LEVERAGE = 1.0
+
+# Maintenance margin rate for paper liquidation math (isolated USDT-margined).
+# Approximates OKX tier-1 for major pairs. Higher tiers and thinner pairs carry
+# a higher MMR, which moves the liquidation price closer to entry.
+PAPER_LIQUIDATION_MMR = 0.005
+
+# Funding charged on open paper positions per settlement interval.
+# Derived from the backtester so the two stay in lockstep.
+PAPER_FUNDING_RATE_8H = BACKTEST_FUNDING_RATE_8H
+
+# Funding settlement interval in hours (OKX settles every 8h at 00/08/16 UTC).
+PAPER_FUNDING_INTERVAL_HOURS = 8
+
+# Whether paper trading simulates liquidation at all. Master switch for the
+# check that runs on every tick.
+PAPER_SIMULATE_LIQUIDATION = True
+
+# Whether paper trading charges funding on held positions.
+PAPER_SIMULATE_FUNDING = True
+
 # Whether to save backtest trade details to a CSV file
 BACKTEST_SAVE_TRADES = False  # Was False
 # Path template for saving backtest trade logs (if BACKTEST_SAVE_TRADES = True)
