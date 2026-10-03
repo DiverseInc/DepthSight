@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable</title>
+  <meta name="description" content="DepthSight is a multi-exchange, multi-timeframe crypto algo-trading platform. Paper-test any strategy risk-free, then go live on Binance, OKX, Bybit, Bitget, Gate.io, or BingX with one click." />
+  <meta name="theme-color" content="#0b1220" />
+
+  <!-- Open Graph -->
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable" />
+  <meta property="og:description" content="Backtest, paper-trade, then go live on the exchange of your choice. 14 services. 6 exchanges. 1m to 4h timeframes. Engineered by traders who actually run it in production." />
+  <meta property="og:url" content="https://depthsight.diverseinc.net" />
+  <meta property="og:site_name" content="DepthSight" />
+  <meta property="og:image" content="https://depthsight.diverseinc.net/og-image.png" />
+  <meta property="og:image:type" content="image/png" />
+  <meta property="og:image:width" content="1200" />
+  <meta property="og:image:height" content="630" />
+  <meta property="og:image:alt" content="DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable. 14 Docker services, 6 exchanges, 1m to 4h timeframes." />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable" />
+  <meta name="twitter:description" content="Backtest, paper-trade, then go live. 6 exchanges. 1m to 4h. Multi-user SaaS. Engineered in production." />
+  <meta name="twitter:image" content="https://depthsight.diverseinc.net/og-image.png" />
+  <meta name="twitter:image:alt" content="DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable." />
+
+<link rel="canonical" href="https://depthsight.diverseinc.net/" />
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large" />
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "Organization",
+      "name": "DepthSight",
+      "alternateName": "DiverseInc DepthSight",
+      "url": "https://depthsight.diverseinc.net",
+      "logo": "https://depthsight.diverseinc.net/logo.svg",
+      "description": "Multi-exchange, multi-timeframe crypto algo-trading platform. Paper-test any strategy risk-free, then go live on Binance, OKX, Bybit, Bitget, Gate.io, or BingX with one click.",
+      "sameAs": [
+        "https://github.com/DiverseInc/DepthSight"
+      ]
+    },
+    {
+      "@type": "SoftwareApplication",
+      "name": "DepthSight",
+      "applicationCategory": "FinanceApplication",
+      "applicationSubCategory": "Algorithmic Trading Platform",
+      "operatingSystem": "Web",
+      "url": "https://depthsight.diverseinc.net",
+      "description": "Build, backtest, and deploy crypto trading strategies on OKX, Binance, Bybit, Bitget, Gate.io, and BingX. Paper trade first, graduate to live when ready.",
+      "offers": [
+        { "@type": "Offer", "name": "Free", "price": "0", "priceCurrency": "USD", "description": "Paper trading, 1 strategy, all exchanges" },
+        { "@type": "Offer", "name": "Pro", "price": "29", "priceCurrency": "USD", "description": "Live trading, unlimited strategies, priority support" },
+        { "@type": "Offer", "name": "Team", "price": "99", "priceCurrency": "USD", "description": "Multi-user accounts, shared strategies, dedicated support" }
+      ],
+      "featureList": [
+        "Paper trading against real candles",
+        "Live trading on 6 exchanges",
+        "20+ pre-built strategies",
+        "Visual no-code strategy builder",
+        "Genetic strategy search",
+        "ML model laboratory",
+        "TradingView webhooks"
+      ]
+    }
+  ]
+}
+</script>
+
+  <style>
+    :root{
+      --bg:#0b1220;
+      --bg-2:#0f172a;
+      --panel:#111c33;
+      --line:#1f2a44;
+      --text:#e6edf7;
+      --muted:#93a4c1;
+      --brand:#22d3ee;
+      --brand-2:#38bdf8;
+      --accent:#a78bfa;
+      --green:#34d399;
+      --amber:#fbbf24;
+      --red:#f87171;
+      --radius:14px;
+      --shadow:0 14px 40px rgba(0,0,0,.35);
+      --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.55;-webkit-font-smoothing:antialiased}
+    a{color:var(--brand);text-decoration:none}
+    a:hover{text-decoration:underline}
+    img{max-width:100%;display:block}
+    .wrap{max-width:1120px;margin:0 auto;padding:0 24px}
+
+    /* ───────── Nav ───────── */
+    .nav{position:sticky;top:0;z-index:50;background:rgba(11,18,32,.85);backdrop-filter:saturate(140%) blur(10px);border-bottom:1px solid var(--line)}
+    .nav-inner{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;max-width:1120px;margin:0 auto}
+    .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:.2px}
+    .brand-mark{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--brand),var(--accent));display:inline-block;position:relative}
+    .brand-mark::after{content:"";position:absolute;inset:6px;border-radius:4px;background:var(--bg)}
+    .nav-links{display:flex;gap:22px;font-size:14px;color:var(--muted)}
+    .nav-links a{color:var(--muted)}
+    .nav-cta{padding:8px 14px;border:1px solid var(--brand);border-radius:10px;color:var(--brand);font-weight:600;font-size:14px}
+
+    /* ───────── Hero ───────── */
+    .hero{padding:96px 0 72px;background:radial-gradient(1200px 600px at 80% -20%,rgba(34,211,238,.18),transparent 60%),radial-gradient(900px 500px at -10% 10%,rgba(167,139,250,.15),transparent 55%)}
+    .hero h1{font-size:56px;line-height:1.05;letter-spacing:-.02em;margin:0 0 18px;font-weight:800}
+    .hero h1 .grad{background:linear-gradient(90deg,var(--brand),var(--accent));-webkit-background-clip:text;background-clip:text;color:transparent}
+    .hero p.lede{font-size:20px;color:var(--muted);max-width:720px;margin:0 0 28px}
+    .hero-cta{display:flex;gap:12px;flex-wrap:wrap}
+    .btn{display:inline-flex;align-items:center;gap:8px;padding:14px 22px;border-radius:12px;font-weight:600;font-size:15px;border:1px solid transparent;transition:transform .12s ease, box-shadow .12s ease;cursor:pointer}
+    .btn-primary{background:linear-gradient(180deg,var(--brand),var(--brand-2));color:#002230;box-shadow:0 6px 18px rgba(34,211,238,.25)}
+    .btn-primary:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(34,211,238,.32);text-decoration:none}
+    .btn-ghost{border-color:var(--line);color:var(--text);background:rgba(255,255,255,.02)}
+    .btn-ghost:hover{border-color:var(--brand);text-decoration:none}
+    .hero-stats{display:flex;gap:32px;flex-wrap:wrap;margin-top:48px;color:var(--muted);font-size:14px}
+    .hero-stats b{color:var(--text);display:block;font-size:22px;font-weight:700}
+
+    /* ───────── Generic section ───────── */
+    section{padding:80px 0;border-top:1px solid var(--line)}
+    section h2{font-size:36px;letter-spacing:-.01em;margin:0 0 12px;font-weight:800}
+    section h2 .grad{background:linear-gradient(90deg,var(--brand),var(--accent));-webkit-background-clip:text;background-clip:text;color:transparent}
+    section .sub{color:var(--muted);font-size:17px;max-width:760px;margin:0 0 40px}
+    .eyebrow{display:inline-block;font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--brand);margin-bottom:14px;font-weight:700}
+
+    /* ───────── Feature grid ───────── */
+    .grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}
+    .grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+    @media (max-width:880px){.grid-3,.grid-2{grid-template-columns:1fr}.hero h1{font-size:42px}}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:22px;box-shadow:var(--shadow)}
+    .card .icon{width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,rgba(34,211,238,.18),rgba(167,139,250,.18));display:inline-flex;align-items:center;justify-content:center;margin-bottom:14px;color:var(--brand);font-size:18px}
+    .card h3{margin:0 0 6px;font-size:17px}
+    .card p{margin:0;color:var(--muted);font-size:14.5px}
+
+    /* ───────── Tech highlights ───────── */
+    .tag-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+    .tag{font-family:var(--mono);font-size:12px;color:var(--brand);background:rgba(34,211,238,.08);border:1px solid rgba(34,211,238,.25);padding:5px 10px;border-radius:999px}
+
+    /* ───────── Story (candle recovery) ───────── */
+    .story{background:linear-gradient(180deg,var(--bg-2),var(--bg));border-top:1px solid var(--line)}
+    .story-card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:36px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+    .story-card::before{content:"";position:absolute;inset:0;background:radial-gradient(600px 300px at 100% 0%,rgba(248,113,113,.10),transparent 60%);pointer-events:none}
+    .story h2 .grad{background:linear-gradient(90deg,#f87171,#fbbf24);-webkit-background-clip:text;background-clip:text;color:transparent}
+    .timeline{display:grid;gap:18px;margin-top:24px;position:relative}
+    .timeline-item{display:grid;grid-template-columns:36px 1fr;gap:14px;padding:18px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.015)}
+    .timeline-item .dot{width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,var(--red),var(--amber));display:flex;align-items:center;justify-content:center;font-weight:700;color:#3a0a0a;font-family:var(--mono)}
+    .timeline-item .dot.fix{background:linear-gradient(135deg,var(--green),var(--brand));color:#03261f}
+    .timeline-item h4{margin:0 0 4px;font-size:15.5px}
+    .timeline-item p{margin:0;color:var(--muted);font-size:14.5px}
+    .timeline-item .meta{font-family:var(--mono);font-size:12px;color:var(--brand);margin-top:8px}
+
+    /* ───────── Pricing ───────── */
+    .price-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}
+    @media (max-width:880px){.price-grid{grid-template-columns:1fr}}
+    .price{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:30px;display:flex;flex-direction:column}
+    .price.featured{border-color:var(--brand);box-shadow:0 0 0 2px rgba(34,211,238,.18),var(--shadow);position:relative}
+    .price.featured .badge{position:absolute;top:-12px;left:50%;transform:translateX(-50%);background:var(--brand);color:#042;padding:4px 12px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.05em}
+    .price h3{margin:0 0 4px;font-size:20px}
+    .price .amt{font-size:42px;font-weight:800;letter-spacing:-.02em;margin:6px 0}
+    .price .amt small{font-size:14px;color:var(--muted);font-weight:500}
+    .price .desc{color:var(--muted);font-size:14px;margin:0 0 18px}
+    .price ul{margin:0 0 22px;padding:0;list-style:none;font-size:14.5px;color:var(--text)}
+    .price li{padding:7px 0;border-bottom:1px dashed var(--line);display:flex;gap:8px}
+    .price li:last-child{border-bottom:none}
+    .price li::before{content:"✓";color:var(--green);font-weight:700}
+    .price li.no{color:var(--muted)}
+    .price li.no::before{content:"—";color:var(--muted)}
+    .price .btn{margin-top:auto;justify-content:center;width:100%}
+    .price .btn:disabled{opacity:.7;cursor:not-allowed}
+
+    /* ───────── Waitlist form ───────── */
+    .waitlist{background:linear-gradient(135deg,rgba(34,211,238,.10),rgba(167,139,250,.10));border:1px solid var(--line);border-radius:18px;padding:36px;display:grid;grid-template-columns:1.2fr 1fr;gap:30px;align-items:center}
+    @media (max-width:880px){.waitlist{grid-template-columns:1fr}}
+    .waitlist form{display:flex;gap:10px;flex-wrap:wrap}
+    .waitlist input[type=email]{flex:1;min-width:200px;padding:14px 16px;border-radius:12px;border:1px solid var(--line);background:var(--bg-2);color:var(--text);font-size:15px;font-family:inherit}
+    .waitlist input[type=email]:focus{outline:2px solid var(--brand);border-color:transparent}
+    .waitlist .small{color:var(--muted);font-size:12.5px;margin-top:12px}
+    .fineprint{color:var(--muted);font-size:12px;margin-top:8px}
+
+    /* ───────── Footer ───────── */
+    footer{border-top:1px solid var(--line);padding:36px 0;color:var(--muted);font-size:14px}
+    .foot{display:flex;justify-content:space-between;flex-wrap:wrap;gap:14px}
+    .foot a{color:var(--muted)}
+    .foot a:hover{color:var(--brand)}
+
+    /* ───────── Misc ───────── */
+    .live-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(52,211,153,.7);animation:pulse 1.8s infinite}
+    @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.7)}70%{box-shadow:0 0 0 10px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
+    .hl{color:var(--brand);font-weight:600}
+    code.inline{font-family:var(--mono);background:rgba(34,211,238,.08);color:var(--brand);padding:1px 6px;border-radius:4px;font-size:13px}
+  </style>
+</head>
+<body>
+
+<!-- ───────────────────────── Nav ───────────────────────── -->
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="#top" aria-label="DepthSight home">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span>DepthSight</span>
+    </a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#story">Engineering</a>
+      <a href="#pricing">Pricing</a>
+      <a href="https://depthsight.diverseinc.net" target="_blank" rel="noopener">Live app ↗</a>
+    </div>
+    <a class="nav-cta" href="#waitlist">Join waitlist</a>
+  </div>
+</nav>
+
+<!-- ───────────────────────── Hero ───────────────────────── -->
+<header class="hero" id="top">
+  <div class="wrap">
+    <span class="eyebrow">Multi-exchange · multi-strategy · multi-timeframe</span>
+    <h1>Algorithmic crypto trading, <br/><span class="grad">paper-tested and live-tradeable.</span></h1>
+    <p class="lede">
+      Backtest a strategy against 6 exchanges and 1-minute to 4-hour candles. Paper-trade it with live market data, no
+      capital at risk. Then flip the same config to a live account — Binance, OKX, Bybit, Bitget, Gate.io, or BingX —
+      with one click. <span class="hl">No code. No vendor lock. No black box.</span>
+    </p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="#waitlist">Get launch access →</a>
+      <a class="btn btn-ghost" href="https://depthsight.diverseinc.net" target="_blank" rel="noopener">Try the live demo</a>
+    </div>
+
+    <div class="hero-stats">
+      <div><b>14</b>Docker services</div>
+      <div><b>6</b>exchanges supported</div>
+      <div><b>1m → 4h</b>timeframes</div>
+      <div><b><span class="live-dot" aria-hidden="true"></span> Live now</b>in production since Aug 2026</div>
+    </div>
+  </div>
+</header>
+
+<!-- ───────────────────────── Features ───────────────────────── -->
+<section id="features">
+  <div class="wrap">
+    <span class="eyebrow">What it does</span>
+    <h2>One platform. <span class="grad">Three trading modes.</span></h2>
+    <p class="sub">
+      Most bots force you to choose: backtest, paper, or live — and rebuild your strategy in a new tool each time.
+      DepthSight keeps a single strategy config and lets you toggle between modes. Same code path, same risk profile,
+      same metrics.
+    </p>
+
+    <div class="grid-3">
+      <div class="card">
+        <div class="icon">⟲</div>
+        <h3>Backtest first</h3>
+        <p>Vectorized historical engine runs years of 1m candles in seconds. Walk-forward, monte-carlo, and genetic optimization out of the box.</p>
+        <div class="tag-row"><span class="tag">vector_backtester</span><span class="tag">optuna</span></div>
+      </div>
+
+      <div class="card">
+        <div class="icon">◇</div>
+        <h3>Paper-trade the same config</h3>
+        <p>Live candle feed, simulated fills, real risk manager. No capital at risk, no testnet credentials needed — paper mode hits the public mainnet WS.</p>
+        <div class="tag-row"><span class="tag">paper_executor</span><span class="tag">live_data</span></div>
+      </div>
+
+      <div class="card">
+        <div class="icon">▣</div>
+        <h3>Go live with one toggle</h3>
+        <p>Flip <code class="inline">mode: paper</code> to <code class="inline">mode: live</code>. Same strategy, same risk envelope, real fills. Read-only API keys by default.</p>
+        <div class="tag-row"><span class="tag">6 venues</span><span class="tag">read-only keys</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Tech ───────────────────────── -->
+<section style="background:var(--bg-2)">
+  <div class="wrap">
+    <span class="eyebrow">Tech highlights</span>
+    <h2>Built for traders who <span class="grad">actually run it in production.</span></h2>
+    <p class="sub">A 14-service distributed system with the boring parts done right: real auth, real persistence, real pub/sub, real WebSocket resilience.</p>
+
+    <div class="grid-3">
+      <div class="card">
+        <div class="icon">⌬</div>
+        <h3>Multi-exchange by default</h3>
+        <p>One strategy, six venues. CCXT-powered executors route to Binance, OKX, Bybit, Bitget, Gate.io, BingX. Spot and futures USDT-margin in the same instance.</p>
+      </div>
+      <div class="card">
+        <div class="icon">⧗</div>
+        <h3>Multi-timeframe strategies</h3>
+        <p>1m entries on a 1h trend on a 4h bias. Higher-timeframe context streams are first-class — no manual resampling, no off-by-one alignment.</p>
+      </div>
+      <div class="card">
+        <div class="icon">✦</div>
+        <h3>AI Co-Pilot</h3>
+        <p>Natural-language strategy ideation via Gemini or OpenRouter. Reads your current config, suggests parameter sweeps, explains drawdowns in plain English.</p>
+      </div>
+      <div class="card">
+        <div class="icon">⎈</div>
+        <h3>Risk manager per strategy</h3>
+        <p>Hard caps on position size, max drawdown, daily loss, exposure. Kill-switch hotkey. Per-symbol and portfolio-level checks.</p>
+      </div>
+      <div class="card">
+        <div class="icon">⛬</div>
+        <h3>Genetic + Bayesian optimizer</h3>
+        <p>Dynamic gene pools evolve strategy templates. Optuna search for parameter sweeps. Both run on Celery workers, not your laptop.</p>
+      </div>
+      <div class="card">
+        <div class="icon">⌖</div>
+        <h3>Discovery Hub</h3>
+        <p>Import a verified preset, share your results, see KPIs and mini equity curves from other traders. Tier-gated templates (RSI Breakout, Bollinger, Grid DCA, ML-Confirmed, …).</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── The candle-recovery story ───────────────────────── -->
+<section class="story" id="story">
+  <div class="wrap">
+    <span class="eyebrow">Engineering story · 2026-09-19 → 2026-09-20</span>
+    <h2><span class="grad">The night our candles went dark.</span></h2>
+    <p class="sub">
+      Last weekend five paper strategies stopped receiving candles — silently, with no errors and no reconnects in the
+      logs. What followed was a 28-hour debugging arc that uncovered five stacked bugs across two services and
+      shipped four production fixes. This is the short version.
+    </p>
+
+    <div class="story-card">
+      <div class="timeline">
+
+        <div class="timeline-item">
+          <div class="dot">1</div>
+          <div>
+            <h4>The watchdog that ate the candles</h4>
+            <p>market_data's "no messages in 30s, reconnect" watchdog was tearing down the Redis pub/sub connection. Reconnecting on a timer — not on an actual fault — meant candle publishers and consumers were getting kicked off the bus in 30-second intervals.</p>
+            <div class="meta">Fix: split commands Redis onto its own connection, exception-based reconnect instead of silence-based · commit <code class="inline">107b83d</code></div>
+          </div>
+        </div>
+
+        <div class="timeline-item">
+          <div class="dot">2</div>
+          <div>
+            <h4>The bot that forgot it had strategies</h4>
+            <p>Restart bot → running strategies vanish from memory. There was no startup hook to rehydrate <code class="inline">running_strategy_instances</code> from Redis. The "two-step restart" rule that lived in our runbook was a superstition — restarting both services just happened to work because the watchdog bug dominated.</p>
+            <div class="meta">Fix: alembic columns for run state, startup rehydrate via pub/sub · commits <code class="inline">d6ec7ef</code> → <code class="inline">31f8461</code> → <code class="inline">026cd64</code></div>
+          </div>
+        </div>
+
+        <div class="timeline-item">
+          <div class="dot">3</div>
+          <div>
+            <h4>The pub/sub subscription timing race</h4>
+            <p>After the rehydrate fix, late-starting controllers still lost their own broadcasts. Pub/sub is at-most-once delivery, and we were publishing <em>before</em> subscribing — for every controller. The fix was to subscribe first, sleep a beat, then rehydrate.</p>
+            <div class="meta">Fix: move listener-task creation before rehydrate, add 1s settle · commit <code class="inline">24a8d1b</code></div>
+          </div>
+        </div>
+
+        <div class="timeline-item">
+          <div class="dot">4</div>
+          <div>
+            <h4>Paper-mode was secretly using testnet</h4>
+            <p>The real killer: factory.py routed any controller with empty API creds to <code class="inline">sandbox=True</code> (testnet). Six other call sites in data_consumer.py re-wrote the exchange prefix unconditionally. Paper-mode candles were silently hitting a flaky testnet WS.</p>
+            <div class="meta">Fix: require both <code class="inline">api_key</code> AND <code class="inline">api_secret</code> for sandbox routing · commits <code class="inline">e1d4097</code> + <code class="inline">05995c9</code></div>
+          </div>
+        </div>
+
+        <div class="timeline-item">
+          <div class="dot fix">✓</div>
+          <div>
+            <h4>The websocket that died without an error</h4>
+            <p>The final layer: ccxt.pro's <code class="inline">watch_ohlcv</code> returns an empty list when OKX closes the socket after a historical backfill. The outer loop happily spins on empty results forever — no exception, no log. We added a silence watchdog (<code class="inline">last_data_at = time.monotonic()</code>) and a v2 that tears the task down to fully recover.</p>
+            <div class="meta">Fix: silence-watchdog v1 + v2 (tear-down not reconnect) · commits <code class="inline">b108973</code> + <code class="inline">9e4394e</code></div>
+          </div>
+        </div>
+
+      </div>
+
+      <p style="margin-top:26px;color:var(--muted);font-size:14.5px">
+        <span class="hl">The lesson:</span> when a single fix doesn't resolve the symptom, look for a second rewrite site
+        before iterating on the same hypothesis. Two stacked bugs, two fixes needed. When a websocket reconnects inside
+        the same loop, the loop is the bug — break out, pop the registry, let the orchestrator rebuild cleanly.
+        Full postmortem in our blog →
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Pricing ───────────────────────── -->
+<section id="pricing">
+  <div class="wrap">
+    <span class="eyebrow">Pricing</span>
+    <h2>Simple tiers. <span class="grad">Cancel any time.</span></h2>
+    <p class="sub">All plans include the backtester, paper-trading, and the Discovery Hub. Paid plans add live trading, more AI usage, and alerts.</p>
+
+    <div class="price-grid">
+      <div class="price">
+        <h3>Free</h3>
+        <div class="amt">$0<small> /month</small></div>
+        <p class="desc">For trying things out. Paper trading only.</p>
+        <ul>
+          <li>1 paper strategy</li>
+          <li>20 AI Co-Pilot requests / day</li>
+          <li>10 backtest runs / day</li>
+          <li>30-day data retention</li>
+          <li>Community + docs support</li>
+          <li class="no">Live trading</li>
+          <li class="no">Email / Telegram alerts</li>
+        </ul>
+        <a class="btn btn-ghost" href="#waitlist">Join waitlist</a>
+      </div>
+
+      <div class="price featured">
+        <div class="badge">MOST POPULAR</div>
+        <h3>Pro</h3>
+        <div class="amt">$29<small> /month</small></div>
+        <p class="desc">For solo traders ready to go live.</p>
+        <ul>
+          <li>5 strategies (live trading enabled)</li>
+          <li>500 AI Co-Pilot requests / day</li>
+          <li>100 backtest runs / day</li>
+          <li>1-year data retention</li>
+          <li>Email + Telegram alerts</li>
+          <li>3 connected exchanges</li>
+          <li>2 concurrent bot runners</li>
+        </ul>
+        <a class="btn btn-primary" href="#waitlist">Get Pro access</a>
+      </div>
+
+      <div class="price">
+        <h3>Team</h3>
+        <div class="amt">$99<small> /month</small></div>
+        <p class="desc">For funds and small desks. Multi-user.</p>
+        <ul>
+          <li>Unlimited strategies</li>
+          <li>5,000 AI Co-Pilot requests / day</li>
+          <li>Unlimited backtest runs</li>
+          <li>Forever data retention</li>
+          <li>Slack + Telegram + Email alerts</li>
+          <li>Unlimited exchanges & bot runners</li>
+          <li>Up to 5 team seats + RBAC</li>
+          <li>Priority support, 4-hour response</li>
+        </ul>
+        <a class="btn btn-ghost" href="#waitlist">Talk to us</a>
+      </div>
+    </div>
+
+    <p class="fineprint">Annual prepay saves ~17%. Stripe Checkout in test mode for now; swap to live keys when you're ready to bill. Source available under AGPL v3.</p>
+  </div>
+</section>
+
+<!-- ───────────────────────── Waitlist ───────────────────────── -->
+<section id="waitlist" style="padding-bottom:96px">
+  <div class="wrap">
+    <span class="eyebrow">Waitlist</span>
+    <h2>Be first when we open the doors.</h2>
+    <p class="sub">We're onboarding users in batches. Drop your email and we'll send you a launch invite plus a $20 credit toward your first month.</p>
+
+    <div class="waitlist">
+      <div>
+        <h3 style="margin:0 0 8px">Join the DepthSight waitlist</h3>
+        <p style="margin:0 0 18px;color:var(--muted);font-size:15px">No spam. One launch email, one reminder, then you decide.</p>
+
+        <!-- Formspree endpoint — Anthony Watson's "A New Form" (form ID xljewqgy) -->
+        <form action="https://formspree.io/f/xljewqgy" method="POST" id="wl-form">
+          <input type="text" name="name" required placeholder="Your name" autocomplete="name" style="margin-bottom:10px" />
+          <input type="email" name="email" required placeholder="you@example.com" autocomplete="email" style="margin-bottom:10px" />
+          <textarea name="message" rows="3" placeholder="What are you looking for? (optional)" style="margin-bottom:10px;font-family:inherit"></textarea>
+          <select name="service" style="margin-bottom:14px">
+            <option value="">What interests you most? (optional)</option>
+            <option>Paper trading</option>
+            <option>Live trading</option>
+            <option>Multi-user / team</option>
+            <option>Custom strategy</option>
+            <option>Just curious</option>
+          </select>
+          <!-- Honeypot — bots fill this, humans don't; Formspree silently rejects -->
+          <input type="text" name="_gotcha" style="display:none" tabindex="-1" autocomplete="off" />
+          <button class="btn btn-primary" type="submit">Join waitlist →</button>
+        </form>
+        <p class="small">
+          Prefer not to use a form? <a href="mailto:hello@depthsight.diverseinc.net?subject=Waitlist">Email us directly</a>.
+          We read every message.
+        </p>
+      </div>
+
+      <div>
+        <h4 style="margin:0 0 10px;font-size:15px">What you get on day one</h4>
+        <ul style="margin:0;padding:0;list-style:none;color:var(--muted);font-size:14.5px;line-height:1.8">
+          <li>✓ Free plan access — no card required</li>
+          <li>✓ $20 credit if you upgrade within 30 days</li>
+          <li>✓ Direct line to the founders</li>
+          <li>✓ Early access to the genetic optimizer beta</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────── Footer ───────────────────────── -->
+<footer>
+  <div class="wrap foot">
+    <div>© 2026 DepthSight · Built by traders who debug their own production.</div>
+    <div>
+      <a href="https://depthsight.diverseinc.net" target="_blank" rel="noopener">Live app</a> ·
+      <a href="#pricing">Pricing</a> ·
+      <a href="#story">Engineering</a> ·
+      <a href="mailto:hello@depthsight.diverseinc.net">Contact</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // Lightweight, dependency-free waitlist UX
+  (function(){
+    var form = document.getElementById('wl-form');
+    if(!form) return;
+    form.addEventListener('submit', function(e){
+      // If the user hasn't yet wired up Formspree, do a graceful client-side thank-you.
+      // This keeps the page functional without a backend.
+      var action = form.getAttribute('action') || '';
+      if(action.indexOf('your-form-id') !== -1){
+        e.preventDefault();
+        var email = form.querySelector('input[type=email]').value;
+        form.innerHTML = '<div style="padding:14px 0;color:var(--green);font-weight:600">Thanks — we\'ll be in touch at '+ email +'.</div>';
+      }
+    });
+  })();
+</script>
+
+</body>
+</html>
