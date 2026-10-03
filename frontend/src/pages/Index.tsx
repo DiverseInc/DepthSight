@@ -12,6 +12,7 @@ import { SystemStatus } from "@/components/dashboard/SystemStatus";
 import { TopStrategiesTable } from "@/components/dashboard/TopStrategiesTable";
 import { TotalPnl } from "@/components/dashboard/TotalPnl";
 import { TradingModeBadge } from "@/components/dashboard/TradingModeBadge";
+import { GoLiveBanner } from "@/components/dashboard/GoLiveBanner";
 import { WelcomeBanner } from "@/components/dashboard/WelcomeBanner";
 import { WizardLauncherCard } from "@/components/dashboard/WizardLauncherCard";
 import { XpLevelCard } from "@/components/dashboard/XpLevelCard";
@@ -35,6 +36,7 @@ const Index = () => {
 				<FirstTradeCelebration />
 				<TradingModeBadge />
 				<CandleFlowIndicator />
+				<GoLiveBanner />
 				<WelcomeBanner />
 				<WizardLauncherCard />
 				<PlatformStatsStrip />

@@ -366,6 +366,28 @@ const Step2 = ({
       title="Connect your OKX key (optional)"
       body="Paste your OKX API key to enable live trading. We validate by reading your balance — never enable Withdraw on the OKX side."
     />
+    <p className="mb-4 text-sm text-muted-foreground">
+      Don't have an OKX account yet?{" "}
+      <a
+        href="https://app.okx.com/en-us/join/30180071"
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-primary underline underline-offset-2 hover:text-primary/80"
+      >
+        Sign up with our referral link
+      </a>
+      . After signup, create an API key with <strong>Trade</strong> permission
+      only (never Withdraw) at{" "}
+      <a
+        href="https://www.okx.com/account/my-account/api"
+        target="_blank"
+        rel="noopener noreferrer"
+        className="text-primary underline underline-offset-2"
+      >
+        okx.com → Account → API
+      </a>
+      , then paste the credentials below.
+    </p>
     <div className="space-y-3">
       <div>
         <Label htmlFor="okx-key">API Key</Label>
