@@ -283,6 +283,10 @@ services:
       - ./caddy.config:/etc/caddy/Caddyfile
       - caddy_data:/data
       - caddy_config:/config
+      # Read-only bind mount so caddy can serve the rich static marketing page
+      # from /welcome. welcome.html is a deployment artifact (curl from
+      # https://8aoin0sskuj4p.space.minimax.io or commit frontend/welcome.html).
+      - ./frontend:/srv/frontend:ro
     depends_on:
       - api
       - websocket
