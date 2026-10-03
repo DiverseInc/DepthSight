@@ -1500,10 +1500,71 @@ class TradingController:
                             user_id = payload.get("user_id")
                             if str(user_id) != str(self.user_id):
                                 continue
-                            logger.info(
+                            logger.critical(
                                 f"Handling EMERGENCY_STOP for user_id: {user_id}"
                             )
-                            # await self.executor.close_all_user_positions(user_id=user_id)
+                            # NOTE: this branch used to do nothing at all. The
+                            # only action was a commented-out call to
+                            # `executor.close_all_user_positions(...)` — a
+                            # method that does not exist on the executor — so
+                            # the bot logged "Handling EMERGENCY_STOP" and
+                            # carried on holding every open position.
+                            #
+                            # 1. Latch new entries off FIRST. This is a plain
+                            #    attribute set, so it holds even if flattening
+                            #    below fails, which is the point of a kill
+                            #    switch.
+                            try:
+                                self.rm.trigger_emergency_stop(
+                                    reason=f"EMERGENCY_STOP command from user {user_id}"
+                                )
+                            except Exception as e:
+                                logger.critical(
+                                    f"Failed to latch emergency stop: {e}",
+                                    exc_info=True,
+                                )
+
+                            # 2. Flatten every open position. Snapshotted under
+                            #    the dict lock, then closed outside it.
+                            try:
+                                async with self._positions_dict_lock:
+                                    positions_to_flatten = [
+                                        (
+                                            pos.symbol,
+                                            self._market_type_for_position(pos),
+                                        )
+                                        for pos in self._active_positions.values()
+                                        if pos.status
+                                        in ("OPEN", "CLOSING", "PENDING_ENTRY", "RESERVING")
+                                    ]
+                            except Exception as e:
+                                logger.critical(
+                                    f"Failed to snapshot positions for emergency stop: {e}",
+                                    exc_info=True,
+                                )
+                                positions_to_flatten = []
+
+                            logger.critical(
+                                f"EMERGENCY_STOP: flattening {len(positions_to_flatten)} "
+                                f"position(s) for user {user_id}: {positions_to_flatten}"
+                            )
+                            for sym, sym_market_type in positions_to_flatten:
+                                try:
+                                    await self.close_position(
+                                        sym,
+                                        reason="EMERGENCY_STOP",
+                                        market_type=sym_market_type,
+                                    )
+                                    logger.critical(
+                                        f"EMERGENCY_STOP: close issued for {sym} "
+                                        f"({sym_market_type})"
+                                    )
+                                except Exception as e:
+                                    logger.critical(
+                                        f"EMERGENCY_STOP: FAILED to close {sym} "
+                                        f"({sym_market_type}): {e}",
+                                        exc_info=True,
+                                    )
 
                         elif command_type == "TEST_NOTIFICATION":
                             user_id = payload.get("user_id")

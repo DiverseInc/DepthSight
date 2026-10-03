@@ -62,6 +62,7 @@ async function validateOkxKey(payload: {
   api_key: string;
   api_secret: string;
   passphrase: string;
+  is_testnet: boolean;
 }) {
   const res = await fetch("/api/v1/onboarding/validate-okx-key", {
     method: "POST",
@@ -117,7 +118,10 @@ export const OnboardingWizard = ({
   const qc = useQueryClient();
   const [step, setStep] = useState<StepIndex>(1);
   const [configId, setConfigId] = useState<string | null>(null);
-  const [okxKey, setOkxKey] = useState({ api_key: "", api_secret: "", passphrase: "" });
+  // `is_testnet` must mirror how the key will actually be stored — an OKX key
+  // only authenticates on the environment it was issued for. Defaults to
+  // testnet so reaching mainnet is a deliberate choice, not the default.
+  const [okxKey, setOkxKey] = useState({ api_key: "", api_secret: "", passphrase: "", is_testnet: true });
   const [okxValid, setOkxValid] = useState<boolean | null>(null);
 
   // ---- Mutations -------------------------------------------------------------
@@ -352,8 +356,8 @@ const Step2 = ({
   onSkip,
   onBack,
 }: {
-  okxKey: { api_key: string; api_secret: string; passphrase: string };
-  setOkxKey: (v: { api_key: string; api_secret: string; passphrase: string }) => void;
+  okxKey: { api_key: string; api_secret: string; passphrase: string; is_testnet: boolean };
+  setOkxKey: (v: { api_key: string; api_secret: string; passphrase: string; is_testnet: boolean }) => void;
   valid: boolean | null;
   loading: boolean;
   onValidate: () => void;
@@ -389,6 +393,21 @@ const Step2 = ({
       , then paste the credentials below.
     </p>
     <div className="space-y-3">
+      <label className="flex items-start gap-3 rounded-lg border p-3">
+        <input
+          type="checkbox"
+          className="mt-1"
+          checked={okxKey.is_testnet}
+          onChange={(e) => setOkxKey({ ...okxKey, is_testnet: e.target.checked })}
+        />
+        <span>
+          <span className="block text-sm font-medium">Demo (testnet) key</span>
+          <span className="block text-xs text-muted-foreground">
+            Keep this on while testing. Turn it off only when you are ready to
+            trade real funds.
+          </span>
+        </span>
+      </label>
       <div>
         <Label htmlFor="okx-key">API Key</Label>
         <Input

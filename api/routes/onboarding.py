@@ -69,6 +69,11 @@ class ValidateOkxKeyRequest(BaseModel):
     api_key: str
     api_secret: str
     passphrase: str
+    # Validate against OKX's testnet endpoints. A credential is only valid on
+    # the environment it was issued for, so this MUST match how the key will
+    # actually be stored (AddApiKeyModal persists `okx_testnet` when its
+    # testnet switch is on).
+    is_testnet: bool = False
 
 
 class ValidateOkxKeyResponse(BaseModel):
@@ -79,6 +84,10 @@ class ValidateOkxKeyResponse(BaseModel):
 
 class ConvertToLiveRequest(BaseModel):
     config_id: str
+    # Optional explicit key choice. When omitted the server resolves the key,
+    # but refuses to guess if the user holds keys on more than one environment.
+    # See convert_to_live.
+    api_key_id: Optional[int] = None
 
 
 class ConvertToLiveResponse(BaseModel):
@@ -211,6 +220,12 @@ async def validate_okx_key(
             "password": req.passphrase,
             "options": {"defaultType": "swap"},
         })
+        if req.is_testnet:
+            # Route the sanity read to OKX testnet. Without this a testnet
+            # credential is signed for testnet hosts and fails authentication
+            # against mainnet, which made the wizard report valid testnet keys
+            # as "invalid" and pushed new users toward mainnet keys.
+            exchange.set_sandbox_mode(True)
         # Sanity read — does NOT require trade permission
         balance = await exchange.fetch_balance()
         await exchange.close()
@@ -290,16 +305,66 @@ async def convert_to_live(
             detail="Your plan doesn't allow live trading. Upgrade to Pro in Settings.",
         )
 
-    # 3. Pick an active OKX key
-    active_keys = await crud.list_active_api_keys_for_user(
-        db, user_id=current_user.id, exchange="okx"
-    )
-    if not active_keys:
-        raise HTTPException(
-            status_code=400,
-            detail="No active OKX key. Add one in Settings → API Keys first.",
+    # 3. Pick the key this strategy will trade with.
+    #
+    # Safety: an OKX key is stored as either "okx" (mainnet) or "okx_testnet"
+    # (AddApiKeyModal writes the suffix; bot_module/exchanges/factory.py keys
+    # sandbox mode off it). This lookup used to filter on exchange="okx" only,
+    # which made a testnet key invisible here and let `active_keys[0]` silently
+    # resolve to a MAINNET key whenever the user held both. Because this
+    # endpoint then flips run_mode to "live", that could put real money on the
+    # wire while the user believed they were still on testnet. We never guess
+    # across environments now.
+    okx_family = {"okx", "okx_testnet"}
+
+    if req.api_key_id is not None:
+        selected_key = await crud.get_api_key_by_id(
+            db, current_user.id, req.api_key_id
         )
-    selected_key = active_keys[0]  # most recent
+        if not selected_key or selected_key.exchange not in okx_family:
+            raise HTTPException(
+                status_code=400,
+                detail="That API key is not an OKX key on your account.",
+            )
+        if not selected_key.is_active or selected_key.status == "invalid":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "That API key is disabled or invalid. Re-enable it in "
+                    "Settings → API Keys, then try again."
+                ),
+            )
+    else:
+        mainnet_keys = list(
+            await crud.list_active_api_keys_for_user(
+                db, user_id=current_user.id, exchange="okx"
+            )
+        )
+        testnet_keys = list(
+            await crud.list_active_api_keys_for_user(
+                db, user_id=current_user.id, exchange="okx_testnet"
+            )
+        )
+        # Newest first, same ordering the old single-query lookup produced.
+        all_keys = sorted(
+            mainnet_keys + testnet_keys, key=lambda k: k.id, reverse=True
+        )
+        if not all_keys:
+            raise HTTPException(
+                status_code=400,
+                detail="No active OKX key. Add one in Settings → API Keys first.",
+            )
+        if mainnet_keys and testnet_keys:
+            # Ambiguous across environments — refuse rather than pick for them.
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "You have both a mainnet and a testnet OKX key, so we can't "
+                    "tell which one you want to trade with. Delete the one you "
+                    "don't need in Settings → API Keys, then try again."
+                ),
+            )
+        selected_key = all_keys[0]  # most recent, single environment
 
     # 4. Update the strategy config + publish RECONFIGURE_STRATEGY
     db_config.run_mode = "live"

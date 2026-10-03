@@ -240,6 +240,12 @@ class RiskManager:
             )
 
         self._is_trading_allowed = True
+        # Latching emergency stop. Deliberately separate from
+        # _is_trading_allowed, which both the daily-stat reset and
+        # _check_risk_limits() legitimately flip back to True on their own.
+        # This latch is only cleared by an explicit clear_emergency_stop().
+        self._emergency_stop_active = False
+        self._emergency_stop_reason: Optional[str] = None
         self._balance_lock = asyncio.Lock()
         self._reset_time_utc = dt_time(0, 1, 0, tzinfo=timezone.utc)
 
@@ -910,12 +916,45 @@ class RiskManager:
                     f"{log_prefix} Improvement check: Cooldown period not yet passed for index {stats.current_risk_multiplier_index}."
                 )
 
+    def trigger_emergency_stop(self, reason: str = "manual emergency stop") -> None:
+        """
+        Latch trading OFF. Blocks every new entry until an operator explicitly
+        clears it.
+
+        This deliberately does NOT flatten positions — the controller owns the
+        exchange calls needed to do that. Splitting the two keeps this method
+        safe to call from any context (including a failed command handler).
+        """
+        self._emergency_stop_active = True
+        self._emergency_stop_reason = reason
+        self._is_trading_allowed = False
+        logger.critical(f"EMERGENCY STOP engaged: {reason}")
+
+    def clear_emergency_stop(self) -> None:
+        """Release the emergency-stop latch. Operator action only."""
+        self._emergency_stop_active = False
+        self._emergency_stop_reason = None
+        self._is_trading_allowed = True
+        logger.warning("EMERGENCY STOP cleared. New entries re-enabled.")
+
+    def is_emergency_stop_active(self) -> bool:
+        return bool(self._emergency_stop_active)
+
     async def is_symbol_trading_allowed(self, symbol: str) -> bool:
         """
         Checks if trading is allowed for the given symbol.
         Includes checking the global flag and the user's blacklist.
         The blacklist is checked "on the fly" from the DB - changes are applied without a restart.
         """
+        # 0. Emergency stop latch. Checked before everything else so that no
+        # other path can re-enable trading while an emergency stop is active.
+        if self._emergency_stop_active:
+            logger.warning(
+                f"[Blacklist:{symbol}] Trading blocked: EMERGENCY STOP active "
+                f"({self._emergency_stop_reason})"
+            )
+            return False
+
         # 1. Check global flag (drawdown, consecutive losses, etc.)
         if not self._is_trading_allowed:
             logger.debug(f"[Blacklist:{symbol}] Trading globally disabled")
@@ -1381,6 +1420,13 @@ class RiskManager:
         logger.debug(
             f"{log_prefix} Initial Base Risk Planned (before S/S): ${initial_base_risk_usd_planned:.2f}"
         )
+
+        if self._emergency_stop_active:
+            logger.warning(
+                f"{log_prefix} Signal REJECTED. Reason: EMERGENCY STOP active "
+                f"({self._emergency_stop_reason})."
+            )
+            return False, None, initial_base_risk_usd_planned, "EMERGENCY_STOP"
 
         if not self._is_trading_allowed:
             logger.warning(

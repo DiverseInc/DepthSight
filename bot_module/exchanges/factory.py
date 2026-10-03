@@ -74,6 +74,16 @@ def create_exchange_executor(
         getattr(config, "ACTIVE_TRADING_ENVIRONMENT", "mainnet") == "testnet"
     )
     _exchange_suffix_is_testnet = exchange_id.endswith("_testnet")
+    # An explicit `_testnet` suffix means the caller deliberately asked for the
+    # testnet environment. If we then fall through to mainnet because credentials
+    # failed to load, a user who selected testnet silently gets real-money
+    # routing. Refuse instead. Paper-mode consumers never carry the suffix (they
+    # pass no exchange id at all), so the no-credentials paper path is untouched.
+    if _exchange_suffix_is_testnet and not (api_key and api_secret):
+        raise ValueError(
+            f"Testnet executor requested ('{exchange_id}') but no API credentials "
+            "were provided. Refusing to fall back to mainnet."
+        )
     # FIX 2026-09-20: paper-mode data consumers (no API credentials) must default to
     # sandbox=False even when the env or exchange-id suffix suggests testnet. Public
     # market-data WS endpoints (kline/trade/depth) work fine on mainnet without

@@ -1210,6 +1210,18 @@ BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE = (
     10.0  # 300% (allows leverage if balance = margin) (was 0.5 = 50%)
 )
 
+# Maximum position notional, as a multiple of account balance, for LIVE trading.
+#
+# This MUST be defined here. `RiskManager._calculate_position_details` reads it
+# with `getattr(config, "MAX_REAL_POSITION_SIZE_PCT_BALANCE", <fallback>)`, and
+# the fallback is BACKTEST_MAX_POSITION_SIZE_PCT_BALANCE (10.0 = 1000% of
+# equity). While this constant was undefined, every live trade was bounded only
+# by available leverage — one position could be sized at 10x the account.
+#
+# 0.10 = a single position may not exceed 10% of equity in notional value.
+# Deliberately conservative; raise it only after validating on testnet.
+MAX_REAL_POSITION_SIZE_PCT_BALANCE = 0.10
+
 # --- Settings for collecting data for the ML confirmation model via the backtester ---
 # Whether to log data for training the ML confirmation model during a REGULAR backtest (non-ML mode)
 BACKTEST_LOG_FOR_ML_CONFIRMATION_MODEL = True
