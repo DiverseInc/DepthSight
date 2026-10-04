@@ -5488,6 +5488,42 @@ class TradingController:
             symbol, required_data_keys, log_prefix, market_type=market_type
         )
 
+    def _resolve_symbol_pool_for_strategy(
+        self, config_dict: Dict[str, Any]
+    ) -> Tuple[str, List[str], bool]:
+        """Resolve a strategy's symbol pool from its symbol_selection_mode.
+
+        Returns ``(mode, symbols, mode_known)``.
+
+        This MUST be the only place that maps ``symbol_selection_mode`` to a
+        symbol list. The subscription builder (``_update_monitored_symbols``,
+        two call sites) and the event matcher (``_select_applicable_instances``)
+        both need this answer, and when they computed it separately they drifted:
+        a ``FIXED`` strategy was handled by the matcher but not by the
+        subscriber, so it matched 1m candles while the stream it required
+        (``kline_1h``) was never subscribed. The strategy then bailed every
+        candle at "Could not gather all required data" and never traded.
+
+        Modes:
+          DYNAMIC - needs a live screener feed (see ``SYMBOL_SOURCE_MODE``).
+          STATIC  - this config's own ``symbols`` list.
+          FIXED   - identical to STATIC, and what the onboarding wizard creates
+                    (see ``api/routes/onboarding.py``). It used to fall through
+                    every branch and yield an empty list.
+        """
+        mode = str(config_dict.get("symbol_selection_mode") or "DYNAMIC").strip().upper()
+
+        if mode == "DYNAMIC":
+            global_mode = self.symbol_selection_config.mode
+            if global_mode in ("DYNAMIC_NATR", "DYNAMIC_ORACLE"):
+                return mode, list(self.currently_managed_symbols), True
+            return mode, list(self._last_known_symbols_from_consumer), True
+
+        if mode in ("STATIC", "FIXED"):
+            return mode, list(config_dict.get("symbols") or []), True
+
+        return mode, [], False
+
     def _select_applicable_instances(
         self,
         running_instances: List[Tuple[BaseStrategy, dict]],
@@ -5519,23 +5555,13 @@ class TradingController:
                 )
                 continue
 
-            # Modes in use: DYNAMIC (needs the external screener), STATIC and
-            # FIXED (both use this config's own symbols list -- FIXED is what the
-            # onboarding wizard creates, see api/routes/onboarding.py). Normalise
-            # case: FIXED previously fell through BOTH branches, leaving the list
-            # empty, so an onboarding strategy was rejected unless its
-            # config_data also carried a hardcoded symbol.
-            mode = str(config_dict.get("symbol_selection_mode") or "DYNAMIC").strip().upper()
-            symbols_for_instance = []
-            if mode == "DYNAMIC":
-                global_mode = self.symbol_selection_config.mode
-                if global_mode in ("DYNAMIC_NATR", "DYNAMIC_ORACLE"):
-                    symbols_for_instance = list(self.currently_managed_symbols)
-                else:
-                    symbols_for_instance = list(self._last_known_symbols_from_consumer)
-            elif mode in ("STATIC", "FIXED"):
-                symbols_for_instance = list(config_dict.get("symbols") or [])
-            else:
+            # Single source of truth for mode -> symbols. See
+            # _resolve_symbol_pool_for_strategy for why this must not be
+            # reimplemented here.
+            mode, symbols_for_instance, mode_known = self._resolve_symbol_pool_for_strategy(
+                config_dict
+            )
+            if not mode_known:
                 rejections.append(
                     f"{strategy_name}: unknown symbol_selection_mode="
                     f"{config_dict.get('symbol_selection_mode')!r}"
@@ -6237,23 +6263,18 @@ class TradingController:
                 if pinned_symbol:
                     required_symbols_from_strategies.add(pinned_symbol)
 
-                mode = config_dict.get("symbol_selection_mode", "DYNAMIC")
-                if mode == "DYNAMIC":
-                    # In dynamic modes, we use
-                    # currently_managed_symbols, which are already filtered by settings
-                    global_mode = self.symbol_selection_config.mode
-                    if global_mode in ("DYNAMIC_NATR", "DYNAMIC_ORACLE"):
-                        required_symbols_from_strategies.update(
-                            self.currently_managed_symbols
-                        )
-                    else:
-                        # In STATIC (global) mode, we take all symbols from the screener
-                        required_symbols_from_strategies.update(
-                            self._last_known_symbols_from_consumer
-                        )
-                elif mode == "STATIC":
-                    required_symbols_from_strategies.update(
-                        config_dict.get("symbols", [])
+                mode, symbol_pool, mode_known = self._resolve_symbol_pool_for_strategy(
+                    config_dict
+                )
+                if mode_known:
+                    required_symbols_from_strategies.update(symbol_pool)
+                else:
+                    logger.warning(
+                        "[UpdateMonitoredSymbols] Strategy %r has an unknown "
+                        "symbol_selection_mode=%r; no symbols will be subscribed "
+                        "for it. Fix the mode or remove the strategy.",
+                        config_dict.get("name"),
+                        config_dict.get("symbol_selection_mode"),
                     )
 
             async with self._positions_dict_lock:
@@ -6301,26 +6322,29 @@ class TradingController:
                 config_data = config_dict.get("config_data", {})
                 pinned_symbol = config_data.get("symbol")
 
+                # A hardcoded symbol (e.g. from the visual editor) is ALWAYS
+                # required and is honoured by BOTH the subscriber and the event
+                # matcher -- they must agree, or a strategy gets candles it can
+                # never match (and vice versa).
                 symbols_for_instance = []
                 if pinned_symbol:
                     symbols_for_instance.append(pinned_symbol)
 
-                mode = config_dict.get("symbol_selection_mode", "DYNAMIC")
-                if mode == "DYNAMIC":
-                    # In dynamic modes, use filtered symbols
-                    global_mode = self.symbol_selection_config.mode
-                    if global_mode in ("DYNAMIC_NATR", "DYNAMIC_ORACLE"):
-                        for sym in self.currently_managed_symbols:
-                            if sym not in symbols_for_instance:
-                                symbols_for_instance.append(sym)
-                    else:
-                        for sym in self._last_known_symbols_from_consumer:
-                            if sym not in symbols_for_instance:
-                                symbols_for_instance.append(sym)
-                elif mode == "STATIC":
-                    for sym in config_dict.get("symbols", []):
-                        if sym not in symbols_for_instance:
-                            symbols_for_instance.append(sym)
+                mode, symbol_pool, mode_known = self._resolve_symbol_pool_for_strategy(
+                    config_dict
+                )
+                if not mode_known:
+                    logger.warning(
+                        "[UpdateMonitoredSymbols] Strategy %r has an unknown "
+                        "symbol_selection_mode=%r; its data requirements will not "
+                        "be subscribed.",
+                        config_dict.get("name"),
+                        config_dict.get("symbol_selection_mode"),
+                    )
+                    continue
+                for sym in symbol_pool:
+                    if sym not in symbols_for_instance:
+                        symbols_for_instance.append(sym)
 
                 strategy_market_type = self._market_type_for_strategy_config(
                     config_dict
