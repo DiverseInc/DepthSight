@@ -1,6 +1,7 @@
 # ruff: noqa: E402
 # bot_module/risk_manager.py
 import logging
+import math
 import time
 import asyncio
 import json
@@ -596,6 +597,17 @@ class RiskManager:
                     except (ValueError, TypeError) as e:
                         logger.error(
                             f"{log_prefix} Error converting USDT balance data to float: {e}. Data: {usdt_balance_data}"
+                        )
+                        return False
+
+                    # Non-finite balances must never reach stats. NaN compares
+                    # False against every limit below (min balance, the >90%
+                    # drop guard, drawdown), so it would sail through all of
+                    # them AND poison shared state for the other balance paths.
+                    if not math.isfinite(current_total_usdt):
+                        logger.error(
+                            f"{log_prefix} Non-finite USDT balance from executor "
+                            f"({current_total_usdt!r}). Ignoring this update."
                         )
                         return False
 
@@ -1397,13 +1409,64 @@ class RiskManager:
                 try:
                     balances = await executor_override.get_account_balance()
                     usdt_balance_data = balances.get("USDT") if balances else None
-                    if usdt_balance_data:
+                    if not usdt_balance_data:
+                        balance_updated_successfully = False
+                    else:
                         free_bal = float(usdt_balance_data.get("free", 0.0) or 0.0)
                         locked_bal = float(usdt_balance_data.get("locked", 0.0) or 0.0)
-                        current_balance_val = free_bal + locked_bal
-                        balance_updated_successfully = current_balance_val > 0
-                    else:
-                        balance_updated_successfully = False
+                        fetched_total = free_bal + locked_bal
+
+                        # Reject non-finite balances before they reach shared
+                        # state. Every limit here (min balance, the >90% drop
+                        # guard, drawdown) is a COMPARISON, and NaN compares
+                        # False against everything -- so NaN would slip past the
+                        # anomaly guard, leave trading enabled, and be written
+                        # into stats.current_balance, poisoning the other
+                        # balance paths too. Fail closed instead.
+                        if not math.isfinite(fetched_total):
+                            logger.error(
+                                f"{log_prefix} Executor override returned a "
+                                f"non-finite USDT balance ({fetched_total!r}). "
+                                f"Treating the balance fetch as failed."
+                            )
+                            current_balance_val = self.stats.current_balance
+                            balance_updated_successfully = False
+                        # Mirror update_balance()'s anomaly guard (its
+                        # "anomalously low new balance" branch): a >90% drop is
+                        # treated as a possible API glitch and the previous
+                        # balance is kept. Without this, the override path would
+                        # act on a bad read that the default path deliberately
+                        # distrusts, and would then latch trading off globally.
+                        elif (
+                            self.stats.current_balance > 10
+                            and fetched_total < self.stats.current_balance * 0.1
+                            and fetched_total < self.min_balance_threshold / 2
+                        ):
+                            logger.warning(
+                                f"{log_prefix} Override executor reported an "
+                                f"anomalously low balance (${fetched_total:.2f}) vs "
+                                f"previous (${self.stats.current_balance:.2f}). "
+                                f"Keeping the previous balance for this assessment."
+                            )
+                            current_balance_val = self.stats.current_balance
+                            balance_updated_successfully = True
+                        else:
+                            current_balance_val = fetched_total
+                            balance_updated_successfully = current_balance_val > 0
+                            if balance_updated_successfully:
+                                # The balance that sizes this trade must also be
+                                # the balance the global risk limits are judged
+                                # against. This branch previously updated neither
+                                # the shared stats nor the limits, so the gate
+                                # below (`if not self._is_trading_allowed`) read a
+                                # STALE flag while sizing used a FRESH balance --
+                                # and this is the branch EVERY live order takes,
+                                # because TradingController._process_signal always
+                                # passes executor_override. An account below
+                                # min_balance_threshold kept opening positions.
+                                async with self._balance_lock:
+                                    self.stats.current_balance = current_balance_val
+                                self._check_risk_limits()
                 except Exception as e:
                     logger.error(
                         f"{log_prefix} Failed to get live balance from market executor override: {e}",
