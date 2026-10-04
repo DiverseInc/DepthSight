@@ -5485,6 +5485,95 @@ class TradingController:
             symbol, required_data_keys, log_prefix, market_type=market_type
         )
 
+    def _select_applicable_instances(
+        self,
+        running_instances: List[Tuple[BaseStrategy, dict]],
+        symbol: str,
+        event: Dict[str, Any],
+        event_market_type: str,
+    ) -> Tuple[List[Tuple[BaseStrategy, dict]], List[str]]:
+        """
+        Decide which running strategy instances should react to this event.
+
+        Returns (applicable, rejections). `rejections` holds one human-readable
+        reason per instance, so the caller can log exactly WHY nothing matched
+        instead of an unactionable "no applicable instances".
+
+        Extracted from _check_signals_for_symbol_on_event so these matching
+        rules are unit-testable in isolation.
+        """
+        applicable_instances: List[Tuple[BaseStrategy, dict]] = []
+        rejections: List[str] = []
+        for instance, config_dict in running_instances:
+            strategy_name = getattr(instance, "NAME", type(instance).__name__)
+            config_data = config_dict.get("config_data", {})
+
+            strategy_market_type = self._market_type_for_strategy_config(config_dict)
+            if strategy_market_type != event_market_type:
+                rejections.append(
+                    f"{strategy_name}: market_type(strategy={strategy_market_type} "
+                    f"event={event_market_type})"
+                )
+                continue
+
+            mode = config_dict.get("symbol_selection_mode", "DYNAMIC")
+            symbols_for_instance = []
+            if mode == "DYNAMIC":
+                global_mode = self.symbol_selection_config.mode
+                if global_mode in ("DYNAMIC_NATR", "DYNAMIC_ORACLE"):
+                    symbols_for_instance = list(self.currently_managed_symbols)
+                else:
+                    symbols_for_instance = list(self._last_known_symbols_from_consumer)
+            elif mode == "STATIC":
+                symbols_for_instance = config_dict.get("symbols", [])
+
+            # A strategy with a hardcoded symbol (e.g. built in the visual
+            # editor) is ALWAYS required: _update_monitored_symbols treats it
+            # that way, and that is what drives the actual data subscription.
+            # This check MUST agree with it. It previously did not, so a
+            # pinned symbol was subscribed but never matched here: candles
+            # arrived for exactly the pinned symbols while every event was
+            # rejected with "No applicable strategy instances", and the
+            # strategy never evaluated a signal.
+            pinned_symbol = config_data.get("symbol")
+            if not pinned_symbol and symbol not in symbols_for_instance:
+                rejections.append(
+                    f"{strategy_name}: symbol not monitored "
+                    f"(mode={mode}, pinned={pinned_symbol!r}, "
+                    f"pool_size={len(symbols_for_instance)})"
+                )
+                continue
+
+            trigger_type = config_data.get("entryTrigger", {}).get("type")
+
+            if event["type"] == "TICK" and trigger_type in {
+                "on_tick",
+                "on_condition_met",
+            }:
+                applicable_instances.append((instance, config_dict))
+            elif event["type"] == "CANDLE_CLOSE" and trigger_type == "on_candle_close":
+                event_tf = event.get("timeframe")
+                strategy_tf = (
+                    config_data.get("entryTrigger", {}).get("timeframe")
+                    or config_data.get("tradingTimeframe")
+                    or "1m"
+                )
+                if not event_tf or event_tf == strategy_tf:
+                    applicable_instances.append((instance, config_dict))
+                else:
+                    rejections.append(
+                        f"{strategy_name}: timeframe(event={event_tf} "
+                        f"strategy={strategy_tf})"
+                    )
+            else:
+                # Previously fell off the end of the if/elif with NO log at all,
+                # which made a trigger-type mismatch completely invisible.
+                rejections.append(
+                    f"{strategy_name}: trigger_type={trigger_type!r} does not "
+                    f"match event type={event['type']!r}"
+                )
+        return applicable_instances, rejections
+
     async def _check_signals_for_symbol_on_event(
         self, symbol: str, event: Dict[str, Any]
     ):
@@ -5511,70 +5600,20 @@ class TradingController:
             )
             return
 
-        applicable_instances: List[Tuple[BaseStrategy, dict]] = []
-        for instance, config_dict in running_instances:
-            strategy_market_type = self._market_type_for_strategy_config(config_dict)
-            if strategy_market_type != event_market_type:
-                logger.debug(
-                    "[SignalCheck:%s] Strategy %s skipped: market_type mismatch strategy=%s event=%s.",
-                    symbol,
-                    getattr(instance, "NAME", type(instance).__name__),
-                    strategy_market_type,
-                    event_market_type,
-                )
-                continue
-            mode = config_dict.get("symbol_selection_mode", "DYNAMIC")
-            symbols_for_instance = []
-            if mode == "DYNAMIC":
-                global_mode = self.symbol_selection_config.mode
-                if global_mode in ("DYNAMIC_NATR", "DYNAMIC_ORACLE"):
-                    symbols_for_instance = list(self.currently_managed_symbols)
-                else:
-                    symbols_for_instance = list(self._last_known_symbols_from_consumer)
-            elif mode == "STATIC":
-                symbols_for_instance = config_dict.get("symbols", [])
-
-            if symbol not in symbols_for_instance:
-                logger.debug(
-                    "[SignalCheck:%s] Strategy %s skipped: symbol not monitored for mode=%s symbols=%s.",
-                    symbol,
-                    getattr(instance, "NAME", type(instance).__name__),
-                    mode,
-                    symbols_for_instance,
-                )
-                continue
-
-            config_data = config_dict.get("config_data", {})
-            trigger_type = config_data.get("entryTrigger", {}).get("type")
-
-            if event["type"] == "TICK" and trigger_type in {
-                "on_tick",
-                "on_condition_met",
-            }:
-                applicable_instances.append((instance, config_dict))
-            elif event["type"] == "CANDLE_CLOSE" and trigger_type == "on_candle_close":
-                event_tf = event.get("timeframe")
-                strategy_tf = (
-                    config_data.get("entryTrigger", {}).get("timeframe")
-                    or config_data.get("tradingTimeframe")
-                    or "1m"
-                )
-
-                # Verify timeframe matching.
-                if not event_tf or event_tf == strategy_tf:
-                    applicable_instances.append((instance, config_dict))
-                else:
-                    logger.debug(
-                        f"[SignalCheck:{symbol}] Timeframe mismatch: Event={event_tf}, Strategy={strategy_tf}. Skipping."
-                    )
+        applicable_instances, rejections = self._select_applicable_instances(
+            running_instances, symbol, event, event_market_type
+        )
 
         if not applicable_instances:
             logger.info(
-                "[SignalCheck:%s] No applicable strategy instances for event=%s timeframe=%s market_type=%s.",
+                "[SignalCheck:%s] No applicable strategy instances for event=%s timeframe=%s market_type=%s. "
+                "%d running instance(s) all rejected: %s",
                 symbol,
                 event.get("type"),
                 event.get("timeframe"),
                 event_market_type,
+                len(running_instances),
+                "; ".join(rejections) if rejections else "no rejection detail available",
             )
             return
 
