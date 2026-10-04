@@ -4365,7 +4365,10 @@ class TradingController:
                         if strategy_config_dict:
                             entry_trigger = strategy_config_dict.get(
                                 "config_data", {}
-                            ).get("entryTrigger", {})
+                            ).get("entryTrigger")
+                            # `or {}` — a present-but-null entryTrigger must not
+                            # crash the signal path.
+                            entry_trigger = entry_trigger or {}
                             trading_timeframe = entry_trigger.get("timeframe", "1m")
 
                         # Log if the event timeframe differs from the trading one
@@ -5544,7 +5547,25 @@ class TradingController:
                 )
                 continue
 
-            trigger_type = config_data.get("entryTrigger", {}).get("type")
+            # Missing trigger_type defaults to "on_candle_close", matching:
+            #   - the timeframe default ("... or '1m'") in the same expression
+            #   - api/ai_assistant.py, which normalises a missing type to
+            #     "on_candle_close"
+            #   - every strategy producer in the codebase (crud seeds, breeder,
+            #     trainer, genetic finder, the visual editor default)
+            # EntryTrigger.type is a required field in the Pydantic schema, but
+            # configs written through paths that bypass validation carry no
+            # type at all. Matching strictly on the literal silently dropped
+            # those strategies: candles arrived, and every event was rejected
+            # with trigger_type=None. An EXPLICITLY unrecognised type is still
+            # rejected -- only a genuinely absent one is defaulted, so a
+            # misconfigured strategy is never silently run.
+            # NOTE: `or {}` rather than `.get(..., {})` — the latter returns
+            # None when the key EXISTS with a null value, which raised
+            # AttributeError inside the signal path.
+            trigger_type = (config_data.get("entryTrigger") or {}).get("type")
+            if not trigger_type:
+                trigger_type = "on_candle_close"
 
             if event["type"] == "TICK" and trigger_type in {
                 "on_tick",
@@ -5554,7 +5575,7 @@ class TradingController:
             elif event["type"] == "CANDLE_CLOSE" and trigger_type == "on_candle_close":
                 event_tf = event.get("timeframe")
                 strategy_tf = (
-                    config_data.get("entryTrigger", {}).get("timeframe")
+                    (config_data.get("entryTrigger") or {}).get("timeframe")
                     or config_data.get("tradingTimeframe")
                     or "1m"
                 )

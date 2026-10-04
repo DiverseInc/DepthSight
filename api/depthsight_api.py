@@ -786,7 +786,7 @@ def _check_intracandle_trigger_permission(
 
     # Check which trigger is used in the configuration
     if isinstance(config_data, dict):
-        entry_trigger = config_data.get("entryTrigger", {})
+        entry_trigger = config_data.get("entryTrigger") or {}
         trigger_type = entry_trigger.get("type")
 
         # If a forbidden trigger type is used, raise an error

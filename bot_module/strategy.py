@@ -2854,7 +2854,7 @@ class BaseStrategy:
         if not isinstance(visual_config, dict):
             visual_config = {}
 
-        entry_trigger_tf = visual_config.get("entryTrigger", {}).get("timeframe")
+        entry_trigger_tf = (visual_config.get("entryTrigger") or {}).get("timeframe")
         trading_tf = visual_config.get("tradingTimeframe")
 
         candle_tf = (
@@ -3216,7 +3216,7 @@ class BaseStrategy:
                     if "candle_timeframe" not in pair_info:
                         pair_info["candle_timeframe"] = (
                             config_val.get("tradingTimeframe")
-                            or config_val.get("entryTrigger", {}).get("timeframe")
+                            or (config_val.get("entryTrigger") or {}).get("timeframe")
                             or "1m"
                         )
 

@@ -347,12 +347,15 @@ def _sanitize_strategy_nulls(node: Any) -> Any:
                 init["params"] = {}
 
     # Ensure entryTrigger has required structure
-    if "entryTrigger" in node:
-        et = node["entryTrigger"]
-        if et is None:
-            node["entryTrigger"] = {"type": "on_candle_close", "timeframe": "1m"}
-        elif isinstance(et, dict) and "type" not in et:
-            et["type"] = "on_candle_close"
+    # Note: the original guard was `if "entryTrigger" in node:`, which did
+    # nothing when the key was absent entirely -- so a config with no
+    # entryTrigger kept none, and the bot's SignalCheck then rejected every
+    # candle event for it (trigger_type=None). Add the key when missing.
+    et = node.get("entryTrigger")
+    if et is None:
+        node["entryTrigger"] = {"type": "on_candle_close", "timeframe": "1m"}
+    elif isinstance(et, dict) and not et.get("type"):
+        et["type"] = "on_candle_close"
 
     # Recurse into all nested dicts and lists
     for key, value in node.items():
