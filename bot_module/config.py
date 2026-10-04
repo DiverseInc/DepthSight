@@ -474,6 +474,12 @@ SYMBOL_SOURCE_JSON_FILE_PATH = "data/static_symbols.json"
 FILTERED_PAIRS_FILE = "data/filtered_pairs.json"
 # WebSocket URL of the main application that provides market data and the list of active pairs
 MAIN_APP_WS_URL = "wss://screener.depthsight.pro/ws/bot/"
+# Consecutive Main_app_ws failures after which the outage is escalated from a
+# throttled WARNING to a CRITICAL trading-outage notice. There is no automatic
+# fallback to SYMBOL_SOURCE_STATIC_LIST, so while this feed is down every
+# DYNAMIC-mode strategy has no symbols to subscribe to or match against.
+# Pinned-symbol strategies keep working, which makes the outage easy to miss.
+MAIN_APP_WS_CRITICAL_AFTER_FAILURES = 10
 # Name of the topic/message in WebSocket from the main app signaling an update to the active pairs list
 MAIN_APP_SYMBOL_UPDATE_TOPIC = "filtered_pairs:update"  # Example, may differ
 

@@ -2961,6 +2961,32 @@ class DataConsumer:
                     )
                     last_warn_ts[err_key] = now
                 consecutive_failures += 1
+
+                # Escalate once the outage stops looking transient.
+                #
+                # SYMBOL_SOURCE_MODE is "MAIN_APP" and there is NO automatic
+                # fallback: the static list is only read when the mode is
+                # literally "STATIC_LIST". So while this feed is down,
+                # currently_managed_symbols stays empty and every DYNAMIC-mode
+                # strategy has nothing to match or subscribe to. Pinned-symbol
+                # strategies are unaffected, which makes this failure mode
+                # look "mostly fine" and easy to miss.
+                #
+                # A dead symbol source is therefore not a WARNING, it is a
+                # trading outage for DYNAMIC strategies. Say so, periodically,
+                # instead of leaving it buried under throttled reconnects.
+                threshold = getattr(
+                    config, "MAIN_APP_WS_CRITICAL_AFTER_FAILURES", 10
+                )
+                if consecutive_failures in (threshold, threshold * 3, threshold * 10):
+                    logger.critical(
+                        f"Main_app_ws has failed {consecutive_failures} consecutive "
+                        f"times ({err_key}: {e_conn}). The symbol source is DOWN: "
+                        f"DYNAMIC-mode strategies cannot trade — they have no symbols "
+                        f"to subscribe to or match against. Pinned-symbol strategies "
+                        f"are unaffected. The static list is NOT used automatically; "
+                        f"set SYMBOL_SOURCE_MODE='STATIC_LIST' to fall back deliberately."
+                    )
             except asyncio.CancelledError:
                 logger.info("Main_app_ws_loop cancelled.")
                 break
