@@ -74,6 +74,23 @@ _global_ws_registry: Dict[str, Dict[str, Any]] = {}
 _global_event_queues: Dict[str, Set[asyncio.Queue]] = defaultdict(set)
 _global_event_queues_lock = asyncio.Lock()
 
+# Generation counter per shared ccxt.pro client, keyed by id(client).
+#
+# The ccxt.pro client comes from the executor (see `_ccxt_pro_data_ws_loop`:
+# `ccxt_pro_client = getattr(executor, "_exchange_pro", None)`), so ONE socket
+# is shared by every stream on that executor -- BTCUSDT 1m, BTCUSDT 1h,
+# BTCUSDT 4h, BTCUSDT openInterest and every other symbol using the same
+# market type. When the silence watchdog decides a socket is wedged it has to
+# close it to force a fresh connection, and that close is collateral damage:
+# the sibling streams are left holding a closed client and silently deliver
+# nothing forever.
+#
+# So closing a client bumps its generation. Every loop records the generation
+# it started on and watches for a change; a loop that sees its generation move
+# tears itself down and re-subscribes on the fresh socket, instead of hanging
+# on a connection that no longer exists.
+_client_generation: Dict[int, int] = {}
+
 # Shared data cache available to all DataConsumer
 _global_kline_cache: Dict[str, deque] = defaultdict(
     lambda: deque(maxlen=DEFAULT_KLINE_CACHE_SIZE_CONFIG)
@@ -4424,6 +4441,13 @@ class DataConsumer:
             )
             return
 
+        # This socket is shared with every other stream on the same executor.
+        # Remember which generation of it we started on so that a sibling's
+        # watchdog recycling the socket also recycles us, rather than leaving
+        # this stream parked on a closed connection forever.
+        client_key = id(ccxt_pro_client)
+        my_generation = _client_generation.get(client_key, 0)
+
         ccxt_symbol = symbol.upper()
         # Some exchanges need CCXT format like "BTC/USDT" or "BTC/USDT:USDT"
         if hasattr(executor, "_normalize_symbol"):
@@ -4461,9 +4485,26 @@ class DataConsumer:
         # Set when the watchdog tears this stream down while it is still wanted,
         # so the post-loop block can re-request it. See the self-heal below.
         exited_for_watchdog = False
+        # Set when a SIBLING stream recycled the shared ccxt client out from
+        # under us. We are still wanted, we just need to move to the new socket.
+        exited_for_client_reset = False
 
         while self._running:
             try:
+                # A sibling stream decided this shared socket was wedged and
+                # closed it. Everything we have on it is gone; get off it and
+                # let the self-heal below re-subscribe on the fresh connection.
+                if _client_generation.get(client_key, 0) != my_generation:
+                    logger.warning(
+                        "%s Shared CCXT Pro client was recycled by another "
+                        "stream (generation %d -> %d); re-subscribing.",
+                        log_prefix,
+                        my_generation,
+                        _client_generation.get(client_key, 0),
+                    )
+                    exited_for_client_reset = True
+                    break
+
                 # FIX 2026-09-20: silence-watchdog check. If we've been silent
                 # for more than `silence_threshold_s`, force-close the WS so
                 # ccxt opens a fresh one on the next watch_ohlcv call. This
@@ -4495,6 +4536,12 @@ class DataConsumer:
                             log_prefix,
                             close_exc,
                         )
+                    # Bump AFTER the close so siblings do not race onto the
+                    # socket we are in the middle of shutting down. They pick
+                    # the change up on their next loop iteration and re-subscribe.
+                    _client_generation[client_key] = (
+                        _client_generation.get(client_key, 0) + 1
+                    )
                     # Break out of the while loop; the post-loop cleanup
                     # pops our registry entry and the self-heal block
                     # re-requests the subscription.
@@ -4644,6 +4691,21 @@ class DataConsumer:
 
             except asyncio.CancelledError:
                 break
+            except asyncio.TimeoutError:
+                # `watch_ohlcv` produced nothing inside its wait_for window.
+                # This is NOT a stream error -- it is the normal "no update
+                # arrived yet" case, and the silence watchdog above is what
+                # decides whether the socket is genuinely dead. Logging it as
+                # an error buried the real cause under an empty-message
+                # "Error in CCXT Pro stream:" line every 30s and printed a
+                # CancelledError traceback pointing into ccxt internals rather
+                # than at the dead socket.
+                logger.warning(
+                    "%s No CCXT Pro update within the watch window; "
+                    "re-checking socket liveness.",
+                    log_prefix,
+                )
+                await asyncio.sleep(2)
             except Exception as e:
                 logger.error(
                     f"{log_prefix} Error in CCXT Pro stream: {e}", exc_info=True
@@ -4654,7 +4716,7 @@ class DataConsumer:
         async with self._binance_market_data_ws_lock:
             self._binance_market_data_ws_tasks.pop(stream_id, None)
 
-        # --- Self-heal: a dead stream used to stay dead forever ------------
+        # --- Drop the corpse, then self-heal --------------------------------
         # Two independent gates prevented any recovery, and a comment here
         # claimed a third path handled it:
         #   * the bot skips republishing, because the stream key is still in
@@ -4670,39 +4732,41 @@ class DataConsumer:
         # watchdog tore it down, and it never returned. The strategy then had
         # no 1m data and no visible cause -- "running" forever, zero trades.
         #
-        # Only self-heal a WATCHDOG teardown. Exiting because the registry
-        # entry disappeared means it was unsubscribed, and exiting via
+        # A previous attempt at this self-heal guarded the corpse removal with
+        # "if the registry task is not done, someone else owns it now, skip".
+        # That condition is never false when checked from inside the stream
+        # task itself: the registry's task IS this task, and this task is by
+        # definition not done while it is running the check. So the guard
+        # always skipped and the self-heal was unreachable -- it logged
+        # "a live task already owns this stream" on the one occasion it was
+        # supposed to fire. The correct question is not "is it done" but "is it
+        # ME", which is what the binance loop above already does correctly.
+        current = asyncio.current_task()
+        async with _global_ws_registry_lock:
+            entry = _global_ws_registry.get(stream_id)
+            if entry is not None and entry.get("task") is current:
+                _global_ws_registry.pop(stream_id, None)
+                async with _global_event_queues_lock:
+                    _global_event_queues.pop(stream_id, None)
+
+        # Only self-heal a teardown we did not ask for. Exiting because the
+        # registry entry disappeared means it was unsubscribed, and exiting via
         # CancelledError means shutdown -- resubscribing there would resurrect
         # a stream the operator deliberately stopped.
-        if exited_for_watchdog and self._running:
+        torn_down_unexpectedly = exited_for_watchdog or exited_for_client_reset
+        if torn_down_unexpectedly and self._running:
             try:
-                # Drop the corpse first: ensure_subscription reuses an existing
-                # registry entry without checking whether its task is alive,
-                # so leaving it in place would re-register a dead task.
-                async with _global_ws_registry_lock:
-                    stale = _global_ws_registry.get(stream_id)
-                    if stale is not None:
-                        stale_task = stale.get("task")
-                        if stale_task is not None and not stale_task.done():
-                            # A newer task already took over this stream.
-                            stale = None
-                    if stale is not None:
-                        _global_ws_registry.pop(stream_id, None)
-                if stale is None:
-                    logger.warning(
-                        "%s Watchdog teardown while still wanted; a live task "
-                        "already owns this stream, skipping self-heal.",
-                        log_prefix,
-                    )
-                else:
-                    logger.warning(
-                        "%s Watchdog teardown while still wanted; "
-                        "re-requesting subscription (self-heal).",
-                        log_prefix,
-                    )
-                    await self.ensure_subscription(
-                        data_type_key, symbol, market_type=market_type
-                    )
+                logger.warning(
+                    "%s Torn down (%s) while still wanted; re-requesting "
+                    "subscription (self-heal).",
+                    log_prefix,
+                    "socket silent"
+                    if exited_for_watchdog
+                    else "shared client recycled",
+                )
+                await self.ensure_subscription(
+                    data_type_key, symbol, market_type=market_type
+                )
             except Exception as heal_exc:
                 logger.error(
                     "%s Self-heal resubscribe failed: %s", log_prefix, heal_exc
