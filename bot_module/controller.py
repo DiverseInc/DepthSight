@@ -6379,6 +6379,34 @@ class TradingController:
                         all_required_data_types[symbol_market_key].update(
                             instance.required_data_types
                         )
+
+                        # The trigger timeframe the MATCHER will demand MUST also
+                        # be SUBSCRIBED. The matcher resolves it from config_data
+                        # (see _select_applicable_instances); instance.
+                        # required_data_types resolves it from the strategy
+                        # object's own _instance_params["config"]. When those two
+                        # disagree the strategy is subscribed to the wrong
+                        # streams and can never be evaluated -- it reported
+                        # "running" indefinitely while every candle was rejected
+                        # with "timeframe(event=1h strategy=1m)", because the 1m
+                        # stream it needed was never subscribed.
+                        #
+                        # Derived from the SAME source as the matcher, using the
+                        # SAME defaulting, so the two cannot drift. Only applied
+                        # for candle-close triggers, because tick-triggered
+                        # strategies evaluate on price ticks and need no kline
+                        # to trigger.
+                        _entry_trigger = config_data.get("entryTrigger") or {}
+                        _trigger_type = _entry_trigger.get("type") or "on_candle_close"
+                        if _trigger_type == "on_candle_close":
+                            _matcher_tf = (
+                                _entry_trigger.get("timeframe")
+                                or config_data.get("tradingTimeframe")
+                                or "1m"
+                            )
+                            all_required_data_types[symbol_market_key].add(
+                                f"kline_{_matcher_tf}"
+                            )
                         all_required_metrics[symbol_market_key].update(
                             instance.required_indicators
                         )
