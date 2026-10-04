@@ -452,6 +452,33 @@ async def start_strategy_instance(
     )
     symbols = request.symbols if request.symbols is not None else config_to_run.symbols
 
+    # Refuse DYNAMIC loudly when this deployment has no working symbol source.
+    #
+    # DYNAMIC needs a live screener feed (MAIN_APP_WS_URL) and there is no
+    # automatic fallback to the static list. If that feed is unreachable the
+    # strategy still starts, still reports "running", and silently never trades
+    # -- no symbols to subscribe to, none to match. Refusing here turns that
+    # into an immediate, explanatory error the user can act on.
+    #
+    # Operators who run their own screener set
+    # SYMBOL_SELECTION_ALLOW_DYNAMIC=true. STATIC and FIXED (the mode the
+    # onboarding wizard creates) are unaffected.
+    _resolved_mode = str(symbol_selection_mode or "").strip().upper()
+    if _resolved_mode == "DYNAMIC" and not getattr(
+        bot_config, "SYMBOL_SELECTION_ALLOW_DYNAMIC", False
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Dynamic symbol selection is not available on this deployment. "
+                "It requires a reachable symbol screener, and there is no "
+                "automatic fallback, so a dynamic strategy would start and then "
+                "never trade. Choose an explicit symbol instead (STATIC/FIXED), "
+                "or set SYMBOL_SELECTION_ALLOW_DYNAMIC=true if you have your own "
+                "screener running."
+            ),
+        )
+
     # 3. Perform permission checks (symbol list restrictions only apply to backtests)
     pass
 

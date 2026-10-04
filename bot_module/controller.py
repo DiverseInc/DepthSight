@@ -5519,7 +5519,13 @@ class TradingController:
                 )
                 continue
 
-            mode = config_dict.get("symbol_selection_mode", "DYNAMIC")
+            # Modes in use: DYNAMIC (needs the external screener), STATIC and
+            # FIXED (both use this config's own symbols list -- FIXED is what the
+            # onboarding wizard creates, see api/routes/onboarding.py). Normalise
+            # case: FIXED previously fell through BOTH branches, leaving the list
+            # empty, so an onboarding strategy was rejected unless its
+            # config_data also carried a hardcoded symbol.
+            mode = str(config_dict.get("symbol_selection_mode") or "DYNAMIC").strip().upper()
             symbols_for_instance = []
             if mode == "DYNAMIC":
                 global_mode = self.symbol_selection_config.mode
@@ -5527,8 +5533,14 @@ class TradingController:
                     symbols_for_instance = list(self.currently_managed_symbols)
                 else:
                     symbols_for_instance = list(self._last_known_symbols_from_consumer)
-            elif mode == "STATIC":
-                symbols_for_instance = config_dict.get("symbols", [])
+            elif mode in ("STATIC", "FIXED"):
+                symbols_for_instance = list(config_dict.get("symbols") or [])
+            else:
+                rejections.append(
+                    f"{strategy_name}: unknown symbol_selection_mode="
+                    f"{config_dict.get('symbol_selection_mode')!r}"
+                )
+                continue
 
             # A strategy with a hardcoded symbol (e.g. built in the visual
             # editor) is ALWAYS required: _update_monitored_symbols treats it

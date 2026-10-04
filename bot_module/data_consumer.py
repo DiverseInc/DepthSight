@@ -392,7 +392,19 @@ class DataConsumer:
         logger.info(f"Symbol source mode: {source_mode}")
 
         if source_mode == "MAIN_APP":
-            if (
+            # The screener loop can be switched off entirely. When nothing can
+            # consume its output (SYMBOL_SELECTION_ALLOW_DYNAMIC is false, so
+            # DYNAMIC strategies are refused at start), reconnecting to an
+            # unreachable host forever is pure cost and floods the logs with a
+            # warning that masks real problems. Pinned-symbol and STATIC/FIXED
+            # strategies do not use this feed at all.
+            if not getattr(config, "MAIN_APP_WS_ENABLED", True):
+                logger.warning(
+                    "MAIN_APP_WS_ENABLED is false - the screener WebSocket loop "
+                    "is disabled. DYNAMIC symbol selection will not work. "
+                    "Pinned-symbol and STATIC/FIXED strategies are unaffected."
+                )
+            elif (
                 websockets
                 and self._main_app_ws_url
                 and self._main_app_ws_url.startswith(("ws://", "wss://"))

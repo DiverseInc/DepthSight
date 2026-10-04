@@ -457,6 +457,37 @@ logger.info("Genetic Algorithm default parameters and GENE_POOL defined.")
 # "JSON_FILE" - from file (SYMBOL_SOURCE_JSON_FILE_PATH)
 SYMBOL_SOURCE_MODE = "MAIN_APP"  # Default is 'MAIN_APP'
 
+# Whether DYNAMIC symbol selection may be used at all.
+#
+# DYNAMIC needs a live symbol source. In MAIN_APP mode that means the external
+# screener WebSocket (MAIN_APP_WS_URL), and there is NO automatic fallback to
+# SYMBOL_SOURCE_STATIC_LIST -- the static list is only read when the mode is
+# literally "STATIC_LIST". If the screener is unreachable, DYNAMIC strategies
+# start, appear "running", and silently never trade: no symbols to subscribe
+# to, none to match against. That is the worst failure mode for a product,
+# because it looks healthy.
+#
+# Default is FALSE so a deployment without a screener refuses DYNAMIC loudly at
+# strategy-start instead of accepting it and never trading. Operators running
+# their own screener should set SYMBOL_SELECTION_ALLOW_DYNAMIC=true.
+#
+# STATIC and FIXED modes need no external dependency: STATIC uses the config's
+# symbols list, FIXED is what the onboarding wizard creates, and both also honour
+# a hardcoded config_data["symbol"].
+SYMBOL_SELECTION_ALLOW_DYNAMIC = os.environ.get(
+    "SYMBOL_SELECTION_ALLOW_DYNAMIC", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Whether the Main_app_ws screener loop runs at all. Set false to stop the
+# reconnect storm against an unreachable screener when nothing can use it
+# (i.e. when SYMBOL_SELECTION_ALLOW_DYNAMIC is false).
+MAIN_APP_WS_ENABLED = os.environ.get("MAIN_APP_WS_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 # Static list of symbols for "STATIC_LIST" mode
 # Format: list of strings, e.g., ["BTCUSDT", "ETHUSDT"]
 SYMBOL_SOURCE_STATIC_LIST: List[str] = [
