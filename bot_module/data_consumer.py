@@ -1986,9 +1986,27 @@ class DataConsumer:
             # GLOBAL REGISTRY WITH BROADCAST
             # One WebSocket per unique stream, events are broadcast to ALL queues
             async with _global_ws_registry_lock:
-                if task_and_client_key in _global_ws_registry:
+                existing_entry = _global_ws_registry.get(task_and_client_key)
+                if existing_entry is not None:
+                    # A FINISHED task is a dead stream. Reusing the entry would
+                    # bump ref_count against a corpse and the data would never
+                    # flow again -- the stream would look subscribed forever
+                    # while delivering nothing. Treat a done task as absent so
+                    # a fresh task is created below.
+                    _existing_task = existing_entry.get("task")
+                    if _existing_task is None or _existing_task.done():
+                        logger.warning(
+                            f"{log_prefix} Registry entry for {task_and_client_key} "
+                            f"holds a finished task; discarding it and "
+                            f"re-establishing the stream."
+                        )
+                        _global_ws_registry.pop(task_and_client_key, None)
+                        async with _global_event_queues_lock:
+                            _global_event_queues.pop(task_and_client_key, None)
+                        existing_entry = None
+                if existing_entry is not None:
                     # Subscription ALREADY exists — just adding our queue to the broadcast list
-                    registry_entry = _global_ws_registry[task_and_client_key]
+                    registry_entry = existing_entry
                     consumer_id = id(self)
 
                     if consumer_id not in registry_entry["consumers"]:
@@ -4440,6 +4458,10 @@ class DataConsumer:
                 # 1h → 5400s, 4h → 21600s.
                 silence_threshold_s = max(90, int(interval_s * 1.5))
 
+        # Set when the watchdog tears this stream down while it is still wanted,
+        # so the post-loop block can re-request it. See the self-heal below.
+        exited_for_watchdog = False
+
         while self._running:
             try:
                 # FIX 2026-09-20: silence-watchdog check. If we've been silent
@@ -4474,9 +4496,9 @@ class DataConsumer:
                             close_exc,
                         )
                     # Break out of the while loop; the post-loop cleanup
-                    # at line 4271 pops our registry entry, and the
-                    # controller's _ensure_subscription_via_redis path
-                    # will see the missing task and spawn a fresh one.
+                    # pops our registry entry and the self-heal block
+                    # re-requests the subscription.
+                    exited_for_watchdog = True
                     break
 
                 if data_type_key.startswith("kline_"):
@@ -4631,3 +4653,57 @@ class DataConsumer:
         logger.info(f"{log_prefix} CCXT Pro stream finished.")
         async with self._binance_market_data_ws_lock:
             self._binance_market_data_ws_tasks.pop(stream_id, None)
+
+        # --- Self-heal: a dead stream used to stay dead forever ------------
+        # Two independent gates prevented any recovery, and a comment here
+        # claimed a third path handled it:
+        #   * the bot skips republishing, because the stream key is still in
+        #     its local _redis_market_stream_keys set (see
+        #     _ensure_subscription_via_redis);
+        #   * MarketDataService._handle_subscribe only re-subscribes when a
+        #     stream has ZERO subscribers, but its subscriber set still holds
+        #     the bot's id;
+        #   * the old comment here asserted "the controller's
+        #     _ensure_subscription_via_redis path will see the missing task and
+        #     spawn a fresh one" -- that path skips known keys, so it never ran.
+        # Observed 2026-10-04 21:38:48 UTC: BTCUSDT@kline_1m went silent, the
+        # watchdog tore it down, and it never returned. The strategy then had
+        # no 1m data and no visible cause -- "running" forever, zero trades.
+        #
+        # Only self-heal a WATCHDOG teardown. Exiting because the registry
+        # entry disappeared means it was unsubscribed, and exiting via
+        # CancelledError means shutdown -- resubscribing there would resurrect
+        # a stream the operator deliberately stopped.
+        if exited_for_watchdog and self._running:
+            try:
+                # Drop the corpse first: ensure_subscription reuses an existing
+                # registry entry without checking whether its task is alive,
+                # so leaving it in place would re-register a dead task.
+                async with _global_ws_registry_lock:
+                    stale = _global_ws_registry.get(stream_id)
+                    if stale is not None:
+                        stale_task = stale.get("task")
+                        if stale_task is not None and not stale_task.done():
+                            # A newer task already took over this stream.
+                            stale = None
+                    if stale is not None:
+                        _global_ws_registry.pop(stream_id, None)
+                if stale is None:
+                    logger.warning(
+                        "%s Watchdog teardown while still wanted; a live task "
+                        "already owns this stream, skipping self-heal.",
+                        log_prefix,
+                    )
+                else:
+                    logger.warning(
+                        "%s Watchdog teardown while still wanted; "
+                        "re-requesting subscription (self-heal).",
+                        log_prefix,
+                    )
+                    await self.ensure_subscription(
+                        data_type_key, symbol, market_type=market_type
+                    )
+            except Exception as heal_exc:
+                logger.error(
+                    "%s Self-heal resubscribe failed: %s", log_prefix, heal_exc
+                )
