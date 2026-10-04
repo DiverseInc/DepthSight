@@ -5569,19 +5569,37 @@ class TradingController:
                 continue
 
             # A strategy with a hardcoded symbol (e.g. built in the visual
-            # editor) is ALWAYS required: _update_monitored_symbols treats it
-            # that way, and that is what drives the actual data subscription.
-            # This check MUST agree with it. It previously did not, so a
-            # pinned symbol was subscribed but never matched here: candles
-            # arrived for exactly the pinned symbols while every event was
-            # rejected with "No applicable strategy instances", and the
-            # strategy never evaluated a signal.
+            # editor) MUST match only that symbol -- but it must still match it
+            # even when the mode pool is empty, which is what the original
+            # "symbol not in symbols_for_instance" test got wrong (a pinned
+            # strategy was subscribed and then never matched).
+            #
+            # The first attempt at that fix short-circuited the symbol test
+            # instead of constraining it:
+            #
+            #     if not pinned_symbol and symbol not in symbols_for_instance:
+            #
+            # which accepts EVERY symbol whenever a pinned symbol exists. A
+            # BTCUSDT-pinned strategy requiring kline_1h then matched ETHUSDT
+            # candles, injected a bare `kline_1h` into the SHARED gather, the
+            # gather resolved it against the event symbol and asked for
+            # ETHUSDT:1h (never subscribed) -> the gather returned None and the
+            # legitimate ETHUSDT strategy was blocked as collateral damage. One
+            # mis-matched strategy silenced a correct one.
+            #
+            # So: a pinned symbol is a CONSTRAINT, not a pass.
             pinned_symbol = config_data.get("symbol")
-            if not pinned_symbol and symbol not in symbols_for_instance:
+            if pinned_symbol:
+                if symbol != pinned_symbol:
+                    rejections.append(
+                        f"{strategy_name}: pinned to {pinned_symbol}, "
+                        f"event symbol={symbol}"
+                    )
+                    continue
+            elif symbol not in symbols_for_instance:
                 rejections.append(
                     f"{strategy_name}: symbol not monitored "
-                    f"(mode={mode}, pinned={pinned_symbol!r}, "
-                    f"pool_size={len(symbols_for_instance)})"
+                    f"(mode={mode}, pool_size={len(symbols_for_instance)})"
                 )
                 continue
 
