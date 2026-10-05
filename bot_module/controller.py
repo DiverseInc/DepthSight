@@ -6721,6 +6721,41 @@ class TradingController:
                             all_required_data_types[symbol_market_key].add(
                                 f"kline_{_matcher_tf}"
                             )
+                        elif _trigger_type in ("on_tick", "on_condition_met"):
+                            # A tick-triggered strategy is matched ONLY against
+                            # TICK events (see _select_applicable_instances),
+                            # and TICK events exist only if `aggTrade` is
+                            # subscribed -- they are emitted by the data
+                            # consumer's aggTrade branch and nowhere else.
+                            #
+                            # Nothing used to subscribe aggTrade for a trigger
+                            # type, only for ML confirmation, so a strategy
+                            # built in the visual editor with "On Condition
+                            # Met (Intra-candle)" -- a real, plan-gated,
+                            # first-class trigger -- was added to the running
+                            # pool, reported status="running", and was then
+                            # NEVER evaluated, because no event could ever
+                            # match it. Observed live 2026-10-05 on strategy
+                            # 6fcf5c10: in the pool, "Entry conditions
+                            # present", and absent from every `instances=[...]`
+                            # group in the signal-check log.
+                            #
+                            # This closes the loop the comment above assumed
+                            # was already closed.
+                            if (
+                                "aggTrade"
+                                not in all_required_data_types[symbol_market_key]
+                            ):
+                                all_required_data_types[symbol_market_key].add(
+                                    "aggTrade"
+                                )
+                                logger.info(
+                                    f"[UpdateMonitoredSymbols] Subscribed aggTrade "
+                                    f"for {symbol_market_key}: strategy "
+                                    f"{str(config_dict.get('id'))[:8]} uses the "
+                                    f"'{_trigger_type}' trigger, which is matched "
+                                    f"only against tick events."
+                                )
                         all_required_metrics[symbol_market_key].update(
                             instance.required_indicators
                         )
