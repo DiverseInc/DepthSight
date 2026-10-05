@@ -322,6 +322,9 @@ class DataConsumer:
             str, pd.DataFrame
         ] = {}  # Leave for backward compatibility if someone is using it
         self._open_interest_cache: Dict[str, pd.DataFrame] = {}
+        # Warn ONCE that there is no live open-interest feed, rather than on
+        # every gather for every subscribed symbol.
+        self._open_interest_unavailable_warned = False
         self._data_cache_lock = asyncio.Lock()
         self._binance_market_data_base_url = (
             config.BINANCE_MARKET_DATA_WS_URL_FOR_CONSUMER
@@ -1007,25 +1010,48 @@ class DataConsumer:
     async def get_open_interest(
         self, symbol: str, limit: int = 100
     ) -> Optional[pd.DataFrame]:
-        # This is a placeholder. In a real implementation, this would fetch data from the exchange.
-        # For now, we will return a dummy DataFrame.
+        """
+        Return real cached open interest, or None.
+
+        There is no live open-interest feed wired up in this repo. The previous
+        implementation invented a monotonic ramp,
+
+            open_interest = [100 + i + (i * 0.1) for i in range(100)]
+
+        and -- worse -- CACHED it, so the fabricated series was then served as
+        if it were market data. A strategy declaring `open_interest` in its
+        required data types was subscribed to it, evaluated its
+        open_interest_filter against a made-up number, and reported
+        status="running" while doing so. In a paper-trading product whose whole
+        purpose is letting someone learn without risk, inventing the data is
+        strictly worse than refusing to trade.
+
+        Returning None makes the gather treat open_interest as unavailable, so
+        the strategy is SKIPPED and logs why, instead of trading on fiction.
+        That is the honest failure.
+
+        A real implementation needs a live open-interest subscription. Note
+        data_loader.py::_download_open_interest_from_api already fetches real
+        Binance open interest for BACKTESTING, so the capability exists -- it
+        was simply never wired into the live consumer.
+        """
         async with self._data_cache_lock:
             df = self._open_interest_cache.get(symbol.upper())
             if df is not None and not df.empty:
                 return df.iloc[-limit:].copy()
-            else:
-                # Create a dummy dataframe
-                data = {
-                    "timestamp": pd.to_datetime(
-                        pd.date_range(
-                            end=datetime.now(timezone.utc), periods=100, freq="1min"
-                        )
-                    ),
-                    "open_interest": [100 + i + (i * 0.1) for i in range(100)],
-                }
-                df = pd.DataFrame(data).set_index("timestamp")
-                self._open_interest_cache[symbol.upper()] = df
-                return df.iloc[-limit:].copy()
+
+        if not self._open_interest_unavailable_warned:
+            self._open_interest_unavailable_warned = True
+            logger.warning(
+                "[get_open_interest] No live open-interest feed is wired up for "
+                "%s. Returning None so affected strategies are SKIPPED rather "
+                "than evaluated against fabricated data. Any strategy "
+                "subscribing to 'open_interest' cannot trade until a real feed "
+                "is implemented. (Backtests are unaffected -- "
+                "data_loader.py fetches real Binance open interest.)",
+                symbol.upper(),
+            )
+        return None
 
     async def _get_valid_symbols_from_exchange_info(
         self, market_type_to_fetch: str, force_update: bool = False

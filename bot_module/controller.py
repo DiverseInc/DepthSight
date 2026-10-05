@@ -5796,13 +5796,25 @@ class TradingController:
         # about the one being skipped. This is exactly how a strategy can be
         # "running", never evaluated, and leave no trace anywhere.
         if rejections:
-            logger.info(
-                "[SignalCheck:%s] %d running instance(s) NOT selected for this "
-                "event: %s",
-                symbol,
-                len(rejections),
-                "; ".join(rejections),
-            )
+            # Same tick-rate problem as the required_data_keys line: ticks
+            # arrive hundreds of times a second, and every candle-close
+            # strategy is "rejected" by every single one of them. Logging that
+            # at INFO replaced one flood with a worse one -- the rejection
+            # reason is identical every time, so all it buys is volume.
+            # Candle-close events keep INFO, where a strategy failing to match
+            # is genuinely worth reading.
+            if _tick_driven:
+                logger.debug(
+                    "[SignalCheck:%s] %d running instance(s) NOT selected for "
+                    "this event: %s",
+                    symbol, len(rejections), "; ".join(rejections),
+                )
+            else:
+                logger.info(
+                    "[SignalCheck:%s] %d running instance(s) NOT selected for "
+                    "this event: %s",
+                    symbol, len(rejections), "; ".join(rejections),
+                )
 
         pair_info_base = await self.consumer.get_active_pair_by_symbol(symbol)
         if not pair_info_base:
