@@ -6013,7 +6013,18 @@ class TradingController:
             ttl = max(900, interval_s * 4)
             await redis_client.set(key, json.dumps(state), ex=ttl)
         except Exception as e:  # never break the trading path
-            logger.debug(f"[EvalState] publish skipped: {e}")
+            # WARNING, not DEBUG. This whole feature exists to answer "why is my
+            # strategy not trading", so swallowing the failure at DEBUG makes
+            # the one function whose job is to report problems the single place
+            # a problem goes unreported. Observed live 2026-10-05: a strategy
+            # that was evaluating every minute was silently absent from the
+            # panel, and the only trace of the cause was this line at a log
+            # level production does not emit.
+            logger.warning(
+                f"[EvalState] publish FAILED for {config_id} -- the strategy "
+                f"panel will not show this strategy: {e!r}",
+                exc_info=True,
+            )
 
     async def _check_and_process_signal_for_instance(
         self,
