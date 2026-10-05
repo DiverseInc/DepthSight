@@ -3578,8 +3578,16 @@ class TradingController:
 
         for config_id, (instance, config_dict) in instances_copy.items():
             symbols_str = "Dynamic (All)"
-            if config_dict.get("symbol_selection_mode") == "STATIC":
-                symbols_list = config_dict.get("symbols", [])
+            # FIXED and STATIC are BOTH explicit-symbol modes
+            # (_resolve_symbol_pool_for_strategy accepts exactly those two), so
+            # honouring only "STATIC" here made every FIXED strategy render as
+            # "Dynamic (All)" with no symbols -- an instance could be correctly
+            # pinned to BTCUSDT and still look unscoped. Which is worse than
+            # cosmetic: it sent me chasing a broken symbol pool for a strategy
+            # whose pool was fine.
+            _sel_mode = str(config_dict.get("symbol_selection_mode") or "").strip().upper()
+            if _sel_mode in ("STATIC", "FIXED"):
+                symbols_list = config_dict.get("symbols") or []
                 symbols_str = ", ".join(symbols_list) if symbols_list else "None"
 
             # Strategy PnL = Realized (from RM) + Unrealized (from current positions)
@@ -5781,6 +5789,20 @@ class TradingController:
         logger.info(
             f"[SignalCheck:{symbol}] Event {event['type']} ({event.get('timeframe', 'TICK')}) matched {len(applicable_instances)} instance(s)."
         )
+
+        # Rejections are normally dropped once anything matches, which makes a
+        # strategy that NEVER matches completely invisible: the log shows a
+        # healthy "matched 1 instance(s)" for a sibling and says nothing at all
+        # about the one being skipped. This is exactly how a strategy can be
+        # "running", never evaluated, and leave no trace anywhere.
+        if rejections:
+            logger.info(
+                "[SignalCheck:%s] %d running instance(s) NOT selected for this "
+                "event: %s",
+                symbol,
+                len(rejections),
+                "; ".join(rejections),
+            )
 
         pair_info_base = await self.consumer.get_active_pair_by_symbol(symbol)
         if not pair_info_base:
