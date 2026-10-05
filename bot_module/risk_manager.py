@@ -579,9 +579,31 @@ class RiskManager:
         log_prefix = "[RiskManager:UpdateBalance]"
         async with self._balance_lock:
             try:
-                balances = (
-                    await self.executor.get_account_balance()
-                )  # This is GET /account
+                # A paper-only account (no API key) is constructed with
+                # executor=None BY DESIGN -- bot_runner.py:563 passes
+                # `executor=None, paper_executor=paper_executor`.
+                #
+                # Reading ONLY self.executor meant every keyless paper account
+                # raised "'NoneType' object has no attribute 'get_account_balance'"
+                # at startup, so success_fetch was False, so
+                # initialize_balance() set _is_trading_allowed = False -- and
+                # nothing ever set it back. Every subsequent signal was dropped
+                # with "Signal REJECTED by rm.is_symbol_trading_allowed (general
+                # block)" once per candle. That is the whole "it says trade is
+                # running but balance stays at 10,000" report: trading was
+                # disabled globally before the first bar.
+                #
+                # The paper executor is the real balance source for those
+                # accounts; it was being passed in and then ignored.
+                source = self.executor if self.executor is not None else self.paper_executor
+                if source is None:
+                    logger.error(
+                        f"{log_prefix} No live executor and no paper_executor available "
+                        f"for user_id={self.user_id}; cannot fetch balance."
+                    )
+                    return False
+
+                balances = await source.get_account_balance()  # GET /account
                 if not balances or isinstance(balances, dict) and balances.get("error"):
                     logger.error(
                         f"{log_prefix} Failed to fetch balances from executor: {balances}"
