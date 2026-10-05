@@ -5812,7 +5812,18 @@ class TradingController:
         _participants = [
             str(_cfg.get("id") or "?")[:8] for _inst, _cfg in applicable_instances
         ]
-        logger.info(
+        # A tick-triggered strategy evaluates on EVERY trade print. At BTCUSDT
+        # volumes that is hundreds of times a second, and one INFO line each
+        # buried every other line in the file: a 2000-line `docker logs --tail`
+        # window contained nothing but this one strategy's ticks, which is how
+        # the StartCmd lines for a concurrently-created strategy scrolled out
+        # of reach and left it looking like it had never started.
+        #
+        # Candle-close evaluation is once per candle per strategy and stays at
+        # INFO -- that is the signal operators actually read.
+        _tick_driven = event.get("type") == "TICK"
+        _log = logger.debug if _tick_driven else logger.info
+        _log(
             f"[SignalCheck:{symbol}] required_data_keys={required_union} "
             f"instances={_participants}"
         )
@@ -5870,6 +5881,7 @@ class TradingController:
                     pair_info_for_instance,
                     shared_market_data=own_data,
                     market_type=event_market_type,
+                    tick_driven=_tick_driven,
                 )
             return
 
@@ -5884,6 +5896,7 @@ class TradingController:
                 pair_info_for_instance,
                 shared_market_data=shared_market_data,
                 market_type=event_market_type,
+                tick_driven=_tick_driven,
             )
 
     def _classify_evaluation_outcome(
@@ -6064,6 +6077,7 @@ class TradingController:
         pair_info: dict,
         shared_market_data: Optional[Dict[str, Any]] = None,
         market_type: Optional[str] = None,
+        tick_driven: bool = False,
     ):
         """
         Helper function. Checks the signal from a single strategy instance for a single symbol,
@@ -6218,7 +6232,12 @@ class TradingController:
                     instance, signal_result, weight, trace
                 )
                 if _outcome == "rejected" and _reason:
-                    logger.info(f"{log_prefix} Signal REJECTED {_reason}.")
+                    # Same reasoning as the required_data_keys line: a
+                    # tick-triggered strategy would emit this hundreds of
+                    # times a second and bury everything else. Tick outcomes go
+                    # to DEBUG; candle-close outcomes stay at INFO.
+                    _outcome_log = logger.debug if tick_driven else logger.info
+                    _outcome_log(f"{log_prefix} Signal REJECTED {_reason}.")
                 elif _outcome == "no_trace" and trace:
                     logger.debug(
                         f"{log_prefix} Strategy returned no signal and no trace "
