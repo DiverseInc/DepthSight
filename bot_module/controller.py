@@ -2024,6 +2024,41 @@ class TradingController:
                 )
                 return
 
+            # A strategy that cannot ever signal must say so at start.
+            #
+            # A VisualBuilderStrategy evaluates `config["entryConditions"]`.
+            # With that key absent, check_signal walks an empty condition tree
+            # and returns weight 0.0 on every candle, forever -- while the
+            # instance reports "running" and the portfolio shows a live
+            # balance. To the user that is indistinguishable from a working
+            # strategy, which is precisely the failure reported as
+            # "it says trade is running but that's it -- no bars, no results,
+            # balance stays at 10,000".
+            #
+            # A strategy that cannot trade must fail loudly at start, never
+            # silently at the first candle.
+            _visual_cfg = params_for_instance.get("config")
+            if isinstance(_visual_cfg, dict) and not _visual_cfg.get(
+                "entryConditions"
+            ):
+                logger.error(
+                    "%s NO ENTRY CONDITIONS -- this strategy CANNOT generate a "
+                    "signal. config_data has no 'entryConditions' key, so "
+                    "check_signal() evaluates an empty condition tree and "
+                    "returns weight=0.00 on every candle, forever. The "
+                    "instance will still report status='running'. Add entry "
+                    "conditions in the strategy editor, or this strategy will "
+                    "never trade. keys present: %s",
+                    log_prefix,
+                    sorted(_visual_cfg.keys()) or "(none)",
+                )
+            else:
+                logger.info(
+                    f"{log_prefix} Entry conditions present: "
+                    f"max_possible_expensive_weight="
+                    f"{getattr(instance, 'max_possible_expensive_weight', 'n/a')}"
+                )
+
             # Adding start time to payload
             payload["started_at"] = datetime.now(timezone.utc).isoformat()
 
