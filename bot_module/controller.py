@@ -5949,6 +5949,15 @@ class TradingController:
         redis_client = getattr(self, "redis_client", None)
         config_id = config_dict.get("id")
         if redis_client is None or not config_id:
+            if redis_client is not None:
+                # Previously a silent return. A missing config id means this
+                # strategy can never appear in the panel, and the whole point
+                # of this function is to make that visible.
+                logger.warning(
+                    f"[EvalState] cannot publish for a strategy with no config "
+                    f"id; it will not appear in the strategy panel. "
+                    f"payload keys: {sorted(config_dict.keys())}"
+                )
             return
 
         try:
@@ -6007,7 +6016,19 @@ class TradingController:
             # a dict, and extended key-by-key into the strategy list. Silently
             # corrupting the payload of the main strategies endpoint is not a
             # cost worth paying for tidier key names.
-            key = f"{STRATEGY_EVAL_STATE_KEY_PREFIX}:{self.user_id}:{config_id}"
+            #
+            # Namespace by the strategy's OWNER, not by whichever controller
+            # happened to receive the event.
+            #
+            # The read side scans `{PREFIX}:{current_user.id}:*` -- the user's
+            # own id, as resolved by auth. Writing under `self.user_id` makes
+            # the panel correct only as long as the evaluating controller and
+            # the strategy's owner are the same user, which is an assumption
+            # about routing rather than a fact carried with the data. The
+            # START_STRATEGY payload records the authoritative owner as
+            # `user_id`; prefer it, and fall back only if it is absent.
+            owner_user_id = config_dict.get("user_id") or self.user_id
+            key = f"{STRATEGY_EVAL_STATE_KEY_PREFIX}:{owner_user_id}:{config_id}"
             # TTL must outlive at least a few missed evaluations, or a 4h
             # strategy would vanish from the UI between candles and look dead.
             ttl = max(900, interval_s * 4)
