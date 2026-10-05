@@ -5806,7 +5806,16 @@ class TradingController:
         for instance, _cfg in applicable_instances:
             required_union.update(instance.required_data_types)
 
-        logger.info(f"[SignalCheck:{symbol}] required_data_keys={required_union}")
+        # Name the participants. Without this, a reader cannot tell WHICH
+        # strategy needed kline_4h, which made every "one instance is missing
+        # data" investigation a guessing game.
+        _participants = [
+            str(_cfg.get("id") or "?")[:8] for _inst, _cfg in applicable_instances
+        ]
+        logger.info(
+            f"[SignalCheck:{symbol}] required_data_keys={required_union} "
+            f"instances={_participants}"
+        )
 
         shared_market_data = await self._gather_market_data_for_required_keys(
             symbol=symbol,
@@ -6060,7 +6069,14 @@ class TradingController:
         Helper function. Checks the signal from a single strategy instance for a single symbol,
         collects market data, and passes the signal for processing.
         """
-        log_prefix = f"[SignalCheck:{instance.NAME}:{symbol}]"
+        # Every VisualBuilderStrategy instance reports NAME="VisualBuilderStrategy",
+        # so this prefix was byte-identical for every strategy of that class on
+        # the same symbol. With three strategies on BTCUSDT the logs could not
+        # say which one was being evaluated, which rejected, or skipped -- the
+        # exact question the log exists to answer. Include the config id.
+        _cfg_id = config_dict.get("id") or "?"
+        _short_id = str(_cfg_id)[:8]
+        log_prefix = f"[SignalCheck:{instance.NAME}:{symbol}:{_short_id}]"
         start_ts = time.perf_counter()
         normalized_market_type = self._normalize_market_type(
             market_type or self._market_type_for_strategy_config(config_dict)
