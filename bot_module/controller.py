@@ -2047,15 +2047,35 @@ class TradingController:
             if isinstance(_visual_cfg, dict) and not _visual_cfg.get(
                 "entryConditions"
             ):
+                # Name the ACTUAL cause, not just the symptom. The seeded
+                # default templates in api/crud.py (7 of them, incl. one with
+                # an empty list) write their conditions into a "blocks" array,
+                # but this engine only ever reads "entryConditions" --
+                # bot_module/strategy.py contains zero references to "blocks",
+                # and the editor has no migration between the two. So every
+                # strategy created from a default template is structurally
+                # incapable of trading, and the only symptom was a weight of
+                # 0.00 in a per-candle log line.
+                _orphan = "blocks" in _visual_cfg
+                _hint = (
+                    "config_data uses the 'blocks' format, which the trading "
+                    "engine does not read; it only understands 'entryConditions'. "
+                    "This strategy must be rebuilt in the visual editor, which "
+                    "emits entryConditions. (The seeded default templates ship "
+                    "the 'blocks' format -- that is a product bug, not your "
+                    "mistake.)"
+                    if _orphan
+                    else "Add entry conditions in the strategy editor."
+                )
                 logger.error(
                     "%s NO ENTRY CONDITIONS -- this strategy CANNOT generate a "
                     "signal. config_data has no 'entryConditions' key, so "
                     "check_signal() evaluates an empty condition tree and "
                     "returns weight=0.00 on every candle, forever. The "
-                    "instance will still report status='running'. Add entry "
-                    "conditions in the strategy editor, or this strategy will "
-                    "never trade. keys present: %s",
+                    "instance will still report status='running'. %s "
+                    "keys present: %s",
                     log_prefix,
+                    _hint,
                     sorted(_visual_cfg.keys()) or "(none)",
                 )
             else:
@@ -5772,9 +5792,53 @@ class TradingController:
             market_type=event_market_type,
         )
         if shared_market_data is None:
+            # Do NOT give up on everyone.
+            #
+            # `required_union` is the UNION of every applicable instance's
+            # needs, so one instance requiring a key the cache cannot satisfy
+            # (observed 2026-10-05: a kline_4h cache stuck at 18 of the 20
+            # candles analysis needs) made the whole gather return None and
+            # skipped EVERY strategy on the symbol — including the ones whose
+            # 1m/1h data was complete and fine. One under-provisioned
+            # instance was a total outage for all the others.
+            #
+            # Shared caches multiply one mistake across everyone using them,
+            # so the fallback has to be per-instance: gather what THIS
+            # instance needs, and let only the genuinely starved one wait.
             logger.warning(
-                f"[SignalCheck:{symbol}] Skipping checks due to missing shared market data."
+                f"[SignalCheck:{symbol}] Shared gather incomplete; falling back "
+                f"to per-instance gather so one starved strategy cannot block "
+                f"the rest."
             )
+            for instance, config_dict in applicable_instances:
+                own_keys = set(instance.required_data_types)
+                own_data = await self._gather_market_data_for_required_keys(
+                    symbol=symbol,
+                    required_data_keys=own_keys,
+                    log_prefix=(
+                        f"[SignalCheck:{symbol}:{event_market_type}:"
+                        f"{type(instance).__name__}]"
+                    ),
+                    market_type=event_market_type,
+                )
+                if own_data is None:
+                    logger.warning(
+                        f"[SignalCheck:{symbol}] {type(instance).__name__} still "
+                        f"missing data for {sorted(own_keys)}; skipping only this "
+                        f"instance."
+                    )
+                    continue
+                pair_info_for_instance = pair_info_base.copy()
+                pair_info_for_instance["strategy_config_id"] = config_dict.get("id")
+                pair_info_for_instance["market_type"] = event_market_type
+                await self._check_and_process_signal_for_instance(
+                    instance,
+                    config_dict,
+                    symbol,
+                    pair_info_for_instance,
+                    shared_market_data=own_data,
+                    market_type=event_market_type,
+                )
             return
 
         for instance, config_dict in applicable_instances:
