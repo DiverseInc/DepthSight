@@ -5773,14 +5773,20 @@ class TradingController:
             running_instances, symbol, event, event_market_type
         )
 
-        # TICK events arrive hundreds per second. Logging the match at INFO for
-        # each one buries every candle-close line: 400 log lines covered 11
-        # seconds of wall clock, so a 1m candle close had roughly an 18% chance
-        # of appearing in any given tail window. c197ffc moved the *evaluation*
-        # lines to DEBUG for tick-driven strategies but left THIS matcher line
-        # at INFO, which reintroduced the same flood by another route.
-        is_tick_event = str(event.get("type", "")).upper() == "TICK"
-        match_log = logger.debug if is_tick_event else logger.info
+        # TICK events arrive hundreds per second, so every log line emitted on
+        # the tick path must be DEBUG; candle-close stays INFO.
+        #
+        # CRITICAL: this must be defined ONCE, here, BEFORE any branch that
+        # reads it. c197ffc assigned `_tick_driven` at the required_data_keys
+        # line but ALSO read it ~50 lines earlier at the rejection log, so any
+        # event where at least one instance matched and at least one was
+        # rejected -- the common case -- raised
+        #     UnboundLocalError: cannot access local variable '_tick_driven'
+        # and killed the whole handler. That silently stopped CANDLE_CLOSE
+        # evaluation too, so a 1m strategy could start, report running, and
+        # never be evaluated once. Define once, early, reuse everywhere.
+        _tick_driven = event.get("type") == "TICK"
+        match_log = logger.debug if _tick_driven else logger.info
 
         if not applicable_instances:
             match_log(
@@ -5864,7 +5870,8 @@ class TradingController:
         #
         # Candle-close evaluation is once per candle per strategy and stays at
         # INFO -- that is the signal operators actually read.
-        _tick_driven = event.get("type") == "TICK"
+        # (_tick_driven is defined once at the top of this function; it must
+        # NOT be re-assigned here, because the rejection log above reads it.)
         _log = logger.debug if _tick_driven else logger.info
         _log(
             f"[SignalCheck:{symbol}] required_data_keys={required_union} "
