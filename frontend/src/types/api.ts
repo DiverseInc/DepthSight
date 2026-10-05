@@ -12,6 +12,9 @@ export interface SystemComponent {
 	name: string;
 	status: string;
 	message?: string;
+	// Human-readable reason for the status. Without this a red panel tells you
+	// nothing you can act on.
+	detail?: string | null;
 }
 
 export interface SystemStatusData {

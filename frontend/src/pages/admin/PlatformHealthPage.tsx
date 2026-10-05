@@ -49,12 +49,8 @@ const PlatformHealthPage: React.FC = () => {
 			description: "Auth system functioning properly",
 			icon: <CheckCircle2 className="h-5 w-5" />,
 		},
-		binance_spot_ws: {
-			description: "Real-time data feed for Spot markets",
-			icon: <Activity className="h-5 w-5" />,
-		},
-		binance_futures_ws: {
-			description: "Real-time data feed for Futures markets",
+		market_data_streams: {
+			description: "Live candle feed for every subscribed kline stream",
 			icon: <Activity className="h-5 w-5" />,
 		},
 		database_connection: {
@@ -71,6 +67,7 @@ const PlatformHealthPage: React.FC = () => {
 		systemStatus?.components.map((component) => ({
 			name: component.name,
 			status: component.status.toLowerCase(),
+			detail: component.detail,
 			responseTime: "N/A", // This data is not available from the current endpoint
 			description:
 				componentDetails[component.name]?.description ||
@@ -157,6 +154,11 @@ const PlatformHealthPage: React.FC = () => {
 						<Clock className="h-4 w-4" />
 						<span>Response time: {check.responseTime}</span>
 					</div>
+					{check.detail && (
+						<p className="mt-2 text-sm text-muted-foreground">
+							{check.detail}
+						</p>
+					)}
 				</CardContent>
 			</Card>
 		));

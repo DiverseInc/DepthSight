@@ -19,6 +19,7 @@ from ..database import get_db
 from ..gamification import grant_achievement
 from ..redis_client import get_redis_client
 from ..session_manager import HttpSessDep
+from .market_data_health import summarize_kline_stream_health
 from bot_module import data_loader
 from bot_module.strategy import (
     find_trend_zones,
@@ -73,29 +74,93 @@ async def get_system_status_endpoint(
     # 1. Database connection check
     try:
         await db.execute(text("SELECT 1"))
-        components.append({"name": "database_connection", "status": "ok"})
+        components.append(
+            {
+                "name": "database_connection",
+                "status": "ok",
+                "detail": "SELECT 1 succeeded",
+            }
+        )
     except Exception as e:
         logger.error(f"System status check: Database connection failed: {e}")
-        components.append({"name": "database_connection", "status": "error"})
+        components.append(
+            {
+                "name": "database_connection",
+                "status": "error",
+                "detail": f"SELECT 1 failed: {type(e).__name__}: {e}",
+            }
+        )
 
     # 2. Redis connection check (also Celery broker)
     try:
         await redis_client.ping()
-        components.append({"name": "task_queue_connection", "status": "ok"})
+        components.append(
+            {
+                "name": "task_queue_connection",
+                "status": "ok",
+                "detail": "PING succeeded",
+            }
+        )
     except Exception as e:
         logger.error(f"System status check: Redis/Task Queue connection failed: {e}")
-        components.append({"name": "task_queue_connection", "status": "error"})
+        components.append(
+            {
+                "name": "task_queue_connection",
+                "status": "error",
+                "detail": f"PING failed: {type(e).__name__}: {e}",
+            }
+        )
 
-    # 3. WebSocket connection status (this data should be published by the bot itself)
-    # Keep stubs for now, but they are now separated from real checks.
-    # In the future, the bot will be able to write its status to Redis, and API will read it.
-    components.append({"name": "binance_spot_ws", "status": "connected"})
-    components.append({"name": "binance_futures_ws", "status": "connected"})
+    # 3. Market-data feed health.
+    #
+    # This used to be two hardcoded literals:
+    #
+    #     components.append({"name": "binance_spot_ws", "status": "connected"})
+    #     components.append({"name": "binance_futures_ws", "status": "connected"})
+    #
+    # named for Binance on an OKX deployment, with a comment admitting they
+    # were placeholders. They could never go red, which is precisely why a
+    # user whose BTCUSDT 1m feed had been dead for hours could find no cause
+    # anywhere in the product. A health line that always says OK is worse than
+    # no health line: it converts "I don't know" into "it's fine".
+    #
+    # The real state is already in Redis -- the bot writes
+    # `market_data:active_streams` and per-stream `market_data:candle_received:*`
+    # heartbeats, and /market-data/candle-health already reads them. Reuse that
+    # same summariser so the panel and the per-stream view cannot disagree.
+    try:
+        summary = await summarize_kline_stream_health(redis_client)
+        components.append(
+            {
+                "name": "market_data_streams",
+                "status": summary["status"],
+                "detail": summary["detail"],
+            }
+        )
+    except Exception as e:
+        logger.error(f"System status check: market data health failed: {e}")
+        components.append(
+            {
+                "name": "market_data_streams",
+                "status": "error",
+                "detail": f"health check failed: {e}",
+            }
+        )
+
+    # Aggregate by severity rather than by an allow-list of "good" strings, so
+    # adding a component with a new status cannot silently flip the whole panel
+    # to error, and a status nobody thought to allow-list cannot silently pass.
+    _SEVERITY = {"ok": 0, "idle": 0, "degraded": 1, "error": 2}
+    worst = max((_SEVERITY.get(c["status"], 2) for c in components), default=0)
+    if worst >= 2:
+        overall_status = "error"
+    elif worst == 1:
+        overall_status = "degraded"
+    else:
+        overall_status = "ok"
 
     dynamic_system_state = {
-        "status": "ok"
-        if all(c["status"] in ["ok", "connected"] for c in components)
-        else "error",
+        "status": overall_status,
         "version": APP_VERSION,  # Dynamic version
         "timestamp_utc": datetime.now(timezone.utc),
         "components": components,

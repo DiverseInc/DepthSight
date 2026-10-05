@@ -46,6 +46,22 @@ There is no Python linter configured. `pytest.ini` sets `pythonpath = .` and
   `if mode == "live": <tight>`.
 - **A filter chain needs a logged `else`.** An `if/elif` with no `else` silently
   discards instances. Aggregate "nothing matched" logs must name per-item reasons.
+- **A live task is not a working task.** A coroutine blocked in `await socket.read()`
+  is alive and not `done()`, and delivering nothing. Never gate recovery on task
+  *liveness* — gate it on **ownership**: `entry.get("task") is asyncio.current_task()`.
+  A liveness check evaluated from inside the task itself is never false, so the
+  recovery path silently becomes dead code. See `AGENTS.md` history for the commit
+  where a self-heal shipped, passed its tests, and could never execute.
+- **Two things failing at the same instant are one cause, not two coincidences.**
+  Check the timestamps before blaming an upstream dependency. A ccxt client comes
+  from `executor._exchange_pro`, so **one socket serves every stream on that
+  executor** — any code that closes it to force a reconnect kills all of them
+  silently. Recycled shared resources need a generation counter so every holder
+  notices and re-subscribes.
+- **Anything that always reports OK is worse than nothing** — it converts "I don't
+  know" into "it's fine", and sends the user hunting for a cause that does not
+  exist. Health endpoints must be able to go red, must say *why*, and must
+  distinguish `unknown`/`idle` from healthy. See `api/routes/diagnostics.py`.
 - **Strategies auto-rehydrate on bot restart.** Do not tell users to manually
   restart strategies after a deploy — verify the automatic path first.
 

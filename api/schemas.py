@@ -2657,6 +2657,12 @@ class TaskResponse(BaseModel):
 class ComponentStatus(BaseModel):
     name: str = Field(..., json_schema_extra={"example": "database_connection"})
     status: str = Field(..., json_schema_extra={"example": "ok"})
+    # Human-readable reason for this status. A bare "error" is not actionable:
+    # it converts "something is wrong" into "something is wrong, good luck".
+    detail: Optional[str] = Field(
+        default=None,
+        json_schema_extra={"example": "7 live, 2 stale, 1 silent of 10 kline streams"},
+    )
 
 
 class SystemStatus(BaseModel):

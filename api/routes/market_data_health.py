@@ -243,3 +243,117 @@ async def get_candle_health(
         logger.error(f"[/market-data/candle-health] failed: {e}", exc_info=True)
 
     return schemas.CandleHealthResponse(streams=entries, evaluated_at_ms=now_ms)
+
+
+# Severity ordering for a stream's candle-flow state. `silent` is the worst
+# (a subscribed stream that is delivering nothing); `unknown` means we have no
+# heartbeat at all, which is NOT the same as healthy and must not be reported
+# as such.
+_STREAM_SEVERITY = {"live": 0, "stale": 1, "unknown": 2, "silent": 3}
+
+
+async def summarize_kline_stream_health(
+    app_redis: redis.Redis, now_ms: Optional[int] = None
+) -> Dict[str, Any]:
+    """Aggregate every subscribed kline stream into one health verdict.
+
+    Single source of truth for BOTH this module's per-stream endpoint and the
+    system-status panel, so the two can never disagree about whether the feed
+    is alive.
+
+    Returns a dict with:
+      status  -- "ok" | "degraded" | "error" | "idle"
+      counts  -- per-state stream counts
+      detail  -- a human-readable reason, so a red panel is actionable
+      worst   -- the specific offending streams (bounded)
+
+    Status rules, and the reasoning behind each:
+      idle     -- nothing is subscribed. A fresh install, or nobody trading.
+                 Deliberately NOT "ok": we have no evidence either way, and
+                 reporting "ok" would be a health line that always agrees
+                 with itself.
+      ok       -- every subscribed stream is live.
+      degraded -- some stream is stale, or we have no heartbeat for it.
+      error    -- at least one subscribed stream is silent: it is marked
+                 active but is delivering nothing. This is the exact failure
+                 that left strategies "running" with a frozen balance.
+    """
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+
+    raw_streams = await app_redis.smembers(
+        bot_config.MARKET_DATA_ACTIVE_STREAMS_SET_KEY
+    )
+    parsed_list = []
+    for sk in raw_streams or []:
+        parsed = _parse_stream_key(sk)
+        if parsed:
+            parsed_list.append(parsed)
+
+    total = len(parsed_list)
+    if total == 0:
+        return {
+            "status": "idle",
+            "counts": {"live": 0, "stale": 0, "silent": 0, "unknown": 0},
+            "total": 0,
+            "detail": "No kline streams subscribed (no strategies running).",
+            "worst": [],
+        }
+
+    redis_keys = [
+        (
+            f"{bot_config.MARKET_DATA_CANDLE_HEALTH_KEY_PREFIX}:"
+            f"{p['exchange']}:{p['market_type']}:{p['symbol']}:{p['timeframe']}"
+        )
+        for p in parsed_list
+    ]
+    raw_values = await app_redis.mget(redis_keys)
+
+    counts = {"live": 0, "stale": 0, "silent": 0, "unknown": 0}
+    per_stream = []
+    for parsed, raw in zip(parsed_list, raw_values):
+        seconds: Optional[float] = None
+        if raw:
+            try:
+                seconds = max(0.0, (now_ms - int(raw)) / 1000.0)
+            except (TypeError, ValueError):
+                seconds = None
+        state = _classify(seconds, parsed["timeframe"])
+        counts[state] = counts.get(state, 0) + 1
+        per_stream.append(
+            {
+                "symbol": parsed["symbol"],
+                "timeframe": parsed["timeframe"],
+                "status": state,
+                "seconds_since_last_candle": round(seconds, 1)
+                if seconds is not None
+                else None,
+            }
+        )
+
+    worst_states = sorted(
+        per_stream, key=lambda s: _STREAM_SEVERITY.get(s["status"], 9), reverse=True
+    )
+
+    if counts.get("silent"):
+        status = "error"
+    elif counts.get("stale") or counts.get("unknown"):
+        status = "degraded"
+    else:
+        status = "ok"
+
+    parts = [f"{counts[k]} {k}" for k in ("live", "stale", "silent", "unknown") if counts.get(k)]
+    detail = f"{', '.join(parts)} of {total} kline streams."
+    offenders = [s for s in worst_states if s["status"] in ("silent", "unknown")][:3]
+    if offenders:
+        named = ", ".join(
+            f"{o['symbol']}@{o['timeframe']} ({o['status']})" for o in offenders
+        )
+        detail = f"{detail} Worst: {named}."
+
+    return {
+        "status": status,
+        "counts": counts,
+        "total": total,
+        "detail": detail,
+        "worst": offenders,
+    }
