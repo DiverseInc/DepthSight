@@ -5773,8 +5773,17 @@ class TradingController:
             running_instances, symbol, event, event_market_type
         )
 
+        # TICK events arrive hundreds per second. Logging the match at INFO for
+        # each one buries every candle-close line: 400 log lines covered 11
+        # seconds of wall clock, so a 1m candle close had roughly an 18% chance
+        # of appearing in any given tail window. c197ffc moved the *evaluation*
+        # lines to DEBUG for tick-driven strategies but left THIS matcher line
+        # at INFO, which reintroduced the same flood by another route.
+        is_tick_event = str(event.get("type", "")).upper() == "TICK"
+        match_log = logger.debug if is_tick_event else logger.info
+
         if not applicable_instances:
-            logger.info(
+            match_log(
                 "[SignalCheck:%s] No applicable strategy instances for event=%s timeframe=%s market_type=%s. "
                 "%d running instance(s) all rejected: %s",
                 symbol,
@@ -5786,7 +5795,7 @@ class TradingController:
             )
             return
 
-        logger.info(
+        match_log(
             f"[SignalCheck:{symbol}] Event {event['type']} ({event.get('timeframe', 'TICK')}) matched {len(applicable_instances)} instance(s)."
         )
 
