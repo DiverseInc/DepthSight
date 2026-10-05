@@ -2333,6 +2333,8 @@ class DataConsumer:
         exchange_id: str = "binance",
     ):
         log_prefix = f"[HistDownload:{cache_key}]"
+        import re as _re  # local: the module-level `re` import is not aliased
+
         try:
             async with self._history_download_semaphore:
                 logger.info(
@@ -2340,6 +2342,39 @@ class DataConsumer:
                 )
                 end_dt = datetime.now(timezone.utc)
                 lookback_days = getattr(config, "REALTIME_HISTORY_LOOKBACK_DAYS", 3)
+
+                # A fixed DAY count is the wrong unit for this decision.
+                #
+                # 3 days is ~4320 candles at 1m, 288 at 15m and 72 at 1h --
+                # all comfortably above MIN_STRATEGY_HISTORY_CANDLES (20). But
+                # at 4h it is 72/4 = 18, which is BELOW the minimum. So a 4h
+                # strategy could never pass the history check, no matter how
+                # long it waited: the log said "Got 18, need 20. Waiting for
+                # cache priming" every minute for 20+ minutes while the cache
+                # was never going to grow. It was not a priming race.
+                #
+                # Derive the lookback from the timeframe so the requirement is
+                # always satisfiable, and keep the configured value as a floor.
+                _min_candles = int(
+                    getattr(config, "MIN_STRATEGY_HISTORY_CANDLES", 20)
+                )
+                _tf_match = _re.match(r"^(\d+)([mhd])$", str(timeframe).strip().lower())
+                if _tf_match:
+                    _n = int(_tf_match.group(1))
+                    _unit = _tf_match.group(2)
+                    _secs_per_candle = (
+                        _n * 60 if _unit == "m" else _n * 3600 if _unit == "h" else _n * 86400
+                    )
+                    _needed_days = (_min_candles * _secs_per_candle) / 86400.0
+                    if _needed_days > lookback_days:
+                        lookback_days = int(_needed_days) + 1
+                        logger.info(
+                            f"{log_prefix} Lookback raised from "
+                            f"{getattr(config, 'REALTIME_HISTORY_LOOKBACK_DAYS', 3)} "
+                            f"to {lookback_days} day(s): {timeframe} needs "
+                            f"{_min_candles} candles and {lookback_days - 1}d "
+                            f"yields fewer."
+                        )
                 start_dt = end_dt - timedelta(days=lookback_days)
 
                 executor_for_market = self._executor_for_market(market_type_for_loader)
