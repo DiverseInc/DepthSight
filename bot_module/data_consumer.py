@@ -91,6 +91,15 @@ _global_event_queues_lock = asyncio.Lock()
 # on a connection that no longer exists.
 _client_generation: Dict[int, int] = {}
 
+# Last time ANY stream on a given shared ccxt client received data.
+# This is what lets a stream's silence watchdog tell "the socket is dead"
+# apart from "this one channel is quiet" — the difference between recycling a
+# connection and needlessly killing every sibling on it. Keyed by id(client).
+_client_last_data: Dict[int, float] = {}
+
+# Consecutive self-heals per stream, for backoff. Reset on data received.
+_stream_reheal_count: Dict[str, int] = {}
+
 # Shared data cache available to all DataConsumer
 _global_kline_cache: Dict[str, deque] = defaultdict(
     lambda: deque(maxlen=DEFAULT_KLINE_CACHE_SIZE_CONFIG)
@@ -4441,6 +4450,37 @@ class DataConsumer:
             )
             return
 
+        # Does the loop below have a data branch for this type at all?
+        #
+        # It only serves kline_*, aggTrade and depth. For anything else the
+        # `if/elif` chain falls through, `last_data_at` is never updated, and
+        # the silence watchdog fires on a perfectly HEALTHY socket after
+        # `silence_threshold_s` -- closing the SHARED client and taking every
+        # sibling stream down with it, every 90 seconds, forever.
+        #
+        # That is precisely what `open_interest` did on 2026-10-05: subscribed,
+        # no branch, silently spinning, recycling the BTCUSDT client every 90s
+        # so kline_1m/1h/4h never produced a candle. ETHUSDT was unaffected
+        # because nothing on its client had this problem.
+        #
+        # (`get_open_interest()` returns a synthetic ramp regardless, so this
+        # subscription was never needed in the first place -- but that is a
+        # separate honesty problem, and fixing it silently here would hide it.)
+        if not (
+            data_type_key.startswith("kline_")
+            or data_type_key in ("aggTrade", "depth")
+        ):
+            logger.error(
+                "%s No CCXT Pro data branch exists for data type '%s', so this "
+                "stream could never receive anything. Not subscribing: a "
+                "stream that cannot produce data would trip the silence "
+                "watchdog on a healthy socket and recycle the SHARED client, "
+                "killing every other stream on it.",
+                log_prefix,
+                data_type_key,
+            )
+            return
+
         # This socket is shared with every other stream on the same executor.
         # Remember which generation of it we started on so that a sibling's
         # watchdog recycling the socket also recycles us, rather than leaving
@@ -4522,8 +4562,44 @@ class DataConsumer:
                 # DataSubEnsure path create a fresh task from scratch.
                 now_mono = time.monotonic()
                 if now_mono - last_data_at > silence_threshold_s:
+                    # Is the SOCKET dead, or is this one channel just quiet?
+                    #
+                    # These are different problems with opposite fixes, and
+                    # treating them as one is what caused the 2026-10-05
+                    # incident: `open_interest` on OKX updates far less often
+                    # than the flat 90s non-kline threshold, so it tripped the
+                    # watchdog on a perfectly healthy socket. Because the ccxt
+                    # client is SHARED, that close took kline_1m and kline_1h
+                    # down with it, every 90 seconds, forever -- which is why
+                    # BTCUSDT never produced a candle while ETHUSDT did.
+                    #
+                    # A generation counter made that collateral damage VISIBLE
+                    # (siblings re-subscribe) but it was still collateral
+                    # damage, and all it achieved was converting a silently
+                    # dead stream into a loudly thrashing one. The fix is to
+                    # not close a socket that other streams are actively using.
+                    client_last = _client_last_data.get(client_key)
+                    client_alive = (
+                        client_last is not None
+                        and (now_mono - client_last) <= silence_threshold_s
+                    )
+                    if client_alive:
+                        logger.warning(
+                            "%s Quiet for %.0fs (threshold=%ds) but the shared "
+                            "CCXT client received data %.0fs ago, so the socket "
+                            "is alive -- this channel is just slow. Dropping "
+                            "only this subscription instead of recycling the "
+                            "client.",
+                            log_prefix,
+                            now_mono - last_data_at,
+                            silence_threshold_s,
+                            now_mono - client_last,
+                        )
+                        exited_for_watchdog = True
+                        break
+
                     logger.warning(
-                        "%s Silent for %.0fs (threshold=%ds); force-closing WS and tearing down task to trigger fresh resubscribe.",
+                        "%s Silent for %.0fs (threshold=%ds) with no data anywhere on the shared client; force-closing WS and tearing down task to trigger fresh resubscribe.",
                         log_prefix,
                         now_mono - last_data_at,
                         silence_threshold_s,
@@ -4557,6 +4633,8 @@ class DataConsumer:
                     )
                     if ohlcv_list:
                         last_data_at = time.monotonic()
+                        _client_last_data[client_key] = time.monotonic()
+                        _stream_reheal_count[stream_id] = 0
                         logger.info(
                             f"{log_prefix} Received {len(ohlcv_list)} candles from {ccxt_symbol}, "
                             f"last_ts={ohlcv_list[-1][0]}"
@@ -4643,6 +4721,8 @@ class DataConsumer:
                     trades = await ccxt_pro_client.watch_trades(ccxt_symbol)
                     if trades:
                         last_data_at = time.monotonic()
+                        _client_last_data[client_key] = time.monotonic()
+                        _stream_reheal_count[stream_id] = 0
                         for trade in trades:
                             # Reformat to Binance payload
                             payload = {
@@ -4665,6 +4745,8 @@ class DataConsumer:
                     )
                     if orderbook:
                         last_data_at = time.monotonic()
+                        _client_last_data[client_key] = time.monotonic()
+                        _stream_reheal_count[stream_id] = 0
                         # Reformat to Binance payload
                         payload = {
                             "e": "depthUpdate",
@@ -4764,6 +4846,22 @@ class DataConsumer:
                     if exited_for_watchdog
                     else "shared client recycled",
                 )
+                # Back off before re-requesting. A channel that is simply
+                # quiet (see the open_interest case above) would otherwise
+                # re-subscribe every 90s forever, burning a task slot and
+                # filling the log. Reset to zero the moment data arrives.
+                _reheals = _stream_reheal_count.get(stream_id, 0) + 1
+                _stream_reheal_count[stream_id] = _reheals
+                _backoff = min(300, 5 * (2 ** min(_reheals - 1, 6)))
+                if _backoff > 5:
+                    logger.warning(
+                        "%s Self-heal attempt %d; waiting %ds before "
+                        "re-subscribing to avoid thrashing.",
+                        log_prefix,
+                        _reheals,
+                        _backoff,
+                    )
+                    await asyncio.sleep(_backoff)
                 await self.ensure_subscription(
                     data_type_key, symbol, market_type=market_type
                 )
