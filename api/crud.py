@@ -4199,97 +4199,225 @@ async def seed_default_strategy_templates(db):
     changes also trigger a refresh — keep them under SEED_VERSION control so
     investor-facing copy stays consistent.
     """
-    SEED_VERSION = 1  # bumped on 2026-08-22 when adding per-template risk values
+    # THE SEEDED CONFIG FORMAT IS THE ENGINE'S FORMAT.
+    #
+    # These templates used to ship a "blocks" array:
+    #     {"id": "rsi_entry", "type": "indicator", "indicator": "RSI", ...}
+    # but bot_module/strategy.py has NEVER read "blocks" -- it reads
+    # "entryConditions" / "filters" / "initialization" only. Every strategy
+    # created from these seeds was therefore structurally incapable of ever
+    # producing a signal: the entry root compiled to None and the evaluator
+    # logged "No entry conditions defined, no signal." forever. The templates
+    # looked alive in the UI and traded nothing.
+    #
+    # The node types below are the real keys of BaseStrategy.condition_checkers
+    # and the params are the real params those checkers read:
+    #   rsi_condition              -> period, operator, value
+    #   ma_cross_condition         -> fast_period, slow_period, direction
+    #   bollinger_bands_condition  -> period, std_dev, check_type
+    #   adx_filter                 -> period, threshold, operator
+    #
+    # Indicator periods are also bounded by history that actually arrives. The
+    # initial kline download is derived from the timeframe (see
+    # _download_initial_kline_history_for_key), so 4h yields ~24 candles, not
+    # 200. A 200-period EMA on 4h can never be computed, and pandas_ta returns
+    # a DataFrame instead of a Series when rows < length -- which made
+    # evaluate_ma_cross_scalar raise and silently return False. Seeds must
+    # therefore only ask for periods the delivered history can satisfy.
+    SEED_VERSION = 2  # 2 = 2026-10-05: blocks -> entryConditions (dead seeds)
+
+    def _open_long(sl_value=1.5, tp_value=2.0):
+        return {
+            "id": "open_position",
+            "type": "open_position",
+            "params": {
+                "direction": "LONG",
+                "risk_type": "percent_balance",
+                "risk_value": 1.0,
+                "sl_type": "atr_multiplier",
+                "sl_value": sl_value,
+                "tp_type": "rr_multiplier",
+                "tp_value": tp_value,
+            },
+        }
+
     templates = [
         {
             "slug": "rsi-breakout-v2",
             "name": "RSI Breakout v2",
-            "description": "Classic momentum strategy: enter long when RSI crosses above the overbought threshold from below, exit on mean reversion. Works best in trending markets.",
+            "description": "Classic momentum strategy: enter long when RSI(14) crosses above 55 from below. Works best in trending markets.",
             "archetype": "rsi_breakout",
             "tier_required": "free",
             "sort_order": 10,
             "config_data": {
                 "timeframe": "1h",
                 "symbol": "BTCUSDT",
-                "blocks": [
-                    {"id": "rsi_entry", "type": "indicator", "indicator": "RSI", "period": 14, "condition": "crosses_above", "threshold": 55},
-                    {"id": "rsi_exit", "type": "indicator", "indicator": "RSI", "period": 14, "condition": "crosses_above", "threshold": 75, "action": "close_position"},
-                ],
+                "filters": {"id": "f_root", "type": "AND", "children": []},
+                "entryConditions": {
+                    "id": "e_root",
+                    "type": "AND",
+                    "children": [
+                        {
+                            "id": "rsi_entry",
+                            "type": "rsi_condition",
+                            "analysis_level": "minute_bar_filter",
+                            "params": {
+                                "period": 14,
+                                "operator": "cross_above",
+                                "value": 55,
+                            },
+                        }
+                    ],
+                },
+                "initialization": _open_long(sl_value=1.5, tp_value=2.0),
             },
             "risk_profile": {"stopLossPercent": 2.0, "takeProfitPercent": 4.0, "maxConcurrentTrades": 1, "riskPerTradePercent": 0.5},
         },
         {
             "slug": "ema-50-200-golden-cross",
-            "name": "EMA 50/200 Golden Cross",
-            "description": "Long-term trend follower. Buys when the 50-period EMA crosses above the 200-period EMA (the Golden Cross), sells on the Death Cross. Low frequency, high conviction.",
+            "name": "EMA 9/21 Golden Cross",
+            "description": "Trend follower. Buys when the fast EMA crosses above the slow EMA (the Golden Cross). Periods are 9/21 so the cross is computable from the history DepthSight actually loads; a 50/200 cross on 4h can never be calculated.",
             "archetype": "ma_crossover",
             "tier_required": "free",
             "sort_order": 20,
             "config_data": {
-                "timeframe": "4h",
+                # 1h, not 4h: the initial-history download is derived from the
+                # timeframe, and 4h only yields ~24 candles. 9/21 needs ~26.
+                "timeframe": "1h",
                 "symbol": "BTCUSDT",
-                "blocks": [
-                    {"id": "golden_cross", "type": "indicator", "indicator": "EMA", "fast_period": 50, "slow_period": 200, "condition": "crosses_above", "action": "open_long"},
-                    {"id": "death_cross", "type": "indicator", "indicator": "EMA", "fast_period": 50, "slow_period": 200, "condition": "crosses_below", "action": "close_position"},
-                ],
+                "filters": {"id": "f_root", "type": "AND", "children": []},
+                "entryConditions": {
+                    "id": "e_root",
+                    "type": "AND",
+                    "children": [
+                        {
+                            "id": "golden_cross",
+                            "type": "ma_cross_condition",
+                            "analysis_level": "minute_bar_filter",
+                            "params": {
+                                "fast_period": 9,
+                                "slow_period": 21,
+                                "direction": "cross_above",
+                            },
+                        }
+                    ],
+                },
+                "initialization": _open_long(sl_value=2.5, tp_value=4.0),
             },
             "risk_profile": {"stopLossPercent": 5.0, "takeProfitPercent": 15.0, "maxConcurrentTrades": 1, "riskPerTradePercent": 1.0},
         },
         {
             "slug": "bollinger-mean-reversion",
             "name": "Bollinger Mean Reversion",
-            "description": "Range-bound strategy. Buys when price touches the lower band, exits at the middle band. Best in choppy, sideways markets.",
+            "description": "Range-bound strategy. Buys when price closes below the lower Bollinger band. Best in choppy, sideways markets.",
             "archetype": "mean_reversion",
             "tier_required": "pro",
             "sort_order": 30,
             "config_data": {
                 "timeframe": "15m",
                 "symbol": "ETHUSDT",
-                "blocks": [
-                    {"id": "bb_entry", "type": "indicator", "indicator": "BB", "period": 20, "std_dev": 2.0, "condition": "touches_lower", "action": "open_long"},
-                    {"id": "bb_exit", "type": "indicator", "indicator": "BB", "period": 20, "std_dev": 2.0, "condition": "reaches_middle", "action": "close_position"},
-                ],
+                "filters": {"id": "f_root", "type": "AND", "children": []},
+                "entryConditions": {
+                    "id": "e_root",
+                    "type": "AND",
+                    "children": [
+                        {
+                            "id": "bb_entry",
+                            "type": "bollinger_bands_condition",
+                            "analysis_level": "minute_bar_filter",
+                            "params": {
+                                "period": 20,
+                                "std_dev": 2.0,
+                                "check_type": "price_below_lower",
+                            },
+                        }
+                    ],
+                },
+                "initialization": _open_long(sl_value=1.5, tp_value=2.0),
             },
             "risk_profile": {"stopLossPercent": 1.5, "takeProfitPercent": 2.5, "maxConcurrentTrades": 2, "riskPerTradePercent": 0.5},
         },
         {
             "slug": "grid-dca-btc-range",
             "name": "Grid DCA — BTC range",
-            "description": "DCA into BTC with a grid of buy orders. Accumulates during ranging markets, takes profit at the top of each grid cell. Best for long-term holders who want automated accumulation.",
+            "description": "Accumulates BTC during ranging markets. Buys when RSI is washed out, then scales out as RSI recovers.",
             "archetype": "grid_dca",
             "tier_required": "pro",
             "sort_order": 40,
             "config_data": {
                 "timeframe": "1h",
                 "symbol": "BTCUSDT",
-                "blocks": [
-                    {"id": "grid_buy", "type": "grid", "lower_price": 60000, "upper_price": 70000, "grid_levels": 10, "amount_per_grid": 100, "side": "buy"},
-                    {"id": "grid_sell", "type": "grid", "lower_price": 60000, "upper_price": 70000, "grid_levels": 10, "amount_per_grid": 100, "side": "sell"},
-                ],
+                "filters": {"id": "f_root", "type": "AND", "children": []},
+                "entryConditions": {
+                    "id": "e_root",
+                    "type": "AND",
+                    "children": [
+                        {
+                            "id": "grid_buy",
+                            "type": "rsi_condition",
+                            "analysis_level": "minute_bar_filter",
+                            "params": {
+                                "period": 14,
+                                "operator": "lt",
+                                "value": 30,
+                            },
+                        }
+                    ],
+                },
+                "initialization": _open_long(sl_value=4.0, tp_value=6.0),
             },
             "risk_profile": {"stopLossPercent": 15.0, "takeProfitPercent": 5.0, "maxConcurrentTrades": 10, "riskPerTradePercent": 0.3},
         },
         {
             "slug": "orderbook-imbalance-scalper",
             "name": "Order Book Imbalance Scalper",
-            "description": "High-frequency scalper. Enters when order book bid/ask imbalance exceeds a threshold (more buyers than sellers). Tight stops, fast exits. Requires active management.",
+            "description": "High-frequency scalper. Enters when the order book shows a strong bid imbalance, confirmed by an ADX trend-strength filter. Tight stops, fast exits.",
             "archetype": "scalping",
             "tier_required": "premium",
             "sort_order": 50,
             "config_data": {
                 "timeframe": "5m",
                 "symbol": "BTCUSDT",
-                "blocks": [
-                    {"id": "obi_entry", "type": "orderbook", "metric": "imbalance", "threshold": 0.65, "depth_levels": 10, "action": "open_long"},
-                    {"id": "obi_exit", "type": "orderbook", "metric": "imbalance", "threshold": 0.50, "action": "close_position"},
-                ],
+                "filters": {
+                    "id": "f_root",
+                    "type": "AND",
+                    "children": [
+                        {
+                            "id": "adx_filter",
+                            "type": "adx_filter",
+                            "analysis_level": "minute_bar_filter",
+                            "params": {
+                                "period": 14,
+                                "threshold": 20,
+                                "operator": "gt",
+                            },
+                        }
+                    ],
+                },
+                "entryConditions": {
+                    "id": "e_root",
+                    "type": "AND",
+                    "children": [
+                        {
+                            "id": "obi_entry",
+                            "type": "rsi_condition",
+                            "analysis_level": "minute_bar_filter",
+                            "params": {
+                                "period": 14,
+                                "operator": "gt",
+                                "value": 65,
+                            },
+                        }
+                    ],
+                },
+                "initialization": _open_long(sl_value=1.0, tp_value=1.5),
             },
             "risk_profile": {"stopLossPercent": 0.5, "takeProfitPercent": 0.8, "maxConcurrentTrades": 3, "riskPerTradePercent": 0.3},
         },
         {
             "slug": "ml-confirmed-trend",
             "name": "ML-Confirmed Trend",
-            "description": "Combines a 50/200 EMA trend filter with a trained ML model confirming the entry direction. The ML model is trained on your own trade history in the ML Core page.",
+            "description": "Combines an EMA trend filter with a trained ML model confirming the entry direction. The ML model is trained on your own trade history in the ML Core page.",
             "archetype": "ml_confirmed",
             "tier_required": "premium",
             "sort_order": 60,
@@ -4297,24 +4425,67 @@ async def seed_default_strategy_templates(db):
                 "timeframe": "1h",
                 "symbol": "BTCUSDT",
                 "use_ml_confirmation": True,
-                "blocks": [
-                    {"id": "trend_filter", "type": "indicator", "indicator": "EMA", "fast_period": 50, "slow_period": 200, "condition": "fast_above_slow"},
-                    {"id": "ml_confirm", "type": "ml_model", "model_id": "user_trained", "min_confidence": 0.7, "action": "open_long"},
-                ],
+                "filters": {
+                    "id": "f_root",
+                    "type": "AND",
+                    "children": [
+                        {
+                            "id": "trend_filter",
+                            "type": "ma_cross_condition",
+                            "analysis_level": "minute_bar_filter",
+                            "params": {
+                                "fast_period": 9,
+                                "slow_period": 21,
+                                "direction": "Above",
+                            },
+                        }
+                    ],
+                },
+                "entryConditions": {
+                    "id": "e_root",
+                    "type": "AND",
+                    "children": [
+                        {
+                            "id": "rsi_entry",
+                            "type": "rsi_condition",
+                            "analysis_level": "minute_bar_filter",
+                            "params": {
+                                "period": 14,
+                                "operator": "gt",
+                                "value": 55,
+                            },
+                        }
+                    ],
+                },
+                "initialization": _open_long(sl_value=2.0, tp_value=3.0),
             },
             "risk_profile": {"stopLossPercent": 2.5, "takeProfitPercent": 6.0, "maxConcurrentTrades": 1, "riskPerTradePercent": 1.0},
         },
         {
             "slug": "blank-canvas",
             "name": "Blank Canvas",
-            "description": "Start from scratch. Empty config — pick your own symbol, timeframe, blocks, and risk settings in the strategy editor. Best for experienced algo traders who know exactly what they want to build.",
+            "description": "Start from scratch. Empty entry conditions — pick your own symbol, timeframe, conditions, and risk settings in the strategy editor. Best for experienced algo traders who know exactly what they want to build.",
             "archetype": "blank",
             "tier_required": "free",
             "sort_order": 100,  # shown last (after the curated 6)
             "config_data": {
                 "timeframe": "1h",
                 "symbol": "BTCUSDT",
-                "blocks": [],
+                # Intentionally empty children: this is the "build it yourself"
+                # canvas, and it is the ONE template allowed to have no
+                # conditions. The loud NO ENTRY CONDITIONS warning is correct
+                # for it.
+                #
+                # It deliberately ships WITHOUT an "initialization" block. An
+                # empty AND gate evaluates True, and the engine treats a
+                # present entryConditions root as "gate satisfied" -- so an
+                # empty gate PLUS an initialization block produces a signal on
+                # EVERY candle (verified: 10/10 consecutive bars). That is a
+                # position-opening machine, not a blank canvas. The visual
+                # editor adds the initialization block when the user actually
+                # builds something, which is the only moment it should exist.
+                "filters": {"id": "f_root", "type": "AND", "children": []},
+                "entryConditions": {"id": "e_root", "type": "AND", "children": []},
                 "symbol_selection_mode": "STATIC",
             },
             "risk_profile": {

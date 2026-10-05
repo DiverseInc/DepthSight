@@ -2044,46 +2044,69 @@ class TradingController:
             # A strategy that cannot trade must fail loudly at start, never
             # silently at the first candle.
             _visual_cfg = params_for_instance.get("config")
-            if isinstance(_visual_cfg, dict) and not _visual_cfg.get(
-                "entryConditions"
-            ):
-                # Name the ACTUAL cause, not just the symptom. The seeded
-                # default templates in api/crud.py (7 of them, incl. one with
-                # an empty list) write their conditions into a "blocks" array,
-                # but this engine only ever reads "entryConditions" --
-                # bot_module/strategy.py contains zero references to "blocks",
-                # and the editor has no migration between the two. So every
-                # strategy created from a default template is structurally
-                # incapable of trading, and the only symptom was a weight of
-                # 0.00 in a per-candle log line.
-                _orphan = "blocks" in _visual_cfg
-                _hint = (
-                    "config_data uses the 'blocks' format, which the trading "
-                    "engine does not read; it only understands 'entryConditions'. "
-                    "This strategy must be rebuilt in the visual editor, which "
-                    "emits entryConditions. (The seeded default templates ship "
-                    "the 'blocks' format -- that is a product bug, not your "
-                    "mistake.)"
-                    if _orphan
-                    else "Add entry conditions in the strategy editor."
-                )
-                logger.error(
-                    "%s NO ENTRY CONDITIONS -- this strategy CANNOT generate a "
-                    "signal. config_data has no 'entryConditions' key, so "
-                    "check_signal() evaluates an empty condition tree and "
-                    "returns weight=0.00 on every candle, forever. The "
-                    "instance will still report status='running'. %s "
-                    "keys present: %s",
-                    log_prefix,
-                    _hint,
-                    sorted(_visual_cfg.keys()) or "(none)",
-                )
-            else:
-                logger.info(
-                    f"{log_prefix} Entry conditions present: "
-                    f"max_possible_expensive_weight="
-                    f"{getattr(instance, 'max_possible_expensive_weight', 'n/a')}"
-                )
+            if isinstance(_visual_cfg, dict):
+                # "absent" and "present but empty" are BOTH unusable, and they
+                # fail in opposite directions:
+                #   absent  -> no signal, ever, silently
+                #   empty   -> an AND with no children is vacuously True, so
+                #               with an initialization block it signals on
+                #               EVERY candle (verified 10/10 bars)
+                # Only the first was detected. `{"children": []}` is truthy,
+                # so the old `not cfg.get("entryConditions")` test let the
+                # second through completely unremarked.
+                _entry_root = _visual_cfg.get("entryConditions")
+
+                def _count_leaves(_node) -> int:
+                    if not isinstance(_node, dict):
+                        return 0
+                    if _node.get("type") in ("AND", "OR"):
+                        return sum(
+                            _count_leaves(c) for c in (_node.get("children") or [])
+                        )
+                    return 1
+
+                _has_entry = bool(_entry_root) and _count_leaves(_entry_root) > 0
+                if not _has_entry:
+                    # Name the ACTUAL cause, not just the symptom.
+                    _orphan = "blocks" in _visual_cfg
+                    if _orphan:
+                        _hint = (
+                            "config_data uses the 'blocks' format, which the "
+                            "trading engine does not read; it only understands "
+                            "'entryConditions'. This strategy must be rebuilt in "
+                            "the visual editor, which emits entryConditions."
+                        )
+                    elif _entry_root:
+                        # Present but childless: the gate is vacuously True, so
+                        # this does not fail silently -- it fails constantly.
+                        _hint = (
+                            "config_data has an 'entryConditions' root with no "
+                            "condition blocks. An empty AND gate is vacuously "
+                            "TRUE, so with an 'initialization' block this "
+                            "strategy opens a position on EVERY candle. Add "
+                            "condition blocks in the strategy editor."
+                        )
+                    else:
+                        _hint = (
+                            "config_data has no 'entryConditions' key, so "
+                            "check_signal() walks an empty condition tree and "
+                            "returns weight=0.00 on every candle, forever. Add "
+                            "entry conditions in the strategy editor."
+                        )
+                    logger.error(
+                        "%s NO ENTRY CONDITIONS -- this strategy cannot make a "
+                        "trade decision. The instance will still report "
+                        "status='running'. %s keys present: %s",
+                        log_prefix,
+                        _hint,
+                        sorted(_visual_cfg.keys()) or "(none)",
+                    )
+                else:
+                    logger.info(
+                        f"{log_prefix} Entry conditions present: "
+                        f"max_possible_expensive_weight="
+                        f"{getattr(instance, 'max_possible_expensive_weight', 'n/a')}"
+                    )
 
             # Adding start time to payload
             payload["started_at"] = datetime.now(timezone.utc).isoformat()
