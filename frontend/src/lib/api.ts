@@ -769,6 +769,48 @@ export const useSystemResources = () =>
 		staleTime: 2000,
 	});
 
+/**
+ * What each running strategy is actually doing right now.
+ *
+ * `useStrategies` tells you an instance is "running", which only means the bot
+ * loaded it. This tells you whether it is being fed candles, whether it is
+ * evaluating, and why it has not traded — the difference between a working
+ * strategy and a starving one, which used to be indistinguishable from the UI.
+ */
+export interface StrategyEvaluationState {
+	strategy_config_id: string;
+	strategy_name?: string | null;
+	symbol?: string | null;
+	outcome: "signal" | "rejected" | "waiting" | "no_trace";
+	reason?: string | null;
+	weight?: number;
+	has_entry_conditions?: boolean;
+	max_possible_expensive_weight?: number | null;
+	last_evaluation_at?: string | null;
+	next_evaluation_at?: string | null;
+	trigger_timeframe?: string | null;
+	seconds_since_last_evaluation?: number | null;
+	seconds_until_next_evaluation?: number | null;
+}
+
+export const useStrategyEvaluationState = () =>
+	useQuery<
+		{ evaluation_state: Record<string, StrategyEvaluationState> },
+		Error
+	>({
+		queryKey: authScopedQueryKey("strategies", "evaluation-state"),
+		queryFn: () =>
+			apiClient<{ evaluation_state: Record<string, StrategyEvaluationState> }>(
+				"/strategies/evaluation-state",
+			),
+		// Fast: this is the signal that a strategy is alive. A stale value here
+		// is the exact failure this endpoint exists to make visible.
+		refetchInterval: 5000,
+		staleTime: 0,
+		gcTime: 0,
+		refetchOnMount: "always",
+	});
+
 export const useStrategies = (params?: {
 	mode?: "live" | "paper";
 	apiKeyId?: number | "all";

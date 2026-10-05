@@ -17,7 +17,7 @@
 import { AlertTriangle, FlaskConical, Wallet } from "lucide-react";
 import { Link } from "react-router-dom";
 import { usePortfolioMode } from "@/context/PortfolioModeContext";
-import { useStrategies } from "@/lib/api";
+import { useStrategies, useStrategyEvaluationState } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -29,6 +29,18 @@ export const TradingModeBadge = () => {
 	const { mode } = usePortfolioMode();
 	const { data: strategies = [] } = useStrategies({ mode });
 	const runningCount = strategies.filter((s) => s.status === "running").length;
+
+	// "running" only means the bot loaded the instance. Count what is actually
+	// being evaluated, so the badge cannot imply a working strategy when the
+	// feed is dead.
+	const { data: evalData } = useStrategyEvaluationState();
+	const evalStates = evalData?.evaluation_state ?? {};
+	const running = strategies.filter((s) => s.status === "running");
+	const evaluatingCount = running.filter((s) => evalStates[String(s.id)]).length;
+	const starvedCount = runningCount - evaluatingCount;
+	const noConditions = running.filter(
+		(s) => evalStates[String(s.id)]?.has_entry_conditions === false,
+	).length;
 
 	const isLive = mode === "live";
 
@@ -87,6 +99,25 @@ export const TradingModeBadge = () => {
 							)}
 						</span>
 					</div>
+				{/* The honest version of the count above. "running" is not
+				    "working": this says whether the strategies are actually
+				    being fed and evaluating, and whether they could trade. */}
+				{runningCount > 0 && (starvedCount > 0 || noConditions > 0) && (
+					<div className="flex items-center gap-2 text-xs text-amber-300/90">
+						<AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+						<span>
+							{starvedCount > 0 && (
+								<>
+									{starvedCount} not receiving data
+									{noConditions > 0 ? " · " : ""}
+								</>
+							)}
+							{noConditions > 0 && (
+								<>{noConditions} with no entry conditions — cannot trade</>
+							)}
+						</span>
+					</div>
+				)}
 					{isLive ? (
 						<div className="flex items-center gap-2 text-xs text-amber-300/90">
 							<AlertTriangle className="w-3.5 h-3.5" />

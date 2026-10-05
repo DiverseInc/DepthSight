@@ -1,7 +1,7 @@
 import logging
 import json
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,11 +29,84 @@ REDIS_COMMAND_CHANNEL = getattr(
 
 logger = logging.getLogger(__name__)
 
+# Per-strategy evaluation state, written by the bot on every evaluation.
+# Must stay in sync with `STRATEGY_EVAL_STATE_KEY_PREFIX` in
+# bot_module/controller.py. Kept as a literal rather than importing the bot
+# module here, because the API process must not depend on bot internals to
+# serve a read.
+STRATEGY_EVAL_STATE_KEY_PREFIX = "depthsight:state:strategy_eval"
+
 strategies_router = APIRouter(
     prefix="/api/v1/strategies",
     tags=["Strategies"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+@strategies_router.get("/evaluation-state")
+async def get_strategy_evaluation_state(
+    redis_client: redis.Redis = Depends(get_redis_client),
+    current_user: models.User = Depends(get_current_user),
+):
+    """What is each running strategy actually doing right now?
+
+    `status == "running"` in the strategies list only means the bot loaded the
+    instance. It does not mean the strategy is being fed candles, that it is
+    evaluating, or why it has not traded. This endpoint answers those, so a
+    user can tell a working strategy from a starving one instead of guessing.
+
+    Returns a mapping of strategy_config_id -> evaluation state. A strategy
+    with no entry is simply absent, which is itself meaningful: the bot has
+    never evaluated it, so it is not being fed.
+    """
+    states: Dict[str, Any] = {}
+    try:
+        pattern = f"{STRATEGY_EVAL_STATE_KEY_PREFIX}:{current_user.id}:*"
+        keys = await redis_client.keys(pattern)
+        if keys:
+            values = await redis_client.mget(keys)
+            for raw in values:
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                cfg_id = parsed.get("strategy_config_id")
+                if not cfg_id:
+                    continue
+                now = datetime.now(timezone.utc)
+                last_raw = parsed.get("last_evaluation_at")
+                next_raw = parsed.get("next_evaluation_at")
+                parsed["seconds_since_last_evaluation"] = _age_seconds(last_raw, now)
+                parsed["seconds_until_next_evaluation"] = _age_seconds(
+                    next_raw, now, negate=True
+                )
+                states[str(cfg_id)] = parsed
+    except Exception as e:
+        logger.error(f"[/strategies/evaluation-state] failed: {e}", exc_info=True)
+
+    return {"data": {"evaluation_state": states}}
+
+
+def _age_seconds(iso_ts: Optional[str], now: datetime, negate: bool = False) -> Optional[float]:
+    """Seconds between `now` and an ISO timestamp. None when unparseable.
+
+    `negate=True` flips the sign so callers can use one helper for
+    "seconds since" (positive = past) and "seconds until" (positive = future).
+    """
+    if not iso_ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(iso_ts))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delta = (now - parsed).total_seconds()
+    return round(-delta if negate else delta, 1)
 
 
 @strategies_router.get(

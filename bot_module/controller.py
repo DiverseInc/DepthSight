@@ -55,6 +55,12 @@ except ImportError:
 
 
 logger = logging.getLogger("bot_module.controller")
+
+# Per-strategy evaluation state, written by the bot on every evaluation and
+# read by the API. Deliberately its OWN namespace, not nested under
+# REDIS_STATE_KEY_STRATEGIES -- see the comment at its use site.
+STRATEGY_EVAL_STATE_KEY_PREFIX = "depthsight:state:strategy_eval"
+
 # Check in case the logger is not configured globally
 if not logging.getLogger("bot_module").hasHandlers():
     logging.basicConfig(level=logging.INFO, format=config.LOG_FORMAT)
@@ -5784,6 +5790,144 @@ class TradingController:
                 market_type=event_market_type,
             )
 
+    def _classify_evaluation_outcome(
+        self,
+        instance: BaseStrategy,
+        signal_result: Any,
+        weight: float,
+        trace: Optional[Dict[str, Any]],
+    ) -> Tuple[str, Optional[str]]:
+        """Decide, ONCE, what happened to a strategy on this candle.
+
+        Returns ``(outcome, reason)`` where outcome is one of:
+          "signal"   -- a tradeable StrategySignal was produced
+          "rejected" -- the strategy ran and declined; `reason` says why
+          "waiting"  -- an external signal is required before it can decide
+          "no_trace" -- the strategy returned nothing and said nothing
+
+        This exists so the per-strategy status the UI shows and the line
+        written to the log are the SAME decision. When these were two
+        independent code paths they could disagree, and a disagreement here
+        is invisible: the user is told "running" either way.
+        """
+        if isinstance(signal_result, StrategySignal):
+            return "signal", None
+
+        if not (trace and isinstance(trace, dict)):
+            return "no_trace", None
+
+        rejection = trace.get("rejection_reason", "")
+        if rejection == "external_signal_required":
+            return "waiting", None
+
+        if rejection in ("filter", "entry_conditions"):
+            reasons = instance._get_failure_reasons(trace)
+            label = "filters" if rejection == "filter" else "entry conditions"
+            return "rejected", (
+                f"by {label}: {', '.join(reasons)}" if reasons else f"by {label}"
+            )
+
+        if rejection == "weight_threshold":
+            return "rejected", f"by weight threshold (weight={weight:.2f})"
+
+        if trace.get("result") is False:
+            reasons = instance._get_failure_reasons(trace)
+            return "rejected", (
+                f"{', '.join(reasons)}" if reasons else "no details"
+            )
+
+        return "rejected", f"weight={weight:.2f}"
+
+    async def _publish_evaluation_state(
+        self,
+        config_dict: Dict[str, Any],
+        signal_result: Any,
+        weight: float,
+        trace: Optional[Dict[str, Any]],
+        instance: Optional[BaseStrategy] = None,
+        symbol: Optional[str] = None,
+    ) -> None:
+        """Publish what actually happened to this strategy, for the API to read.
+
+        `status == "running"` only means the bot loaded the instance. It says
+        nothing about whether the strategy is being fed, whether it is
+        evaluating, or why it is not trading -- which is why a user could
+        watch "3 strategies running" with a frozen balance and no way to tell
+        a working strategy from a starving one. This key is what makes that
+        distinction visible instead of a guess.
+
+        Fire-and-forget and never raises: this is observability, and
+        observability must not be able to break the trading path.
+        """
+        redis_client = getattr(self, "redis_client", None)
+        config_id = config_dict.get("id")
+        if redis_client is None or not config_id:
+            return
+
+        try:
+            outcome, reason = self._classify_evaluation_outcome(
+                instance, signal_result, weight, trace
+            )
+            config_data = config_dict.get("config_data") or {}
+            visual_cfg = (
+                config_data.get("config")
+                if isinstance(config_data.get("config"), dict)
+                else config_data
+            )
+            has_entry_conditions = bool(
+                isinstance(visual_cfg, dict) and visual_cfg.get("entryConditions")
+            )
+
+            # Next evaluation is one trigger interval away. Used by the UI to
+            # say "last checked 12s ago, next in 48s" instead of leaving the
+            # user to guess whether a 1m strategy is mid-cycle or dead.
+            trigger_tf = ((config_data.get("entryTrigger") or {}) or {}).get(
+                "timeframe"
+            ) or "1m"
+            try:
+                interval_s = (
+                    int(str(trigger_tf)[:-1])
+                    * (3600 if str(trigger_tf).endswith("h") else 60)
+                )
+            except (ValueError, IndexError):
+                interval_s = 60
+
+            now = datetime.now(timezone.utc)
+            state = {
+                "strategy_config_id": str(config_id),
+                "strategy_name": config_dict.get("name")
+                or config_dict.get("strategy_name"),
+                "symbol": symbol,
+                "outcome": outcome,
+                "reason": reason,
+                "weight": round(float(weight or 0.0), 4),
+                "has_entry_conditions": has_entry_conditions,
+                "max_possible_expensive_weight": getattr(
+                    instance, "max_possible_expensive_weight", None
+                ),
+                "last_evaluation_at": now.isoformat(),
+                "next_evaluation_at": (
+                    now + timedelta(seconds=interval_s)
+                ).isoformat(),
+                "trigger_timeframe": trigger_tf,
+            }
+            # A SEPARATE key namespace, deliberately.
+            #
+            # `list_strategies` and the candle-health endpoint both SCAN
+            # `{REDIS_STATE_KEY_STRATEGIES}:{user_id}:*` and parse every match
+            # as a list of strategy records. An evaluation-state key nested
+            # under that prefix would be read as a strategy, json.loads'd into
+            # a dict, and extended key-by-key into the strategy list. Silently
+            # corrupting the payload of the main strategies endpoint is not a
+            # cost worth paying for tidier key names.
+            key = f"{STRATEGY_EVAL_STATE_KEY_PREFIX}:{self.user_id}:{config_id}"
+            # TTL must outlive at least a few missed evaluations, or a 4h
+            # strategy would vanish from the UI between candles and look dead.
+            ttl = max(900, interval_s * 4)
+            await redis_client.set(key, json.dumps(state), ex=ttl)
+        except Exception as e:  # never break the trading path
+            logger.debug(f"[EvalState] publish skipped: {e}")
+
     async def _check_and_process_signal_for_instance(
         self,
         instance: BaseStrategy,
@@ -5835,6 +5979,16 @@ class TradingController:
             # MODIFICATION: Capture trace for HFT publishing
             signal_result, weight, trace = await instance.check_signal(
                 pair_info, market_data
+            )
+
+            # Publish what actually happened, before any of the branches below
+            # can return early. Fire-and-forget on purpose: observability must
+            # never be able to slow down or break the trading path.
+            self.loop.create_task(
+                self._publish_evaluation_state(
+                    config_dict, signal_result, weight, trace, instance, symbol
+                ),
+                name=f"PubEvalState_{config_dict.get('id')}",
             )
 
             # HFT DATA PUBLISHING
@@ -5920,31 +6074,21 @@ class TradingController:
                                 f"{log_prefix} Failed to publish to hft:oracle: {e_pub}"
                             )
 
-            if signal_result is None and trace and isinstance(trace, dict):
-                rejection = trace.get("rejection_reason", "")
-                if rejection == "filter":
-                    reasons = instance._get_failure_reasons(trace)
-                    logger.info(
-                        f"{log_prefix} Signal REJECTED by filters: {', '.join(reasons)}"
+            # The log line and the state published above are now ONE decision.
+            # They used to be two independent branch chains over the same
+            # `rejection_reason`, which could disagree -- and a disagreement
+            # here is invisible, because the user is told "running" either way.
+            if signal_result is None:
+                _outcome, _reason = self._classify_evaluation_outcome(
+                    instance, signal_result, weight, trace
+                )
+                if _outcome == "rejected" and _reason:
+                    logger.info(f"{log_prefix} Signal REJECTED {_reason}.")
+                elif _outcome == "no_trace" and trace:
+                    logger.debug(
+                        f"{log_prefix} Strategy returned no signal and no trace "
+                        f"(weight={weight:.2f})."
                     )
-                elif rejection == "entry_conditions":
-                    reasons = instance._get_failure_reasons(trace)
-                    logger.info(
-                        f"{log_prefix} Signal REJECTED by entry conditions: {', '.join(reasons)}"
-                    )
-                elif rejection == "weight_threshold":
-                    logger.info(
-                        f"{log_prefix} Signal REJECTED by weight threshold (weight={weight:.2f})."
-                    )
-                elif rejection in ("external_signal_required",):
-                    pass
-                elif trace.get("result") is False:
-                    reasons = instance._get_failure_reasons(trace)
-                    logger.info(
-                        f"{log_prefix} Signal REJECTED: {', '.join(reasons) if reasons else 'no details'}"
-                    )
-                else:
-                    logger.info(f"{log_prefix} Signal REJECTED (weight={weight:.2f}).")
             if isinstance(signal_result, StrategySignal):
                 if signal_result.details is None:
                     signal_result.details = {}
