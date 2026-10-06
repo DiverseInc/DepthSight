@@ -4610,7 +4610,12 @@ class TradingController:
                         )
 
                         # What manage_position returned
-                        logger.warning(
+                        # INFO, not WARNING: this is a state trace, identical in
+                        # kind to the [BE_DIAG] line just below it (already INFO).
+                        # At WARNING it was indistinguishable from a genuine
+                        # anomaly such as "Could not get tick_size", which is
+                        # exactly the signal that matters on this path.
+                        logger.info(
                             f"{log_prefix_pm} [PM_RETURN] is_stop_at_be={getattr(updated_pos_obj, 'is_stop_at_be', 'N/A')}, "
                             f"current_sl={updated_pos_obj.current_sl_price}, "
                             f"be_reason={getattr(updated_pos_obj, 'be_trigger_reason', 'N/A')}"
