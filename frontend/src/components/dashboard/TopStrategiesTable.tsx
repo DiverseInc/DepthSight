@@ -32,6 +32,11 @@ const getStatusBadgeVariant = (status: string) => {
 		case "running":
 		case "active":
 			return "bg-green-500 hover:bg-green-600";
+		// A live position is the strongest "working" signal there is. This
+		// fell through to the grey default before, which made the one strategy
+		// actually trading look idle.
+		case "in_position":
+			return "bg-green-600 hover:bg-green-700 text-white";
 		case "stopped":
 		case "paused":
 			return "bg-yellow-500 hover:bg-yellow-600";
@@ -72,9 +77,21 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 
 	const topStrategies = useMemo(() => {
 		if (!strategies) return [];
-		return [...strategies]
-			.sort((a, b) => (b.pnl || 0) - (a.pnl || 0)) // Sort by PnL descending
-			.slice(0, topN);
+		// A strategy holding a live position is pinned into view and is NEVER
+		// truncated away, regardless of rank.
+		//
+		// Ranking purely by PnL and slicing dropped exactly the row that
+		// matters most: a position-holding strategy is usually the ONLY one
+		// with a non-zero PnL, and on this account it was the only one that
+		// had any at all, so it always sorted LAST and was the first row cut.
+		// With more strategies added it would have kept losing rows, silently
+		// hiding open risk from the dashboard.
+		const holdsPosition = (s: (typeof strategies)[number]) =>
+			s.status === "in_position" || (s.open_positions ?? 0) > 0;
+		const holding = strategies.filter(holdsPosition);
+		const rest = strategies.filter((s) => !holdsPosition(s));
+		rest.sort((a, b) => (b.pnl || 0) - (a.pnl || 0)); // Sort by PnL descending
+		return [...holding, ...rest].slice(0, Math.max(topN, holding.length));
 	}, [strategies, topN]);
 
 	const handleRowClick = (strategyId: string) => {
