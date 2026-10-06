@@ -173,9 +173,20 @@ const StrategyCard = forwardRef<
 									{t("colSymbols")}:
 								</span>
 								<span className="font-medium text-xs truncate max-w-[150px]">
-									{strategy.symbol_selection_mode === "STATIC"
-										? strategy.symbols?.join(", ") || "N/A"
-										: "Dynamic"}
+									{/* symbol_selection_mode has THREE values: STATIC,
+									    FIXED and DYNAMIC. FIXED is a PINNED-symbol mode
+									    (it is what the onboarding wizard creates, see
+									    routes/onboarding.py) and routes/strategies.py
+									    documents STATIC and FIXED together as the
+									    non-dynamic modes. This only checked "STATIC",
+									    so every FIXED strategy was mislabelled
+									    "Dynamic" -- claiming a screener-feed dependency
+									    it does not have, while actually holding a
+									    pinned symbol. */}
+									{(strategy.symbol_selection_mode || "").toUpperCase() ===
+									"DYNAMIC"
+										? "Dynamic"
+										: strategy.symbols?.join(", ") || "N/A"}
 								</span>
 							</div>
 
