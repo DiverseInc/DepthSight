@@ -25,10 +25,18 @@ export function PortfolioOverview() {
 		marketType: mode === "live" ? selectedMarketType : undefined,
 	});
 
-	// Calculate Equity = Balance + Unrealized PnL (assuming today_pnl is unrealized for the overview)
-	const equity = portfolioData
-		? portfolioData.balance + portfolioData.today_pnl
-		: 0;
+	// Unrealized PnL is reported separately by the API. `today_pnl` is REALIZED
+	// PnL for the day, so rendering it here omitted every open position from
+	// both this tile and Equity. Fall back to today_pnl only when the dedicated
+	// field is absent, so an older API still renders something sensible.
+	const unrealizedPnl =
+		portfolioData?.total_unrealized_pnl ??
+		portfolioData?.totalUnrealizedPnl ??
+		portfolioData?.today_pnl ??
+		0;
+
+	// Equity = Balance (realized cash) + Unrealized PnL on open positions.
+	const equity = (portfolioData?.balance ?? 0) + unrealizedPnl;
 
 	// Define metrics using keys from index.json
 	const metricsConfig = [
@@ -39,7 +47,7 @@ export function PortfolioOverview() {
 		},
 		{
 			jsonKey: "unrealizedPnl",
-			value: portfolioData?.today_pnl?.toFixed(2) ?? "0.00",
+			value: unrealizedPnl.toFixed(2),
 			isMonetary: true,
 			isPnL: true,
 		},

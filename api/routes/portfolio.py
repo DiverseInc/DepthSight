@@ -236,12 +236,46 @@ async def get_portfolio_status(
         )
         today_pnl = today_pnl_result.scalar() or 0.0
 
+        # Unrealized PnL lives in the bot's published state, NOT in the paper
+        # wallet -- the wallet only holds realized cash. This branch used to
+        # return without reading that state, so `total_unrealized_pnl` fell
+        # through to the schema default of 0.0 and every paper account showed
+        # $0.00 unrealized while holding an open position worth hundreds.
+        # Read the same Redis keys the fallback branch aggregates, and treat an
+        # unreachable bot as zero rather than failing the whole response.
+        total_unrealized_pnl = 0.0
+        try:
+            base_portfolio_key = (
+                f"{bot_config.REDIS_STATE_KEY_PORTFOLIO}:{current_user.id}"
+            )
+            portfolio_keys = await redis_client.keys(f"{base_portfolio_key}:*")
+            if portfolio_keys:
+                for raw in await redis_client.mget(portfolio_keys):
+                    if not raw:
+                        continue
+                    try:
+                        state = json.loads(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if state.get("mode") != "paper":
+                        continue
+                    total_unrealized_pnl += float(
+                        state.get("total_unrealized_pnl", 0) or 0
+                    )
+        except Exception as e:
+            logger.warning(
+                f"User '{current_user.username}' - could not read paper unrealized PnL "
+                f"from Redis: {e}"
+            )
+
         paper_portfolio_status = schemas.PortfolioStatus(
             balance=total_balance,
             today_pnl=today_pnl,  # Real PnL for today
             is_trading_allowed=True,
             consecutive_losses=0,  # Not tracked yet
             timestamp_utc=datetime.now(timezone.utc),
+            total_unrealized_pnl=round(total_unrealized_pnl, 2),
+            market_type=normalized_market_type,
         )
         return {"data": paper_portfolio_status}
 
