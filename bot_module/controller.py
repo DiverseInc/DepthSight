@@ -691,16 +691,28 @@ class TradingController:
         return "spot" in str(getattr(executor, "market_type", "")).lower()
 
     def _can_execute_spot(self) -> bool:
-        """Whether any executor on this controller can serve spot orders.
+        """Whether this controller can actually TRADE spot, not just read it.
 
-        A spot position is only ever reachable if a spot executor exists, so
-        when this is False the spot-only code paths can be skipped before they
-        take a symbol lock, scan the position map and log.
+        `market_executors` is NOT evidence of spot trading. bot_runner builds
+        one entry per market type for the data consumer even for a paper-only
+        account (see `market_executors_for_data_consumer`), so a "spot" key is
+        present on deployments that can never open a spot position. Counting it
+        here made this predicate always True and defeated the gate entirely --
+        the first version of it shipped that way and the per-tick flood did
+        not stop.
+
+        A spot executor in market_executors only counts when the controller
+        also has a real live executor, which is what bot_runner passes for a
+        live API key. A paper-only controller has live_executor=None.
         """
         if self._executor_is_spot(self.executors.get("paper")):
             return True
         if self._executor_is_spot(self.executors.get("live")):
             return True
+        # Data-consumer executors are market-data-only; require a real trading
+        # executor before treating a spot executor as tradeable.
+        if self.executors.get("live") is None:
+            return False
         return any(
             self._executor_is_spot(executor)
             for executor in self.market_executors.values()
@@ -13459,7 +13471,14 @@ class TradingController:
         async with symbol_lock:
             position = self._active_position_get(symbol, market_type)
             if not position:
-                logger.warning(
+                # DEBUG, not WARNING: returning None is a normal resolution
+                # result, not an anomaly. Every caller already branches on
+                # `if not executor:` and logs its own consequence with more
+                # context than this line has. At WARNING this fired once per
+                # trade print from the TICK handler and buried the Critical
+                # Events panel -- 46 of the last 100 entries were this one
+                # message.
+                logger.debug(
                     f"[_get_executor_for_symbol] Position not found for symbol {symbol} market={market_type}. Cannot determine mode."
                 )
                 return None

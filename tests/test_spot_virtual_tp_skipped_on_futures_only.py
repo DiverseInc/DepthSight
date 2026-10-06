@@ -173,7 +173,7 @@ def test_gate_returns_the_same_answer_the_old_path_returned():
     [
         ("spot", None, None),
         (None, "spot", None),
-        ("futures_usdtm", None, {"spot": _Executor("spot")}),
+        ("futures_usdtm", "futures_usdtm", {"spot": _Executor("spot")}),
     ],
 )
 def test_spot_deployments_are_not_short_circuited(
@@ -196,7 +196,37 @@ def test_futures_market_executor_alone_does_not_enable_spot():
     """A futures executor in market_executors must not enable the spot path."""
     ctrl = _FakeController(
         paper_market="futures_usdtm",
-        live_market=None,
+        live_market="futures_usdtm",
         market_executors={"futures_usdtm": _Executor("futures_usdtm")},
     )
     assert ctrl._can_execute_spot() is False
+
+
+def test_data_consumer_only_spot_executor_does_not_enable_spot():
+    """THE REGRESSION THAT MATTERS.
+
+    bot_runner builds `market_executors_for_data_consumer` with BOTH
+    'futures_usdtm' and 'spot' for every paper-only controller, so a "spot"
+    key is always present there. Those executors are market-data-only --
+    created with empty credentials -- and cannot open a spot position.
+
+    A gate that trusted market_executors would return True here, never fire,
+    and the per-tick flood would continue unchanged. That is exactly what the
+    first version did, and deploying it proved the flood still running.
+    """
+    data_only = {
+        "futures_usdtm": _Executor("futures_usdtm"),
+        "spot": _Executor("spot"),
+    }
+    ctrl = _FakeController(
+        paper_market="futures_usdtm",
+        live_market=None,
+        market_executors=data_only,
+    )
+    assert ctrl._can_execute_spot() is False, (
+        "A paper-only controller's data-consumer spot executor must not count "
+        "as tradeable spot."
+    )
+    ctrl.run(symbol="BTCUSDT", last_price=85000.0)
+    assert ctrl.lookup_calls == []
+    assert ctrl.lock_calls == []
