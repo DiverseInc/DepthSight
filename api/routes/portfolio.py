@@ -65,6 +65,22 @@ portfolio_router = APIRouter(
 )
 
 
+def _parse_equity_member(member: str) -> Optional[float]:
+    """Return the balance stored in an equity sorted-set member.
+
+    Members are written as "<timestamp_ms>:<balance>" so that every recording
+    is a distinct point. Points written before that format used the bare
+    balance as the member, so those are still read as-is. A member that yields
+    no number returns None instead of raising: one corrupt point must not turn
+    the whole chart into a 500.
+    """
+    candidate = member.rsplit(":", 1)[-1] if ":" in member else member
+    try:
+        return float(candidate)
+    except (TypeError, ValueError):
+        return None
+
+
 @portfolio_router.get(
     "/portfolio/equity",
     response_model=schemas.ApiResponseData[List[Tuple[int, float]]],
@@ -104,7 +120,16 @@ async def get_portfolio_equity(
             redis_key, min=start_timestamp_ms, max=end_timestamp_ms, withscores=True
         )
 
-        result = [(int(score), float(value)) for value, score in equity_data]
+        result = []
+        for value, score in equity_data:
+            balance = _parse_equity_member(value)
+            if balance is None:
+                logger.warning(
+                    f"Skipping unparseable equity point {value!r} for user "
+                    f"{current_user.id} (mode: {mode})."
+                )
+                continue
+            result.append((int(score), balance))
 
         # Replace 'count=1' with 'num=1'
         prev_point_data = await redis_client.zrevrangebyscore(
@@ -117,7 +142,14 @@ async def get_portfolio_equity(
         )
         if prev_point_data:
             prev_value, prev_score = prev_point_data[0]
-            result.insert(0, (int(prev_score), float(prev_value)))
+            prev_balance = _parse_equity_member(prev_value)
+            if prev_balance is not None:
+                result.insert(0, (int(prev_score), prev_balance))
+            else:
+                logger.warning(
+                    f"Skipping unparseable prior equity point {prev_value!r} for "
+                    f"user {current_user.id} (mode: {mode})."
+                )
 
         return {"data": result}
     except Exception as e:

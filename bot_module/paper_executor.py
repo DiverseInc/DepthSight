@@ -1238,7 +1238,11 @@ class PaperTradingExecutor:
         Called after each balance change.
         """
         if not self.redis_client:
-            logger.debug(
+            # WARNING, not DEBUG: this is a silent no-op. With it at DEBUG, a
+            # bot that never records equity looks identical to an account whose
+            # balance simply has not moved, and the dashboard chart is flat at
+            # $0.00 with no way to tell the two apart.
+            logger.warning(
                 f"[EquityRecord] Redis client not configured, skipping equity recording for user {self.user_id}"
             )
             return
@@ -1253,11 +1257,20 @@ class PaperTradingExecutor:
             # Write to Redis Sorted Set
             # Key: equity_history:paper:{user_id}
             # Score: timestamp_ms
-            # Value: balance
+            # Member: "<timestamp_ms>:<balance>"
+            #
+            # The member MUST be unique per recording. A sorted set is keyed on
+            # the member, so using the bare balance as the member made every
+            # repeated balance overwrite its OWN score instead of adding a new
+            # point. The "curve" therefore held one point per DISTINCT balance
+            # value, not one per time, and froze the moment the balance stopped
+            # moving. The reader in api/routes/portfolio.py parses both formats.
             timestamp_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
             redis_key = f"equity_history:paper:{self.user_id}"
 
-            await self.redis_client.zadd(redis_key, {str(total_balance): timestamp_ms})
+            await self.redis_client.zadd(
+                redis_key, {f"{timestamp_ms}:{total_balance}": timestamp_ms}
+            )
 
             # Limiting the number of points (storing the last 30 days)
             thirty_days_ago_ms = timestamp_ms - (30 * 24 * 60 * 60 * 1000)

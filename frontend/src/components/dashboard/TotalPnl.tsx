@@ -41,9 +41,12 @@ const CustomTooltip = ({
 }) => {
 	if (active && payload?.length) {
 		const data = payload[0].payload;
+		const sign = data.value >= 0 ? "+" : "-";
 		return (
 			<div className="rounded-lg border bg-background p-2 shadow-sm text-xs">
-				<p className="font-bold">${data.value.toFixed(2)}</p>
+				<p className="font-bold">
+					{sign}${Math.abs(data.value).toFixed(2)}
+				</p>
 				<p className="text-muted-foreground">
 					{new Date(data.time).toLocaleString()}
 				</p>
@@ -73,6 +76,25 @@ const toTimestampMs = (value: string | number | undefined): number | null => {
 
 	const timestamp = new Date(value).getTime();
 	return Number.isFinite(timestamp) ? timestamp : null;
+};
+
+/**
+ * A trade row only carries realized PnL once the position leg is closed.
+ *
+ * Every fill writes a trade row, and the ENTRY leg already carries a
+ * `timestamp_close` (its fill time) while having `pnl: 0` and
+ * `is_final_exit: false`. Counting it as a closed trade made every period look
+ * non-empty with a total of exactly $0.00, which pinned the chart to a flat
+ * zero line AND meant the equity-curve branch below it was unreachable. Mirrors
+ * the classification in lib/tradeGrouping.ts.
+ */
+const isRealizedExit = (trade: {
+	exit_type?: string | null;
+	is_final_exit?: boolean | null;
+}): boolean => {
+	if (trade.is_final_exit === false) return false;
+	if (trade.exit_type === "ENTRY") return false;
+	return true;
 };
 
 const TOTAL_PNL_PERIOD_STORAGE_KEY = "dashboard.totalPnl.period";
@@ -124,11 +146,47 @@ export function TotalPnl() {
 		const endMs = now.getTime();
 		return (periodTradesData?.trades || []).filter((trade) => {
 			const closeMs = toTimestampMs(trade.timestamp_close);
-			return closeMs !== null && closeMs >= startMs && closeMs <= endMs;
+			return (
+				closeMs !== null &&
+				closeMs >= startMs &&
+				closeMs <= endMs &&
+				isRealizedExit(trade)
+			);
 		});
 	}, [periodTradesData, periodStart, now]);
 
+	// Normalised equity series for the period, oldest first. Two points are the
+	// minimum that can describe any change at all.
+	const equitySeries = useMemo<ChartPoint[]>(() => {
+		if (!equityData || equityData.length < 2) return [];
+		return equityData
+			.map(([time, value]) => ({ time, value }))
+			.filter((p) => Number.isFinite(p.time) && Number.isFinite(p.value))
+			.sort((a, b) => a.time - b.time);
+	}, [equityData]);
+
+	// Change relative to the start of the period. Every branch below plots this
+	// same quantity, so the y-axis always means "PnL" and never silently
+	// switches to absolute balance.
+	const equityDelta = useMemo<ChartPoint[]>(() => {
+		if (equitySeries.length < 2) return [];
+		const baseline = equitySeries[0].value;
+		return equitySeries.map((p) => ({ time: p.time, value: p.value - baseline }));
+	}, [equitySeries]);
+
 	const { periodPnl, periodPnlPercent, isPositive } = useMemo(() => {
+		// Equity change is the honest headline: it tracks the account itself and
+		// agrees by construction with the chart drawn from the same series.
+		if (equityDelta.length > 0) {
+			const pnl = equityDelta[equityDelta.length - 1].value;
+			const startValue = equitySeries[0].value;
+			return {
+				periodPnl: pnl,
+				periodPnlPercent: startValue > 0 ? (pnl / startValue) * 100 : 0,
+				isPositive: pnl >= 0,
+			};
+		}
+
 		if (periodTrades.length > 0) {
 			const pnl = periodTrades.reduce(
 				(sum, trade) => sum + (Number(trade.pnl) || 0),
@@ -149,7 +207,7 @@ export function TotalPnl() {
 			periodPnlPercent: startValue > 0 ? (fallbackPnl / startValue) * 100 : 0,
 			isPositive: fallbackPnl >= 0,
 		};
-	}, [periodTrades, portfolioData, period]);
+	}, [equityDelta, equitySeries, periodTrades, portfolioData, period]);
 
 	const periodButtons: { key: EquityPeriod; label: string }[] = [
 		{ key: "1d", label: t("index:dailyPnl.period1D") },
@@ -158,6 +216,12 @@ export function TotalPnl() {
 	];
 
 	const chartData = useMemo<ChartPoint[]>(() => {
+		// Preferred: the recorded equity curve, as PnL delta. This is what makes
+		// the chart move as the account moves.
+		if (equityDelta.length > 0) {
+			return equityDelta;
+		}
+
 		if (periodTrades.length > 0) {
 			let cumulative = 0;
 			const sortedTrades = [...periodTrades].sort((a, b) => {
@@ -176,10 +240,6 @@ export function TotalPnl() {
 			return points;
 		}
 
-		if (equityData && equityData.length > 1) {
-			return equityData.map(([time, value]) => ({ time, value }));
-		}
-
 		if (portfolioData?.balance !== undefined) {
 			const currentTime = now.getTime();
 			return [
@@ -187,12 +247,12 @@ export function TotalPnl() {
 					time: periodStart.getTime(),
 					value: portfolioData.balance - periodPnl,
 				},
-				{ time: currentTime, value: portfolioData.balance },
+				{ time: currentTime, value: portfolioData.balance - periodPnl },
 			];
 		}
 
 		return [];
-	}, [equityData, portfolioData, periodPnl, periodTrades, periodStart, now]);
+	}, [equityDelta, portfolioData, periodPnl, periodTrades, periodStart, now]);
 
 	const chartColor = isPositive ? "hsl(var(--profit))" : "hsl(var(--loss))";
 	const chartGradientId = isPositive ? "gradient-profit" : "gradient-loss";
