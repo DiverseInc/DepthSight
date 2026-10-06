@@ -1,0 +1,77 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "share": "disabled",
+
+  "watcher": {
+    "ignore": [
+      "node_modules/**",
+      "frontend/node_modules/**",
+      "frontend/dist/**",
+      ".git/**",
+      ".venv*/**",
+      "__pycache__/**",
+      "*.pyc"
+    ]
+  },
+
+  "permission": {
+    "edit": {
+      "*": "allow",
+
+      "bot_module/**": "deny",
+      "api/**": "deny",
+      "market_data_service.py": "deny",
+      "bot_runner.py": "deny",
+      "alembic/**": "deny",
+      "infra/**": "deny",
+      "ops/**": "deny",
+      "scripts/**": "deny",
+      "slack_agent/**": "deny",
+      "tests/**": "deny"
+    },
+    "bash": {
+      "*": "ask",
+
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git show*": "allow",
+      "git blame*": "allow",
+
+      "git push*": "deny",
+      "git commit*": "deny",
+      "git reset*": "deny",
+      "git checkout*": "deny",
+      "git restore*": "deny",
+      "git rebase*": "deny",
+      "git merge*": "deny",
+      "git clean*": "deny",
+      "docker compose*": "deny",
+      "docker *": "deny",
+      "alembic*": "deny",
+      "rm *": "deny",
+      "rmdir *": "deny",
+
+      "npm run lint*": "allow",
+      "npm run build*": "allow",
+      "npx tsc*": "allow",
+      "grep *": "allow",
+      "ls*": "allow",
+      "cat *": "allow"
+    }
+  },
+
+  "agent": {
+    "audit": {
+      "description": "Read-only hunter for silent-defect classes in DepthSight. Cannot edit anything.",
+      "mode": "subagent",
+      "temperature": 0.1
+    },
+    "frontend": {
+      "description": "Owns frontend/ (React + TypeScript). Trading core is off-limits.",
+      "mode": "primary",
+      "temperature": 0.1
+    }
+  }
+}
