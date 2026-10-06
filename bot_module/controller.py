@@ -690,6 +690,22 @@ class TradingController:
     def _executor_is_spot(executor: Any) -> bool:
         return "spot" in str(getattr(executor, "market_type", "")).lower()
 
+    def _can_execute_spot(self) -> bool:
+        """Whether any executor on this controller can serve spot orders.
+
+        A spot position is only ever reachable if a spot executor exists, so
+        when this is False the spot-only code paths can be skipped before they
+        take a symbol lock, scan the position map and log.
+        """
+        if self._executor_is_spot(self.executors.get("paper")):
+            return True
+        if self._executor_is_spot(self.executors.get("live")):
+            return True
+        return any(
+            self._executor_is_spot(executor)
+            for executor in self.market_executors.values()
+        )
+
     @staticmethod
     def _normalize_market_type(raw_market_type: Optional[Any]) -> str:
         return _normalize_position_market_type(raw_market_type)
@@ -10424,6 +10440,17 @@ class TradingController:
         low_price: Optional[float] = None,
         last_price: Optional[float] = None,
     ) -> bool:
+        # This is a SPOT-ONLY feature. It is called from the TICK handler on
+        # every trade print, and below it hardcodes market_type="spot" before
+        # returning False unless the resolved executor is a spot executor.
+        # With no spot executor on this deployment that outcome is already
+        # decided, so short-circuit here instead of taking a symbol lock,
+        # scanning the position map and emitting a WARNING on every tick.
+        # PaperTradingExecutor hardcodes market_type="futures_usdtm", so a
+        # paper-only account can never satisfy _executor_is_spot.
+        if not self._can_execute_spot():
+            return False
+
         if high_price is None and low_price is None and last_price is None:
             return False
 
