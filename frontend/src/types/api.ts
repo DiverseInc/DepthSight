@@ -58,6 +58,13 @@ export interface StrategyData {
 	symbol: string;
 	market_type: string;
 	status: string;
+	/**
+	 * Present only when `status` is "cannot_trade" -- the engine detected at
+	 * instance start that this strategy can never signal (e.g. its config uses
+	 * the legacy `blocks` shape, which the trading engine does not read).
+	 * Carries the human-readable reason so the UI can explain, not just colour.
+	 */
+	status_detail?: string | null;
 	pnl: number;
 	open_positions: number;
 	started_at: string;

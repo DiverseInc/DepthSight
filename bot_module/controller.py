@@ -95,6 +95,27 @@ def _make_position_key(market_type: Optional[Any], symbol: str) -> str:
     return f"{_normalize_position_market_type(market_type)}:{str(symbol).upper()}"
 
 
+def _derive_strategy_status(
+    open_positions: int, cannot_trade_reason: Optional[str]
+) -> str:
+    """Derives the published status for one running strategy instance.
+
+    This used to be `"in_position" if open_positions > 0 else "running"` --
+    a two-way choice that had no way to express "this strategy structurally
+    cannot ever signal". The engine already detects that at start (it logs
+    NO ENTRY CONDITIONS); this carries the same fact out to the UI so a dead
+    strategy stops being rendered as a working one.
+
+    Precedence is deliberate: an open position still wins, because it is the
+    risk-relevant fact and a config warning must never hide it.
+    """
+    if open_positions > 0:
+        return "in_position"
+    if cannot_trade_reason:
+        return "cannot_trade"
+    return "running"
+
+
 class ActivePositionMap(dict):
     """
     Stores live positions by market-aware key while preserving legacy symbol-only
@@ -2121,10 +2142,19 @@ class TradingController:
                             "returns weight=0.00 on every candle, forever. Add "
                             "entry conditions in the strategy editor."
                         )
+                    # Surface it instead of only logging it. Logging alone left
+                    # the instance reporting status='running' forever, which the
+                    # dashboard rendered as a working strategy. The instance
+                    # deliberately STAYS in the running pool (it must still be
+                    # stoppable and visible), but this marker makes the publisher
+                    # derive status 'cannot_trade' so the UI stops implying it
+                    # works. See _derive_strategy_status.
+                    payload["cannot_trade_reason"] = _hint
+
                     logger.error(
                         "%s NO ENTRY CONDITIONS -- this strategy cannot make a "
-                        "trade decision. The instance will still report "
-                        "status='running'. %s keys present: %s",
+                        "trade decision. It will be reported with "
+                        "status='cannot_trade'. %s keys present: %s",
                         log_prefix,
                         _hint,
                         sorted(_visual_cfg.keys()) or "(none)",
@@ -3641,6 +3671,10 @@ class TradingController:
                 # Optional: Persist back to dict so we don't check every time (race condition safe as it's a dict read)
                 config_dict["api_key_id"] = self.api_key_id
 
+            # A strategy the engine already knows cannot ever signal is published
+            # as such, rather than as a healthy "running" one.
+            _cannot_trade_reason = config_dict.get("cannot_trade_reason")
+
             strat_data = {
                 "id": config_id,
                 "strategy_name": instance.NAME,
@@ -3648,7 +3682,10 @@ class TradingController:
                 "market_type": config_dict.get("config_data", {})
                 .get("marketType", "PAPER")
                 .lower(),
-                "status": "in_position" if instance_open_positions > 0 else "running",
+                "status": _derive_strategy_status(
+                    instance_open_positions, _cannot_trade_reason
+                ),
+                "status_detail": _cannot_trade_reason,
                 "pnl": round(total_instance_pnl, 4),
                 "open_positions": instance_open_positions,
                 "started_at": config_dict.get(

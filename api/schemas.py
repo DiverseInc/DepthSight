@@ -1094,6 +1094,13 @@ class StrategyInfo(StrategyRunRequest):  # For response
     name: Optional[str] = Field(
         None, description="User-defined name for the strategy instance"
     )
+    status_detail: Optional[str] = Field(
+        None,
+        description=(
+            "Why this strategy reports status='cannot_trade', when it does. "
+            "Set by the bot at instance creation; absent for every other status."
+        ),
+    )
 
     model_config = ConfigDict(from_attributes=True)
 

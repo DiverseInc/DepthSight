@@ -36,6 +36,9 @@ const getStatusBadgeVariant = (status: string) => {
 		case "paused":
 			return "bg-yellow-500 hover:bg-yellow-600";
 		case "error":
+		// The engine detected a strategy that structurally cannot signal.
+		// Red, not grey: it is broken, not merely idle.
+		case "cannot_trade":
 			return "bg-red-500 hover:bg-red-600";
 		default:
 			return "bg-gray-500 hover:bg-gray-600";
@@ -179,8 +182,8 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 										{strategy.symbol}
 									</TableCell>
 									<TableCell className="text-center">
-										<Badge className={getStatusBadgeVariant(strategy.status)}>
-											{strategy.status.toUpperCase()}
+										<Badge className={getStatusBadgeVariant(strategy.status)} title={strategy.status_detail || undefined}>
+											{strategy.status.replace(/_/g, " ").toUpperCase()}
 										</Badge>
 									</TableCell>
 									<TableCell
