@@ -249,19 +249,25 @@ async def get_portfolio_status(
                 f"{bot_config.REDIS_STATE_KEY_PORTFOLIO}:{current_user.id}"
             )
             portfolio_keys = await redis_client.keys(f"{base_portfolio_key}:*")
-            if portfolio_keys:
-                for raw in await redis_client.mget(portfolio_keys):
-                    if not raw:
-                        continue
-                    try:
-                        state = json.loads(raw)
-                    except (TypeError, ValueError):
-                        continue
-                    if state.get("mode") != "paper":
-                        continue
-                    total_unrealized_pnl += float(
-                        state.get("total_unrealized_pnl", 0) or 0
-                    )
+            for key, raw in zip(portfolio_keys, await redis_client.mget(portfolio_keys)):
+                if not raw:
+                    continue
+                # The portfolio payload has NO "mode" field (unlike the
+                # positions payload), so mode cannot be read from the value.
+                # The key suffix is the api_key_id: live controllers publish a
+                # numeric id, paper controllers have none and publish a
+                # non-numeric suffix. Filtering on the VALUE instead silently
+                # skipped every key and reported 0.0.
+                suffix = str(key).rsplit(":", 1)[-1]
+                if suffix.isdigit():
+                    continue
+                try:
+                    state = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                total_unrealized_pnl += float(
+                    state.get("total_unrealized_pnl", 0) or 0
+                )
         except Exception as e:
             logger.warning(
                 f"User '{current_user.username}' - could not read paper unrealized PnL "

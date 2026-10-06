@@ -154,11 +154,14 @@ def _call(redis_payloads, wallet_balance=9995.50497923637, pnl=0.0):
 
 
 def test_paper_portfolio_reports_unrealized_pnl_from_bot_state():
+    # NOTE: the real bot payload has NO "mode" field. An earlier version of
+    # this fix filtered on state["mode"] == "paper" and therefore skipped every
+    # key, reporting 0.0 -- it shipped broken and was caught by measuring the
+    # live response. The discriminator is the key suffix, not the value.
     published = {
         "depthsight:state:portfolio:10:None": json.dumps(
             {
                 "user_id": 10,
-                "mode": "paper",
                 "total_wallet_balance": 9995.50497923637,
                 "total_unrealized_pnl": 48.2925,
                 "total_equity": 10043.7975,
@@ -176,22 +179,37 @@ def test_paper_portfolio_reports_unrealized_pnl_from_bot_state():
     assert abs(data.balance - 9995.50497923637) < 1e-9
 
 
-def test_paper_portfolio_aggregates_multiple_keys_and_ignores_live_mode():
+def test_paper_portfolio_ignores_live_keys_by_numeric_api_key_id():
+    """Live controllers publish a numeric api_key_id suffix; paper has none."""
     published = {
         "depthsight:state:portfolio:10:None": json.dumps(
-            {"user_id": 10, "mode": "paper", "total_unrealized_pnl": 30.0}
+            {"user_id": 10, "total_unrealized_pnl": 30.0}
         ),
         "depthsight:state:portfolio:10:5": json.dumps(
-            {"user_id": 10, "mode": "paper", "total_unrealized_pnl": 12.5}
+            {"user_id": 10, "total_unrealized_pnl": 999.0}
         ),
         "depthsight:state:portfolio:10:9": json.dumps(
-            {"user_id": 10, "mode": "live", "total_unrealized_pnl": 999.0}
+            {"user_id": 10, "total_unrealized_pnl": 12.5}
         ),
     }
     data = _call(published, wallet_balance=10000.0)["data"]
-    assert data.total_unrealized_pnl == 42.5, (
-        "Must sum paper-mode keys only and ignore live-mode state."
+    assert data.total_unrealized_pnl == 30.0, (
+        "Must sum only paper keys (non-numeric api_key_id suffix) and never "
+        "double-count live controllers."
     )
+
+
+def test_paper_portfolio_aggregates_multiple_paper_keys():
+    published = {
+        "depthsight:state:portfolio:10:None": json.dumps(
+            {"user_id": 10, "total_unrealized_pnl": 30.0}
+        ),
+        "depthsight:state:portfolio:10:paper_a": json.dumps(
+            {"user_id": 10, "total_unrealized_pnl": 12.5}
+        ),
+    }
+    data = _call(published, wallet_balance=10000.0)["data"]
+    assert data.total_unrealized_pnl == 42.5
 
 
 def test_paper_portfolio_survives_missing_or_corrupt_bot_state():
