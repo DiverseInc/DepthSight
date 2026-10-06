@@ -416,6 +416,51 @@ class CcxtExecutor:
             )
             return None
 
+    def _symbol_filters(self, info: Dict[str, Any]) -> Dict[str, Any]:
+        """Binance-shaped filters + normalized sizes for one ccxt market dict.
+
+        fetch_exchange_info() and get_symbol_info() MUST agree on shape. The
+        market-info cache in the controller parses `filters`, so a bulk shape
+        without them silently yields tick_size=None for every symbol -- which is
+        exactly what happened: breakeven logic was running with no tick_size and
+        only a WARNING to say so.
+        """
+        price_step = self._precision_to_step(
+            info.get("precision", {}).get("price"), 0.01
+        )
+        amount_step = self._precision_to_step(
+            info.get("precision", {}).get("amount"), 0.001
+        )
+        amount_limits = info.get("limits", {}).get("amount", {}) or {}
+        cost_limits = info.get("limits", {}).get("cost", {}) or {}
+        min_qty = self._safe_float(amount_limits.get("min"), amount_step)
+        max_qty = self._safe_float(amount_limits.get("max"), 1000000.0)
+        amount_step, min_qty, max_qty = self._normalize_amount_units_for_market(
+            info.get("symbol", ""), info, amount_step, min_qty, max_qty
+        )
+        min_notional = self._safe_float(cost_limits.get("min"), 5.0)
+
+        return {
+            "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": str(price_step)},
+                {
+                    "filterType": "LOT_SIZE",
+                    "stepSize": str(amount_step),
+                    "minQty": str(min_qty),
+                    "maxQty": str(max_qty),
+                },
+                {"filterType": "MIN_NOTIONAL", "notional": str(min_notional)},
+                {"filterType": "NOTIONAL", "minNotional": str(min_notional)},
+            ],
+            "tick_size": price_step,
+            "lot_params": {
+                "stepSize": amount_step,
+                "minQty": min_qty,
+                "maxQty": max_qty,
+            },
+            "min_notional": min_notional,
+        }
+
     async def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         ccxt_symbol = self._normalize_symbol(symbol)
         try:
@@ -441,38 +486,7 @@ class CcxtExecutor:
             raw_symbol = self._to_legacy_symbol(
                 m_data.get("symbol") or m_data.get("id", "")
             )
-            price_step = self._precision_to_step(
-                m_data.get("precision", {}).get("price"), 0.01
-            )
-            amount_step = self._precision_to_step(
-                m_data.get("precision", {}).get("amount"), 0.001
-            )
-            amount_limits = m_data.get("limits", {}).get("amount", {}) or {}
-            cost_limits = m_data.get("limits", {}).get("cost", {}) or {}
-            min_qty = self._safe_float(amount_limits.get("min"), amount_step)
-            max_qty = self._safe_float(amount_limits.get("max"), 1000000.0)
-            amount_step, min_qty, max_qty = self._normalize_amount_units_for_market(
-                ccxt_symbol,
-                m_data,
-                amount_step,
-                min_qty,
-                max_qty,
-            )
-            min_notional = self._safe_float(cost_limits.get("min"), 5.0)
-
-            filters = [
-                {"filterType": "PRICE_FILTER", "tickSize": str(price_step)},
-                {
-                    "filterType": "LOT_SIZE",
-                    "stepSize": str(amount_step),
-                    "minQty": str(min_qty),
-                    "maxQty": str(max_qty),
-                },
-                {"filterType": "MIN_NOTIONAL", "notional": str(min_notional)},
-                {"filterType": "NOTIONAL", "minNotional": str(min_notional)},
-            ]
-
-            return {
+            payload = {
                 "symbol": raw_symbol,
                 "pair": raw_symbol,
                 "status": "TRADING" if m_data.get("active", True) else "BREAK",
@@ -480,15 +494,9 @@ class CcxtExecutor:
                 "isSpotTradingAllowed": bool(m_data.get("spot", False)),
                 "baseAsset": m_data.get("base", ""),
                 "quoteAsset": m_data.get("quote", ""),
-                "filters": filters,
-                "tick_size": price_step,
-                "lot_params": {
-                    "stepSize": amount_step,
-                    "minQty": min_qty,
-                    "maxQty": max_qty,
-                },
-                "min_notional": min_notional,
             }
+            payload.update(self._symbol_filters(m_data))
+            return payload
         except Exception as e:
             logger.error(
                 f"Error fetching symbol info for {symbol} on {self.exchange_id}: {e}",
@@ -568,6 +576,15 @@ class CcxtExecutor:
         ]
         top_volume_spot = top_volume_futures_usdtm
 
+        # Index every USDT market by legacy symbol so the hardcoded top-volume
+        # safety net can still recover precision for pairs that the swap/quote
+        # filter below drops. Without this those entries carry no tick_size.
+        by_base: Dict[str, Dict[str, Any]] = {}
+        for _m in raw_markets.values():
+            base = _m.get("base", "")
+            if base and _m.get("quote") == "USDT":
+                by_base.setdefault((base + "USDT").upper(), _m)
+
         if "futures" in market_type:
             symbols_by_name: dict = {}
             for ccxt_symbol, info in raw_markets.items():
@@ -585,6 +602,7 @@ class CcxtExecutor:
                     "isSpotTradingAllowed": False,
                     "baseAsset": base,
                 }
+                entry.update(self._symbol_filters(info))
                 symbols_by_name[entry["symbol"]] = entry
             # Augment with hardcoded top-volume list (covers ccxt 4.4.89 OKX
             # cases where the swap/quote filter drops BTCUSDT/ETHUSDT).
@@ -592,7 +610,7 @@ class CcxtExecutor:
                 if s in symbols_by_name:
                     continue
                 base = s[:-4] if s.endswith("USDT") else s
-                symbols_by_name[s] = {
+                entry = {
                     "symbol": s,
                     "pair": f"{base}/USDT:USDT",
                     "status": "TRADING",
@@ -601,6 +619,10 @@ class CcxtExecutor:
                     "isSpotTradingAllowed": False,
                     "baseAsset": base,
                 }
+                fallback = by_base.get(s.upper())
+                if fallback:
+                    entry.update(self._symbol_filters(fallback))
+                symbols_by_name[s] = entry
             return {"symbols": list(symbols_by_name.values())}
         if "spot" in market_type:
             symbols_by_name = {}
@@ -618,12 +640,13 @@ class CcxtExecutor:
                     "baseAsset": base,
                     "quoteAsset": "USDT",
                 }
+                entry.update(self._symbol_filters(info))
                 symbols_by_name[entry["symbol"]] = entry
             for s in top_volume_spot:
                 if s in symbols_by_name:
                     continue
                 base = s[:-4] if s.endswith("USDT") else s
-                symbols_by_name[s] = {
+                entry = {
                     "symbol": s,
                     "pair": f"{base}/USDT",
                     "status": "TRADING",
@@ -631,6 +654,10 @@ class CcxtExecutor:
                     "baseAsset": base,
                     "quoteAsset": "USDT",
                 }
+                fallback = by_base.get(s.upper())
+                if fallback:
+                    entry.update(self._symbol_filters(fallback))
+                symbols_by_name[s] = entry
             return {"symbols": list(symbols_by_name.values())}
         return None
 

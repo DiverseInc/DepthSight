@@ -13378,8 +13378,20 @@ class TradingController:
                 current_cache = dict(self._market_info_cache)
             for extra_market_type, extra_executor in self.market_executors.items():
                 normalized_extra_market = self._normalize_market_type(extra_market_type)
-                if normalized_extra_market == self._normalize_market_type(
-                    getattr(self.executors.get("live"), "market_type", None)
+                live_market_type = getattr(
+                    self.executors.get("live"), "market_type", None
+                )
+                # Only skip when the LIVE executor really did populate this
+                # market type. Comparing against _normalize_market_type(None)
+                # makes an ABSENT live executor normalize to the configured
+                # default (futures_usdtm), which made the futures_usdtm entry
+                # look like a duplicate of itself and skip -- so on every
+                # paper-only account the futures cache keys were never written
+                # at all and tick_size was always None.
+                if (
+                    live_market_type is not None
+                    and normalized_extra_market
+                    == self._normalize_market_type(live_market_type)
                 ):
                     continue
                 if extra_executor is None:
