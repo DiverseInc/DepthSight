@@ -4218,7 +4218,11 @@ class DataConsumer:
             }
 
         if event_to_push and stream_key:
-            logger.info(
+            # DEBUG, not INFO: one line per market event, and TICK events arrive
+            # at aggTrade rate. At INFO this filled all 100 slots of the
+            # Critical Events buffer within seconds, so any genuine WARNING or
+            # ERROR was pushed out before a human could read it.
+            logger.debug(
                 "[DataConsumer] Enqueue market event: type=%s stream_key=%s symbol=%s timeframe=%s market_type=%s",
                 event_to_push.get("type"),
                 stream_key,

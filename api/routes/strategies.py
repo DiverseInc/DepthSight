@@ -115,6 +115,7 @@ def _age_seconds(iso_ts: Optional[str], now: datetime, negate: bool = False) -> 
 async def list_strategies(
     redis_client: redis.Redis = Depends(get_redis_client),
     current_user: models.User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
     mode: str = Query("live", enum=["live", "paper"]),
     api_key_id: Optional[int] = Query(
         None, description="Filter by specific API key (subaccount)"
@@ -165,6 +166,31 @@ async def list_strategies(
             user_mode_strategies = [
                 s for s in user_mode_strategies if s.get("api_key_id") == api_key_id
             ]
+
+        # Join the user-facing config name. The bot publishes `id` = config_id
+        # and `strategy_name` = the strategy CLASS name ("VisualBuilderStrategy"),
+        # and never publishes a display name at all -- so every running strategy
+        # rendered as the same class name and the dashboard's Top Performing
+        # table showed N identical rows. The real names live on StrategyConfig.
+        # Best-effort: a DB failure must not break the Redis-backed list.
+        if user_mode_strategies:
+            try:
+                configs = await crud.get_strategy_configs_by_user(
+                    db, user_id=current_user.id
+                )
+                name_by_id = {
+                    str(c.id): c.name for c in configs if getattr(c, "name", None)
+                }
+                for s in user_mode_strategies:
+                    if not s.get("name"):
+                        resolved = name_by_id.get(str(s.get("id")))
+                        if resolved:
+                            s["name"] = resolved
+            except Exception as e:
+                logger.warning(
+                    f"Could not resolve strategy config names for user "
+                    f"'{current_user.username}': {e}"
+                )
 
         validated_strategies = [schemas.StrategyInfo(**s) for s in user_mode_strategies]
         return {"data": validated_strategies}
