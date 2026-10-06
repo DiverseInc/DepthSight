@@ -55,6 +55,39 @@ DEFAULT_TRADE_CACHE_SIZE = getattr(
 BINANCE_WS_RECONNECT_DELAY_BASE = 5  # Seconds
 BINANCE_WS_MAX_RECONNECT_DELAY = 300  # Seconds (5 min). FIX 2026-09-23: raised from 60s so stuck-upstream HTTP 525 from Cloudflare (or any persistent connection-refused) doesn't fill the bot logs every minute across many controllers.
 
+# Minimum spacing between CRITICAL escalations, in failures. At the 300s
+# reconnect delay this is roughly one CRITICAL every 50 minutes.
+WS_CRITICAL_ESCALATION_MIN_CADENCE = 5
+
+
+def should_escalate_ws_failure(consecutive_failures: int, threshold: int) -> bool:
+    """Should a main_app_ws failure be escalated to CRITICAL?
+
+    Escalation exists so a dead symbol source is not buried under throttled
+    reconnects: while SYMBOL_SOURCE_MODE is "MAIN_APP" there is no automatic
+    fallback, so every DYNAMIC-mode strategy is blind until this feed returns.
+
+    The original predicate was `consecutive_failures in (t, t*3, t*10)` --
+    exact membership. It therefore fired at 10, 30 and 100 and then went
+    permanently silent, because the counter only resets on a SUCCESSFUL
+    connect. The longer the outage ran, the quieter it got. Observed live on
+    2026-10-06: a 50-consecutive-failure outage logging only WARNING, which is
+    precisely the burying the escalation was written to prevent.
+
+    So: fire at every multiple of the threshold once past it. `>=` alone would
+    flood (every single failure past the threshold), hence the cadence floor.
+    """
+    try:
+        t = int(threshold)
+    except (TypeError, ValueError):
+        t = 10
+    if t < 1:
+        t = 1
+    n = int(consecutive_failures)
+    if n < t:
+        return False
+    return n % max(t, WS_CRITICAL_ESCALATION_MIN_CADENCE) == 0
+
 # New constants for tape metrics
 TAPE_METRIC_WINDOWS = [5, 10, 30, 60, 120]  # Seconds
 
@@ -3095,7 +3128,7 @@ class DataConsumer:
                 threshold = getattr(
                     config, "MAIN_APP_WS_CRITICAL_AFTER_FAILURES", 10
                 )
-                if consecutive_failures in (threshold, threshold * 3, threshold * 10):
+                if should_escalate_ws_failure(consecutive_failures, threshold):
                     logger.critical(
                         f"Main_app_ws has failed {consecutive_failures} consecutive "
                         f"times ({err_key}: {e_conn}). The symbol source is DOWN: "
