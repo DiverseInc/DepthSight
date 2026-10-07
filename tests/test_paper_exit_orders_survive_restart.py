@@ -226,6 +226,9 @@ def _build_controller(persisted_position, live_executor=None, price=PRICE_AT_RES
     controller._symbol_locks = {}
     controller._market_info_cache = {}
     controller._market_info_lock = asyncio.Lock()
+    # `_handle_final_exit` stamps the close time here; without it the finalize
+    # path raises before it ever reaches the PnL bookkeeping under test.
+    controller._last_position_close_time_per_symbol = {}
     controller.telegram_notifier = None
     controller.user_telegram_chat_id = None
     controller.rm = RiskManager(
@@ -650,4 +653,70 @@ async def test_zero_quantity_closing_record_is_finalized_not_ignored():
         "a CLOSING record with zero remaining quantity must still be picked up for "
         "finalisation; filtering it out on remaining_quantity > 0 leaves a "
         "permanent zombie that is invisible on the dashboard"
+    )
+
+
+@pytest.mark.skip(reason=(
+    "NOT YET WIRED. The PnL-preservation guard in _handle_final_exit is real and "
+    "reviewed, but this test could not be made to drive the real path: "
+    "_handle_final_exit resolves its executor through its own lookup and reaches "
+    "order-cancellation code that this harness does not wire, so the assertions "
+    "never run. A skipped test must NOT be read as coverage -- the guard is "
+    "currently verified by code reading only. Either wire the executor/cancel "
+    "surface in _build_controller, or drop this test and re-derive the guard "
+    "through the recovery path."
+))
+@pytest.mark.asyncio
+async def test_zero_price_finalization_preserves_already_booked_pnl():
+    """A finalization-only close must NOT overwrite real, already-booked PnL.
+
+    The zombie recovery calls `_handle_final_exit` with `exit_price=0.0` so no
+    further PnL is booked. Without a guard, the fallback branch computes
+    `total_pnl_calculated = 0` and assigns it to `position.pnl`, DESTROYING the
+    PnL the original fill had already recorded -- silently rewriting the
+    account's realised history the first time a zombie with real PnL is cleaned.
+
+    ⚠️ See the skip reason: this does not currently verify anything.
+    """
+    controller, _, _ = _build_controller(_persisted_position())
+
+    BOOKED_PNL = -137.25
+    zombie = _persisted_position(
+        status="CLOSING",
+        remaining_quantity=0.0,
+        pnl=BOOKED_PNL,
+        exit_reason="CLOSED_WHILE_OFFLINE",
+    )
+    controller._active_positions = ActivePositionMap()
+    controller._active_position_set(zombie)
+
+    captured: dict = {}
+    real_pop = controller._active_position_pop
+
+    def _capture_pop(symbol, market_type=None):
+        pos = controller._active_position_get(symbol, market_type)
+        if pos is not None:
+            captured["pnl"] = pos.pnl
+        return real_pop(symbol, market_type)
+
+    controller._active_position_pop = _capture_pop
+
+    await controller._handle_final_exit(
+        SYMBOL,
+        "FINALIZE_ORPHANED_CLOSING",
+        exit_price=0.0,
+        commission=0.0,
+        commission_asset=None,
+        order_id=None,
+        client_order_id=None,
+        realized_pnl_from_exchange=0.0,
+        exchange_pnl_available=False,
+        market_type="futures_usdtm",
+    )
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert controller._active_position_get(SYMBOL, "futures_usdtm") is None
+    assert captured.get("pnl") == BOOKED_PNL, (
+        f"already-booked PnL {BOOKED_PNL} became {captured.get('pnl')!r}"
     )

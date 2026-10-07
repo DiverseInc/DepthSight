@@ -9757,11 +9757,25 @@ class TradingController:
                             pnl_this_event = -pnl_this_event
                         total_pnl_calculated += pnl_this_event
 
-                position.pnl = float(total_pnl_calculated)
-                logger.warning(
-                    f"{log_prefix} Exchange realized PnL ('rp') not available for this close event — "
-                    f"using CALCULATED PnL fallback: {position.pnl:.4f}"
-                )
+                # FIX 2026-10-07: a zero exit_price means "finalize this record,
+                # the money already moved" -- used by the stuck-CLOSING zombie
+                # recovery, which calls _handle_final_exit with exit_price=0.0
+                # precisely so no further PnL is booked. The arithmetic above
+                # then produces 0.0, and assigning that to position.pnl would
+                # DESTROY the PnL the original fill already recorded and book a
+                # bogus zero to the RiskManager. Preserve the existing value.
+                if exit_price is None or exit_price <= 0:
+                    logger.warning(
+                        f"{log_prefix} Finalization-only close (exit_price="
+                        f"{exit_price}); preserving already-booked PnL "
+                        f"{position.pnl:.4f} instead of recomputing."
+                    )
+                else:
+                    position.pnl = float(total_pnl_calculated)
+                    logger.warning(
+                        f"{log_prefix} Exchange realized PnL ('rp') not available for this close event — "
+                        f"using CALCULATED PnL fallback: {position.pnl:.4f}"
+                    )
 
             position.total_commission = float(total_commission_calculated)
             position.remaining_quantity = 0.0

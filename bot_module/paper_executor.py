@@ -493,9 +493,25 @@ class PaperTradingExecutor:
         symbol: str,
         orderId: Optional[int] = None,
         origClientOrderId: Optional[str] = None,
+        is_algo_order: bool = False,
     ) -> Dict[str, Any]:
+        # `is_algo_order` was missing here, but `_handle_final_exit` calls
+        # `executor.cancel_order(..., is_algo_order=...)` on every position close.
+        # Without the parameter, cancelling resting exit orders raised
+        # `TypeError: unexpected keyword argument 'is_algo_order'` on EVERY
+        # paper position close, so SL/TP orders were never actually cancelled.
+        # The paper book has no separate algo namespace, so the flag is accepted
+        # for interface parity and ignored -- exactly as ccxt_executor does.
         log_prefix = "[PaperCancelOrder]"
         order_to_cancel_id = origClientOrderId
+
+        if not order_to_cancel_id and orderId is not None:
+            # Callers that only know the numeric id still need to be able to
+            # cancel, otherwise the resting order survives the close.
+            for cid, existing in list(self._open_orders.items()):
+                if str(existing.get("orderId")) == str(orderId):
+                    order_to_cancel_id = cid
+                    break
 
         if order_to_cancel_id and order_to_cancel_id in self._open_orders:
             cancelled_order = self._open_orders.pop(order_to_cancel_id)
