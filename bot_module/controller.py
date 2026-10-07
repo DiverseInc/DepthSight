@@ -1146,6 +1146,36 @@ class TradingController:
             self._run_market_info_updater(), name="MarketInfoUpdater"
         )
 
+        # FIX 2026-10-06: re-arm the resting exit orders of restored PAPER
+        # positions (their orders died with the previous process's in-memory
+        # order book). This point in the startup sequence is chosen for three
+        # reasons:
+        #  1. AFTER `_load_runtime_state` (which discarded the stale order state),
+        #     the rehydrate and `_reconcile_positions_with_exchange` -- for a
+        #     paper-only controller reconcile is a no-op, so nothing below
+        #     clobbers what we re-arm here.
+        #  2. AFTER `self.consumer.start()` and `await _update_market_info_cache()`:
+        #     `_place_stop_loss` resolves tick size/lot params through the market
+        #     info cache, and the paper executor prices MARKET orders off the data
+        #     consumer. Both must be usable before we place anything.
+        #  3. BEFORE `_main_task` is created. The main loop runs
+        #     `_check_and_close_positions_without_sl()`, which reads
+        #     `sl_placement_initiated` and market-closes any position left without
+        #     a stop once `time_status_open` is older than the grace period. A
+        #     position restored from Redis is typically hours old, so re-arming
+        #     after the main loop's first tick would market-close the position
+        #     instead of protecting it -- which is why the flags cannot simply be
+        #     cleared without re-placing the orders.
+        try:
+            await self._rearm_paper_exit_orders_after_restart()
+        except Exception as rearm_startup_err:
+            logger.critical(
+                f"[ReArmPaperExits:{self.api_key_name}] Startup re-arm of paper "
+                f"exit orders failed: {rearm_startup_err}. Restored paper "
+                f"positions may be left without stop-losses.",
+                exc_info=True,
+            )
+
         self._main_task = self.loop.create_task(
             self._run_main_loop(), name="ControllerMainLoop"
         )
@@ -3361,6 +3391,67 @@ class TradingController:
                 exc_info=True,
             )
 
+    def _invalidate_stale_paper_exit_order_state(self, position: LivePosition) -> bool:
+        """
+        Wipes the persisted exit-order state of a restored PAPER position.
+
+        Paper SL / partial-TP orders are resting orders that live only in
+        `PaperTradingExecutor._open_orders` -- a plain in-memory dict built empty in
+        `PaperTradingExecutor.__init__`. Nothing persists it and nothing rebuilds
+        it, so after a bot restart those orders are gone while the restored
+        position still carries their ids.
+
+        Leaving that state in place is NOT neutral, it is actively harmful:
+        - `_place_stop_loss` returns True on a stale `current_sl_order_id` without
+          placing anything;
+        - `_place_partial_tp` returns early on `ptp_placement_initiated_flags`;
+        - `_check_and_close_positions_without_sl` skips any position whose
+          `sl_placement_initiated` is True.
+
+        So the position is reported as protected while nothing can close it.
+
+        Live controllers must NEVER be passed here: their orders live on the
+        exchange, and the `get_open_positions()` verification in
+        `_load_runtime_state` is the authority on whether they still exist.
+
+        Returns True if any stale exit-order state was cleared.
+        """
+        if position is None:
+            return False
+
+        cleared = False
+
+        if (
+            position.current_sl_order_id is not None
+            or position.current_sl_client_order_id is not None
+            or position.is_sl_algo_order
+            or position.sl_placement_initiated
+        ):
+            position.current_sl_order_id = None
+            position.current_sl_client_order_id = None
+            position.is_sl_algo_order = False
+            position.sl_placement_initiated = False
+            cleared = True
+
+        if position.ptp_placement_initiated_flags:
+            position.ptp_placement_initiated_flags = {}
+            cleared = True
+
+        for tp in position.partial_tp_orders:
+            # "PENDING" carrying an id is what a successfully placed, still-resting
+            # LIMIT TP looks like (`_place_partial_tp` sets exactly that on success).
+            # That order no longer exists. "PENDING_PLACEMENT" is the state a
+            # planned-but-not-yet-placed TP is already in, and the state the
+            # placement scheduler looks for. VIRTUAL_*/FILLED/CANCELLED/FAILED
+            # never had a resting order behind them and are left untouched.
+            if tp.status == "PENDING" and (tp.order_id or tp.client_order_id):
+                tp.order_id = None
+                tp.client_order_id = None
+                tp.status = "PENDING_PLACEMENT"
+                cleared = True
+
+        return cleared
+
     async def _load_runtime_state(self):
         """
         Loads the saved controller state from Redis at startup.
@@ -3475,6 +3566,35 @@ class TradingController:
                         # If no live executor, we can't verify, so we just restore all
                         validated_positions = restored_positions_objects
 
+                        # FIX 2026-10-06: a paper position's resting SL/partial-TP
+                        # orders live only in the paper executor's in-memory order
+                        # book, which starts empty on every process start. The ids
+                        # persisted in Redis therefore point at orders that no
+                        # longer exist, and the stale `sl_placement_initiated` /
+                        # `ptp_placement_initiated_flags` flags suppress both the
+                        # re-placement paths and the missing-SL safety net. Drop
+                        # that state here; `_rearm_paper_exit_orders_after_restart`
+                        # puts real orders back once the executors are usable.
+                        #
+                        # `api_key_id is None` is this repo's existing marker for a
+                        # paper-only controller (same discriminator used by
+                        # `_reconcile_positions_with_exchange`). A live controller
+                        # whose executor merely failed to build must keep its
+                        # persisted ids -- its orders are real and sit on the
+                        # exchange -- so that branch is deliberately excluded.
+                        if self.api_key_id is None:
+                            for _pos_key, restored_pos in validated_positions.items():
+                                if self._invalidate_stale_paper_exit_order_state(
+                                    restored_pos
+                                ):
+                                    logger.info(
+                                        f"{log_prefix} Paper position "
+                                        f"{restored_pos.symbol} ({_pos_key}): discarded stale "
+                                        f"persisted exit-order state; its SL/partial-TP orders "
+                                        f"lived only in the in-memory paper order book, which is "
+                                        f"empty after a restart. Will be re-armed at startup."
+                                    )
+
                 except Exception as exch_err:
                     logger.error(
                         f"{log_prefix} Failed to verify positions with exchange: {exch_err}. Restoring all as-is."
@@ -3499,6 +3619,123 @@ class TradingController:
                 f"{log_prefix} Clearing potentially corrupted state to avoid issues."
             )
             self._active_positions = ActivePositionMap()
+
+    async def _rearm_paper_exit_orders_after_restart(self):
+        """
+        Re-places the resting exit orders of paper positions restored from Redis.
+
+        `_load_runtime_state` discards the persisted exit-order state of paper
+        positions because the orders behind that state lived only in the paper
+        executor's in-memory order book, which starts empty. This puts real
+        resting orders back so `PaperTradingExecutor.check_open_orders()` can fill
+        them again on the next periodic tick.
+
+        Runs on the PAPER-ONLY path only. Live controllers keep real orders on a
+        real exchange and their restore state is left exactly as it was.
+
+        Placement is AWAITED rather than scheduled as background tasks: this runs
+        during startup, before the main loop exists, and the outcome has to be
+        known and logged before positions are managed again.
+
+        Idempotent: both `_place_stop_loss` and `_place_partial_tp` short-circuit
+        on the flags this method causes to be set, so a second run places nothing.
+        """
+        log_prefix = f"[ReArmPaperExits:{self.api_key_name}]"
+
+        if self.api_key_id is not None or self.executors.get("live") is not None:
+            # Not a paper-only controller. Never touch the live restore path.
+            logger.debug(f"{log_prefix} Skipped: not a paper-only controller.")
+            return
+
+        async with self._positions_dict_lock:
+            restored_positions = [
+                LivePosition(**vars(pos))
+                for pos in self._active_positions.values()
+                if pos.status == "OPEN" and getattr(pos, "api_key_id", None) is None
+            ]
+
+        if not restored_positions:
+            logger.debug(f"{log_prefix} No restored paper positions to re-arm.")
+            return
+
+        logger.info(
+            f"{log_prefix} Re-arming resting exit orders for "
+            f"{len(restored_positions)} restored paper position(s)..."
+        )
+
+        rearmed_sl = 0
+        rearmed_tp = 0
+        failed: List[str] = []
+
+        for position in restored_positions:
+            pos_log_prefix = f"{log_prefix}:{position.symbol}"
+
+            try:
+                if self._position_is_intentional_no_sl_mode(position):
+                    logger.info(
+                        f"{pos_log_prefix} Position runs in NO_STOP_LOSS mode by "
+                        f"design. Nothing to re-arm."
+                    )
+                elif self._position_has_active_stop_target(position):
+                    if await self._place_stop_loss(position):
+                        rearmed_sl += 1
+                    else:
+                        failed.append(f"{position.symbol}:stop-loss")
+                else:
+                    logger.info(
+                        f"{pos_log_prefix} No active SL target stored "
+                        f"(current_sl_price={position.current_sl_price}). "
+                        f"SL re-arm skipped."
+                    )
+
+                paper_executor = self.executors.get("paper")
+                if self._position_should_use_virtual_spot_tps(position, paper_executor):
+                    # Spot-with-active-SL keeps its TPs virtual by design; there
+                    # was never a resting order to re-arm.
+                    logger.info(
+                        f"{pos_log_prefix} TPs are virtual by design. "
+                        f"TP re-arm skipped."
+                    )
+                else:
+                    for index, tp in enumerate(list(position.partial_tp_orders)):
+                        if tp.status != "PENDING_PLACEMENT":
+                            continue
+                        if tp.quantity is None or tp.quantity <= 0:
+                            continue
+                        await self._place_partial_tp(
+                            position,
+                            tp.target_price,
+                            tp.quantity,
+                            tp.orig_fraction,
+                            index,
+                        )
+                        # `partial_tp_orders` is shared with the live position
+                        # object, so the placed ids are visible right here.
+                        if tp.order_id or tp.client_order_id:
+                            rearmed_tp += 1
+                        else:
+                            failed.append(f"{position.symbol}:tp#{index}")
+            except Exception as rearm_err:
+                logger.error(
+                    f"{pos_log_prefix} Failed to re-arm exit orders: {rearm_err}",
+                    exc_info=True,
+                )
+                failed.append(f"{position.symbol}:exception")
+
+        if failed:
+            # Loud on purpose: these positions may be left unprotected. The
+            # missing-SL watchdog will still force-close any position that ends
+            # up without a stop, but only once its grace period expires.
+            logger.warning(
+                f"{log_prefix} Re-arm incomplete: {len(failed)} exit order(s) "
+                f"could not be re-placed ({', '.join(failed)})."
+            )
+        else:
+            logger.info(
+                f"{log_prefix} Re-arm complete: {rearmed_sl} stop-loss(es) and "
+                f"{rearmed_tp} partial TP(s) re-placed and resting in the paper "
+                f"order book."
+            )
 
     async def _publish_state_to_redis(self):
         """

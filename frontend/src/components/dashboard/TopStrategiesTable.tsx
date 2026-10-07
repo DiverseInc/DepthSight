@@ -75,8 +75,8 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 		return enUS;
 	}, [i18n.language]);
 
-	const topStrategies = useMemo(() => {
-		if (!strategies) return [];
+	const { rows: topStrategies, hiddenCount } = useMemo(() => {
+		if (!strategies) return { rows: [], hiddenCount: 0 };
 		// A strategy holding a live position is pinned into view and is NEVER
 		// truncated away, regardless of rank.
 		//
@@ -91,7 +91,16 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 		const holding = strategies.filter(holdsPosition);
 		const rest = strategies.filter((s) => !holdsPosition(s));
 		rest.sort((a, b) => (b.pnl || 0) - (a.pnl || 0)); // Sort by PnL descending
-		return [...holding, ...rest].slice(0, Math.max(topN, holding.length));
+		const ordered = [...holding, ...rest];
+		const limit = Math.max(topN, holding.length);
+		return {
+			rows: ordered.slice(0, limit),
+			// The card is a "Top N" highlight, so cutting rows is intentional —
+			// but doing it SILENTLY is what made the position-holder truncation
+			// look like a stopped strategy rather than a display limit. State
+			// the remainder so the panel can never quietly under-report.
+			hiddenCount: Math.max(0, ordered.length - limit),
+		};
 	}, [strategies, topN]);
 
 	const handleRowClick = (strategyId: string) => {
@@ -218,6 +227,12 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 					</TableBody>
 				</Table>
 				</div>
+				{hiddenCount > 0 && (
+					<p className="mt-2 px-1 text-xs text-muted-foreground">
+						+{hiddenCount} more strateg{hiddenCount === 1 ? "y" : "ies"} not
+						shown
+					</p>
+				)}
 			</CardContent>
 		</Card>
 	);
