@@ -4895,6 +4895,33 @@ class TradingController:
                                 strategy_config_dict = instance_tuple[
                                     1
                                 ]  # NEW: extracting config_dict
+                elif position is not None:
+                    # FIX 2026-10-07: this branch used to log NOTHING. A position
+                    # that exists but is not OPEN fell through every guard below
+                    # with `position_to_manage is None`, so manage_position never
+                    # ran and there was no trace anywhere.
+                    #
+                    # Log level matters here. CLOSING, RESERVING and
+                    # PENDING_ENTRY are all NORMAL states that legitimately hold
+                    # remaining quantity, and they can persist across many
+                    # candles. Warning on every one would be log spam on a hot
+                    # path -- and alerts that fire on normal traffic train us to
+                    # ignore alerts. Only CLOSED-with-exposure is genuinely
+                    # anomalous, so only that is loud.
+                    _remaining = getattr(position, "remaining_quantity", 0.0) or 0.0
+                    if position.status == "CLOSED" and abs(_remaining) > 1e-9:
+                        logger.warning(
+                            f"[PositionMgmt:{symbol}] Position is CLOSED but still "
+                            f"holds {_remaining} units, so no management runs and it "
+                            f"is excluded from risk accounting. Operator attention "
+                            f"required."
+                        )
+                    else:
+                        logger.debug(
+                            f"[PositionMgmt:{symbol}] Position status is "
+                            f"'{position.status}' (remaining={_remaining:.8f}); "
+                            f"normal pre-entry or closing state, no management run."
+                        )
 
             # Log why strategy_instance might be None
             if position_to_manage and not strategy_instance:
@@ -5366,6 +5393,22 @@ class TradingController:
         async with symbol_lock:
             position = self._active_position_get(symbol, market_type)
             if not position or position.status != "OPEN":
+                # FIX 2026-10-07: this used to return with NO log at any level.
+                # NOTE the level is INFO, not WARNING: a scale-in order placed
+                # while the position was OPEN can fill AFTER an SL or forced
+                # close has already moved the position to CLOSING (or removed
+                # it entirely). That race is routine on a volatile symbol and is
+                # not itself a fault, so it must not cry wolf. It IS recorded,
+                # because the average entry price and TP quantities genuinely
+                # were not updated and that is worth being able to find later.
+                logger.info(
+                    f"{log_prefix} Scale-in fill arrived for a position that is no "
+                    f"longer OPEN (position="
+                    f"{'None' if position is None else position.status}, "
+                    f"filled_qty={filled_qty}, fill_price={fill_price}, "
+                    f"client_order_id={client_order_id}). Average entry price and "
+                    f"TP quantities were NOT updated for this fill."
+                )
                 return
 
             old_qty = position.remaining_quantity
@@ -6227,7 +6270,39 @@ class TradingController:
         # Check if a position already exists or if signal processing is in progress
         symbol_lock_check = self._get_lock_for_position(symbol, event_market_type)
         async with symbol_lock_check:
-            if self._active_position_get(symbol, event_market_type):
+            _existing = self._active_position_get(symbol, event_market_type)
+            if _existing is not None:
+                # FIX 2026-10-07: this used to return with NO log. A record stuck
+                # in a non-OPEN status blocks this symbol from ever opening a new
+                # position, and nothing in the logs said why.
+                #
+                # The block itself is CORRECT and is kept: any live record for this
+                # symbol (including one mid-close) must prevent a duplicate entry.
+                # This is deliberately NOT auto-cleaned -- evicting a record that
+                # still holds exposure could open the position twice. What was
+                # missing was the trace, so the states are now distinguished:
+                # a genuinely closing position is normal, a CLOSED record still
+                # holding quantity is not.
+                if _existing.status == "OPEN":
+                    logger.debug(
+                        f"[SignalCheck:{symbol}] OPEN position already exists; "
+                        f"skipping signal for {event.get('type')}."
+                    )
+                    return
+                if _existing.status == "CLOSED":
+                    logger.warning(
+                        f"[SignalCheck:{symbol}] Blocking new entry for "
+                        f"{event.get('type')}: a CLOSED position record for this "
+                        f"symbol still holds {getattr(_existing, 'remaining_quantity', 0.0)} "
+                        f"units. This is inconsistent state and will keep blocking "
+                        f"entries until it is cleared. Operator attention required."
+                    )
+                    return
+                logger.info(
+                    f"[SignalCheck:{symbol}] Position is '{_existing.status}'; "
+                    f"blocking duplicate entry for {event.get('type')} until it "
+                    f"finalises."
+                )
                 return
         async with self._processing_signal_lock:
             if f"{event_market_type}:{symbol}" in self._processing_signal_for_symbol:
@@ -13782,30 +13857,84 @@ class TradingController:
                     stop_price = float(stop_price_str) if stop_price_str else 0.0
 
                     if stop_price > 0 and order_status in ["NEW", "PARTIALLY_FILLED"]:
-                        logger.info(
-                            f"{log_prefix} Found EXTERNAL SL order {order_id} (CliID: {client_order_id}) for unprotected position. Adopting."
+                        # FIX 2026-10-07: adoption used to be decided purely on
+                        # direction + order type, with no check that the order
+                        # actually belongs to THIS position. Any unrelated
+                        # stop-shaped order for the symbol (e.g. left behind by a
+                        # different run, or a partially closed position's stale
+                        # order) would be adopted as "our" stop -- and because
+                        # adoption sets `current_sl_order_id`, the missing-SL
+                        # watchdog then sees a stop and skips its safety net for
+                        # this symbol. A stop that does not belong can therefore
+                        # disarm the only thing that would have force-closed an
+                        # unprotected position.
+                        #
+                        # Only adopt when the order is positively attributable to
+                        # this position: either it carries our position's config
+                        # id, or its client order id references this position's
+                        # entry client order id. Anything else is reported, not
+                        # silently adopted.
+                        _adopt_cfg_id = order_data_payload.get(
+                            "strategy_config_id"
+                        )
+                        _matches_config = (
+                            position.config_id is not None
+                            and _adopt_cfg_id is not None
+                            and str(_adopt_cfg_id) == str(position.config_id)
+                        )
+                        _entry_cid = position.entry_client_order_id or ""
+                        _matches_entry = bool(
+                            client_order_id
+                            and _entry_cid
+                            and _entry_cid in str(client_order_id)
                         )
 
-                        position.current_sl_order_id = order_id
-                        position.current_sl_client_order_id = client_order_id
-                        position.current_sl_price = stop_price
+                        if not (_matches_config or _matches_entry):
+                            logger.warning(
+                                f"[{log_prefix}] NOT adopting order {order_id} "
+                                f"(CliID: {client_order_id}) as the SL for "
+                                f"{symbol}: it is stop-shaped but not attributable "
+                                f"to this position (order strategy_config_id="
+                                f"{_adopt_cfg_id}, position config_id="
+                                f"{position.config_id}, position entry CID="
+                                f"{_entry_cid}). Adopting it would also disarm "
+                                f"the missing-SL watchdog for this symbol. "
+                                f"Operator attention required."
+                            )
+                            # MUST return here. Falling through would re-process
+                            # this same order as an UNKNOWN/UNEXPECTED order, and
+                            # a stop-shaped order is an opposing trade, so that
+                            # path can decide it closed the position and spawn a
+                            # SECOND close on top of whatever really happened --
+                            # double-closing the position and double-recording PnL.
+                            # We have decided what this order is; do not let a
+                            # later block re-decide it.
+                            return
+                        else:
+                            logger.info(
+                                f"{log_prefix} Found EXTERNAL SL order {order_id} (CliID: {client_order_id}) for unprotected position. Adopting."
+                            )
 
-                        # If this is the first stop, it can be considered initial
-                        if position.initial_stop_loss is None:
-                            position.initial_stop_loss = stop_price
+                            position.current_sl_order_id = order_id
+                            position.current_sl_client_order_id = client_order_id
+                            position.current_sl_price = stop_price
 
-                        # Reset placement flags if they were set
-                        position.sl_placement_initiated = False
+                            # If this is the first stop, it can be considered initial
+                            if position.initial_stop_loss is None:
+                                position.initial_stop_loss = stop_price
 
-                        logger.info(
-                            f"{log_prefix} Successfully ADOPTED external SL {order_id} at price {stop_price}."
-                        )
+                            # Reset placement flags if they were set
+                            position.sl_placement_initiated = False
 
-                        # Can exit since we processed it as SL
-                        logger.debug(
-                            f"{log_prefix} Finished processing ADOPTED SL order update."
-                        )
-                        return
+                            logger.info(
+                                f"{log_prefix} Successfully ADOPTED external SL {order_id} at price {stop_price}."
+                            )
+
+                            # Can exit since we processed it as SL
+                            logger.debug(
+                                f"{log_prefix} Finished processing ADOPTED SL order update."
+                            )
+                            return
 
             # 6. Unknown/Unexpected order (possibly placed manually)
             if position.status == "OPEN":  # Only if the position is still active
