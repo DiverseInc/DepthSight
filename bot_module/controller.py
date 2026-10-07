@@ -679,6 +679,36 @@ class TradingController:
             f"Symbol cooldown after close: {self._symbol_cooldown_duration} seconds."
         )
 
+    @property
+    def _log_scope(self) -> str:
+        """Identifies this controller in log lines.
+
+        FIX 2026-10-07: `api_key_name` alone is NOT a unique controller
+        identifier. Every paper-only controller is constructed with
+        `api_key_name="paper"` (bot_runner.py), and one controller is spawned
+        PER USER. The deployment currently runs 12 users, so twelve controllers
+        emit byte-identical prefixes like `[EnsurePaperExitOrders:paper]`.
+
+        That is not cosmetic. On 2026-10-07 five such lines, evenly spaced
+        ~3.3 s apart, were read as one controller misbehaving on a 60-second
+        throttle. They were in fact five different controllers each logging its
+        own one-time startup event. Identical prefixes from independent actors
+        make that class of misdiagnosis very easy, and the throttle/cadence
+        investigation it triggered was entirely wasted effort.
+
+        Including the user id makes the actor identifiable, which is the minimum
+        needed to tell "this controller is looping" from "these controllers are
+        each starting once".
+
+        NOTE: this property MUST stay outside `__init__`. It was briefly defined
+        immediately after the "TradingController initialized." log line, which
+        placed the rest of the constructor -- the TelegramNotifier status logs and
+        the symbol-cooldown log -- inside this property's body, after the
+        `return`, where they were silently dead. `__init__` now ends at the
+        symbol-cooldown log as it always did.
+        """
+        return f"{self.api_key_name}/u{self.user_id}"
+
     def _position_uses_no_stop_loss_mode(
         self, position: Optional[LivePosition]
     ) -> bool:
@@ -1170,7 +1200,7 @@ class TradingController:
             await self._ensure_paper_exit_orders_present(reason="startup")
         except Exception as rearm_startup_err:
             logger.critical(
-                f"[EnsurePaperExitOrders:{self.api_key_name}] Startup re-arm of paper "
+                f"[EnsurePaperExitOrders:{self._log_scope}] Startup re-arm of paper "
                 f"exit orders failed: {rearm_startup_err}. Restored paper "
                 f"positions may be left without stop-losses.",
                 exc_info=True,
@@ -3124,7 +3154,7 @@ class TradingController:
         Synchronizes the internal state of positions with the actual state on the exchange.
         Optimized using fine-grained locks and snapshotting to avoid blocking the event loop.
         """
-        log_prefix = f"[ReconcilePositions:{self.api_key_name}]"
+        log_prefix = f"[ReconcilePositions:{self._log_scope}]"
         logger.info(f"{log_prefix} Starting reconciliation with exchange...")
 
         executor = self.executors.get("live")
@@ -3651,7 +3681,7 @@ class TradingController:
         Idempotent: a position that already has a resting STOP_MARKET is skipped
         without logging, so the periodic call is cheap and quiet.
         """
-        log_prefix = f"[EnsurePaperExitOrders:{self.api_key_name}]"
+        log_prefix = f"[EnsurePaperExitOrders:{self._log_scope}]"
         is_startup = reason == "startup"
 
         paper_executor = self.executors.get("paper")
@@ -4390,7 +4420,7 @@ class TradingController:
                             )
                         except Exception as ensure_err:
                             logger.error(
-                                f"[EnsurePaperExitOrders:{self.api_key_name}] "
+                                f"[EnsurePaperExitOrders:{self._log_scope}] "
                                 f"Periodic ensure failed: {ensure_err}",
                                 exc_info=True,
                             )
@@ -6881,7 +6911,7 @@ class TradingController:
         and enough time has passed since opening (sl_placement_grace_period),
         the position is forcibly closed at market price.
         """
-        log_prefix = f"[MissingSLCheck:{self.api_key_name}]"
+        log_prefix = f"[MissingSLCheck:{self._log_scope}]"
         now = time.time()
         positions_to_process_for_missing_sl: List[
             LivePosition
@@ -7068,7 +7098,7 @@ class TradingController:
         there is nothing to do.
         """
         if not log_prefix:
-            log_prefix = f"[MissingSLCheck:{self.api_key_name}]"
+            log_prefix = f"[MissingSLCheck:{self._log_scope}]"
 
         async with self._positions_dict_lock:
             stuck_closing_positions = [
@@ -7248,7 +7278,7 @@ class TradingController:
         4. For symbols that are no longer needed but have a position, moves them to "managed close" status.
         5. Subscribes to all necessary data for active and managed symbols.
         """
-        log_prefix = f"[UpdateMonitoredSymbols:{self.api_key_name}]"
+        log_prefix = f"[UpdateMonitoredSymbols:{self._log_scope}]"
         logger.info(
             f"{log_prefix} Updating monitored symbols and data subscriptions..."
         )
@@ -7982,6 +8012,12 @@ class TradingController:
             ml_confirmed_this_signal_live = True
             ml_confirm_proba_1_live: Optional[float] = None
             ml_confirm_proba_0_live: Optional[float] = None
+            # Did the ML model actually reach a verdict for THIS signal? Tracked
+            # separately from `ml_confirmed_this_signal_live`, because that flag is
+            # True both when the model approved the signal AND when the model
+            # never ran at all -- so on its own it cannot distinguish "the ML
+            # cleared this trade" from "nothing checked this trade".
+            ml_confirm_evaluated_this_signal_live = False
 
             if use_ml_confirmation_flag:
                 logger.info(
@@ -8140,6 +8176,12 @@ class TradingController:
                                                 logger.info(
                                                     f"{log_prefix} LIVE ML REJECTED (Threshold/Opposite). P(1)={ml_confirm_proba_1_live:.3f} (Thr={config.ML_CONFIRMATION_PROBABILITY_THRESHOLD:.2f}), P(0)={ml_confirm_proba_0_live:.3f}"
                                                 )
+                                            # The model produced probabilities and
+                                            # reached a verdict, so this signal really
+                                            # WAS evaluated. Every fail-open path below
+                                            # leaves it False, which is the whole point
+                                            # of tracking it.
+                                            ml_confirm_evaluated_this_signal_live = True
                                         else:
                                             logger.warning(
                                                 f"{log_prefix} LIVE ML Confirm: predict_proba_one returned None. Allowing signal (fail-open)."
@@ -8162,12 +8204,79 @@ class TradingController:
                         logger.debug(
                             f"{log_prefix} Strategy '{signal.strategy_name}' not in ML_CONFIRMATION_STRATEGIES. Skipping LIVE ML confirmation."
                         )
+                        # FIX 2026-10-07: same failure mode as the
+                        # components-not-ready branch below. The strategy asked
+                        # for ML confirmation and did not get any, and the only
+                        # trace was a DEBUG line. Recorded now so the trade log
+                        # shows the difference between "ML approved this" and
+                        # "ML never looked at this".
+                        signal.details["ml_confirmation_skipped_reason"] = (
+                            "Strategy requested ML confirmation but is not in "
+                            "ML_CONFIRMATION_STRATEGIES, so it was never evaluated. "
+                            "The signal was allowed through unconfirmed (fail-open)."
+                        )
                 else:
-                    logger.debug(
-                        f"{log_prefix} Live ML Confirmation not enabled or components not ready. Skipping."
+                    # FIX 2026-10-07: this used to be a `logger.debug` that said
+                    # only "not enabled or components not ready. Skipping." and
+                    # then fell through with `ml_confirmed_this_signal_live` still
+                    # True from its initialisation.
+                    #
+                    # Every OTHER fail-open in this block is a WARNING that spells
+                    # out "Allowing signal (fail-open)" -- missing klines, None from
+                    # predict_proba_one, failed feature extraction, failed
+                    # normalisation. This branch was the single fail-open that did
+                    # not announce itself, and it is not even the same kind of
+                    # event: the others are "the model ran but could not reach a
+                    # verdict on this candle". This one is "the model never loaded
+                    # at all", which is structural, not transient.
+                    #
+                    # The operator-facing consequence is the part that matters:
+                    # `signal.details["ml_confirmed_live"]` was being stamped True
+                    # below, so the trade log affirmatively recorded that the ML
+                    # model had approved a signal it never evaluated. A strategy
+                    # configured with `use_ml_confirmation: true` was trading as
+                    # though a risk control was gating it when nothing was.
+                    #
+                    # Naming the missing component matters too: "not ready" is not
+                    # actionable, whereas "the model file did not load" tells the
+                    # operator exactly what to fix.
+                    _ml_missing = []
+                    if not self._ml_confirmation_enabled_live_runtime:
+                        _ml_missing.append(
+                            "runtime flag _ml_confirmation_enabled_live_runtime is False"
+                        )
+                    if not self._ml_confirmation_feature_extractor_live:
+                        _ml_missing.append("feature extractor is None")
+                    if not self._ml_confirmation_pipeline_live:
+                        _ml_missing.append("model pipeline is None")
+                    ml_confirm_evaluated_this_signal_live = False
+                    signal.details["ml_confirmation_evaluated"] = False
+                    signal.details["ml_confirmation_skipped_reason"] = (
+                        "ML confirmation was requested by this strategy but could "
+                        "not run: " + "; ".join(_ml_missing) + ". The signal was "
+                        "allowed through unconfirmed (fail-open)."
+                    )
+                    logger.warning(
+                        f"{log_prefix} ML confirmation was REQUESTED for this "
+                        f"strategy but the model is not available, so the signal "
+                        f"will be allowed through WITHOUT any ML confirmation "
+                        f"(fail-open). Missing: {'; '.join(_ml_missing)}. If you "
+                        f"believe ML confirmation should be active, check "
+                        f"ML_CONFIRMATION_ENABLED and the model file path."
                     )
 
                 signal.details["ml_confirmed_live"] = ml_confirmed_this_signal_live
+                # FIX 2026-10-07: recorded alongside `ml_confirmed_live` because
+                # that flag alone is ambiguous. It is True both when the model
+                # approved the signal and when the model never ran, so a trade log
+                # reading `ml_confirmed_live: true` did not prove any model had
+                # seen the trade. Now the two can be read together:
+                #   evaluated=True,  confirmed=True  -> model approved it
+                #   evaluated=True,  confirmed=False -> model rejected it
+                #   evaluated=False                  -> nothing checked it
+                signal.details["ml_confirmation_evaluated"] = (
+                    ml_confirm_evaluated_this_signal_live
+                )
                 signal.details["ml_confirm_proba_1_live"] = ml_confirm_proba_1_live
                 signal.details["ml_confirm_proba_0_live"] = ml_confirm_proba_0_live
                 signal.details["ml_threshold_good_live"] = (

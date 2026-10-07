@@ -61,7 +61,21 @@
       "npx tsc*": "allow",
       "grep *": "allow",
       "ls*": "allow",
-      "cat *": "allow"
+      "cat *": "allow",
+      "wc *": "allow",
+      "head *": "allow",
+      "tail *": "allow",
+      "echo *": "allow",
+      "sed -n *": "allow",
+      "find *": "allow",
+      "pwd": "allow",
+
+      "Get-ChildItem*": "allow",
+      "Get-Content*": "allow",
+      "Select-String*": "allow",
+      "Measure-Object*": "allow",
+      "Measure-Line*": "allow",
+      "Test-Path*": "allow"
     }
   },
 
