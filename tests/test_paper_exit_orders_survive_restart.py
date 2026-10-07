@@ -554,3 +554,61 @@ async def test_non_open_paper_position_is_surfaced_never_silently_skipped(caplog
         "a non-OPEN position must not be given a resting order -- it is outside "
         "risk management and needs an operator, not a silent repair"
     )
+
+
+# --- The stuck-CLOSING recovery was UNREACHABLE (2026-10-07) ----------------
+#
+# `_check_and_close_positions_without_sl` collects only positions whose status is
+# "OPEN", then `return`s early when that list is empty. The stuck-CLOSING retry
+# and Telegram escalation lived BELOW that return. A position stuck in CLOSING is
+# not OPEN, so it never entered the list -- and with no OPEN positions present,
+# the function returned before ever reaching its own recovery code. ETHUSDT and
+# BTCUSDT sat in CLOSING for hours with zero retries, zero escalations and zero
+# log lines, purely because of that early return.
+
+
+@pytest.mark.asyncio
+async def test_stuck_closing_position_is_retried_when_no_open_positions_exist():
+    """The recovery must run even when there are NO OPEN positions.
+
+    This is the exact production condition: both positions were CLOSING, the
+    OPEN list was empty, and the old early return meant nothing ever retried.
+    """
+    controller, _, _ = _build_controller(_persisted_position())
+
+    stuck = _persisted_position(
+        status="CLOSING",
+        remaining_quantity=REMAINING_QTY,
+        exit_reason="RETRY_CLOSE_STUCK_CLOSING_test",
+        failed_close_attempts=2,
+    )
+    # Put ONLY the stuck position in the controller's live state. Deliberately
+    # no OPEN position: the OPEN list this function collects will be empty,
+    # which is exactly the production condition that made the old early return
+    # skip the recovery block entirely.
+    controller._active_positions = ActivePositionMap()
+    controller._active_position_set(stuck)
+
+    retries = []
+
+    async def _fake_close_position(*args, **kwargs):
+        retries.append((args, kwargs))
+
+    controller.close_position = _fake_close_position
+
+    await controller._check_and_close_positions_without_sl()
+    # `close_position` is dispatched via `loop.create_task`, so yield a couple of
+    # times to let the scheduled coroutine actually run before asserting.
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert retries, (
+        "a position stuck in CLOSING with remaining quantity must be retried even "
+        "when there are no OPEN positions; the early return used to skip it entirely"
+    )
+    assert retries[0][0][0] == SYMBOL, (
+        f"expected a retry for {SYMBOL}, got {retries[0][0][0]}"
+    )
+    assert stuck.failed_close_attempts >= 3, (
+        "the attempt counter must advance so escalation thresholds are reachable"
+    )

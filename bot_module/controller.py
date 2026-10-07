@@ -4379,6 +4379,9 @@ class TradingController:
                         self.executors["paper"].check_open_orders(),
                         name=f"PeriodicPaperOrderCheck_User{self.user_id}",
                     )
+                    # Throttle bookkeeping lives here but the interval is checked
+                    # by the single guard below, so a controller can never fire
+                    # the ensure on every loop iteration.
                     if now - last_paper_exit_ensure_time >= paper_exit_ensure_interval:
                         last_paper_exit_ensure_time = now
                         try:
@@ -6821,7 +6824,16 @@ class TradingController:
                     )
 
         if not positions_to_process_for_missing_sl:
+            # FIX 2026-10-07: this `return` used to sit ABOVE the stuck-CLOSING
+            # recovery block, which made that block unreachable in exactly the
+            # case it exists for. A position stuck in CLOSING is not OPEN, so it
+            # never entered this list; with no OPEN positions the function
+            # returned early and the retry/escalation loop below never ran. Two
+            # paper positions (ETHUSDT, BTCUSDT) were stuck in CLOSING for
+            # hours with no retry, no Telegram escalation, and no log line.
+            # Do NOT move this early return back above the recovery block.
             logger.debug(f"{log_prefix} No OPEN positions to check for missing SL.")
+            await self._recover_stuck_closing_positions(log_prefix)
             return
 
         logger.info(
@@ -6960,7 +6972,29 @@ class TradingController:
                     f"{pos_log_prefix} Position OPEN for {time_since_opened:.1f}s without SL. Within grace period."
                 )
 
-        # Second level of protection: checking positions stuck in CLOSING status
+        # Second level of protection: checking positions stuck in CLOSING status.
+        # Extracted into its own method so BOTH the normal path and the
+        # "no OPEN positions" early return above reach it. See the FIX comment
+        # on that early return.
+        await self._recover_stuck_closing_positions(log_prefix)
+
+    async def _recover_stuck_closing_positions(self, log_prefix: str) -> None:
+        """
+        Retries the close of any position stuck in CLOSING with quantity left.
+
+        A position only leaves CLOSING when a close actually completes. If the
+        close never finalises -- no executor, a paper fill that never marks it
+        closed, a dropped event -- the position stays in CLOSING forever: excluded
+        from the dashboard publish, excluded from unrealized PnL, and never
+        retried. This is the recovery that was supposed to prevent that and was
+        unreachable behind an early `return`.
+
+        Runs on every missing-SL check cycle, so it must be safe to call when
+        there is nothing to do.
+        """
+        if not log_prefix:
+            log_prefix = f"[MissingSLCheck:{self.api_key_name}]"
+
         async with self._positions_dict_lock:
             stuck_closing_positions = [
                 (
