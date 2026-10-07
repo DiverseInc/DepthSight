@@ -12004,14 +12004,59 @@ class TradingController:
                 )
                 return
 
-            # Check if this TP has already been initiated
+            # Check if this TP has already been initiated.
+            #
+            # FIX 2026-10-07: the persisted `ptp_placement_initiated_flags` and the
+            # PTP `order_id`/`client_order_id` are NOT proof a resting order
+            # exists. The flag is written to Redis by `to_dict()` and survives a
+            # restart, but the LIMIT order itself lives only in
+            # `PaperTradingExecutor._open_orders`, which starts empty. This is
+            # the exact defect that left the BTCUSDT long of 2026-10-07
+            # unprotected for eleven hours, applied to take-profit instead of
+            # stop-loss: the guard below returned without placing anything, at
+            # DEBUG, so the refusal was invisible at INFO.
+            #
+            # Consult the paper order book before honouring either signal. On the
+            # paper path the book is the only authority for paper trading.
+            _ptp_already_resting = False
+            _paper_exec_ptp = self.executors.get("paper")
+            if (
+                _paper_exec_ptp is not None
+                and self.api_key_id is None
+                and self.executors.get("live") is None
+            ):
+                try:
+                    _ptp_orders = await _paper_exec_ptp.get_open_orders()
+                    _ptp_already_resting = any(
+                        str(o.get("symbol")) == symbol_to_use
+                        and str(o.get("type", "")).upper() == "LIMIT"
+                        and abs(float(o.get("price") or 0.0) - float(target_price))
+                        < 1e-9 * float(target_price or 1.0)
+                        for o in _ptp_orders
+                    )
+                except Exception as _ptp_book_err:
+                    logger.warning(
+                        f"{log_prefix} Could not read the paper order book "
+                        f"({_ptp_book_err}); falling back to persisted state."
+                    )
+
             if current_pos_in_db.ptp_placement_initiated_flags.get(
                 flag_key_for_initiated_check, False
             ):
-                logger.debug(
-                    f"{log_prefix} Pos {entry_client_order_id_for_log}: PTP (key {flag_key_for_initiated_check}) placement already initiated. Skipping."
+                if _ptp_already_resting:
+                    logger.debug(
+                        f"{log_prefix} Pos {entry_client_order_id_for_log}: PTP (key {flag_key_for_initiated_check}) placement already initiated. Skipping."
+                    )
+                    return
+                logger.warning(
+                    f"{log_prefix} Pos {entry_client_order_id_for_log}: PTP (key "
+                    f"{flag_key_for_initiated_check}) flag says placed but no "
+                    f"LIMIT order is resting for {symbol_to_use}. Clearing stale "
+                    f"state; the order lived only in the previous process's memory."
                 )
-                return
+                current_pos_in_db.ptp_placement_initiated_flags[
+                    flag_key_for_initiated_check
+                ] = False
 
             # Check if there is already an active order for this specific TP (if it is from the list)
             ptp_info_object_in_pos: Optional[PartialTpOrderInfo] = None
@@ -12033,10 +12078,23 @@ class TradingController:
                         ptp_info_object_in_pos.order_id
                         or ptp_info_object_in_pos.client_order_id
                     ):
-                        logger.debug(
-                            f"{log_prefix} Pos {entry_client_order_id_for_log}: PTP (key {flag_key_for_initiated_check}) order ID/CliID already exists (ID: {ptp_info_object_in_pos.order_id}, Status: {ptp_info_object_in_pos.status}). Skipping."
+                        # Same stale-persisted-id hazard as the flag check above.
+                        # Honouring it returns without placing anything.
+                        if _ptp_already_resting:
+                            logger.debug(
+                                f"{log_prefix} Pos {entry_client_order_id_for_log}: PTP (key {flag_key_for_initiated_check}) order ID/CliID already exists (ID: {ptp_info_object_in_pos.order_id}, Status: {ptp_info_object_in_pos.status}). Skipping."
+                            )
+                            return
+                        logger.warning(
+                            f"{log_prefix} Pos {entry_client_order_id_for_log}: PTP "
+                            f"(key {flag_key_for_initiated_check}) has persisted id "
+                            f"{ptp_info_object_in_pos.order_id} but no matching LIMIT "
+                            f"order is resting for {symbol_to_use}. Clearing it; the "
+                            f"referenced order does not exist."
                         )
-                        return
+                        ptp_info_object_in_pos.order_id = None
+                        ptp_info_object_in_pos.client_order_id = None
+                        ptp_info_object_in_pos.status = "PENDING_PLACEMENT"
             elif flag_key_for_initiated_check == -1:  # Final TP
                 is_this_final_tp_not_in_list = True  # Assuming that for the final TP (not from the list) there is no entry in partial_tp_orders yet
                 # (or it will be added later if successfully placed)
