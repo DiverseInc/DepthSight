@@ -27,7 +27,7 @@ below the stop on every sample -- and the position never closed.
 WHY THIS TEST SHAPE
 -------------------
 It drives the REAL `_load_runtime_state` and the REAL
-`_rearm_paper_exit_orders_after_restart` against a REAL `PaperTradingExecutor`
+`_ensure_paper_exit_orders_present` against a REAL `PaperTradingExecutor`
 and a REAL `RiskManager`, and it asserts the OUTCOME: an order is actually
 resting in `paper_executor._open_orders` and the real `check_open_orders()`
 actually consumes it once price crosses. No production logic is copied here and
@@ -43,6 +43,7 @@ mark -- is the real, unmodified `check_open_orders`.
 
 import asyncio
 import json
+import logging
 import time
 
 import pytest
@@ -72,6 +73,20 @@ PRICE_AFTER_STOP_CROSSED = 84000.0
 
 
 # --- Test doubles: inputs only, never behaviour under test --------------------
+
+
+class _FakeTradeLogger:
+    """Minimal stand-in for the controller's trade_logger.
+
+    `_place_partial_tp` calls `log_order_placed(...)` after a successful
+    placement. It only needs to not raise.
+    """
+
+    def __init__(self):
+        self.placed = []
+
+    def log_order_placed(self, *args, **kwargs):
+        self.placed.append((args, kwargs))
 
 
 class _FakeDataConsumer:
@@ -221,6 +236,11 @@ def _build_controller(persisted_position, live_executor=None, price=PRICE_AT_RES
         user_settings={},
     )
     paper_executor.controller = controller
+    # `_place_partial_tp` records the order through `trade_logger`. The real
+    # controller always has one; without it the TP branch raises, and the
+    # 2026-10-07 failure mode where a TP error discarded a successful SL
+    # placement would be an artefact of the harness rather than production.
+    controller.trade_logger = _FakeTradeLogger()
 
     return controller, paper_executor, data_consumer
 
@@ -228,7 +248,7 @@ def _build_controller(persisted_position, live_executor=None, price=PRICE_AT_RES
 async def _restart(controller) -> LivePosition:
     """Simulates the restart: restore from Redis, then re-arm exit orders."""
     await controller._load_runtime_state()
-    await controller._rearm_paper_exit_orders_after_restart()
+    await controller._ensure_paper_exit_orders_present()
     return controller._active_position_get(SYMBOL, "futures_usdtm")
 
 
@@ -366,7 +386,7 @@ async def test_re_running_the_re_arm_places_no_duplicate_orders():
     await _restart(controller)
     first = dict(paper_executor._open_orders)
 
-    await controller._rearm_paper_exit_orders_after_restart()
+    await controller._ensure_paper_exit_orders_present()
     second = dict(paper_executor._open_orders)
 
     assert len(first) == 2, f"expected SL + one partial TP, got {len(first)}"
@@ -403,7 +423,7 @@ async def test_live_controller_keeps_its_persisted_exit_order_state():
     assert restored.current_sl_client_order_id == "x-sl-deadbeefdeadbeef"
 
     # And the re-arm declines to touch a live controller's order book.
-    await controller._rearm_paper_exit_orders_after_restart()
+    await controller._ensure_paper_exit_orders_present()
     assert paper_executor._open_orders == {}
     assert restored.current_sl_order_id == "99887766"
 
@@ -430,5 +450,107 @@ async def test_live_controller_without_executor_keeps_its_persisted_state():
     assert restored.sl_placement_initiated is True
     assert restored.current_sl_order_id == "99887766"
 
-    await controller._rearm_paper_exit_orders_after_restart()
+    await controller._ensure_paper_exit_orders_present()
     assert restored.current_sl_order_id == "99887766"
+
+
+# --- The 2026-10-07 production failure --------------------------------------
+#
+# `4f59b54` shipped the startup re-arm and it FAILED on the live system: the
+# method ran, placed no order, and emitted no INFO line at all. These three tests
+# encode exactly the conditions that let that happen, so the same failure cannot
+# recur silently.
+
+
+@pytest.mark.asyncio
+async def test_ensure_repairs_when_the_flag_claims_a_stop_but_none_exists():
+    """The flag is not evidence. The ORDER BOOK is.
+
+    `_place_stop_loss` returns True on a stale `current_sl_order_id`, so any
+    check driven by `sl_placement_initiated` concludes the stop is fine. On
+    2026-10-07 that made the deployed fix skip a BTCUSDT long that had no
+    resting order at all, while the position sat 1.7% below its stop.
+    """
+    controller, paper_executor, _ = _build_controller(_persisted_position())
+
+    await controller._load_runtime_state()
+    restored = controller._active_position_get(SYMBOL, "futures_usdtm")
+    assert restored is not None
+
+    # Reproduce the live incident exactly: persisted state says "stop placed",
+    # and the in-memory order book is empty (it always is after a restart).
+    restored.sl_placement_initiated = True
+    restored.current_sl_order_id = "2200861599"
+    restored.current_sl_client_order_id = "x-sl-deadbeefdeadbeef"
+    assert paper_executor._open_orders == {}
+
+    await controller._ensure_paper_exit_orders_present()
+
+    resting_types = [
+        o.get("type") for o in paper_executor._open_orders.values()
+    ]
+    assert "STOP_MARKET" in resting_types, (
+        "the ensure must place a real STOP_MARKET even though the persisted "
+        f"flags claim one is already placed; resting orders were {resting_types}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_periodic_ensure_repairs_an_order_book_emptied_after_startup():
+    """Correctness must not depend on startup-path ordering.
+
+    The one-shot startup call is not sufficient: anything that empties the paper
+    order book afterwards must be repaired by the periodic ensure within one
+    cycle, with no restart and no operator action.
+    """
+    controller, paper_executor, _ = _build_controller(_persisted_position())
+    await _restart(controller)
+
+    assert any(
+        o.get("type") == "STOP_MARKET" for o in paper_executor._open_orders.values()
+    ), "precondition: the stop is resting right after startup"
+
+    # Simulate the order book being wiped while the bot keeps running.
+    paper_executor._open_orders.clear()
+    assert paper_executor._open_orders == {}
+
+    await controller._ensure_paper_exit_orders_present(reason="periodic")
+
+    assert any(
+        o.get("type") == "STOP_MARKET" for o in paper_executor._open_orders.values()
+    ), (
+        "the periodic ensure must restore protection after the order book is "
+        "emptied mid-run; relying on a one-shot startup call is not sufficient"
+    )
+
+
+@pytest.mark.asyncio
+async def test_non_open_paper_position_is_surfaced_never_silently_skipped(caplog):
+    """A paper position that is not OPEN is invisible to BOTH consumers.
+
+    `_publish_state_to_redis` skips `status != "OPEN"`, and the ensure skips it
+    too -- so the position is neither protected nor shown, while still holding
+    exposure. That double invisibility is how a position can disappear from every
+    view without ever being closed or booked. It must be logged, loudly.
+    """
+    controller, paper_executor, _ = _build_controller(_persisted_position())
+    await controller._load_runtime_state()
+
+    restored = controller._active_position_get(SYMBOL, "futures_usdtm")
+    assert restored is not None
+    restored.status = "CLOSING"
+
+    with caplog.at_level(logging.WARNING):
+        await controller._ensure_paper_exit_orders_present()
+
+    surfaced = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(
+        "CLOSING" in m and SYMBOL in m for m in surfaced
+    ), (
+        "a paper position holding exposure in a non-OPEN status must be surfaced "
+        f"at WARNING; warnings were {surfaced}"
+    )
+    assert paper_executor._open_orders == {}, (
+        "a non-OPEN position must not be given a resting order -- it is outside "
+        "risk management and needs an operator, not a silent repair"
+    )

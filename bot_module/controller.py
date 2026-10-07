@@ -1167,10 +1167,10 @@ class TradingController:
         #     instead of protecting it -- which is why the flags cannot simply be
         #     cleared without re-placing the orders.
         try:
-            await self._rearm_paper_exit_orders_after_restart()
+            await self._ensure_paper_exit_orders_present(reason="startup")
         except Exception as rearm_startup_err:
             logger.critical(
-                f"[ReArmPaperExits:{self.api_key_name}] Startup re-arm of paper "
+                f"[EnsurePaperExitOrders:{self.api_key_name}] Startup re-arm of paper "
                 f"exit orders failed: {rearm_startup_err}. Restored paper "
                 f"positions may be left without stop-losses.",
                 exc_info=True,
@@ -3573,7 +3573,7 @@ class TradingController:
                         # longer exist, and the stale `sl_placement_initiated` /
                         # `ptp_placement_initiated_flags` flags suppress both the
                         # re-placement paths and the missing-SL safety net. Drop
-                        # that state here; `_rearm_paper_exit_orders_after_restart`
+                        # that state here; `_ensure_paper_exit_orders_present`
                         # puts real orders back once the executors are usable.
                         #
                         # `api_key_id is None` is this repo's existing marker for a
@@ -3620,52 +3620,114 @@ class TradingController:
             )
             self._active_positions = ActivePositionMap()
 
-    async def _rearm_paper_exit_orders_after_restart(self):
+    async def _ensure_paper_exit_orders_present(self, reason: str = "periodic"):
         """
-        Re-places the resting exit orders of paper positions restored from Redis.
+        Guarantees every OPEN paper position has a REAL resting exit order in the
+        paper executor's in-memory order book.
 
-        `_load_runtime_state` discards the persisted exit-order state of paper
-        positions because the orders behind that state lived only in the paper
-        executor's in-memory order book, which starts empty. This puts real
-        resting orders back so `PaperTradingExecutor.check_open_orders()` can fill
-        them again on the next periodic tick.
+        WHY THIS IS A LOOP AND NOT A ONE-SHOT STARTUP CALL
+        ----------------------------------------------------
+        Paper SL/TP orders live only in `PaperTradingExecutor._open_orders`, which
+        starts empty on every process start. The first version of this routine ran
+        exactly once, during startup, and then silently declined to do anything --
+        its two "nothing to do" paths were `logger.debug`, invisible at the
+        deployed INFO level. On 2026-10-07 that shipped as `4f59b54`, the method
+        ran, no INFO line ever appeared, NO order was placed, and a BTCUSDT long
+        sat 1.7% below its stop for eleven hours.
 
-        Runs on the PAPER-ONLY path only. Live controllers keep real orders on a
-        real exchange and their restore state is left exactly as it was.
+        Two lessons are baked into this design:
+          1. It runs periodically from the main loop as well as at startup, so
+             correctness no longer depends on startup-path ordering. Anything
+             that clears the order book (a restart, or a future code path that
+             resets it) is repaired within one cycle instead of never.
+          2. It checks REALITY, not flags. The persisted `sl_placement_initiated`
+             flag is exactly what was stale, so trusting it is what caused the
+             outage. The check below asks the paper executor what orders actually
+             exist right now.
 
-        Placement is AWAITED rather than scheduled as background tasks: this runs
-        during startup, before the main loop exists, and the outcome has to be
-        known and logged before positions are managed again.
+        Runs on the PAPER-ONLY path only; live controllers keep real orders on a
+        real exchange and are never touched.
 
-        Idempotent: both `_place_stop_loss` and `_place_partial_tp` short-circuit
-        on the flags this method causes to be set, so a second run places nothing.
+        Idempotent: a position that already has a resting STOP_MARKET is skipped
+        without logging, so the periodic call is cheap and quiet.
         """
-        log_prefix = f"[ReArmPaperExits:{self.api_key_name}]"
+        log_prefix = f"[EnsurePaperExitOrders:{self.api_key_name}]"
+        is_startup = reason == "startup"
 
-        if self.api_key_id is not None or self.executors.get("live") is not None:
+        paper_executor = self.executors.get("paper")
+        if (
+            self.api_key_id is not None
+            or self.executors.get("live") is not None
+            or paper_executor is None
+        ):
             # Not a paper-only controller. Never touch the live restore path.
-            logger.debug(f"{log_prefix} Skipped: not a paper-only controller.")
+            if is_startup:
+                logger.info(
+                    f"{log_prefix} Skipped ({reason}): not a paper-only controller."
+                )
             return
 
         async with self._positions_dict_lock:
-            restored_positions = [
+            paper_positions = [
                 LivePosition(**vars(pos))
                 for pos in self._active_positions.values()
-                if pos.status == "OPEN" and getattr(pos, "api_key_id", None) is None
+                if getattr(pos, "api_key_id", None) is None
             ]
 
-        if not restored_positions:
-            logger.debug(f"{log_prefix} No restored paper positions to re-arm.")
+        if not paper_positions:
+            if is_startup:
+                logger.info(
+                    f"{log_prefix} No restored paper positions present to re-arm."
+                )
             return
 
+        # A paper position that is NOT open is invisible to BOTH this routine and
+        # `_publish_state_to_redis` (which skips `status != "OPEN"`). That double
+        # invisibility is how the failed deployment left a position that was
+        # neither protected nor shown. Surface it loudly instead of skipping it.
+        non_open = [p for p in paper_positions if p.status != "OPEN"]
+        if non_open:
+            logger.warning(
+                f"{log_prefix} {len(non_open)} paper position(s) are NOT in OPEN "
+                f"status. They are excluded from risk management AND from the "
+                f"dashboard publish. Operator attention required: "
+                + ", ".join(f"{p.symbol}={p.status}" for p in non_open)
+            )
+
+        restored_positions = [p for p in paper_positions if p.status == "OPEN"]
+        if not restored_positions:
+            logger.warning(
+                f"{log_prefix} No OPEN paper position among {len(paper_positions)} "
+                f"restored paper position(s); nothing can be re-armed."
+            )
+            return
+
+        # Ask the executor what is ACTUALLY resting, rather than trusting flags.
+        try:
+            resting_orders = await paper_executor.get_open_orders()
+        except Exception as open_orders_err:
+            logger.warning(
+                f"{log_prefix} Could not read the paper order book "
+                f"({open_orders_err}); skipping this cycle and retrying."
+            )
+            return
+
+        def _has_resting_stop(symbol: str) -> bool:
+            return any(
+                str(o.get("symbol")) == symbol
+                and str(o.get("type", "")).upper() == "STOP_MARKET"
+                for o in resting_orders
+            )
+
         logger.info(
-            f"{log_prefix} Re-arming resting exit orders for "
-            f"{len(restored_positions)} restored paper position(s)..."
+            f"{log_prefix} Ensuring resting exit orders for "
+            f"{len(restored_positions)} OPEN paper position(s) ({reason})."
         )
 
         rearmed_sl = 0
         rearmed_tp = 0
         failed: List[str] = []
+
 
         for position in restored_positions:
             pos_log_prefix = f"{log_prefix}:{position.symbol}"
@@ -3676,17 +3738,59 @@ class TradingController:
                         f"{pos_log_prefix} Position runs in NO_STOP_LOSS mode by "
                         f"design. Nothing to re-arm."
                     )
-                elif self._position_has_active_stop_target(position):
+                elif not self._position_has_active_stop_target(position):
+                    logger.warning(
+                        f"{pos_log_prefix} OPEN paper position has NO active stop "
+                        f"target stored (current_sl_price="
+                        f"{position.current_sl_price}). It cannot be protected by "
+                        f"a resting order."
+                    )
+                elif _has_resting_stop(position.symbol):
+                    # Reality check passed: a STOP_MARKET for this symbol is
+                    # genuinely resting right now. Stay quiet -- this is the
+                    # steady state the periodic call will hit every cycle.
+                    logger.debug(
+                        f"{pos_log_prefix} STOP_MARKET already resting; nothing to do."
+                    )
+                else:
+                    # The order book is the authority. If it has no STOP_MARKET for
+                    # this symbol, any persisted "placed" flag is stale (the order
+                    # lived only in a previous process's memory) and MUST be
+                    # cleared here -- otherwise `_place_stop_loss` short-circuits
+                    # on `sl_placement_initiated` / `current_sl_order_id`, returns
+                    # True, and places nothing. That exact path left the 2026-10-07
+                    # BTCUSDT position unprotected with no log at INFO.
+                    if (
+                        position.sl_placement_initiated
+                        or position.current_sl_order_id
+                        or position.current_sl_client_order_id
+                        or position.is_sl_algo_order
+                    ):
+                        logger.warning(
+                            f"{pos_log_prefix} Persisted flags claim an SL order "
+                            f"({position.current_sl_order_id}) but no STOP_MARKET is "
+                            f"resting for {position.symbol}. Clearing stale state; the "
+                            f"order lived only in the previous process's memory."
+                        )
+                        position.sl_placement_initiated = False
+                        position.current_sl_order_id = None
+                        position.current_sl_client_order_id = None
+                        position.is_sl_algo_order = False
+
                     if await self._place_stop_loss(position):
                         rearmed_sl += 1
+                        logger.info(
+                            f"{pos_log_prefix} Placed missing STOP_MARKET "
+                            f"(current_sl_price={position.current_sl_price}). "
+                            f"Position was protected by the persisted flags but had "
+                            f"no live order; repaired."
+                        )
                     else:
                         failed.append(f"{position.symbol}:stop-loss")
-                else:
-                    logger.info(
-                        f"{pos_log_prefix} No active SL target stored "
-                        f"(current_sl_price={position.current_sl_price}). "
-                        f"SL re-arm skipped."
-                    )
+                        logger.warning(
+                            f"{pos_log_prefix} FAILED to place a stop-loss order for an "
+                            f"OPEN position with no resting protection."
+                        )
 
                 paper_executor = self.executors.get("paper")
                 if self._position_should_use_virtual_spot_tps(position, paper_executor):
@@ -3697,27 +3801,39 @@ class TradingController:
                         f"TP re-arm skipped."
                     )
                 else:
-                    for index, tp in enumerate(list(position.partial_tp_orders)):
-                        if tp.status != "PENDING_PLACEMENT":
-                            continue
-                        if tp.quantity is None or tp.quantity <= 0:
-                            continue
-                        await self._place_partial_tp(
-                            position,
-                            tp.target_price,
-                            tp.quantity,
-                            tp.orig_fraction,
-                            index,
+                    # Isolated from the SL pass on purpose. These are two
+                    # independent repairs; a failure re-arming a take-profit must
+                    # never discard the fact that the stop-loss was successfully
+                    # placed, which is what a shared try block did on 2026-10-07.
+                    try:
+                        for index, tp in enumerate(list(position.partial_tp_orders)):
+                            if tp.status != "PENDING_PLACEMENT":
+                                continue
+                            if tp.quantity is None or tp.quantity <= 0:
+                                continue
+                            await self._place_partial_tp(
+                                position,
+                                tp.target_price,
+                                tp.quantity,
+                                tp.orig_fraction,
+                                index,
+                            )
+                            # `partial_tp_orders` is shared with the live position
+                            # object, so the placed ids are visible right here.
+                            if tp.order_id or tp.client_order_id:
+                                rearmed_tp += 1
+                            else:
+                                failed.append(f"{position.symbol}:tp#{index}")
+                    except Exception as tp_err:
+                        logger.error(
+                            f"{pos_log_prefix} Failed to re-arm partial take-profit "
+                            f"orders (stop-loss repair above is unaffected): {tp_err}",
+                            exc_info=True,
                         )
-                        # `partial_tp_orders` is shared with the live position
-                        # object, so the placed ids are visible right here.
-                        if tp.order_id or tp.client_order_id:
-                            rearmed_tp += 1
-                        else:
-                            failed.append(f"{position.symbol}:tp#{index}")
+                        failed.append(f"{position.symbol}:partial-tp")
             except Exception as rearm_err:
                 logger.error(
-                    f"{pos_log_prefix} Failed to re-arm exit orders: {rearm_err}",
+                    f"{pos_log_prefix} Failed to re-arm stop-loss: {rearm_err}",
                     exc_info=True,
                 )
                 failed.append(f"{position.symbol}:exception")
@@ -3727,14 +3843,21 @@ class TradingController:
             # missing-SL watchdog will still force-close any position that ends
             # up without a stop, but only once its grace period expires.
             logger.warning(
-                f"{log_prefix} Re-arm incomplete: {len(failed)} exit order(s) "
-                f"could not be re-placed ({', '.join(failed)})."
+                f"{log_prefix} Ensure incomplete: {len(failed)} exit order(s) "
+                f"could not be placed ({', '.join(failed)})."
+            )
+        elif rearmed_sl or rearmed_tp:
+            logger.info(
+                f"{log_prefix} Repaired {rearmed_sl} stop-loss(es) and "
+                f"{rearmed_tp} partial TP(s); all OPEN paper positions now have "
+                f"live resting exit orders."
             )
         else:
-            logger.info(
-                f"{log_prefix} Re-arm complete: {rearmed_sl} stop-loss(es) and "
-                f"{rearmed_tp} partial TP(s) re-placed and resting in the paper "
-                f"order book."
+            # Steady state on a periodic cycle: every OPEN paper position already
+            # has a resting STOP_MARKET. Expected, and deliberately quiet.
+            logger.debug(
+                f"{log_prefix} All OPEN paper positions already protected; "
+                f"nothing to repair."
             )
 
     async def _publish_state_to_redis(self):
@@ -3757,6 +3880,19 @@ class TradingController:
 
         for pos in active_positions_copy:
             if pos.status != "OPEN":
+                # A non-OPEN position is invisible to the dashboard AND excluded
+                # from unrealized PnL. If it still carries exposure, that exposure
+                # is being hidden -- the exact failure observed on 2026-10-07, where
+                # a BTCUSDT long vanished from every view while never being closed
+                # or booked. Never let that happen quietly again.
+                remaining = getattr(pos, "remaining_quantity", 0.0) or 0.0
+                if abs(remaining) > 1e-9:
+                    logger.warning(
+                        f"[PublishState:User{self.user_id}] Position {pos.symbol} "
+                        f"has status '{pos.status}' but still holds {remaining} "
+                        f"units. It is NOT shown on the dashboard and is excluded "
+                        f"from unrealized PnL. Operator attention required."
+                    )
                 continue
 
             # Getting the current price
@@ -3897,7 +4033,16 @@ class TradingController:
                     unrealized_pnl_strat += position_pnl_cache.get(
                         pos.entry_client_order_id, 0.0
                     )
-                    instance_open_positions += 1
+                    # MUST match the filter used when building
+                    # `positions_to_publish` just above, which skips
+                    # `status != "OPEN"`. Counting a position here that is
+                    # excluded there is what produced a strategy showing
+                    # "IN POSITION" while the positions list said "No active
+                    # positions yet" -- on the same screen, at the same moment.
+                    # Observed live on New Strategy (6fcf5c10) at 13:18 UTC,
+                    # BEFORE any of this session's changes.
+                    if pos.status == "OPEN":
+                        instance_open_positions += 1
 
             total_instance_pnl = realized_pnl + unrealized_pnl_strat
 
@@ -4215,6 +4360,15 @@ class TradingController:
             60  # Reconciliation once per minute (sufficient for prevention)
         )
 
+        # Self-healing check that every OPEN paper position still has a LIVE
+        # resting stop-loss in the paper executor's order book. Deliberately on a
+        # timer rather than done once at startup: the 2026-10-07 `4f59b54`
+        # deployment proved a one-shot startup call can silently decline to act,
+        # and anything that empties that in-memory order book afterwards must be
+        # repaired without a restart.
+        last_paper_exit_ensure_time = 0
+        paper_exit_ensure_interval = 60
+
         while self._running:
             token = user_id_context.set(self.user_id)
             try:
@@ -4225,6 +4379,18 @@ class TradingController:
                         self.executors["paper"].check_open_orders(),
                         name=f"PeriodicPaperOrderCheck_User{self.user_id}",
                     )
+                    if now - last_paper_exit_ensure_time >= paper_exit_ensure_interval:
+                        last_paper_exit_ensure_time = now
+                        try:
+                            await self._ensure_paper_exit_orders_present(
+                                reason="periodic"
+                            )
+                        except Exception as ensure_err:
+                            logger.error(
+                                f"[EnsurePaperExitOrders:{self.api_key_name}] "
+                                f"Periodic ensure failed: {ensure_err}",
+                                exc_info=True,
+                            )
 
                 # 1. Checking symbol list updates
                 if now - last_symbol_check_time >= symbol_check_interval:
@@ -11084,18 +11250,73 @@ class TradingController:
                 )
                 return False
 
-            # Check if SL has already been placed or is in the process of being placed (idempotency)
+            # Check if SL has already been placed or is in the process of being placed (idempotency).
+            #
+            # The persisted order id is NOT proof that a live order exists. On
+            # 2026-10-07 `4f59b54` re-armed restored paper positions by calling
+            # this function, and it returned True here without placing anything:
+            # the id survived in Redis while the order lived only in the previous
+            # process's in-memory paper order book, which starts empty. A restored
+            # paper position was therefore reported protected while no order
+            # existed to fill. Before honouring either signal, confirm against the
+            # paper order book, which is the only authority for paper trading.
+            _sl_already_resting = False
+            _paper_exec = self.executors.get("paper")
+            if (
+                _paper_exec is not None
+                and self.api_key_id is None
+                and self.executors.get("live") is None
+            ):
+                try:
+                    _existing_orders = await _paper_exec.get_open_orders()
+                    _sl_already_resting = any(
+                        str(o.get("symbol")) == symbol_to_use
+                        and str(o.get("type", "")).upper() == "STOP_MARKET"
+                        for o in _existing_orders
+                    )
+                except Exception as _order_book_err:
+                    logger.warning(
+                        f"{log_prefix} Could not read the paper order book "
+                        f"({_order_book_err}); falling back to persisted state."
+                    )
+
             if current_pos_in_db.sl_placement_initiated:
-                logger.debug(
-                    f"{log_prefix} SL placement already initiated. Skipping duplicate attempt."
+                if _sl_already_resting:
+                    logger.debug(
+                        f"{log_prefix} SL placement already initiated. Skipping duplicate attempt."
+                    )
+                    return True
+                # Flags say placed, the order book disagrees. The order book wins.
+                logger.warning(
+                    f"{log_prefix} Persisted state claims an SL order "
+                    f"({current_pos_in_db.current_sl_order_id}) but no STOP_MARKET "
+                    f"is resting for {symbol_to_use}. The persisted id refers to an "
+                    f"order that no longer exists; clearing it and re-placing."
                 )
-                return True if current_pos_in_db.current_sl_order_id else False
+                current_pos_in_db.sl_placement_initiated = False
+                current_pos_in_db.current_sl_order_id = None
+                current_pos_in_db.current_sl_client_order_id = None
+                current_pos_in_db.is_sl_algo_order = False
 
             if current_pos_in_db.current_sl_order_id:
-                logger.info(
-                    f"{log_prefix} SL order ID {current_pos_in_db.current_sl_order_id} already exists. Skipping placement."
+                if _sl_already_resting:
+                    logger.info(
+                        f"{log_prefix} SL order ID {current_pos_in_db.current_sl_order_id} already exists. Skipping placement."
+                    )
+                    return True
+                # A persisted id with no matching resting order is the exact 2026-10-07
+                # failure: the order lived only in the previous process's in-memory
+                # book. Honouring the id here returns True having placed nothing.
+                logger.warning(
+                    f"{log_prefix} Persisted SL order ID "
+                    f"{current_pos_in_db.current_sl_order_id} has no matching "
+                    f"STOP_MARKET resting for {symbol_to_use}. Clearing it and "
+                    f"re-placing; the referenced order does not exist."
                 )
-                return True
+                current_pos_in_db.sl_placement_initiated = False
+                current_pos_in_db.current_sl_order_id = None
+                current_pos_in_db.current_sl_client_order_id = None
+                current_pos_in_db.is_sl_algo_order = False
 
             if current_pos_in_db.remaining_quantity <= 0:
                 logger.warning(
