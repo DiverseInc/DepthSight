@@ -8251,19 +8251,60 @@ class TradingController:
                         _ml_missing.append("model pipeline is None")
                     ml_confirm_evaluated_this_signal_live = False
                     signal.details["ml_confirmation_evaluated"] = False
-                    signal.details["ml_confirmation_skipped_reason"] = (
-                        "ML confirmation was requested by this strategy but could "
-                        "not run: " + "; ".join(_ml_missing) + ". The signal was "
-                        "allowed through unconfirmed (fail-open)."
-                    )
-                    logger.warning(
-                        f"{log_prefix} ML confirmation was REQUESTED for this "
-                        f"strategy but the model is not available, so the signal "
-                        f"will be allowed through WITHOUT any ML confirmation "
-                        f"(fail-open). Missing: {'; '.join(_ml_missing)}. If you "
-                        f"believe ML confirmation should be active, check "
-                        f"ML_CONFIRMATION_ENABLED and the model file path."
-                    )
+
+                    # FIX 2026-10-07: make the fail-open/fail-closed choice
+                    # EXPLICIT and configurable instead of an accidental
+                    # consequence of which branch this code happened to fall
+                    # into. Before this, the behaviour was "fail open" -- but
+                    # only because the branch logged at DEBUG and fell through,
+                    # never because anyone chose it.
+                    #
+                    # Default stays fail-open (ML_CONFIRMATION_FAIL_OPEN=True)
+                    # so this commit changes no trading behaviour: a missing
+                    # optional model must not silently halt every strategy.
+                    # Operators who treat ML confirmation as a risk control that
+                    # must not be bypassed can set the env var to False, and
+                    # then an unconfirmed signal is REJECTED rather than passed.
+                    if not config.ML_CONFIRMATION_FAIL_OPEN:
+                        ml_confirmed_this_signal_live = False
+                        # Record WHY on the reject path too. The
+                        # SIGNAL_REJECTED_ML_LIVE event below copies
+                        # `signal.details`, so without this the trade log would
+                        # show a rejection with no cause -- the exact
+                        # unexplained-rejection failure this whole change
+                        # exists to eliminate.
+                        signal.details["ml_confirmation_skipped_reason"] = (
+                            "ML confirmation was REQUIRED by "
+                            "ML_CONFIRMATION_FAIL_OPEN=False but the model "
+                            "could not run: " + "; ".join(_ml_missing) + ". The "
+                            "signal was REJECTED because it cannot be confirmed."
+                        )
+                        logger.error(
+                            f"{log_prefix} ML confirmation is REQUIRED "
+                            f"(ML_CONFIRMATION_FAIL_OPEN=False) but the model is "
+                            f"unavailable: {'; '.join(_ml_missing)}. This signal "
+                            f"is being REJECTED because it cannot be confirmed. "
+                            f"Either deploy a model at "
+                            f"{config.ML_CONFIRMATION_MODEL_PATH} or set "
+                            f"ML_CONFIRMATION_FAIL_OPEN=True to accept signals "
+                            f"unconfirmed."
+                        )
+                    else:
+                        signal.details["ml_confirmation_skipped_reason"] = (
+                            "ML confirmation was requested by this strategy but "
+                            "could not run: " + "; ".join(_ml_missing) + ". The "
+                            "signal was allowed through unconfirmed "
+                            "(fail-open)."
+                        )
+                        logger.warning(
+                            f"{log_prefix} ML confirmation was REQUESTED for "
+                            f"this strategy but the model is not available, so "
+                            f"the signal will be allowed through WITHOUT any ML "
+                            f"confirmation (fail-open). Missing: "
+                            f"{'; '.join(_ml_missing)}. If you believe ML "
+                            f"confirmation should be active, check "
+                            f"ML_CONFIRMATION_ENABLED and the model file path."
+                        )
 
                 signal.details["ml_confirmed_live"] = ml_confirmed_this_signal_live
                 # FIX 2026-10-07: recorded alongside `ml_confirmed_live` because

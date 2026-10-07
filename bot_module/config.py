@@ -805,12 +805,64 @@ RETRAIN_WINDOW_SIZE = 50
 # ==============================================================================
 # ML Confirmation Model Settings (Used in Backtester and potentially in Controller)
 # ==============================================================================
-# Whether to enable the use of an ML model for CONFIRMATION of signals from REGULAR strategies
-ML_CONFIRMATION_ENABLED = True
+# FIX 2026-10-07: this flag used to be a hardcoded `True` pointing at
+# `data/offline_trained_model.joblib`, a file that has never existed in this
+# repository -- `data/` is gitignored and `data/models/` is empty, and
+# `logs/` holds no training CSV either.
+#
+# The result was a configuration that LIES: every one of the 12 paper
+# controllers logged
+#   ERROR [MLConfirmLive] Failed to load Live ML Confirmation model ...
+# on every start, while `ML_CONFIRMATION_STRATEGIES` includes
+# "VisualBuilderStrategy" -- i.e. every strategy on the platform -- so any
+# strategy setting `use_ml_confirmation: True` looked like it was being gated
+# by a model that had never run.
+#
+# A flag that advertises a risk control which does not exist is worse than an
+# honest `False`, so the default is now False and it is environment-overridable
+# so that deploying a model becomes a deployment decision rather than a code
+# edit plus a rebuild of every bot container.
+#
+# To actually enable it you need BOTH: this flag set truthy, AND a trained
+# model at ML_CONFIRMATION_MODEL_PATH. Training is possible
+# (`python -m bot_module.train_offline_model --data-file <csv>`) but requires a
+# labelled CSV that this deployment has never produced.
+#
+# SCOPE NOTE -- this default is read by MORE than the live bot. `bot_module/
+# trainer.py` reads ML_CONFIRMATION_ENABLED and ML_CONFIRMATION_MODEL_PATH to
+# decide `enable_ml_confirmation_backtest` for the DepthSightBacktester, so
+# flipping the default to False also turns OFF ML confirmation in backtests and
+# in the genetic/bayesian optimisation sweeps. That is the correct direction --
+# those paths were asking for a model that does not exist -- but it is a real
+# behaviour change beyond the live controller and is why it is called out here
+# rather than buried. Anyone who later deploys a real model and wants it in
+# backtests too must set the env var for those runs as well.
+ML_CONFIRMATION_ENABLED = os.environ.get(
+    "ML_CONFIRMATION_ENABLED", "False"
+).strip().lower() in ("1", "true", "yes", "on")
 # Path to the model for confirmation (can be the same as ML_OFFLINE_TRAINED_MODEL_PATH)
 ML_CONFIRMATION_MODEL_PATH = Path(
-    "data/offline_trained_model.joblib"
-)  # Path to the model for confirmation
+    os.environ.get(
+        "ML_CONFIRMATION_MODEL_PATH", "data/offline_trained_model.joblib"
+    )
+)
+# FIX 2026-10-07: what to do when a strategy asks for ML confirmation but the
+# model cannot run -- no model file, a failed load, or unavailable components.
+#
+# True  (default, and the behaviour before this flag existed): allow the signal
+#        through UNCONFIRMED. Availability is preferred over integrity -- a
+#        missing optional model must not silently halt all trading.
+# False: reject the signal. Appropriate if ML confirmation is treated as a
+#        risk control that must never be bypassed rather than an advisory filter.
+#
+# It was previously neither: it was an implicit side effect of a branch that
+# logged at DEBUG and fell through. See the WARNING now emitted at
+# controller.py `_process_signal` when this path is taken, and
+# `signal.details["ml_confirmation_evaluated"]`, which distinguishes "the model
+# approved this" from "nothing checked this".
+ML_CONFIRMATION_FAIL_OPEN = os.environ.get(
+    "ML_CONFIRMATION_FAIL_OPEN", "True"
+).strip().lower() in ("1", "true", "yes", "on")
 # List of strategies for which ML confirmation will be applied. If empty - for all.
 ML_CONFIRMATION_STRATEGIES = [
     "VolumeBreakout",

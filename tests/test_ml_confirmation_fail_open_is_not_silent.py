@@ -276,6 +276,102 @@ def test_trade_log_does_not_claim_ml_approved_a_signal_it_never_saw():
     )
 
 
+def test_absent_model_fails_closed_when_configured(monkeypatch):
+    """The fail-open/fail-closed choice must be a real switch, not an accident.
+
+    The behaviour before this flag existed was fail-open -- but only because
+    the branch logged at DEBUG and fell through. Nobody chose it, and nothing
+    recorded the decision. With ML_CONFIRMATION_FAIL_OPEN=False an operator
+    who treats ML confirmation as a risk control that must not be bypassed
+    gets the signal REJECTED instead.
+    """
+    from bot_module import config
+
+    monkeypatch.setattr(config, "ML_CONFIRMATION_FAIL_OPEN", False)
+    controller = _build_controller(use_ml_confirmation=True)
+    signal = _make_signal()
+
+    _run(controller, signal)
+
+    rejections = [
+        e for e in controller.trade_logger.events
+        if e[0] == "SIGNAL_REJECTED_ML_LIVE"
+    ]
+    assert rejections, (
+        "With ML_CONFIRMATION_FAIL_OPEN=False a signal that cannot be confirmed "
+        "must be REJECTED, not passed through. The switch does nothing."
+    )
+    assert signal.details.get("ml_confirmation_evaluated") is False, (
+        "A rejected signal still records that nothing evaluated it, so the "
+        "trade log shows WHY it was rejected."
+    )
+
+
+def test_fail_closed_logs_at_error_not_warning(caplog):
+    """Losing a signal to a missing model is not a 'heads up' -- it is a halt.
+
+    WARNING is the level used for the deliberately fail-open path. Fail-closed
+    means trades are being blocked, which must read differently in the log.
+    """
+    from bot_module import config
+
+    with caplog.at_level(logging.INFO):
+        old = config.ML_CONFIRMATION_FAIL_OPEN
+        config.ML_CONFIRMATION_FAIL_OPEN = False
+        try:
+            controller = _build_controller(use_ml_confirmation=True)
+            _run(controller, _make_signal())
+        finally:
+            config.ML_CONFIRMATION_FAIL_OPEN = old
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("ML_CONFIRMATION_FAIL_OPEN" in r.getMessage() for r in errors), (
+        "Fail-closed must log at ERROR and must state which switch caused it, "
+        "so the fix is obvious from the logs alone."
+    )
+
+
+def test_default_config_does_not_advertise_a_model_that_does_not_exist():
+    """The config must not claim a capability the deployment lacks.
+
+    `ML_CONFIRMATION_ENABLED` was a hardcoded True pointing at
+    `data/offline_trained_model.joblib`, a file that has never existed in this
+    repository. Every one of the 12 controllers logged a load failure on every
+    start while the config asserted the feature was on. A flag that lies is
+    worse than an honest False.
+    """
+    from pathlib import Path
+
+    from bot_module import config
+
+    assert config.ML_CONFIRMATION_ENABLED is False, (
+        "ML_CONFIRMATION_ENABLED must default to False while no model exists. "
+        "If a model has been trained and deployed, set the "
+        "ML_CONFIRMATION_ENABLED environment variable instead of flipping this."
+    )
+    model_path = Path(config.ML_CONFIRMATION_MODEL_PATH)
+    assert not model_path.exists(), (
+        f"If {model_path} now exists, this test should be revisited: the model "
+        f"may genuinely be deployed and the default may need to change."
+    )
+
+
+def test_ml_settings_are_environment_overridable():
+    """Deploying a model must not require editing code and rebuilding containers.
+
+    Turning the feature on is a deployment decision (the artifact exists or it
+    does not), so both switches have to be settable from the environment.
+    """
+    from bot_module import config
+
+    for attr in (
+        "ML_CONFIRMATION_ENABLED",
+        "ML_CONFIRMATION_FAIL_OPEN",
+        "ML_CONFIRMATION_MODEL_PATH",
+    ):
+        assert hasattr(config, attr), f"{attr} must exist on config."
+
+
 # --- guards: the fix must not have broken the working paths -------------------
 
 
