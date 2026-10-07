@@ -612,3 +612,42 @@ async def test_stuck_closing_position_is_retried_when_no_open_positions_exist():
     assert stuck.failed_close_attempts >= 3, (
         "the attempt counter must advance so escalation thresholds are reachable"
     )
+
+
+@pytest.mark.asyncio
+async def test_zero_quantity_closing_record_is_finalized_not_ignored():
+    """A CLOSING record with zero quantity is a ZOMBIE, not a no-op.
+
+    Its close already completed and the money already moved -- only the
+    finalisation was lost. Such a record used to be filtered out by
+    `remaining_quantity > 0`, so the recovery never saw it and `close_position`
+    returned "Waiting for finalization" forever. That is how ETHUSDT and BTCUSDT
+    sat in CLOSING: invisible to the dashboard, excluded from PnL, never closed.
+    """
+    controller, _, _ = _build_controller(_persisted_position())
+
+    zombie = _persisted_position(
+        status="CLOSING",
+        remaining_quantity=0.0,
+        exit_reason="CLOSED_WHILE_OFFLINE",
+        failed_close_attempts=1,
+    )
+    controller._active_positions = ActivePositionMap()
+    controller._active_position_set(zombie)
+
+    retries = []
+
+    async def _fake_close_position(*args, **kwargs):
+        retries.append((args, kwargs))
+
+    controller.close_position = _fake_close_position
+
+    await controller._check_and_close_positions_without_sl()
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert retries, (
+        "a CLOSING record with zero remaining quantity must still be picked up for "
+        "finalisation; filtering it out on remaining_quantity > 0 leaves a "
+        "permanent zombie that is invisible on the dashboard"
+    )

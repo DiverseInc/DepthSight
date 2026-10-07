@@ -7005,7 +7005,14 @@ class TradingController:
                     pos.failed_close_attempts,
                 )
                 for pos in list(self._active_positions.values())
-                if pos.status == "CLOSING" and pos.remaining_quantity > 0
+                if pos.status == "CLOSING"
+                # FIX 2026-10-07: the `remaining_quantity > 0` condition used to
+                # exclude zero-quantity CLOSING records entirely. Those are
+                # positions whose close COMPLETED but whose finalisation was
+                # lost -- invisible to the dashboard, excluded from PnL, and
+                # never retried. They are exactly the records that need
+                # finalising, so include them here.
+                and (pos.remaining_quantity or 0.0) >= 0
             ]
 
         for (
@@ -7026,10 +7033,24 @@ class TradingController:
                 if stuck_position:
                     stuck_position.failed_close_attempts += 1
                     failed_attempts = stuck_position.failed_close_attempts
+                    remaining_qty = stuck_position.remaining_quantity
+                else:
+                    remaining_qty = None
 
-            logger.warning(
-                f"{stuck_log_prefix} Position still in CLOSING status with remaining qty > 0. Attempt #{failed_attempts}."
-            )
+            if remaining_qty is not None and remaining_qty <= 0:
+                # The close already completed; only finalisation is missing.
+                # `close_position` detects this and calls `_handle_final_exit`
+                # without booking any further PnL.
+                logger.warning(
+                    f"{stuck_log_prefix} Position stuck in CLOSING with ZERO "
+                    f"remaining quantity (close already completed). Attempt "
+                    f"#{failed_attempts}. Finalising."
+                )
+            else:
+                logger.warning(
+                    f"{stuck_log_prefix} Position still in CLOSING status with "
+                    f"remaining qty > 0. Attempt #{failed_attempts}."
+                )
 
             reason_for_retry_closure = (
                 exit_reason or f"RETRY_CLOSE_STUCK_CLOSING_{entry_cid}"
@@ -14081,10 +14102,41 @@ class TradingController:
                     )
                     return
 
-                # If the position is already in CLOSING status, but remaining_quantity = 0, we also exit
+                # If the position is already in CLOSING status with zero remaining quantity,
+                # the close has ALREADY completed and been booked (the paper/live
+                # fill did the money movement) -- only the finalisation step was
+                # lost. This used to `return` here with "Waiting for
+                # finalization", which never arrives: the event it waits for is
+                # the very event that already happened. The position then sat in
+                # CLOSING forever -- excluded from the dashboard publish and from
+                # unrealized PnL -- which is exactly how ETHUSDT and BTCUSDT
+                # became invisible zombies on 2026-10-07 while the balance
+                # correctly moved.
+                #
+                # Finalize it explicitly instead of waiting for an event that
+                # cannot arrive. Pass zeros so this books no additional PnL or
+                # commission: the fill already did that, and re-booking would
+                # double-count the exit.
                 if position.status == "CLOSING" and position.remaining_quantity <= 0:
-                    logger.info(
-                        f"{log_prefix} Position is already in CLOSING status with zero balance. Waiting for finalization."
+                    logger.warning(
+                        f"{log_prefix} Position is CLOSING with zero remaining "
+                        f"quantity: the close already completed but finalisation "
+                        f"was lost. Finalising now (no PnL booked again)."
+                    )
+                    self.loop.create_task(
+                        self._handle_final_exit(
+                            symbol,
+                            reason or "FINALIZE_ORPHANED_CLOSING",
+                            exit_price=0.0,
+                            commission=0.0,
+                            commission_asset=None,
+                            order_id=None,
+                            client_order_id=None,
+                            realized_pnl_from_exchange=0.0,
+                            exchange_pnl_available=False,
+                            market_type=normalized_market_type,
+                        ),
+                        name=f"FinalizeOrphanedClosing_{symbol}",
                     )
                     return
 
