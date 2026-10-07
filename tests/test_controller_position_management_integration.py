@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 def create_mock_kline_df(num_rows=100, base_price=100.0):
     """Creates DataFrame with candles with DatetimeIndex."""
     now = datetime.now(timezone.utc)
-    timestamps = pd.date_range(end=now, periods=num_rows, freq="1T", tz="UTC")
+    # FIX 2026-10-07: "1T" was the pandas alias for one-minute frequency and was
+    # REMOVED in pandas 3.0 ("Invalid frequency: T ... Did you mean min?").
+    # The canonical spelling is "1min". Both failures in this file died inside
+    # this fixture before reaching an assertion, so this was never a
+    # trading-logic failure -- but a permanently red suite trains people to
+    # ignore red, which is how real regressions hide behind "known failure".
+    timestamps = pd.date_range(end=now, periods=num_rows, freq="1min", tz="UTC")
 
     return pd.DataFrame(
         {

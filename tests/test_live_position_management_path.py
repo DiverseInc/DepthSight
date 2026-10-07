@@ -23,7 +23,13 @@ def create_mock_kline_df_with_datetime_index(num_rows=100, base_price=100.0):
     Creates a DataFrame with candles where the index is a DatetimeIndex (as in reality).
     """
     now = datetime.now(timezone.utc)
-    timestamps = pd.date_range(end=now, periods=num_rows, freq="1T", tz="UTC")
+    # FIX 2026-10-07: "1T" was the pandas alias for one-minute frequency and was
+    # REMOVED in pandas 3.0 ("Invalid frequency: T ... Did you mean min?").
+    # The canonical spelling is "1min". This was never a trading-logic failure --
+    # all three failures in this file died inside this fixture, before reaching
+    # a single assertion -- but a permanently red suite teaches everyone to
+    # ignore red, which is how real regressions get dismissed as "known".
+    timestamps = pd.date_range(end=now, periods=num_rows, freq="1min", tz="UTC")
 
     df = pd.DataFrame(
         {
