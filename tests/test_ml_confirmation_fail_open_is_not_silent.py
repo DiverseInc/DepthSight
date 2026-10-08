@@ -483,6 +483,40 @@ def test_log_scope_is_a_property_not_a_constructor_step():
     )
 
 
+# --- per-user log identity -----------------------------------------------------
+
+
+def test_startcmd_log_prefix_identifies_the_user():
+    """Twelve controllers log concurrently; StartCmd lines must say which user.
+
+    A strategy id (`571be7ef`) showed up "already running" in the log but in no
+    user's API response, and there was no way to tell from the log whether it
+    was a real unlisted strategy of the logged-in user or simply another
+    account's. Twelve controllers, one log, no attribution.
+
+    The same gap `_log_scope` closed for the paper-exit and risk-check paths.
+    Without the user id this question is unanswerable after the fact.
+    """
+    controller = _build_controller(use_ml_confirmation=True)
+    # The property is what StartCmd now interpolates.
+    assert controller._log_scope == "paper/u10", (
+        "StartCmd must resolve a per-user scope so twelve concurrent "
+        f"controllers can be told apart. Got: {controller._log_scope!r}"
+    )
+    assert controller._log_scope.startswith(
+        controller.api_key_name
+    ), "scope should still identify the trading mode"
+
+    # And the attributes it depends on must exist before any handler runs.
+    import inspect
+
+    src = inspect.getsource(TradingController)
+    assert "self.user_id =" in src and "self.api_key_name =" in src, (
+        "_log_scope reads user_id and api_key_name; both must be assigned in "
+        "__init__ or StartCmd would raise AttributeError on every START."
+    )
+
+
 # --- the RESERVING placeholder leak -------------------------------------------
 
 

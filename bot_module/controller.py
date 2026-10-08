@@ -2119,7 +2119,21 @@ class TradingController:
             )
             return
 
-        log_prefix = f"[StartCmd:{strategy_name}:{config_id[:8]}]"
+        # FIX 2026-10-08: include the user id.
+        #
+        # Twelve controllers run concurrently, one per user, and each logs its
+        # own `[StartCmd:...]` lines with no indication of which account they
+        # belong to. `grep`ing this log therefore mixes all twelve users'
+        # strategies into one undifferentiated list.
+        #
+        # Concretely: a strategy id `571be7ef` showed up "already running" but
+        # appears in no user's API response, and there was no way to tell from
+        # the log whether it was a real unlisted strategy of the logged-in user
+        # or simply another account's. Same diagnosability gap that
+        # `_log_scope` fixed for the paper-exit and risk-check paths.
+        log_prefix = (
+            f"[StartCmd:{self._log_scope}:{strategy_name}:{config_id[:8]}]"
+        )
 
         async with self.instances_lock:
             if config_id in self.running_strategy_instances:
