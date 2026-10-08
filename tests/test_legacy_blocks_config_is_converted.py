@@ -98,6 +98,7 @@ def _pair_info(**over):
         "close": 100.0,
         "current_candle_index": 59,
         "candle_timeframe": "1m",
+        "timestamp_dt": pd.Timestamp("2024-01-10 12:00:00", tz="UTC"),
         "RSI_14": 50,
         "ADX_14": 20.0,
         "BBL_20_2.0": 95.0,
@@ -557,3 +558,108 @@ def test_every_emitted_leaf_type_has_a_registered_checker():
             f"{node_type!r} is not a registered checker (strategy.py:2148); "
             f"it would silently never evaluate"
         )
+
+
+# --- the seam: the converted exit must actually CLOSE a position -------------
+#
+# Everything above proves the shape. None of it proves the exit fires. The real
+# defect that shipped the dead seeds was a config that parsed, showed "running"
+# in the dashboard, and never traded -- a shape test cannot catch that.
+# These tests call the REAL `_execute_position_management` (strategy.py:4239)
+# against the converted config and require an actual position closure.
+
+
+def _open_position():
+    from bot_module.controller import LivePosition
+
+    return LivePosition(
+        symbol="BTCUSDT",
+        direction=SignalDirection.LONG,
+        entry_price=100.0,
+        initial_quantity=1.0,
+        remaining_quantity=1.0,
+        entry_time=1.0,
+        strategy="VisualBuilderStrategy",
+        initial_stop_loss=90.0,
+        initial_take_profit=120.0,
+        current_sl_price=90.0,
+        status="OPEN",
+    )
+
+
+@pytest.mark.asyncio
+async def test_converted_rsi75_exit_actually_closes_the_position():
+    """THE seam test: RSI crossing above 75 must close, through the real engine.
+
+    The cross needs BOTH values: the engine reads the CURRENT one from
+    `pair_info` (`_check_condition_rsi`, strategy.py:7605) and the PREVIOUS one
+    from an `RSI_14` COLUMN on the candle frame at `current_candle_index - 1`
+    (`_get_previous_indicator_value`, strategy.py:7645-7665). Setting only
+    `pair_info` leaves prev=None and every cross silently evaluates False --
+    which is how a well-formed exit stays dead. So the column is set too.
+    """
+    out = convert_legacy_blocks_config(RSI_LEGACY)
+    inst = _instance(out)
+
+    md = _market_data()
+    pi = _pair_info(RSI_14=80.0)
+    df = md["kline_1m"]
+    cur = pi["current_candle_index"]
+    df["RSI_14"] = 80.0
+    df.iloc[cur - 1, df.columns.get_loc("RSI_14")] = 70.0  # prev, below 75
+    df.iloc[cur, df.columns.get_loc("RSI_14")] = 80.0  # now, above 75
+
+    _, exit_details = await inst._execute_position_management(
+        out, _open_position(), pi, md, _pair_info(RSI_14=70.0)
+    )
+
+    assert exit_details is not None, (
+        "converted RSI-75 exit did not signal a close: "
+        "the config is well-formed but dead, which is the exact failure "
+        "this file exists to prevent"
+    )
+    # `close_position` is ADVISORY: it returns exit_details and never touches
+    # remaining_quantity (strategy.py:3685-3697). The caller performs the
+    # actual close, so exit_details -- not the quantity -- is the signal that
+    # the exit fired.
+    assert exit_details["reason"] == "PM_ACTION_CLOSE", (
+        f"wrong exit reason {exit_details['reason']!r}; the position would be "
+        f"closed for a reason the strategy never asked for"
+    )
+    # Bind to the value that actually decided the comparison, so a regression in
+    # the resolved exit price is visible. An earlier version asserted
+    # `remaining_quantity == 1.0` here; that restated the fixture and passed
+    # whether or not the exit fired, so it proved nothing.
+    assert exit_details["exit_price"] == pi["last_price"], (
+        f"exit price {exit_details['exit_price']!r} was not resolved from "
+        f"pair_info['last_price']={pi['last_price']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_converted_rsi75_exit_does_not_close_below_the_threshold():
+    """The negative control, without which the test above proves nothing.
+
+    RSI goes 70 -> 72 and never crosses 75, so the position must survive.
+    A test that only asserts the happy path can pass against an exit that
+    closes on every candle.
+    """
+    out = convert_legacy_blocks_config(RSI_LEGACY)
+    inst = _instance(out)
+
+    md = _market_data()
+    pi = _pair_info(RSI_14=72.0)
+    df = md["kline_1m"]
+    cur = pi["current_candle_index"]
+    df["RSI_14"] = 72.0
+    df.iloc[cur - 1, df.columns.get_loc("RSI_14")] = 70.0
+    df.iloc[cur, df.columns.get_loc("RSI_14")] = 72.0
+
+    updated, exit_details = await inst._execute_position_management(
+        out, _open_position(), pi, md, _pair_info(RSI_14=70.0)
+    )
+
+    assert exit_details is None, (
+        f"position closed at RSI 72 with no cross of 75: {exit_details}"
+    )
+    assert updated.remaining_quantity == 1.0, "position was closed below the threshold"
