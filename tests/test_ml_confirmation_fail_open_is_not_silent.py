@@ -522,6 +522,65 @@ def test_exception_after_reservation_does_not_leak_the_slot():
     )
 
 
+def test_ordinary_return_after_reservation_does_not_leak_the_slot():
+    """THE CASE THAT ACTUALLY BIT PRODUCTION -- no exception involved.
+
+    `git grep` on the deployed logs showed "UNEXPECTED EXCEPTION in
+    _process_signal" in NO log file, so the leak was not the exception path at
+    all. It was an ordinary early `return`.
+
+    `_process_signal` reserves the slot at the top and then bails at several
+    points without releasing it. This drives the single most likely one: the
+    strategy config is not found (controller.py:8001, "CRITICAL: Running
+    configuration not found for strategy ... Signal ignored"), which happens
+    when a candle arrives for a symbol before its strategy instance has been
+    registered -- a startup race.
+
+    A leaked reservation blocks that symbol permanently, hides it from the API,
+    and eats a `max_concurrent_trades` slot. `RESERVING` is in that status
+    tuple, so the damage compounds over time.
+    """
+    controller = _build_controller(use_ml_confirmation=False)
+
+    # Simulate the startup race: no strategy config is registered, so
+    # `_process_signal` bails at the "Running configuration not found" return.
+    # The instances_lock guards concurrent mutation; a single-threaded test
+    # does not need to await it.
+    controller.running_strategy_instances = {}
+
+    signal = _make_signal()
+    _run(controller, signal)
+
+    leftover = controller._active_position_get("BTCUSDT", "futures")
+    assert leftover is None, (
+        f"A plain early return leaked the RESERVING placeholder: "
+        f"status={getattr(leftover, 'status', None)!r}. BTCUSDT was stuck this "
+        f"way in production. The release must live in `finally` so every exit "
+        f"is covered, not only the paths that remembered to pop."
+    )
+
+
+def test_release_happens_on_a_normal_reject_too():
+    """Even a *correct* rejection must release the slot.
+
+    RiskManager saying "no" is the system working. It must not cost the symbol
+    its ability to trade on the next candle.
+    """
+    controller = _build_controller(use_ml_confirmation=False)
+
+    async def _reject(*a, **k):
+        # A rejection raised from downstream still unwinds through `finally`.
+        raise RuntimeError("downstream rejection")
+
+    controller._get_market_info = _reject
+    signal = _make_signal()
+    _run(controller, signal)
+
+    assert controller._active_position_get("BTCUSDT", "futures") is None, (
+        "The reservation must be released regardless of why processing ended."
+    )
+
+
 def test_exception_does_not_pop_a_real_position():
     """Cleanup must never orphan a real trade.
 

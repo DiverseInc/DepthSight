@@ -9049,31 +9049,51 @@ class TradingController:
                 f"{log_prefix} UNEXPECTED EXCEPTION in _process_signal: {e_proc_sig}",
                 exc_info=True,
             )
-            # FIX 2026-10-07: release the RESERVING slot reservation.
+        finally:
+            # FIX 2026-10-07: release the RESERVING slot reservation on EVERY
+            # exit, not just the ones that remembered to.
             #
             # `_process_signal` inserts a zero-quantity placeholder with status
-            # "RESERVING" BEFORE doing any exchange work, to stop a second
-            # signal for the same symbol racing in. It is popped again on each
-            # explicit failure path further up, but the generic handler here
-            # did NOT pop it. So any unexpected exception after the reservation
-            # leaked the placeholder forever.
+            # "RESERVING" (`:7862-7877`) to stop a second signal for the same
+            # symbol racing in while this one places its entry order. Only four
+            # paths ever popped it (symbol blocked, pre-existing position,
+            # order error, no order placed). NINE did not, each a plain
+            # `return`:
             #
-            # A leaked reservation is the same failure shape as the 2026-10-07
-            # incident, and worse in one respect: the record is invisible to
-            # `_publish_state_to_redis` (which skips status != "OPEN"), so
-            # `/api/v1/positions` returns [] while the bot still holds the slot.
-            # It also counts toward `max_concurrent_trades`, since RESERVING is
-            # in that status tuple. The practical effect is that the symbol can
-            # never open a position again, with no money moved and nothing in
-            # the API to explain why.
+            #   :8001  running configuration not found for the strategy
+            #   :8018  no executor found for this mode/market
+            #   :8401  signal rejected by live ML confirmation
+            #   :8455  rejected by the final risk checks
+            #   :8529  pre-flight found an existing position on the exchange
+            #   :8536  pre-flight itself raised
+            #   :8561  LIMIT order with no entry_price
+            #   :8578  rounded LIMIT price came out <= 0
+            #   :8591  unsupported order mode
+            #
+            # Any of those leaves the reservation in place forever, and a
+            # reservation that leaks blocks that symbol permanently while
+            # consuming a `max_concurrent_trades` slot, because RESERVING is in
+            # that status tuple. It is invisible to `/api/v1/positions`, since
+            # `_publish_state_to_redis` skips status != "OPEN" -- so the API
+            # reports no positions while the bot still holds the symbol, and
+            # nothing on any endpoint explains why.
             #
             # Observed live 2026-10-07: BTCUSDT stuck in RESERVING, surfaced
             # only by `_ensure_paper_exit_orders_present`'s "NOT in OPEN status"
-            # warning, not by any endpoint.
+            # warning. `git grep` confirmed "UNEXPECTED EXCEPTION in
+            # _process_signal" appears in NO log file, so the trigger was one of
+            # these ordinary returns, not an exception -- most likely :8001,
+            # where a candle for a symbol arrives before its strategy instance
+            # is registered, which is a startup race.
             #
-            # Only pop if it is STILL the zero-quantity placeholder. By this
-            # point the reservation may have been promoted into a real filled
-            # position, and popping that would orphan a live trade.
+            # Doing this in `finally` rather than patching nine call sites means
+            # the next exit added to this method is covered automatically.
+            #
+            # The guard is the same either way: pop ONLY if the record is still
+            # the zero-quantity RESERVING placeholder. By the time we get here
+            # the reservation may have been promoted into a real filled
+            # position, and popping that would orphan a live trade while the
+            # exchange still holds it.
             try:
                 async with self._positions_dict_lock:
                     _leaked = self._active_position_get(
@@ -9091,9 +9111,9 @@ class TradingController:
                         )
                         logger.warning(
                             f"{log_prefix} Released the RESERVING placeholder "
-                            f"for {signal.symbol} after the exception above. "
-                            f"Without this the symbol would stay blocked with "
-                            f"the slot leaked and no visible position."
+                            f"for {signal.symbol} on exit from _process_signal. "
+                            f"Without this the symbol stays blocked, with the "
+                            f"slot leaked and no visible position."
                         )
                     elif _leaked is not None:
                         # Something real took the slot over; leave it alone.
@@ -9103,13 +9123,13 @@ class TradingController:
                             f"placeholder. Leaving it untouched."
                         )
             except Exception as reservation_cleanup_err:
-                # Never let cleanup mask the original exception.
+                # Never let cleanup mask the original failure.
                 logger.error(
                     f"{log_prefix} Failed to release RESERVING placeholder for "
                     f"{signal.symbol}: {reservation_cleanup_err}",
                     exc_info=True,
                 )
-        finally:
+
             async with self._processing_signal_lock:
                 if processing_key in self._processing_signal_for_symbol:
                     self._processing_signal_for_symbol.remove(processing_key)
