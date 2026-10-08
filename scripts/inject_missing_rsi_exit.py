@@ -77,7 +77,7 @@ def select_candidates(conn):
                config_data
           FROM strategy_configs
          WHERE name LIKE $1
-           AND config_data::jsonb->'entryConditions'->'children'->0->'type' = $2
+           AND config_data::jsonb->'entryConditions'->'children'->0->>'type' = $2
            AND config_data::jsonb->'entryConditions'->'children'->0->'params'->>'value' = $3
            AND jsonb_exists(config_data::jsonb, 'positionManagement') = false
          ORDER BY user_id, created_at
