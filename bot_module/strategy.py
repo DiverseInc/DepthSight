@@ -4757,7 +4757,12 @@ class BaseStrategy:
         )
         if not entry_conditions_passed:
             reasons = self._get_failure_reasons(trace)
-            logger.debug(
+            # INFO, not DEBUG: an entry block that can never evaluate (e.g. a
+            # 200-period EMA on a timeframe seeded with fewer rows) returns
+            # False silently, and at DEBUG this line is invisible. The INFO at
+            # :4791-4793 prints only "FAILED. Signal rejected." with no
+            # reasons, so a dead strategy looks exactly like a patient one.
+            logger.info(
                 "%s >>> Entry conditions result: FAILED. Reasons: %s",
                 log_prefix,
                 ", ".join(reasons),

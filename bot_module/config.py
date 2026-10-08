@@ -1398,6 +1398,36 @@ TRAINER_TARGET_SYMBOLS = [
 TRAINER_ENABLED = True
 # Trainer start time by schedule (UTC)
 TRAINER_SCHEDULE_TIME = "03:00"
+# Minimum candle history required before a strategy may evaluate.
+#
+# WHY 205 AND NOT 20
+# ------------------
+# This value feeds two places, and BOTH derive the initial history download from
+# it:
+#   * bot_module/data_consumer.py:2417-2436  -- sizes the download
+#   * bot_module/controller.py:6161-6171      -- gates evaluation
+# Neither had any knowledge of the strategy's configured indicator periods, so
+# the old fallback of 20 only ever guaranteed ~20 candles per timeframe.
+#
+# That made a 200-period EMA structurally unreachable. `evaluate_ma_cross_scalar`
+# (condition_core.py:911-919) slices `df.tail(max(250, slow_p + 5))` and reads
+# both `.iloc[-1]` and `.iloc[-2]`, so it needs 205 rows for a defined cross.
+# Under the old value only timeframes faster than 15m seeded enough rows; 4h
+# seeded 24. The strategy showed "running" and never traded.
+#
+# It failed silently too: below `length` rows the pandas_ta accessor returns a
+# DataFrame rather than a Series, so `float()` raises TypeError at
+# condition_core.py:918, `except Exception` at :930 swallows it into
+# `return False, {"error": ...}`, and entry-condition failures log at DEBUG
+# (strategy.py:4760). At default log level an unevaluable block emits nothing.
+#
+# Raising this to 205 makes the existing derivation self-correct: 4h now needs a
+# 35-day lookback (210 candles) and 1d a 205-day one. The 5000-row cache ceiling
+# is not the binding constraint at any supported timeframe.
+#
+# Cost: larger initial downloads for slow timeframes.
+MIN_STRATEGY_HISTORY_CANDLES = int(os.environ.get("MIN_STRATEGY_HISTORY_CANDLES", 205))
+
 # Depth of historical data in days used for analysis/optimization
 TRAINER_DATA_LOOKBACK_DAYS = 2  # Was 90
 # Number of days of data overlap during loading for optimization (for indicator warm-up)

@@ -480,6 +480,11 @@ class TradingController:
     ):
         self.loop = loop if loop else asyncio.get_running_loop()
 
+        # (strategy_key, data_key, required) -> True once the insufficient-history
+        # ERROR has been logged, so a permanently-stalled strategy logs once
+        # instead of 10x/second. See _gather_required_data.
+        self._insufficient_history_seen: Dict[Any, bool] = {}
+
         self.event_queue = asyncio.Queue(maxsize=1000)
         self._event_handler_semaphore = asyncio.Semaphore(
             int(getattr(config, "MAX_PARALLEL_EVENT_HANDLERS", 64))
@@ -6165,8 +6170,27 @@ class TradingController:
                 if k.startswith("kline_"):
                     df = market_data.get(k)
                     if df is not None and len(df) < MIN_HISTORY_REQUIRED:
-                        logger.warning(
-                            f"{log_prefix} Insufficient history for {k}. Got {len(df)}, need {MIN_HISTORY_REQUIRED}. Waiting for cache priming."
+                        # This gate runs every loop (~0.1s). The download seeds the
+                        # cache ONCE, so once the key is marked loaded the row
+                        # count stops growing: if it is still short after that,
+                        # waiting cannot help and the strategy would show
+                        # "running" forever while silently never trading.
+                        # That is the same dead-seed failure this check was
+                        # meant to prevent, so escalate to ERROR and log ONCE
+                        # per (strategy, key) instead of 10x/second.
+                        seen_key = (k, MIN_HISTORY_REQUIRED)
+                        if self._insufficient_history_seen.get(seen_key):
+                            return None
+                        self._insufficient_history_seen[seen_key] = True
+
+                        logger.error(
+                            f"{log_prefix} Insufficient history for {k}: got {len(df)}, "
+                            f"need {MIN_HISTORY_REQUIRED}. History for this key is "
+                            f"already loaded and will not grow, so this strategy "
+                            f"CANNOT evaluate and will not trade. Either the symbol "
+                            f"has less history than {MIN_HISTORY_REQUIRED} candles at "
+                            f"this timeframe, or MIN_STRATEGY_HISTORY_CANDLES is set "
+                            f"above what the exchange can supply."
                         )
                         return None
 
