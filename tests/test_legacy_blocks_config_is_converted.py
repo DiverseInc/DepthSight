@@ -30,6 +30,7 @@ import pytest
 from bot_module import strategy as strategy_module
 from bot_module.legacy_blocks_migration import (
     LossyConversionError,
+    build_rsi_exit_block,
     convert_legacy_blocks_config,
     is_legacy_blocks_config,
 )
@@ -663,3 +664,131 @@ async def test_converted_rsi75_exit_does_not_close_below_the_threshold():
         f"position closed at RSI 72 with no cross of 75: {exit_details}"
     )
     assert updated.remaining_quantity == 1.0, "position was closed below the threshold"
+
+
+# --- the INJECTED exit: same shape, no `blocks` to convert from ---------------
+#
+# Rows repaired by the template swap no longer carry `blocks`; their exit has to
+# be injected rather than converted. This is hand-built JSON, so shape
+# assertions are not enough -- it has to fire through the real engine exactly
+# like a converted one.
+
+
+def _injected_config():
+    """A config already in engine format that has LOST its exit, as stored."""
+    converted = convert_legacy_blocks_config(RSI_LEGACY)
+    return {
+        "timeframe": converted["timeframe"],
+        "symbol": converted["symbol"],
+        "filters": converted["filters"],
+        "entryConditions": converted["entryConditions"],
+        "initialization": converted["initialization"],
+        # deliberately NO positionManagement -- this is the broken state
+    }
+
+
+@pytest.mark.asyncio
+async def test_injected_rsi75_exit_closes_through_the_real_engine():
+    """The injected block must behave identically to a converted one.
+
+    `build_rsi_exit_block` hand-builds engine JSON rather than translating it,
+    so it could produce something that parses and never fires -- the exact
+    dead-seed failure. Only driving the real `_execute_position_management`
+    proves otherwise.
+    """
+    cfg = _injected_config()
+    assert "positionManagement" not in cfg, "fixture must start with no exit"
+
+    cfg["positionManagement"] = build_rsi_exit_block()
+    inst = _instance(cfg)
+
+    md = _market_data()
+    pi = _pair_info(RSI_14=80.0)
+    df = md["kline_1m"]
+    cur = pi["current_candle_index"]
+    df["RSI_14"] = 80.0
+    df.iloc[cur - 1, df.columns.get_loc("RSI_14")] = 70.0
+    df.iloc[cur, df.columns.get_loc("RSI_14")] = 80.0
+
+    _, exit_details = await inst._execute_position_management(
+        cfg, _open_position(), pi, md, _pair_info(RSI_14=70.0)
+    )
+
+    assert exit_details is not None, (
+        "the INJECTED exit did not signal a close; it parses but is dead, "
+        "which is the failure this whole file exists to prevent"
+    )
+    assert exit_details["reason"] == "PM_ACTION_CLOSE", (
+        f"wrong reason {exit_details['reason']!r}"
+    )
+    assert exit_details["exit_price"] == pi["last_price"], (
+        f"exit price {exit_details['exit_price']!r} was not resolved from pair_info"
+    )
+
+
+@pytest.mark.asyncio
+async def test_injected_rsi75_exit_respects_the_threshold():
+    """Control for the injected exit: 70 -> 72 must NOT close."""
+    cfg = _injected_config()
+    cfg["positionManagement"] = build_rsi_exit_block()
+    inst = _instance(cfg)
+
+    md = _market_data()
+    pi = _pair_info(RSI_14=72.0)
+    df = md["kline_1m"]
+    cur = pi["current_candle_index"]
+    df["RSI_14"] = 72.0
+    df.iloc[cur - 1, df.columns.get_loc("RSI_14")] = 70.0
+    df.iloc[cur, df.columns.get_loc("RSI_14")] = 72.0
+
+    updated, exit_details = await inst._execute_position_management(
+        cfg, _open_position(), pi, md, _pair_info(RSI_14=70.0)
+    )
+
+    assert exit_details is None, (
+        f"injected exit closed at RSI 72 with no cross of 75: {exit_details}"
+    )
+    assert updated.remaining_quantity == 1.0
+
+
+def test_injected_exit_is_marked_to_always_evaluate():
+    """`analysis_level` must NOT be `second_bar_trigger`.
+
+    A node marked `second_bar_trigger` is skipped entirely during a cheap scan
+    and returns True (strategy.py:5248-5254). For a take-profit that would mean
+    silently ignored on the minute-bar pass.
+    """
+    node = build_rsi_exit_block()[0]["if_conditions"]["children"][0]
+    assert node["analysis_level"] == "minute_bar_filter", (
+        f"exit node analysis_level is {node['analysis_level']!r}; it would be "
+        f"skipped during the cheap scan and never trigger"
+    )
+    assert node["params"]["value"] == 75.0
+    assert node["params"]["operator"] == "cross_above"
+
+
+def test_injected_and_converted_exits_are_structurally_equivalent():
+    """An injected exit must be indistinguishable to the engine from a converted one.
+
+    Compares SHAPE (types, nesting, keys), not the generated ids, which are
+    random by design.
+    """
+    injected = build_rsi_exit_block()
+    converted = convert_legacy_blocks_config(RSI_LEGACY)["positionManagement"]
+
+    def shape(node):
+        out = {"type": node.get("type"), "params": node.get("params", {})}
+        if "children" in node:
+            out["children"] = [shape(c) for c in node["children"]]
+        if "then_actions" in node:
+            out["then_actions"] = [shape(a) for a in node["then_actions"]]
+        return out
+
+    def shape_pm(pm):
+        return {"type": pm["type"], "if": shape(pm["if_conditions"]),
+                "then": [shape(a) for a in pm["then_actions"]]}
+
+    assert shape_pm(injected[0]) == shape_pm(converted[0]), (
+        "the injected exit differs in shape from the converted one; the engine "
+        "may read one and not the other"
+    )

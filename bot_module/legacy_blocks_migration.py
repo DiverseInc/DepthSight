@@ -345,3 +345,55 @@ def convert_legacy_blocks_config(
 def is_legacy_blocks_config(config: Any) -> bool:
     """True when a stored config still carries the unread `blocks` key."""
     return isinstance(config, dict) and "blocks" in config
+
+
+def build_rsi_exit_block(
+    period: int = 14,
+    threshold: float = 75.0,
+    operator: str = "cross_above",
+) -> List[Dict[str, Any]]:
+    """An RSI take-profit expressed as engine-format `positionManagement`.
+
+    Needed for rows whose ORIGINAL `blocks` are already gone -- repaired by the
+    template swap, which overwrote config_data and dropped the exit. Those rows
+    cannot be recovered by `convert_legacy_blocks_config`; the exit has to be
+    injected instead.
+
+    Shape mirrors what the converter emits for a `close_position` block, so an
+    injected exit and a converted one are indistinguishable to the engine.
+    `close_position` is an ACTION and only runs inside `conditional_management`
+    (strategy.py:4307).
+
+    `analysis_level` is `minute_bar_filter` on purpose: a node is only skipped
+    during a cheap scan when it says `second_bar_trigger` (strategy.py:5248-5254),
+    so a take-profit must be evaluated at every level.
+    """
+    if operator not in ("cross_above", "cross_below"):
+        raise LossyConversionError(
+            f"exit operator {operator!r} is not a cross; refusing to build an exit"
+        )
+    return [
+        {
+            "id": _uid("pm"),
+            "type": "conditional_management",
+            "if_conditions": {
+                "id": _uid("x"),
+                "type": "AND",
+                "children": [
+                    {
+                        "id": f"rsi_exit_{_uid('r')}",
+                        "type": "rsi_condition",
+                        "analysis_level": "minute_bar_filter",
+                        "params": {
+                            "period": int(period),
+                            "operator": operator,
+                            "value": _num(threshold, "threshold", "exit"),
+                        },
+                    }
+                ],
+            },
+            "then_actions": [
+                {"id": _uid("act"), "type": "close_position", "params": {}}
+            ],
+        }
+    ]
