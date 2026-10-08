@@ -8997,6 +8997,66 @@ class TradingController:
                 f"{log_prefix} UNEXPECTED EXCEPTION in _process_signal: {e_proc_sig}",
                 exc_info=True,
             )
+            # FIX 2026-10-07: release the RESERVING slot reservation.
+            #
+            # `_process_signal` inserts a zero-quantity placeholder with status
+            # "RESERVING" BEFORE doing any exchange work, to stop a second
+            # signal for the same symbol racing in. It is popped again on each
+            # explicit failure path further up, but the generic handler here
+            # did NOT pop it. So any unexpected exception after the reservation
+            # leaked the placeholder forever.
+            #
+            # A leaked reservation is the same failure shape as the 2026-10-07
+            # incident, and worse in one respect: the record is invisible to
+            # `_publish_state_to_redis` (which skips status != "OPEN"), so
+            # `/api/v1/positions` returns [] while the bot still holds the slot.
+            # It also counts toward `max_concurrent_trades`, since RESERVING is
+            # in that status tuple. The practical effect is that the symbol can
+            # never open a position again, with no money moved and nothing in
+            # the API to explain why.
+            #
+            # Observed live 2026-10-07: BTCUSDT stuck in RESERVING, surfaced
+            # only by `_ensure_paper_exit_orders_present`'s "NOT in OPEN status"
+            # warning, not by any endpoint.
+            #
+            # Only pop if it is STILL the zero-quantity placeholder. By this
+            # point the reservation may have been promoted into a real filled
+            # position, and popping that would orphan a live trade.
+            try:
+                async with self._positions_dict_lock:
+                    _leaked = self._active_position_get(
+                        signal.symbol, initial_market_type
+                    )
+                    _is_placeholder = (
+                        _leaked is not None
+                        and _leaked.status == "RESERVING"
+                        and abs(getattr(_leaked, "remaining_quantity", 0.0) or 0.0)
+                        <= 1e-9
+                    )
+                    if _is_placeholder:
+                        self._active_position_pop(
+                            signal.symbol, initial_market_type
+                        )
+                        logger.warning(
+                            f"{log_prefix} Released the RESERVING placeholder "
+                            f"for {signal.symbol} after the exception above. "
+                            f"Without this the symbol would stay blocked with "
+                            f"the slot leaked and no visible position."
+                        )
+                    elif _leaked is not None:
+                        # Something real took the slot over; leave it alone.
+                        logger.info(
+                            f"{log_prefix} Reservation slot for {signal.symbol} "
+                            f"is now status='{_leaked.status}', not the "
+                            f"placeholder. Leaving it untouched."
+                        )
+            except Exception as reservation_cleanup_err:
+                # Never let cleanup mask the original exception.
+                logger.error(
+                    f"{log_prefix} Failed to release RESERVING placeholder for "
+                    f"{signal.symbol}: {reservation_cleanup_err}",
+                    exc_info=True,
+                )
         finally:
             async with self._processing_signal_lock:
                 if processing_key in self._processing_signal_for_symbol:

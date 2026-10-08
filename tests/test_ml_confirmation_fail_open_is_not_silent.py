@@ -481,3 +481,87 @@ def test_log_scope_is_a_property_not_a_constructor_step():
         "_log_scope must be declared as a @property at class level. If it is "
         "defined inside __init__ it becomes dead code after its return."
     )
+
+
+# --- the RESERVING placeholder leak -------------------------------------------
+
+
+def test_exception_after_reservation_does_not_leak_the_slot():
+    """An unexpected exception must NOT leave a RESERVING placeholder behind.
+
+    `_process_signal` inserts a zero-quantity `RESERVING` placeholder before any
+    exchange work so a second signal for the same symbol cannot race in. It is
+    popped on every explicit failure path, but the generic `except Exception`
+    did not pop it -- so any unexpected exception leaked the reservation
+    permanently.
+
+    A leaked reservation is invisible to `_publish_state_to_redis` (which skips
+    status != "OPEN"), so `/api/v1/positions` returns [] while the bot still
+    holds the slot. It also counts toward `max_concurrent_trades`, because
+    RESERVING is in that status tuple. The symbol can then never open a
+    position again, with no money moved and nothing in the API to explain it.
+
+    Observed live 2026-10-07 as `BTCUSDT=RESERVING`.
+    """
+    controller = _build_controller(use_ml_confirmation=False)
+
+    # Drive the REAL method and blow up inside it, after the reservation.
+    async def _boom(*a, **k):
+        raise RuntimeError("simulated mid-flight failure")
+
+    controller._get_market_info = _boom
+    signal = _make_signal()
+    _run(controller, signal)
+
+    leftover = controller._active_position_get("BTCUSDT", "futures")
+    assert leftover is None, (
+        f"The RESERVING placeholder leaked after an exception. The symbol is "
+        f"now permanently blocked, invisible to the API, and consuming a "
+        f"concurrent-trades slot. Leaked record: status="
+        f"{getattr(leftover, 'status', None)!r}"
+    )
+
+
+def test_exception_does_not_pop_a_real_position():
+    """Cleanup must never orphan a real trade.
+
+    By the time the handler runs, the reservation may have been promoted into a
+    genuine filled position. Popping that would remove a live trade from
+    tracking while the exchange still holds it.
+
+    The record is mutated IN PLACE rather than replaced with a fresh
+    `LivePosition`, because `ActivePositionMap` keys on a normalised
+    market-type string and a synthetic position can land under a different key
+    than the one the controller reserved. Mutating preserves the exact key and
+    tests the guard itself: zero-quantity RESERVING is the placeholder, anything
+    else is real and must survive.
+    """
+    controller = _build_controller(use_ml_confirmation=False)
+    captured = {}
+
+    async def _promote_then_boom(*a, **k):
+        # The placeholder already exists under the controller's own key.
+        key = controller._position_key("BTCUSDT", "futures")
+        placeholder = controller._active_positions.get(key)
+        assert placeholder is not None, "expected the reservation to exist"
+        captured["placeholder"] = placeholder
+        # Simulate it being promoted into a real filled position mid-flight.
+        placeholder.status = "OPEN"
+        placeholder.remaining_quantity = 0.01
+        placeholder.entry_price = 92000.0
+        raise RuntimeError("simulated failure AFTER the position went live")
+
+    controller._get_market_info = _promote_then_boom
+    signal = _make_signal()
+    _run(controller, signal)
+
+    survivor = controller._active_position_get("BTCUSDT", "futures")
+    assert survivor is not None, (
+        "A real OPEN position was popped by the reservation cleanup. That "
+        "orphans a live trade while the exchange still holds it."
+    )
+    assert survivor.status == "OPEN"
+    assert survivor is captured["placeholder"], (
+        "The map must still hold the same object; a pop-and-reinsert would "
+        "mean the cleanup removed the record entirely."
+    )
