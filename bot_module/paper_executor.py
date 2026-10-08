@@ -525,6 +525,58 @@ class PaperTradingExecutor:
             logger.warning(f"{log_prefix} {msg}")
             return {"error": True, "code": -2011, "msg": "Unknown order sent."}
 
+    async def cancel_all_open_orders(self, symbol: str) -> Dict[str, Any]:
+        """Cancels every resting order for one symbol.
+
+        This method was missing entirely. `BaseExecutor` declares it
+        (exchanges/base.py) and ccxt_executor implements it, but the paper
+        executor did not -- so every paper position close raised
+        `AttributeError: 'PaperTradingExecutor' object has no attribute
+        'cancel_all_open_orders'` at the three controller call sites
+        (`_handle_final_exit` hard reset, pre-market-close, post-close
+        confirmation).
+
+        The close still completed, because all three sites catch `Exception`
+        and log. That is what made it dangerous: the "Hard Reset ... to be 100%
+        safe" safety net raised, logged an error, and moved on, leaving the
+        stop-loss and take-profit orders resting on the book. An orphaned SL
+        can then fire against a position that no longer exists.
+
+        Returns the same shape as the ccxt executor: a dict without an
+        "error" key on success, `{"error": True, ...}` on failure, which is
+        exactly what the three callers branch on.
+        """
+        log_prefix = f"[PaperCancelAllOrders:{symbol}]"
+        target = (symbol or "").upper()
+
+        try:
+            matching_cids = [
+                cid
+                for cid, order in self._open_orders.items()
+                if str(order.get("symbol", "")).upper() == target
+            ]
+            if not matching_cids:
+                logger.info(f"{log_prefix} No resting orders for {target}; nothing to cancel.")
+                return {"symbol": target, "status": "OK", "count": 0, "cancelled": []}
+
+            for cid in matching_cids:
+                cancelled = self._open_orders.pop(cid)
+                cancelled["status"] = "CANCELED"
+
+            logger.info(
+                f"{log_prefix} Cancelled {len(matching_cids)} order(s) for {target}: "
+                f"{', '.join(matching_cids)}"
+            )
+            return {
+                "symbol": target,
+                "status": "OK",
+                "count": len(matching_cids),
+                "cancelled": matching_cids,
+            }
+        except Exception as e:
+            logger.error(f"{log_prefix} Error: {e}", exc_info=True)
+            return {"error": True, "code": -999, "msg": str(e)}
+
     async def get_open_orders(self, symbol: Optional[str] = None) -> list:
         if symbol:
             return [

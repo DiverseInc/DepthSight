@@ -9952,6 +9952,65 @@ class TradingController:
                     name=f"TelegramNotify_PartialTP_{symbol}_{tp_index}",
                 )
 
+    async def _hard_reset_cancel_all_orders(
+        self,
+        executor: Any,
+        symbol: str,
+        log_prefix: str,
+    ) -> Dict[str, Any]:
+        """Symbol-wide "cancel everything resting" safety net on the close path.
+
+        Every executor implements `cancel_all_open_orders` as returning a dict
+        that reports failure in-band via an `"error"` key -- `PaperTradingExecutor`
+        and `ccxt_executor` both catch their own exceptions and return
+        `{"error": True, "code": ..., "msg": ...}` rather than raising.
+
+        The call site this replaced awaited the coroutine and logged
+        "cancelled successfully" UNCONDITIONALLY. An in-band error therefore
+        produced a success log while resting stop-loss and take-profit orders
+        survived -- the safety net whose own comment says "to be 100% safe"
+        failing quietly. It also could not be tested, being inline in a ~300
+        line function.
+
+        The other two call sites (`:14749`, `:15220`) already branched on the
+        error key; this brings the third into line. Returns the executor's
+        response so callers can still inspect it.
+        """
+        try:
+            response = await asyncio.wait_for(
+                executor.cancel_all_open_orders(symbol),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"{log_prefix} Hard Reset: Timeout cancelling open orders for {symbol}."
+                f" Scheduling background retry."
+            )
+            self.loop.create_task(
+                executor.cancel_all_open_orders(symbol),
+                name=f"FinalExitHardCancelRetry_{symbol}",
+            )
+            return {"error": True, "code": -110, "msg": "timeout"}
+
+        except Exception as e:
+            logger.error(
+                f"{log_prefix} Hard Reset: Error cancelling open orders: {e}",
+                exc_info=True,
+            )
+            return {"error": True, "code": -999, "msg": str(e)}
+
+        if isinstance(response, dict) and response.get("error"):
+            logger.error(
+                f"{log_prefix} Hard Reset: cancel_all_open_orders reported a failure "
+                f"for {symbol}: {response}. Orders may still be resting."
+            )
+            return response
+
+        logger.info(
+            f"{log_prefix} Hard Reset: All open orders for {symbol} cancelled successfully."
+        )
+        return response
+
     async def _handle_final_exit(
         self,
         symbol: str,
@@ -10226,27 +10285,12 @@ class TradingController:
         logger.info(
             f"{log_prefix} Triggering symbol-wide 'Hard Reset' order cancellation for {symbol}."
         )
-        try:
-            await asyncio.wait_for(
-                executor_for_cancel.cancel_all_open_orders(symbol),
-                timeout=10.0,
-            )
-            logger.info(
-                f"{log_prefix} Hard Reset: All open orders for {symbol} cancelled successfully."
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                f"{log_prefix} Hard Reset: Timeout cancelling open orders for {symbol}. Scheduling background retry."
-            )
-            self.loop.create_task(
-                executor_for_cancel.cancel_all_open_orders(symbol),
-                name=f"FinalExitHardCancelRetry_{symbol}",
-            )
-        except Exception as e:
-            logger.error(
-                f"{log_prefix} Hard Reset: Error cancelling open orders: {e}",
-                exc_info=True,
-            )
+        # The response is checked in-band by the helper: executors report
+        # failure in the returned dict rather than raising, and this site used
+        # to log "cancelled successfully" regardless of what came back.
+        await self._hard_reset_cancel_all_orders(
+            executor_for_cancel, symbol, log_prefix
+        )
 
         if position_to_process_copy:
             await self.rm.update_trade_result(
