@@ -111,6 +111,15 @@ class _FakeRedis:
     async def get(self, key):
         return json.dumps(self._snapshot)
 
+    async def set(self, key, value):
+        # Added so the real `_save_runtime_state` can be exercised in tests that
+        # assert on what the controller WRITES, not only what it reads back.
+        try:
+            self._snapshot = json.loads(value)
+        except (TypeError, ValueError):
+            self._snapshot = value
+        return True
+
 
 class _FakeLiveExecutor:
     """Stands in for a real exchange connection on the live-controller test only."""

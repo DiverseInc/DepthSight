@@ -3296,8 +3296,29 @@ class TradingController:
             # Collect data that is critically important for recovery
             # JSON-compatible serialization under dictionary lock to prevent iteration errors
             async with self._positions_dict_lock:
+                # FIX 2026-10-07: do NOT persist RESERVING placeholders.
+                #
+                # A `RESERVING` position is an in-process mutex. `_process_signal`
+                # inserts one to stop a second signal for the same symbol racing
+                # in while this process places its entry order, and it is popped
+                # when that work finishes. It has NO meaning across processes: the
+                # reservation belongs to a process that is by definition no longer
+                # running, and nothing will ever release it.
+                #
+                # Serializing it anyway (this loop used to include every entry
+                # regardless of status) made a transient lock durable. Observed
+                # live: BTCUSDT stayed RESERVING across a full restart, kept
+                # blocking every entry for that symbol, stayed invisible to
+                # `/api/v1/positions`, and consumed a `max_concurrent_trades`
+                # slot -- so a restart, the obvious remedy, could never clear it.
+                #
+                # `_load_runtime_state` now also discards any RESERVING it finds
+                # in already-persisted state, which is what clears the existing
+                # stuck record on the next deploy.
                 serialized_positions = {
-                    k: v.to_dict() for k, v in self._active_positions.items()
+                    k: v.to_dict()
+                    for k, v in self._active_positions.items()
+                    if getattr(v, "status", None) != "RESERVING"
                 }
 
             state_snapshot = {
@@ -3547,6 +3568,7 @@ class TradingController:
 
                 # 1. Deserialize all positions first
                 restored_positions_objects = {}
+                discarded_reserving = []
                 for k, v in restored_positions_raw.items():
                     try:
                         pos = LivePosition.from_dict(v)
@@ -3555,11 +3577,41 @@ class TradingController:
                         if getattr(pos, "api_key_id", None) is None:
                             pos.api_key_id = self.api_key_id
 
+                        # FIX 2026-10-07: never restore a RESERVING placeholder.
+                        #
+                        # `RESERVING` is an in-process mutex used by
+                        # `_process_signal` to stop two signals racing in for one
+                        # symbol. A reservation belonging to a process that is no
+                        # longer running is meaningless -- nothing will ever
+                        # release it -- so restoring one converts a transient lock
+                        # into a permanent one. `_save_runtime_state` no longer
+                        # writes these, but state persisted by an earlier build can
+                        # still contain one, and dropping it here is what clears
+                        # the record that is already stuck.
+                        #
+                        # Restoring it also has no upside: a placeholder carries
+                        # zero quantity and a `RESERVE_` client order id, so there
+                        # is no real exposure to recover.
+                        if getattr(pos, "status", None) == "RESERVING":
+                            discarded_reserving.append(k)
+                            continue
+
                         restored_positions_objects[k] = pos
                     except Exception as e:
                         logger.error(
                             f"{log_prefix} Error deserializing position {k}: {e}"
                         )
+
+                if discarded_reserving:
+                    logger.warning(
+                        f"{log_prefix} Discarded {len(discarded_reserving)} "
+                        f"RESERVING placeholder(s) from saved state: "
+                        f"{', '.join(discarded_reserving)}. These are in-process "
+                        f"signal reservations owned by a previous process; "
+                        f"restoring one would block that symbol permanently, "
+                        f"stay invisible to the dashboard, and consume a "
+                        f"max_concurrent_trades slot."
+                    )
 
                 validated_positions = {}
                 # 2. Getting real positions from the exchange for verification
