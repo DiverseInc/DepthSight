@@ -316,7 +316,17 @@ async def test_ensure_subscription_for_kline_and_history_load(
         # App adds to global registry, and our fixture linked them
         from bot_module import data_consumer as dc_mod
 
-        assert cache_key_hist in dc_mod._global_history_loaded_keys
+        # CHANGED 2026-10-09. This used to assert the key WAS added, i.e. it
+        # encoded the bug: an EMPTY download marked history as loaded anyway.
+        # _global_history_loaded_keys has no TTL, no sweeper and no discard()
+        # in production code, so that made the failure permanent for the life
+        # of the process -- the download could never be retried. The mock above
+        # returns an empty DataFrame, so the correct expectation is the
+        # opposite: do NOT mark it loaded.
+        assert cache_key_hist not in dc_mod._global_history_loaded_keys, (
+            "an empty download marked history as loaded; every later call "
+            "short-circuits at the global-cache-hit gate and never retries"
+        )
 
         task_key = "binance:spot:validspot@kline_1m"
         assert task_key in data_consumer_instance._binance_market_data_ws_tasks

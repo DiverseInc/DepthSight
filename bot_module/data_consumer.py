@@ -1652,21 +1652,74 @@ class DataConsumer:
                 if not rows:
                     return False
                 cache_deque = _global_kline_cache[cache_key]
+                # MERGE, do not replace.
+                #
+                # This used to `clear()` then `extend(rows)`, so a SHORT snapshot
+                # would wipe whatever history had already been downloaded or
+                # streamed. Once `_ensure_history_loaded` started fetching real
+                # history in Redis mode, a later short snapshot would silently
+                # undo it and put the cache back to ~103 live rows.
+                #
+                # Merge by timestamp, same as the download path does at
+                # data_consumer.py:2564-2568: snapshot rows win on collision
+                # (they are the fresher shared copy), everything else is kept.
+                existing_rows = list(cache_deque)
+                merged: Dict[int, Any] = {int(r[0]): r for r in existing_rows}
+                for row in rows:
+                    merged[int(row[0])] = row
+                sorted_merged = sorted(merged.values(), key=lambda r: int(r[0]))
                 cache_deque.clear()
-                cache_deque.extend(rows)
+                cache_deque.extend(sorted_merged)
                 _global_kline_df_cache[cache_key] = (
-                    _build_kline_dataframe_from_cache_rows(rows)
+                    _build_kline_dataframe_from_cache_rows(sorted_merged)
                 )
                 legacy_cache_key = f"{exchange_id}:{symbol}:{timeframe}"
                 if legacy_cache_key != cache_key:
                     legacy_deque = _global_kline_cache[legacy_cache_key]
+                    # Same merge semantics as the canonical key above -- keep
+                    # anything already present rather than replacing it with a
+                    # potentially shorter snapshot.
+                    legacy_merged: Dict[int, Any] = {
+                        int(r[0]): r for r in legacy_deque
+                    }
+                    for row in sorted_merged:
+                        legacy_merged[int(row[0])] = row
                     legacy_deque.clear()
-                    legacy_deque.extend(rows)
+                    legacy_deque.extend(
+                        sorted(legacy_merged.values(), key=lambda r: int(r[0]))
+                    )
                     _global_kline_df_cache[legacy_cache_key] = _global_kline_df_cache[
                         cache_key
                     ].copy()
-                _global_history_loaded_keys.add(cache_key)
-                _global_history_loaded_keys.add(legacy_cache_key)
+                # A snapshot must NOT mark history loaded on its own.
+                #
+                # This used to add the key unconditionally, on every snapshot,
+                # regardless of how many rows it carried. That defeated both
+                # the redis-mode fallthrough above AND the "don't stamp on empty"
+                # rule in the download path: a download that failed left the key
+                # unmarked (correct), then a ~103-row snapshot arrived, marked it
+                # loaded anyway, and every later _ensure_history_loaded call
+                # short-circuited at the global-cache-hit gate. The retry the
+                # download path enables was disarmed the moment a snapshot landed.
+                #
+                # The set has no TTL and no discard(), so a wrong add here is
+                # permanent for the life of the process. Only add the key when
+                # the merged cache is actually big enough to satisfy a strategy.
+                required_for_snapshot = int(
+                    getattr(config, "MIN_STRATEGY_HISTORY_CANDLES", 20)
+                )
+                merged_total = len(sorted_merged)
+                if merged_total >= required_for_snapshot:
+                    _global_history_loaded_keys.add(cache_key)
+                    _global_history_loaded_keys.add(legacy_cache_key)
+                else:
+                    logger.info(
+                        f"[RedisMarketData] Snapshot for {cache_key} merged "
+                        f"{len(rows)} rows but the cache holds {merged_total} of "
+                        f"{required_for_snapshot} required candles. NOT marking "
+                        f"history loaded, so the next _ensure_history_loaded call "
+                        f"falls through to a direct exchange download."
+                    )
                 async with _global_pairs_lock:
                     _global_active_pairs[symbol]["last_price"] = float(rows[-1][4])
                 await self._apply_pair_state_update(
@@ -1859,7 +1912,9 @@ class DataConsumer:
                     )
                 else:
                     logger.info(
-                        "[RedisMarketData] shared snapshot not ready for %s; live payloads will fill local cache.",
+                        "[RedisMarketData] shared snapshot not ready for %s; "
+                        "live payloads will fill local cache until the exchange "
+                        "history download completes.",
                         spec["stream_key"],
                     )
 
@@ -2063,10 +2118,28 @@ class DataConsumer:
                     data_type_key, uc_symbol, timeframe, market_type_sub, exchange_id
                 )
                 if not history_loaded:
-                    logger.error(
-                        f"{log_prefix} Kline history FAILED for exchange '{exchange_id}', market '{market_type_sub}'. WebSocket will NOT be started."
+                    # History is a WARMUP concern; the websocket is the actual
+                    # data source. Do not skip the stream.
+                    #
+                    # Before the empty-download fix this returned True here even
+                    # with zero candles, so the WS started on live-only data.
+                    # Once empty downloads stopped stamping the key loaded, that
+                    # path began returning False, and this `continue` would kill
+                    # the stream outright on a single empty REST response --
+                    # with no stream, nothing can ever re-prime the cache.
+                    #
+                    # Starting the WS is safe: controller.py's
+                    # MIN_STRATEGY_HISTORY_CANDLES gate already refuses to run
+                    # any strategy that needs more history than the cache holds,
+                    # and the next subscription attempt retries the download.
+                    logger.warning(
+                        f"{log_prefix} Kline history is NOT loaded for exchange "
+                        f"'{exchange_id}', market '{market_type_sub}'. Starting the "
+                        f"WebSocket anyway on live-only data: strategies needing "
+                        f"more history stay blocked by the "
+                        f"MIN_STRATEGY_HISTORY_CANDLES gate until a later "
+                        f"subscription retries the download."
                     )
-                    continue
 
             # GLOBAL REGISTRY WITH BROADCAST
             # One WebSocket per unique stream, events are broadcast to ALL queues
@@ -2175,10 +2248,47 @@ class DataConsumer:
             bool: True if history was successfully loaded (or was loaded previously), False in case of error.
         """
         if self._market_data_mode == "redis":
-            logger.debug(
-                f"DataConsumer is in REDIS mode. Skipping local history download for {data_type_key}:{symbol_uc}."
-            )
-            return True
+            # THE ROOT CAUSE (2026-10-09)
+            # ------------------------------
+            # This branch used to `return True` unconditionally, so in Redis
+            # mode -- which is how PRODUCTION runs (MARKET_DATA_FANOUT_MODE=redis)
+            # -- no kline history was EVER downloaded. The shared Redis snapshot
+            # is meant to supply history instead, but when it is absent or short
+            # the cache silently degraded to live websocket candles only
+            # (~103 rows for kline_1m). Any MIN_STRATEGY_HISTORY_CANDLES above
+            # that was then unsatisfiable, and the gate in controller.py
+            # blocked every 1m strategy with an ERROR nobody could trace here,
+            # because this skip was logged at DEBUG.
+            #
+            # The snapshot is an OPTIMISATION, not the only source of history.
+            # Fall through to the real download whenever the cache is not
+            # already adequately primed.
+            if data_type_key.startswith("kline_") and timeframe:
+                cache_key = _kline_cache_key(
+                    symbol_uc, timeframe, exchange_id, market_type
+                )
+                required = int(
+                    getattr(config, "MIN_STRATEGY_HISTORY_CANDLES", 20)
+                )
+                async with _global_cache_lock:
+                    have = len(_global_kline_cache.get(cache_key, ()))
+                if have >= required:
+                    logger.debug(
+                        f"[HistLoadEnsure:{symbol_uc}:{timeframe}] Redis mode but cache "
+                        f"already holds {have} >= {required} candles; skipping download."
+                    )
+                    return True
+                logger.info(
+                    f"[HistLoadEnsure:{symbol_uc}:{timeframe}] Redis mode, but cache holds "
+                    f"only {have} of {required} required candles. Fetching history from the "
+                    f"exchange instead of relying on the shared snapshot."
+                )
+            else:
+                logger.debug(
+                    f"DataConsumer is in REDIS mode. Skipping local history download for "
+                    f"{data_type_key}:{symbol_uc}."
+                )
+                return True
 
         # Step 1: Define a unique key for the cache and a prefix for logs
         log_prefix_base = f"[HistLoadEnsure:{symbol_uc}]"
@@ -2201,7 +2311,11 @@ class DataConsumer:
         # Step 2: Check if the history has already been loaded or if the task is already active (GLOBALLY)
         async with _global_cache_lock:
             if cache_key in _global_history_loaded_keys:
-                logger.debug(
+                # INFO, not DEBUG. This short-circuit is why the 2026-10-08
+                # investigation produced no log lines at all: a key marked
+                # loaded with zero candles makes every later call return here
+                # silently, so the failure was invisible at default log level.
+                logger.info(
                     f"{log_prefix} History already loaded (global cache hit). Returning True."
                 )
                 return True
@@ -2475,6 +2589,17 @@ class DataConsumer:
                                 f"{log_prefix} Error parsing CCXT OHLCV row: {row}, error: {e}"
                             )
 
+                    if not historical_candles_tuples:
+                        # Same reasoning as the binance branch below: never
+                        # stamp a key as loaded when the fetch produced nothing,
+                        # or the "global cache hit" gate blocks every retry for
+                        # the life of the process (no TTL, no discard()).
+                        logger.error(
+                            f"{log_prefix} CCXT fetch returned NO candles for {cache_key}. "
+                            f"Not marking history as loaded so a later call can retry."
+                        )
+                        return
+
                     async with _global_cache_lock:
                         cache_deque = _global_kline_cache[cache_key]
                         existing_live_candles = list(cache_deque)
@@ -2546,14 +2671,32 @@ class DataConsumer:
                         )
                         continue
 
-                if not historical_candles_tuples and not df_history.empty:
-                    logger.warning(
-                        f"{log_prefix} No valid tuples from historical data, though df_history was not empty. Downloaded df head:\n{df_history.head().to_string()}"
-                    )
-                elif not historical_candles_tuples and df_history.empty:
-                    logger.info(
-                        f"{log_prefix} historical_candles_tuples is empty because df_history was empty. Proceeding to mark history loaded."
-                    )
+                if not historical_candles_tuples:
+                    # Never mark this key loaded on a fetch that yielded nothing
+                    # usable. BOTH sub-cases have to return.
+                    #
+                    # The non-empty-but-unparseable case used to only log a
+                    # warning and then fall through to the merge/marking block
+                    # below, which added the key with ZERO candles -- silently
+                    # disarming every future retry for the life of the process.
+                    # Unparseable rows usually mean a column/schema mismatch,
+                    # which is precisely the case worth retrying.
+                    if df_history.empty:
+                        logger.error(
+                            f"{log_prefix} Download returned NO candles for {cache_key}. "
+                            f"Not marking history as loaded, so a later call can retry. "
+                            f"The cache will be served from live websocket candles only "
+                            f"until then, and any strategy needing more history than that "
+                            f"will be blocked by the MIN_STRATEGY_HISTORY_CANDLES gate."
+                        )
+                    else:
+                        logger.error(
+                            f"{log_prefix} Download returned {len(df_history)} rows for "
+                            f"{cache_key} but none could be parsed (expected OHLCV columns). "
+                            f"Not marking history as loaded, so a later call can retry. "
+                            f"Downloaded df head:\n{df_history.head().to_string()}"
+                        )
+                    return
 
             # Using GLOBAL cache for multi-user mode
             async with _global_cache_lock:
