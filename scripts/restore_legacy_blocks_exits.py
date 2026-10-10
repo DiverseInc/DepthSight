@@ -24,8 +24,18 @@ SAFETY
     cannot be converted losslessly is reported and skipped.
 
 USAGE (on Elestio, from /opt/app/depthsight)
-    docker compose exec -T bot python scripts/restore_legacy_blocks_exits.py --dry-run
-    docker compose exec -T bot python scripts/restore_legacy_blocks_exits.py --apply
+
+    # 1. always dry-run first (nothing is written without --apply)
+    docker compose exec -T bot python scripts/restore_legacy_blocks_exits.py \
+      --ids be485ab9-384a-4adb-9f9b-a2df412d6db0 --sl-atr 1.5 --tp-rr 2.0
+
+    # 2. only after reviewing the dry-run output
+    docker compose exec -T bot python scripts/restore_legacy_blocks_exits.py \
+      --ids be485ab9-384a-4adb-9f9b-a2df412d6db0 --sl-atr 1.5 --tp-rr 2.0 --apply
+
+--sl-atr and --tp-rr are REQUIRED and have no defaults. Legacy blocks carry no
+stop-loss or take-profit, so any value supplied here introduces a risk
+parameter that did not previously exist. That is an operator decision.
 """
 
 import argparse
@@ -44,17 +54,17 @@ from bot_module.legacy_blocks_migration import (  # noqa: E402
     is_legacy_blocks_config,
 )
 
-# The six rows repaired by the template swap, with the RSI-75 exit removed.
-TARGET_IDS = [
-    "571be7ef1b7a4a6f9c2d3e4f5a6b7c8d",
-    "c118a7024e5f6a7b8c9d0e1f2a3b4c5d",
-    "37fcdcb0c2d3e4f5a6b7c8d9e0f1a2b3c",
-    "5b804b4f3a4b5c6d7e8f9a0b1c2d3e4f",
-    "7c9f4a7e5b6c7d8e9f0a1b2c3d4e5f6",
-    "6f9cce45d6e7f8a9b0c1d2e3f4a5b6c",
-]
-
 BACKUP_PATH = "/app/logs/blocks_restore_backup.csv"
+
+# NOTE: this script previously carried a hardcoded TARGET_IDS list of
+# PLACEHOLDER uuids that matched no real row. They were flagged as
+# placeholders rather than fabricated into plausible-looking ids. Targets are
+# now passed explicitly with --ids so a wrong id can never look real.
+#
+# Verified live 2026-10-08 (16-row audit) -- still legacy `blocks`:
+#   be485ab9-384a-4adb-9f9b-a2df412d6db0  paper-test-2       BTCUSDT 1h  RSI 55/75  converts cleanly
+#   e43d1cb2-123c-4ca7-ba4f-bb25d245e969  paper-bollinger-1  ETHUSDT 15m Bollinger    REFUSED (reaches_middle lossy)
+#   e898f74e                              EMA 50/200 Golden Cross 4h               see audit note
 
 
 def _dsn():
@@ -67,20 +77,34 @@ def _dsn():
 
 async def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--ids",
+        nargs="+",
+        required=True,
+        help="full config ids (uuids) to convert. Explicit on purpose: a wrong "
+        "id must never be able to look like a real one.",
+    )
     ap.add_argument("--apply", action="store_true", help="actually write (default: dry run)")
     ap.add_argument(
         "--sl-atr",
         type=float,
-        default=1.5,
-        help="stop-loss ATR multiple; legacy blocks carry no SL, so this is a decision",
+        required=True,
+        help="stop-loss ATR multiple. REQUIRED, no default: legacy blocks carry no "
+        "stop-loss, so any value here is a risk decision that belongs to the "
+        "operator, not to this script.",
     )
     ap.add_argument(
         "--tp-rr",
         type=float,
-        default=2.0,
-        help="take-profit reward:risk; legacy blocks carry no TP, so this is a decision",
+        required=True,
+        help="take-profit reward:risk. REQUIRED, no default, for the same reason "
+        "as --sl-atr.",
     )
     args = ap.parse_args()
+
+    if args.sl_atr <= 0 or args.tp_rr <= 0:
+        print("--sl-atr and --tp-rr must both be > 0")
+        return 1
 
     import asyncpg
 
@@ -94,14 +118,16 @@ async def main():
 
     rows = await conn.fetch(
         "SELECT id::text AS id, name, config_data FROM strategy_configs WHERE id::text = ANY($1::text[])",
-        TARGET_IDS,
+        list(args.ids),
     )
     if not rows:
         print("No matching strategies found. Check the ids against the live DB.")
         await conn.close()
         return 1
 
-    print(f"Found {len(rows)} target strategies.\n")
+    print(f"Found {len(rows)} target strategies.")
+    print(f"Risk parameters: sl_atr={args.sl_atr}  tp_rr={args.tp_rr}")
+    print("(these are NOT carried in legacy blocks - they are being introduced)\n")
 
     backup_rows, planned, skipped = [], [], []
 
@@ -125,7 +151,9 @@ async def main():
         pm = converted.get("positionManagement", [])
         has_exit = bool(pm) and pm[0].get("then_actions")
         backup_rows.append({"id": row["id"], "name": row["name"], "config_data": json.dumps(cfg)})
-        planned.append((row["id"], row["name"], converted, has_exit))
+        planned.append(
+            (row["id"], row["name"], converted, has_exit, json.dumps(cfg))
+        )
 
         print(f"  {row['id'][:8]}  {row['name'][:40]:<40} exit_restored={has_exit}")
 
@@ -137,8 +165,8 @@ async def main():
     missing = [p for p in planned if not p[3]]
     if missing:
         print(f"\nWARNING: {len(missing)} row(s) would be written WITHOUT an exit:")
-        for sid, name, _, _ in missing:
-            print(f"  {sid[:8]}  {name}")
+        for p in missing:
+            print(f"  {p[0][:8]}  {p[1]}")
 
     if not planned:
         print("\nNothing to do.")
@@ -159,24 +187,41 @@ async def main():
 
     # The guard makes this idempotent AND protects any row edited since the swap:
     # only rows that still carry the legacy 'blocks' key are overwritten.
-    applied = 0
-    for sid, _name, converted, _has_exit in planned:
+    applied, contended = 0, 0
+    for sid, _name, converted, _has_exit, original_cfg in planned:
+        # Compare-and-swap. The jsonb_exists check alone only proves a key named
+        # 'blocks' is present; it does not prove the row is still the row we
+        # read. A concurrent hand-edit that keeps the key would pass that guard
+        # and be overwritten by a conversion of data we no longer hold. The
+        # equality predicate closes that window: if anything changed since the
+        # SELECT, the UPDATE matches zero rows and nothing is written.
         res = await conn.execute(
             """
             UPDATE strategy_configs
-               SET config_data = $2::jsonb
+               SET config_data = $3::jsonb
              WHERE id::text = $1
                AND jsonb_exists(config_data::jsonb, 'blocks')
+               AND config_data::jsonb = $2::jsonb
             """,
             sid,
+            original_cfg,
             json.dumps(converted),
         )
         n = int(res.split()[-1]) if res else 0
         applied += n
-        print(f"  {sid[:8]}  rows_updated={n}")
+        if n == 0:
+            contended += 1
+            print(f"  {sid[:8]}  rows_updated=0  (row changed since it was read -- SKIPPED)")
+        else:
+            print(f"  {sid[:8]}  rows_updated={n}")
 
     await conn.close()
     print(f"\nApplied {applied} update(s).")
+    if contended:
+        print(
+            f"WARNING: {contended} row(s) changed between the read and the write and "
+            f"were left untouched. Re-run the dry-run to see their current state."
+        )
     if applied == 0:
         print("Nothing was written -- the guard blocked every row. Inspect above.")
     else:
