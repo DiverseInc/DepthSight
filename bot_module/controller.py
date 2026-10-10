@@ -6013,8 +6013,14 @@ class TradingController:
         required_data_keys: Set[str],
         log_prefix: str,
         market_type: Optional[str] = None,
+        min_candles_required: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Fetch market data for an arbitrary set of required keys."""
+        """Fetch market data for an arbitrary set of required keys.
+
+        `min_candles_required` is the per-strategy floor derived from that
+        strategy's own indicator periods (see bot_module.strategy_requirements).
+        None means "no opinion" and the configured global applies unchanged.
+        """
         start_ts = time.perf_counter()
         if not required_data_keys:
             return {}
@@ -6163,9 +6169,22 @@ class TradingController:
             # Checking minimum history for candles
             # This prevents 'Operand was None' errors when calculating indicators/conditions,
             # while DataConsumer has not yet had time to load the full history.
+            #
+            # PER-STRATEGY (2026-10-10). The floor is still the configured
+            # global, but a strategy's own configured indicator periods now
+            # raise it. A 200-period average can no longer be gated by a
+            # constant that happens to be smaller, and a 300-period one is no
+            # longer permanently unsatisfiable.
+            #
+            # The DOWNLOAD side derives its window from the same function
+            # (bot_module.strategy_requirements), so the two cannot drift --
+            # raising the gate alone would manufacture a strategy that can
+            # never satisfy it.
             MIN_HISTORY_REQUIRED = int(
                 getattr(config, "MIN_STRATEGY_HISTORY_CANDLES", 20)
             )
+            if min_candles_required:
+                MIN_HISTORY_REQUIRED = max(MIN_HISTORY_REQUIRED, min_candles_required)
             for k in required_data_keys:
                 if k.startswith("kline_"):
                     df = market_data.get(k)
@@ -6215,8 +6234,31 @@ class TradingController:
         """
         log_prefix = f"[GatherData:{strategy_instance.NAME}:{symbol}]"
         required_data_keys = set(strategy_instance.required_data_types)
+
+        # Per-strategy candle floor, derived from this strategy's OWN configured
+        # indicator periods rather than a single global constant.
+        _derived = 0
+        try:
+            from .strategy_requirements import required_candles_for_indicator_keys
+
+            _derived = required_candles_for_indicator_keys(
+                strategy_instance.required_indicators,
+                floor=int(getattr(config, "MIN_STRATEGY_HISTORY_CANDLES", 20)),
+            )
+        except Exception as exc:  # never block trading on this
+            logger.debug(
+                "%s per-strategy history requirement unavailable (%s); "
+                "falling back to the global floor",
+                log_prefix,
+                exc,
+            )
+
         return await self._gather_market_data_for_required_keys(
-            symbol, required_data_keys, log_prefix, market_type=market_type
+            symbol,
+            required_data_keys,
+            log_prefix,
+            market_type=market_type,
+            min_candles_required=_derived or None,
         )
 
     def _resolve_symbol_pool_for_strategy(

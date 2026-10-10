@@ -2518,19 +2518,49 @@ class DataConsumer:
 
                 # A fixed DAY count is the wrong unit for this decision.
                 #
-                # 3 days is ~4320 candles at 1m, 288 at 15m and 72 at 1h --
-                # all comfortably above MIN_STRATEGY_HISTORY_CANDLES (20). But
-                # at 4h it is 72/4 = 18, which is BELOW the minimum. So a 4h
-                # strategy could never pass the history check, no matter how
-                # long it waited: the log said "Got 18, need 20. Waiting for
-                # cache priming" every minute for 20+ minutes while the cache
-                # was never going to grow. It was not a priming race.
+                # Derive the lookback from the timeframe AND from what the
+                # strategies subscribed to this symbol actually need
+                # (2026-10-10). The global constant alone cannot serve both 1m
+                # (1000 candles) and a 200-period average on 4h -- and a
+                # strategy configured for a 300-period indicator would be
+                # permanently unsatisfiable: reporting "running" and never
+                # trading.
                 #
-                # Derive the lookback from the timeframe so the requirement is
-                # always satisfiable, and keep the configured value as a floor.
+                # `self._required_metrics[symbol]` already holds the union of
+                # every subscribed strategy's required indicator keys (populated
+                # at controller.py:7551 from `instance.required_indicators`), so
+                # the requirement needs no new plumbing. It is the SAME
+                # computation the read gate uses
+                # (bot_module.strategy_requirements), so the two cannot drift.
                 _min_candles = int(
                     getattr(config, "MIN_STRATEGY_HISTORY_CANDLES", 20)
                 )
+                try:
+                    from .strategy_requirements import (
+                        required_candles_for_indicator_keys,
+                    )
+
+                    _derived = required_candles_for_indicator_keys(
+                        (self._required_metrics or {}).get(symbol_uc)
+                    )
+                    if _derived > _min_candles:
+                        logger.info(
+                            "%s Raising candle requirement from %d to %d: a "
+                            "subscribed strategy needs %d candles at this "
+                            "timeframe.",
+                            log_prefix,
+                            _min_candles,
+                            _derived,
+                            _derived,
+                        )
+                    _min_candles = max(_min_candles, _derived)
+                except Exception as exc:  # never block history on this
+                    logger.debug(
+                        "%s per-strategy history requirement unavailable (%s); "
+                        "using the global floor",
+                        log_prefix,
+                        exc,
+                    )
                 _tf_match = _re.match(r"^(\d+)([mhd])$", str(timeframe).strip().lower())
                 # Initialised here so the pagination loop below can read it
                 # unconditionally; it stays 0 when the timeframe does not match
