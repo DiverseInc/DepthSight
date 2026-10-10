@@ -1879,12 +1879,25 @@ class CcxtExecutor:
 
     def _normalize_symbol(self, symbol: str) -> str:
         """Converts Binance format (BTCUSDT) to CCXT format (BTC/USDT or BTC/USDT:USDT)."""
-        symbol_upper = symbol.upper().replace(":", ":")
+        symbol_upper = symbol.upper().strip()
         if "/" in symbol_upper:
             if self.supports_positions and ":" not in symbol_upper:
                 quote = symbol_upper.split("/", 1)[1].split(":", 1)[0]
                 return f"{symbol_upper}:{quote}"
             return symbol_upper
+        # FIX 2026-10-09: some stored configs use the exchange's native dashed
+        # form ("BTC-USDT"). Splitting off only the trailing quote left the
+        # separator in the base -- "BTC-USDT"[:-4] is "BTC-" -- which produced
+        # the market "BTC-/USDT:USDT" and failed with
+        #   okx does not have market symbol BTC-/USDT:USDT
+        # leaving those strategies with zero candles. No crypto base or quote
+        # asset contains "-" or "_", so removing them here is safe.
+        # OKX native instrument ids carry a "-SWAP" suffix ("BTC-USDT-SWAP").
+        # Drop it before the separator cleanup, otherwise it fuses onto the
+        # quote and the result no longer ends with USDT at all.
+        if symbol_upper.endswith("-SWAP"):
+            symbol_upper = symbol_upper[: -len("-SWAP")]
+        symbol_upper = symbol_upper.replace("-", "").replace("_", "")
         if symbol_upper.endswith("USDT"):
             base = symbol_upper[:-4]
             if self.supports_positions:
