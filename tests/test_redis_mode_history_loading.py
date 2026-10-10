@@ -502,3 +502,143 @@ async def test_ensure_history_loaded_end_to_end_through_real_download(monkeypatc
         f"cache holds {_cache_len(cache_key)} after a real 300-row download, "
         f"need {ROWS_NEEDED} for a {LONG_SLOW_PERIOD}-period cross"
     )
+
+
+# --- 9. PAGINATION: one fetch cannot fill the window ------------------------
+# Measured live 2026-10-09: kline_1m came back with exactly 100 candles while a
+# 3-day 1m window holds 4320. 100 is OKX's *default* per-request limit, not its
+# 300 maximum, so the requested limit was not reaching the exchange.
+#
+# A 205-candle requirement was therefore unsatisfiable by construction -- the
+# ceiling was the single unpaginated fetch, not MIN_STRATEGY_HISTORY_CANDLES.
+
+
+class _PagedExecutor:
+    """A fake CCXT executor that honours a per-request limit, like a real one.
+
+    Anchors to the FIRST `since` it is given (the window start) and serves rows
+    forward from there, so each subsequent page continues where the last ended.
+    Anchoring to a hardcoded date instead would serve nothing, because the real
+    window start is `now - lookback`, not a constant.
+    """
+
+    def __init__(self, total_rows, per_page_cap):
+        self.total_rows = total_rows
+        self.per_page_cap = per_page_cap
+        self.calls = []
+        self._anchor = None
+
+    def _executor_for_market(self, market_type):
+        return self
+
+    exchange_id = "okx"
+
+    async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+        limit = min(int(limit or self.per_page_cap), self.per_page_cap)
+        self.calls.append({"since": since, "limit": limit})
+        if self._anchor is None:
+            self._anchor = int(since)
+        offset = max(0, (int(since) - self._anchor)) // 60_000
+        rows = []
+        for i in range(offset, min(offset + limit, self.total_rows)):
+            ts = self._anchor + i * 60_000
+            rows.append([ts, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i, 10.0 + i])
+        return rows
+
+
+@pytest.mark.asyncio
+async def test_ccxt_download_paginates_past_a_single_page(monkeypatch):
+    """A 1m window that holds more than one page must be paged, not truncated.
+
+    Without pagination this returns one page (100 rows on the real exchange) and
+    a 205-candle requirement stays unsatisfiable no matter what the constant is.
+    """
+    inst = _make_consumer(redis_mode=False)
+    symbol, tf, mt, exch = "BTCUSDT", "1m", "futures_usdtm", "okx"
+    cache_key = dc_mod._kline_cache_key(symbol, tf, exch, mt)
+
+    # The exchange will serve at most 300 per call, and the 3-day 1m window
+    # holds 4320 rows.
+    executor = _PagedExecutor(total_rows=4320, per_page_cap=300)
+
+    monkeypatch.setattr(inst, "_executor_for_market", executor._executor_for_market)
+
+    await inst._download_initial_kline_history_for_key(cache_key, symbol, tf, mt, exch)
+
+    assert len(executor.calls) > 1, (
+        "only one fetch_ohlcv call was made; a window holding more than one "
+        "page cannot be filled without pagination"
+    )
+    assert all(c["limit"] <= 300 for c in executor.calls), (
+        f"a request asked for more than the exchange's 300/page maximum: "
+        f"{[c['limit'] for c in executor.calls]}"
+    )
+    assert _cache_len(cache_key) >= ROWS_NEEDED, (
+        f"pagination produced only {_cache_len(cache_key)} candles, need "
+        f"{ROWS_NEEDED} for a {LONG_SLOW_PERIOD}-period cross"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ccxt_pagination_survives_out_of_order_rows(monkeypatch):
+    """The cursor must advance by the MAX timestamp, not the last row's.
+
+    Advancing by `batch[-1]` breaks if the exchange returns rows out of order:
+    the cursor moves backwards, the next page re-serves rows already held, and
+    the window in between is skipped entirely. OpenCode review, 2026-10-09.
+    """
+
+    class _ShuffledExecutor(_PagedExecutor):
+        async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+            rows = await super().fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+            # Reverse every page so the last row is the OLDEST timestamp.
+            return list(reversed(rows))
+
+    inst = _make_consumer(redis_mode=False)
+    symbol, tf, mt, exch = "BTCUSDT", "1m", "futures_usdtm", "okx"
+    cache_key = dc_mod._kline_cache_key(symbol, tf, exch, mt)
+
+    executor = _ShuffledExecutor(total_rows=4320, per_page_cap=300)
+    monkeypatch.setattr(inst, "_executor_for_market", executor._executor_for_market)
+
+    await asyncio.wait_for(
+        inst._download_initial_kline_history_for_key(cache_key, symbol, tf, mt, exch),
+        timeout=60.0,
+    )
+
+    assert _cache_len(cache_key) >= ROWS_NEEDED, (
+        f"out-of-order pages produced only {_cache_len(cache_key)} candles; the "
+        f"cursor advanced by the last row instead of the max timestamp, so it "
+        f"re-fetched and skipped windows. Need {ROWS_NEEDED}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_ccxt_pagination_stops_when_exchange_ignores_since(monkeypatch):
+    """If `since` is ignored the loop must stop, not spin forever."""
+
+    class _IgnoringExecutor(_PagedExecutor):
+        async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+            self.calls.append({"since": since, "limit": limit})
+            # Always the same page, regardless of `since`.
+            return [
+                [1_700_000_000_000 + i * 60_000, 1.0, 2.0, 0.5, 1.5, 1.0]
+                for i in range(300)
+            ]
+
+    inst = _make_consumer(redis_mode=False)
+    symbol, tf, mt, exch = "BTCUSDT", "1m", "futures_usdtm", "okx"
+    cache_key = dc_mod._kline_cache_key(symbol, tf, exch, mt)
+
+    executor = _IgnoringExecutor(total_rows=0, per_page_cap=300)
+    monkeypatch.setattr(inst, "_executor_for_market", executor._executor_for_market)
+
+    await asyncio.wait_for(
+        inst._download_initial_kline_history_for_key(cache_key, symbol, tf, mt, exch),
+        timeout=30.0,
+    )
+
+    assert len(executor.calls) <= 3, (
+        f"pagination kept requesting pages ({len(executor.calls)} calls) even "
+        f"though the exchange ignored `since`; this would spin"
+    )

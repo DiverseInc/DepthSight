@@ -2532,6 +2532,10 @@ class DataConsumer:
                     getattr(config, "MIN_STRATEGY_HISTORY_CANDLES", 20)
                 )
                 _tf_match = _re.match(r"^(\d+)([mhd])$", str(timeframe).strip().lower())
+                # Initialised here so the pagination loop below can read it
+                # unconditionally; it stays 0 when the timeframe does not match
+                # the simple <n><m|h|d> pattern.
+                _secs_per_candle = 0
                 if _tf_match:
                     _n = int(_tf_match.group(1))
                     _unit = _tf_match.group(2)
@@ -2566,9 +2570,84 @@ class DataConsumer:
                 is_binance = exchange_id.startswith("binance")
                 if not is_binance and hasattr(executor_for_market, "fetch_ohlcv"):
                     since_ms = int(start_dt.timestamp() * 1000)
-                    ohlcv_rows = await executor_for_market.fetch_ohlcv(
-                        symbol_uc, timeframe, since=since_ms, limit=1000
+                    end_ms = int(end_dt.timestamp() * 1000)
+
+                    # PAGINATE (2026-10-09)
+                    # --------------------
+                    # A single fetch_ohlcv call cannot fill the requested window.
+                    # OKX's GET /api/v5/market/candles caps `limit` at 300 per
+                    # request and serves at most the latest 1,440 entries per bar.
+                    # Measured live on 2026-10-09: kline_1m returned exactly 100
+                    # candles -- OKX's *default*, not its 300 maximum -- so `limit`
+                    # was not reaching the exchange on that path at all. Every 1m
+                    # strategy was therefore capped at 100 candles, which makes a
+                    # 205-candle requirement (a 200-period EMA) unsatisfiable BY
+                    # CONSTRUCTION. That is the real ceiling, not the constant.
+                    #
+                    # 15m/1h/4h looked fine only because their 3-day windows
+                    # (288 / 72 / 24 rows) already fit inside one page. 1m's
+                    # 3-day window is 4320 rows and never could.
+                    _PAGE = 300  # documented OKX per-request maximum
+                    _MAX_PAGES = 10  # hard bound: <= 3000 candles per fetch
+                    _window_rows = (
+                        max(1, (end_ms - since_ms) // 1000 // _secs_per_candle)
+                        if _secs_per_candle > 0
+                        else _PAGE
                     )
+                    _target_rows = min(_window_rows, _PAGE * _MAX_PAGES)
+
+                    # Keyed by timestamp so that (a) duplicates from an
+                    # overlapping page cannot inflate the count and falsely
+                    # satisfy the target, and (b) the cursor can advance by the
+                    # MAXIMUM timestamp seen rather than the last row's.
+                    collected_by_ts: Dict[int, Any] = {}
+                    cursor_ms = since_ms
+                    for _page in range(_MAX_PAGES):
+                        batch = await executor_for_market.fetch_ohlcv(
+                            symbol_uc, timeframe, since=cursor_ms, limit=_PAGE
+                        )
+                        batch = list(batch or [])
+                        if not batch:
+                            break
+                        for row in batch:
+                            try:
+                                collected_by_ts[int(row[0])] = row
+                            except (TypeError, ValueError, IndexError):
+                                continue
+                        if len(collected_by_ts) >= _target_rows:
+                            break
+                        if len(batch) < _PAGE:
+                            # Short page means no more data in the window.
+                            break
+                        # Advance by the MAX timestamp in the page, never by
+                        # the last row's. Advancing by batch[-1] assumes the
+                        # exchange returns rows ascending; if it does not, the
+                        # cursor moves backwards, refetching rows already held
+                        # and skipping the window in between.
+                        try:
+                            page_max = max(int(r[0]) for r in batch)
+                        except (TypeError, ValueError, IndexError):
+                            break
+                        if page_max <= cursor_ms:
+                            # The exchange ignored `since` and returned the same
+                            # page forever. Stop rather than spin.
+                            logger.warning(
+                                f"{log_prefix} Exchange ignored `since` while "
+                                f"paginating {cache_key}; stopping after "
+                                f"{len(collected_by_ts)} candles."
+                            )
+                            break
+                        cursor_ms = page_max + 1
+
+                    ohlcv_rows = list(collected_by_ts.values())
+                    if len(collected_by_ts) >= _target_rows or (
+                        _window_rows > _PAGE * _MAX_PAGES
+                    ):
+                        logger.info(
+                            f"{log_prefix} Fetched {len(collected_by_ts)} {timeframe} candles "
+                            f"for {cache_key} across {len(collected_by_ts) and _page + 1} page(s) "
+                            f"(target {_target_rows}, window holds {_window_rows})."
+                        )
                     historical_candles_tuples = []
                     for row in ohlcv_rows or []:
                         try:
