@@ -221,6 +221,14 @@ class FastVectorBacktester:
         alias_map = {
             "below_lower": "price_below_lower",
             "above_upper": "price_above_upper",
+            # Middle-band checks (2026-10-10). BBM was always computed by
+            # bbands and never read; these close the gap that made a legacy
+            # `reaches_middle` exit unconvertible.
+            "reaches_middle": "price_touches_middle",
+            "touches_middle": "price_touches_middle",
+            "price_touch_middle": "price_touches_middle",
+            "above_middle": "price_above_middle",
+            "below_middle": "price_below_middle",
         }
         return alias_map.get(normalized, normalized)
 

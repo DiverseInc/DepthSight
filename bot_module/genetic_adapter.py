@@ -246,6 +246,8 @@ class GeneticCompatibleStrategy(VisualBuilderStrategy):
         std_dev = float(params.get("std_dev", 2.0))
         check_type = params.get("check_type", "price_below_lower")
         width_val = float(params.get("width_value", 0.01))
+        # Fraction of the band span that counts as "touching" the middle band.
+        touch_tol = float(params.get("touch_tolerance", 0.10))
 
         candle_tf = pair_info.get("candle_timeframe", "1m")
         df = market_data.get(f"kline_{candle_tf}")
@@ -260,6 +262,7 @@ class GeneticCompatibleStrategy(VisualBuilderStrategy):
 
         cols = bb.columns
         lower_col = next((c for c in cols if c.startswith("BBL")), None)
+        middle_col = next((c for c in cols if c.startswith("BBM")), None)
         upper_col = next((c for c in cols if c.startswith("BBU")), None)
         width_col = next((c for c in cols if c.startswith("BBB")), None)
 
@@ -267,6 +270,7 @@ class GeneticCompatibleStrategy(VisualBuilderStrategy):
         lower = bb[lower_col].iloc[-1]
         upper = bb[upper_col].iloc[-1]
         width = bb[width_col].iloc[-1]
+        middle = bb[middle_col].iloc[-1] if middle_col else None
 
         result = False
         if check_type == "price_below_lower":
@@ -277,10 +281,27 @@ class GeneticCompatibleStrategy(VisualBuilderStrategy):
             result = width > (width_val * 100)
         elif check_type == "width_lt":
             result = width < (width_val * 100)
+        elif check_type in ("price_touches_middle", "price_above_middle", "price_below_middle"):
+            # BBM was already computed and never read. See the same branch in
+            # condition_core.evaluate_bb_scalar.
+            if middle is not None:
+                if check_type == "price_above_middle":
+                    result = close > middle
+                elif check_type == "price_below_middle":
+                    result = close < middle
+                else:
+                    band_span = abs(upper - lower)
+                    tol = (
+                        touch_tol * band_span if band_span > 0 else close * touch_tol
+                    )
+                    result = abs(close - middle) <= tol
+        else:
+            return False, {"error": f"Unknown bollinger check_type: {check_type!r}"}
 
         return bool(result), {
             "close": float(close),
             "lower": float(lower),
+            "middle": None if middle is None else float(middle),
             "upper": float(upper),
             "width": float(width),
             "check": check_type,

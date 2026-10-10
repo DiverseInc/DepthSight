@@ -105,6 +105,8 @@ def evaluate_bollinger_logic(
     width: Optional[float],
     check_type: str,
     width_threshold: float = 0.01,
+    middle: Optional[float] = None,
+    touch_tolerance: float = 0.10,
 ) -> bool:
     """
     Pure logic for Bollinger Bands evaluation.
@@ -114,8 +116,16 @@ def evaluate_bollinger_logic(
         lower: Lower BB band
         upper: Upper BB band
         width: BB width (bandwidth)
-        check_type: 'price_below_lower', 'price_above_upper', 'width_gt', 'width_lt'
+        check_type: 'price_below_lower', 'price_above_upper', 'width_gt',
+                    'width_lt', 'price_touches_middle', 'price_above_middle',
+                    'price_below_middle'
         width_threshold: Width threshold
+        middle: Middle band (BBM). Optional so existing callers keep working.
+        touch_tolerance: Fraction of the band span that counts as "touching"
+
+    Returns False for an unknown check_type rather than defaulting to one of
+    them -- a silent wrong answer here is how a death cross once became a
+    golden cross.
     """
     if check_type == "price_below_lower" and lower is not None:
         return close < lower
@@ -125,6 +135,16 @@ def evaluate_bollinger_logic(
         return width > (width_threshold * 100)
     elif check_type == "width_lt" and width is not None:
         return width < (width_threshold * 100)
+    elif check_type in ("price_touches_middle", "price_above_middle", "price_below_middle"):
+        if middle is None:
+            return False
+        if check_type == "price_above_middle":
+            return close > middle
+        if check_type == "price_below_middle":
+            return close < middle
+        band_span = abs(upper - lower) if (upper is not None and lower is not None) else 0.0
+        tol = touch_tolerance * band_span if band_span > 0 else close * touch_tolerance
+        return abs(close - middle) <= tol
 
     return False
 
@@ -472,14 +492,17 @@ def evaluate_bollinger_vectorized(
     std_dev: float,
     check_type: str,
     width_value: float = 0.01,
+    touch_tolerance: float = 0.10,
 ) -> pd.Series:
     """
     Bollinger Bands condition.
 
-    check_type: 'price_below_lower', 'price_above_upper', 'width_gt', 'width_lt'
+    check_type: 'price_below_lower', 'price_above_upper', 'width_gt', 'width_lt',
+                'price_touches_middle', 'price_above_middle', 'price_below_middle'
     """
     all_cols = list(main_df.columns) + list(signals_df.columns)
     lower_col = next((c for c in all_cols if c.startswith(f"BBL_{period}")), None)
+    middle_col = next((c for c in all_cols if c.startswith(f"BBM_{period}")), None)
     upper_col = next((c for c in all_cols if c.startswith(f"BBU_{period}")), None)
     width_col = next((c for c in all_cols if c.startswith(f"BBB_{period}")), None)
 
@@ -493,15 +516,30 @@ def evaluate_bollinger_vectorized(
     width = (
         _get_series_from_context(width_col, main_df, signals_df) if width_col else None
     )
+    middle = (
+        _get_series_from_context(middle_col, main_df, signals_df) if middle_col else None
+    )
 
+    close = main_df["close"]
     if check_type == "price_below_lower":
-        return main_df["close"] < lower
+        return close < lower
     elif check_type == "price_above_upper" and upper is not None:
-        return main_df["close"] > upper
+        return close > upper
     elif check_type == "width_gt" and width is not None:
         return width > (width_value * 100)
     elif check_type == "width_lt" and width is not None:
         return width < (width_value * 100)
+    elif check_type in ("price_touches_middle", "price_above_middle", "price_below_middle"):
+        if middle is None:
+            return pd.Series(False, index=main_df.index)
+        if check_type == "price_above_middle":
+            return close > middle
+        if check_type == "price_below_middle":
+            return close < middle
+        band_span = (upper - lower).abs() if upper is not None else pd.Series(0.0, index=main_df.index)
+        tol = band_span * touch_tolerance
+        tol = tol.where(band_span > 0, close.abs() * touch_tolerance)
+        return (close - middle).abs() <= tol
 
     return pd.Series(False, index=main_df.index)
 
@@ -850,6 +888,9 @@ def evaluate_bollinger_scalar(
     std_dev = float(params.get("std_dev", 2.0))
     check_type = params.get("check_type", "price_below_lower")
     width_value = float(params.get("width_value", 0.01))
+    # Fraction of the band span within which price counts as "touching" the
+    # middle band. See the price_touches_middle branch below.
+    touch_tolerance = float(params.get("touch_tolerance", 0.10))
 
     if df is None or df.empty or len(df) < period + 5:
         return False, {"error": "Not enough data"}
@@ -863,6 +904,7 @@ def evaluate_bollinger_scalar(
 
         cols = bb.columns
         lower_col = next((c for c in cols if c.startswith("BBL")), None)
+        middle_col = next((c for c in cols if c.startswith("BBM")), None)
         upper_col = next((c for c in cols if c.startswith("BBU")), None)
         width_col = next((c for c in cols if c.startswith("BBB")), None)
 
@@ -870,6 +912,7 @@ def evaluate_bollinger_scalar(
         lower = float(bb[lower_col].iloc[-1])
         upper = float(bb[upper_col].iloc[-1]) if upper_col else 0
         width = float(bb[width_col].iloc[-1]) if width_col else 0
+        middle = float(bb[middle_col].iloc[-1]) if middle_col else None
 
         result = False
         if check_type == "price_below_lower":
@@ -880,10 +923,44 @@ def evaluate_bollinger_scalar(
             result = width > (width_value * 100)
         elif check_type == "width_lt":
             result = width < (width_value * 100)
+        # MIDDLE-BAND CHECKS (2026-10-10)
+        #
+        # BBM was already being computed by bbands and simply never read --
+        # only BBL/BBU/BBB were picked out. These close the gap that made a
+        # legacy `reaches_middle` exit unconvertible.
+        elif check_type in ("price_touches_middle", "price_above_middle", "price_below_middle"):
+            if middle is None:
+                return False, {"error": "BB middle band column (BBM) missing"}
+            if check_type == "price_above_middle":
+                result = close > middle
+            elif check_type == "price_below_middle":
+                result = close < middle
+            else:
+                # "touches" is a proximity test, not an equality test. Bands
+                # are recomputed every bar, so an exact == would almost never
+                # fire. Tolerance is a fraction of the band span so it scales
+                # with volatility rather than being a fixed price.
+                #
+                # Guard on the COLUMNS, not on `band_span > 0`. `upper`
+                # defaults to 0 when BBU is missing (0, not None), so
+                # abs(upper - lower) is |lower| -- positive -- and the
+                # price-relative fallback would never fire. That yielded a
+                # tolerance of 10% of the lower band PRICE instead of of the
+                # span. Caught by OpenCode.
+                band_span = abs(upper - lower) if (upper_col and lower_col) else 0.0
+                tol = (
+                    touch_tolerance * band_span
+                    if band_span > 0
+                    else close * touch_tolerance
+                )
+                result = abs(close - middle) <= tol
+        else:
+            return False, {"error": f"Unknown bollinger check_type: {check_type!r}"}
 
         return bool(result), {
             "close": close,
             "lower": lower,
+            "middle": middle,
             "upper": upper,
             "width": width,
             "check": check_type,

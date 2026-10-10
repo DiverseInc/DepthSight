@@ -43,12 +43,25 @@ refuses to guess:
 Anything not in these tables raises `LossyConversionError`. Silence is the one
 acceptable outcome for a repair tool.
 
-KNOWN-LOSSY
+RESOLVED (2026-10-10) -- was the single known-lossy condition
 -----------
-`bollinger_bands_condition` accepts exactly four `check_type` values
-(`price_below_lower`, `price_above_upper`, `width_gt`, `width_lt`). There is no
-"price reached the middle band" check, so a legacy `reaches_middle` exit cannot
-be expressed. That raises rather than substituting something that looks similar.
+`bollinger_bands_condition` accepted exactly four `check_type` values
+(`price_below_lower`, `price_above_upper`, `width_gt`, `width_lt`), so a legacy
+`reaches_middle` exit could not be expressed and the converter raised.
+
+That was an **implementation gap, not a semantic limit**: `pandas_ta.bbands`
+has always returned the middle band as `BBM_*`, and every evaluator was
+already computing it -- they just picked `BBL`/`BBU`/`BBB` out of the result
+and never read `BBM`. The check is now implemented (`price_touches_middle`,
+`price_above_middle`, `price_below_middle`) in
+`condition_core.evaluate_bb_scalar`, `condition_core.evaluate_bollinger_logic`,
+`condition_core.evaluate_bollinger_vectorized` and
+`genetic_adapter._check_condition_bb`, and `reaches_middle` converts faithfully.
+
+"Touches" is a proximity test rather than an equality test -- bands are
+recomputed every bar, so `close == BBM` would almost never be exactly true.
+The tolerance is a fraction of the current band span (`touch_tolerance`,
+default 0.10) so it scales with volatility rather than being a fixed price.
 """
 
 from __future__ import annotations
@@ -110,6 +123,14 @@ _BB_CHECK_TYPES = {
     "above_upper": "price_above_upper",
     "width_expands": "width_gt",
     "width_squeeze": "width_lt",
+    # Middle band (2026-10-10). BBM was always computed by bbands and never
+    # read by any evaluator, so this used to be the one legacy condition with
+    # no equivalent -- and the converter refused it. Implemented rather than
+    # approximated; see condition_core.evaluate_bb_scalar.
+    "reaches_middle": "price_touches_middle",
+    "touches_middle": "price_touches_middle",
+    "above_middle": "price_above_middle",
+    "below_middle": "price_below_middle",
 }
 
 # Entries open a position; these actions exit one.
@@ -192,7 +213,7 @@ def _block_to_condition_node(block: Dict[str, Any]) -> Dict[str, Any]:
                 f"block {node_id!r}: Bollinger condition {condition!r} has no equivalent. "
                 f"bollinger_bands_condition only supports "
                 f"{sorted(set(_BB_CHECK_TYPES.values()))} "
-                f"(condition_core.py:120). Substituting one would silently change "
+                f"(condition_core.evaluate_bb_scalar). Substituting one would silently change "
                 f"the strategy -- rebuild it in the visual editor instead."
             )
         return {

@@ -20,7 +20,8 @@ wrong one. Both rows are set explicitly below.
 
 The legacy rows themselves are transcribed verbatim from the production
 database (ids elided) so the mapping is exercised against the real shapes,
-including the one that is genuinely lossy.
+including the Bollinger row whose `reaches_middle` exit was -- until
+2026-10-10 -- the one condition the converter refused.
 """
 
 import numpy as np
@@ -227,19 +228,72 @@ def test_exit_becomes_a_conditional_management_block_not_an_entry():
 # --- lossless refusal -------------------------------------------------------
 
 
-def test_lossy_bollinger_exit_is_refused_not_approximated():
-    """`reaches_middle` has no equivalent and must raise.
+def test_bollinger_reaches_middle_converts_faithfully():
+    """`reaches_middle` -> `price_touches_middle` (no longer refused).
 
-    The BB checker has exactly four check types and none of them means "price
-    returned to the middle band". Substituting `price_above_upper` would produce
-    a strategy that looks migrated and trades differently.
+    This test USED TO assert the opposite -- that `reaches_middle` must raise,
+    on the grounds that the BB checker had no middle-band check. That was true
+    of the *implementation*, not of the semantics: `pandas_ta.bbands` always
+    returned the middle band as `BBM_*` and every evaluator was already
+    computing it, they just never read it.
+
+    Rather than approximate the user's condition, the check was implemented.
+    """
+    out = convert_legacy_blocks_config(BB_LEGACY)
+
+    assert "positionManagement" in out, "the BB exit was dropped"
+
+    pm = out["positionManagement"][0]
+    assert pm["type"] == "conditional_management"
+    assert pm["then_actions"][0]["type"] == "close_position"
+
+    gate = pm["if_conditions"]["children"][0]
+    assert gate["params"]["check_type"] == "price_touches_middle"
+    assert gate["params"]["period"] == 20
+    assert gate["params"]["std_dev"] == 2.0
+
+    # It must be an EXIT, not an entry.
+    entry_checks = [c["params"].get("check_type") for c in out["entryConditions"]["children"]]
+    assert entry_checks == ["price_below_lower"], (
+        f"the middle-band exit leaked into the entry gate: {entry_checks}"
+    )
+
+
+def test_genuinely_unknown_bollinger_condition_is_still_refused():
+    """The guard must survive the middle-band work.
+
+    `reaches_middle` becoming expressible must not turn the converter into one
+    that guesses: a condition nobody implemented still has to raise.
     """
     with pytest.raises(LossyConversionError) as exc:
-        convert_legacy_blocks_config(BB_LEGACY)
+        convert_legacy_blocks_config(
+            {
+                "timeframe": "15m",
+                "symbol": "ETHUSDT",
+                "blocks": [
+                    {
+                        "id": "bb_entry",
+                        "indicator": "BB",
+                        "period": 20,
+                        "std_dev": 2.0,
+                        "condition": "touches_lower",
+                        "action": "open_long",
+                    },
+                    {
+                        "id": "bb_exit",
+                        "indicator": "BB",
+                        "period": 20,
+                        "std_dev": 2.0,
+                        "condition": "touches_the_ceiling_of_reality",
+                        "action": "close_position",
+                    },
+                ],
+            }
+        )
 
     msg = str(exc.value)
-    assert "reaches_middle" in msg
-    assert "price_below_lower" in msg  # the tool tells you what IS supported
+    assert "touches_the_ceiling_of_reality" in msg
+    assert "price_touches_middle" in msg  # the tool tells you what IS supported
 
 
 def test_unknown_indicator_is_refused():
