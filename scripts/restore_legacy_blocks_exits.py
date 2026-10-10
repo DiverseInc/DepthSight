@@ -88,13 +88,22 @@ def _summarise_condition(node) -> str:
         return str(node)
     kind = node.get("type", "?")
     params = node.get("params") or {}
-    bits = [
-        f"{k}={params[k]}"
-        for k in ("indicator", "operator", "value", "threshold", "period")
-        if k in params
-    ]
+    # Render EVERY parameter, not an allowlist. An allowlist silently dropped
+    # length/multiplier/source/timeframe/fast_period, so a Bollinger printed as
+    # `bb()` and an EMA cross printed without its periods -- the operator would
+    # be approving a gate they cannot read. (OpenCode review, 2026-10-10)
+    bits = [f"{k}={v}" for k, v in sorted(params.items())]
     head = f"{kind}({', '.join(bits)})" if bits else str(kind)
-    children = node.get("children") or []
+    # Follow every nesting key the engine uses, not just `children`, or nested
+    # trees flatten and hide their contents.
+    children = (
+        node.get("children")
+        or node.get("if_conditions")
+        or node.get("node_branch")
+        or []
+    )
+    if isinstance(children, dict):
+        children = [children]
     if children:
         return head + "[" + ", ".join(_summarise_condition(c) for c in children) + "]"
     return head
@@ -174,7 +183,25 @@ async def main():
             continue
 
         pm = converted.get("positionManagement", [])
-        has_exit = bool(pm) and bool(pm[0].get("then_actions"))
+        _actions = (pm[0].get("then_actions") or []) if pm else []
+        _gate = (pm[0].get("if_conditions") or {}) if pm else {}
+
+        # SAFETY (OpenCode review, 2026-10-10): `has_exit` used to test only
+        # `then_actions`. An exit whose close_position action exists but whose
+        # `if_conditions` gate does NOT is the worst possible outcome: the engine
+        # would close the position on EVERY tick. `then_actions` alone is not
+        # evidence of a take-profit, so refuse rather than write it.
+        if _actions and not _gate:
+            skipped.append(
+                (
+                    row["id"],
+                    "REFUSED: exit action present but NO if_conditions gate -- "
+                    "would close_position on every tick",
+                )
+            )
+            continue
+
+        has_exit = bool(_actions) and bool(_gate)
         backup_rows.append({"id": row["id"], "name": row["name"], "config_data": json.dumps(cfg)})
         planned.append(
             (row["id"], row["name"], converted, has_exit, json.dumps(cfg))
@@ -182,11 +209,10 @@ async def main():
 
         print(f"  {row['id'][:8]}  {row['name'][:40]:<40} exit_restored={has_exit}")
         if has_exit:
-            gate = pm[0].get("if_conditions") or {}
-            print(f"      gate:    {_summarise_condition(gate)}")
+            print(f"      gate:    {_summarise_condition(_gate)}")
             acts = ", ".join(
                 f"{a.get('type')}({a.get('params') or {}})"
-                for a in (pm[0].get("then_actions") or [])
+                for a in _actions
             )
             print(f"      action:  {acts}")
             print(f"      risk:    sl_atr={args.sl_atr} tp_rr={args.tp_rr} (INTRODUCED)")
