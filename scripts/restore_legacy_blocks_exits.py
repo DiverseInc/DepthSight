@@ -75,6 +75,31 @@ def _dsn():
     )
 
 
+def _summarise_condition(node) -> str:
+    """Compact, human-readable summary of a converted condition tree.
+
+    The dry-run previously printed only ``then_actions``, which is the ACTION
+    list. That made a properly-gated exit indistinguishable from a bare
+    close-on-any-tick: `close_position` with empty params reads like "closes
+    immediately", when in fact the gate lives in ``if_conditions``. Never apply
+    a database write you cannot inspect, so print the gate too.
+    """
+    if not isinstance(node, dict):
+        return str(node)
+    kind = node.get("type", "?")
+    params = node.get("params") or {}
+    bits = [
+        f"{k}={params[k]}"
+        for k in ("indicator", "operator", "value", "threshold", "period")
+        if k in params
+    ]
+    head = f"{kind}({', '.join(bits)})" if bits else str(kind)
+    children = node.get("children") or []
+    if children:
+        return head + "[" + ", ".join(_summarise_condition(c) for c in children) + "]"
+    return head
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -149,13 +174,24 @@ async def main():
             continue
 
         pm = converted.get("positionManagement", [])
-        has_exit = bool(pm) and pm[0].get("then_actions")
+        has_exit = bool(pm) and bool(pm[0].get("then_actions"))
         backup_rows.append({"id": row["id"], "name": row["name"], "config_data": json.dumps(cfg)})
         planned.append(
             (row["id"], row["name"], converted, has_exit, json.dumps(cfg))
         )
 
         print(f"  {row['id'][:8]}  {row['name'][:40]:<40} exit_restored={has_exit}")
+        if has_exit:
+            gate = pm[0].get("if_conditions") or {}
+            print(f"      gate:    {_summarise_condition(gate)}")
+            acts = ", ".join(
+                f"{a.get('type')}({a.get('params') or {}})"
+                for a in (pm[0].get("then_actions") or [])
+            )
+            print(f"      action:  {acts}")
+            print(f"      risk:    sl_atr={args.sl_atr} tp_rr={args.tp_rr} (INTRODUCED)")
+        entry = converted.get("entryConditions")
+        print(f"      entry:   {_summarise_condition(entry)}")
 
     if skipped:
         print("\nSkipped:")
