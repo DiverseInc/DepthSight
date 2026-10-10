@@ -580,6 +580,50 @@ async def test_ccxt_download_paginates_past_a_single_page(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ccxt_pagination_continues_past_short_pages(monkeypatch):
+    """A short page is NOT end-of-data. This is the real OKX 1m behaviour.
+
+    Measured live 2026-10-10: OKX returns exactly 100 rows for kline_1m even
+    when 300 were requested. Treating "fewer than I asked for" as "no more data"
+    stopped after ONE page and left 1m capped at exactly 100 -- the ceiling the
+    loop exists to remove, still in place, with every test green.
+
+    The fake caps at 100 regardless of the requested limit, so a correct loop
+    must keep going to reach 205+.
+    """
+
+    class _CappedExecutor(_PagedExecutor):
+        HARD_CAP = 100  # ignores the requested limit, like OKX on 1m
+
+        async def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+            rows = await super().fetch_ohlcv(
+                symbol, timeframe, since=since, limit=min(int(limit or 1), self.HARD_CAP)
+            )
+            return rows[: self.HARD_CAP]
+
+    inst = _make_consumer(redis_mode=False)
+    symbol, tf, mt, exch = "BTCUSDT", "1m", "futures_usdtm", "okx"
+    cache_key = dc_mod._kline_cache_key(symbol, tf, exch, mt)
+
+    executor = _CappedExecutor(total_rows=4320, per_page_cap=100)
+    monkeypatch.setattr(inst, "_executor_for_market", executor._executor_for_market)
+
+    await asyncio.wait_for(
+        inst._download_initial_kline_history_for_key(cache_key, symbol, tf, mt, exch),
+        timeout=60.0,
+    )
+
+    assert len(executor.calls) > 1, (
+        "only one page was requested; the exchange returned a short page "
+        "(100 of 300) and the loop treated that as end-of-data"
+    )
+    assert _cache_len(cache_key) >= ROWS_NEEDED, (
+        f"pagination through 100-row pages produced only {_cache_len(cache_key)} "
+        f"candles; need {ROWS_NEEDED}. The 1m ceiling is NOT removed."
+    )
+
+
+@pytest.mark.asyncio
 async def test_ccxt_pagination_survives_out_of_order_rows(monkeypatch):
     """The cursor must advance by the MAX timestamp, not the last row's.
 

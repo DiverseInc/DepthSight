@@ -2602,11 +2602,18 @@ class DataConsumer:
                     # MAXIMUM timestamp seen rather than the last row's.
                     collected_by_ts: Dict[int, Any] = {}
                     cursor_ms = since_ms
+                    pages_used = 0
+                    short_pages = 0
                     for _page in range(_MAX_PAGES):
+                        if cursor_ms >= end_ms:
+                            # The window is fully covered; no point asking for
+                            # candles at or after the end of the range.
+                            break
                         batch = await executor_for_market.fetch_ohlcv(
                             symbol_uc, timeframe, since=cursor_ms, limit=_PAGE
                         )
                         batch = list(batch or [])
+                        pages_used += 1
                         if not batch:
                             break
                         for row in batch:
@@ -2616,9 +2623,16 @@ class DataConsumer:
                                 continue
                         if len(collected_by_ts) >= _target_rows:
                             break
+                        # A SHORT PAGE IS NOT END-OF-DATA. Measured live
+                        # 2026-10-10: OKX returns only 100 rows for kline_1m even
+                        # when 300 were requested, so treating "fewer than asked"
+                        # as "no more data" stopped after ONE page and left 1m
+                        # capped at exactly 100 -- the very ceiling this loop
+                        # exists to remove. Keep paging while the cursor still
+                        # advances; the real terminators are an empty page, an
+                        # exhausted window, or a stuck cursor.
                         if len(batch) < _PAGE:
-                            # Short page means no more data in the window.
-                            break
+                            short_pages += 1
                         # Advance by the MAX timestamp in the page, never by
                         # the last row's. Advancing by batch[-1] assumes the
                         # exchange returns rows ascending; if it does not, the
@@ -2640,12 +2654,18 @@ class DataConsumer:
                         cursor_ms = page_max + 1
 
                     ohlcv_rows = list(collected_by_ts.values())
+                    if short_pages:
+                        logger.info(
+                            f"{log_prefix} {short_pages} short page(s) for "
+                            f"{cache_key}; the exchange serves fewer rows than "
+                            f"requested ({_PAGE}) and paging continued."
+                        )
                     if len(collected_by_ts) >= _target_rows or (
                         _window_rows > _PAGE * _MAX_PAGES
                     ):
                         logger.info(
                             f"{log_prefix} Fetched {len(collected_by_ts)} {timeframe} candles "
-                            f"for {cache_key} across {len(collected_by_ts) and _page + 1} page(s) "
+                            f"for {cache_key} across {pages_used} page(s) "
                             f"(target {_target_rows}, window holds {_window_rows})."
                         )
                     historical_candles_tuples = []
