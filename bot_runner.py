@@ -31,6 +31,7 @@ from bot_module.controller import TradingController
 from bot_module.telegram_notifier import TelegramNotifier
 from bot_module.compass_strategy import CompassStrategy
 from bot_module.strategy import STRATEGIES
+from bot_module.rehydrate import refresh_payload_config_from_db
 
 # Register CompassStrategy manually to avoid circular imports in strategy.py
 STRATEGIES["CompassStrategy"] = CompassStrategy
@@ -248,6 +249,24 @@ async def _rehydrate_all_strategies_globally(redis_client) -> None:
                 )
                 skipped_malformed += 1
                 continue
+
+            # The cached payload is a point-in-time snapshot. Re-read config_data
+            # from Postgres so a restart cannot resurrect a config that has since
+            # been edited or migrated in place.
+            payload, refreshed = await refresh_payload_config_from_db(
+                payload, user_id_str, get_db
+            )
+            if refreshed:
+                # Persist the corrected payload so later restarts start from it.
+                try:
+                    await redis_client.set(
+                        payload_key, json.dumps(payload, default=str)
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"{log_prefix} Could not write back the refreshed payload "
+                        f"at {payload_key}: {exc}; continuing with the in-memory copy."
+                    )
 
             command = {"command": "START_STRATEGY", "payload": payload}
             await redis_client.publish(

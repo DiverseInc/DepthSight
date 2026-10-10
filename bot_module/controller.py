@@ -34,6 +34,7 @@ from bot_module.runtime_dependencies import (
     get_db as _default_get_db,
     send_push_notification,
 )
+from bot_module.rehydrate import refresh_payload_config_from_db
 from bot_module.symbol_selection import SymbolSelectionConfig
 from bot_module.strategy import (
     StrategySignal,
@@ -3441,6 +3442,26 @@ class TradingController:
                     if isinstance(payload_raw, bytes):
                         payload_raw = payload_raw.decode("utf-8")
                     payload = json.loads(payload_raw)
+                    payload, refreshed = await refresh_payload_config_from_db(
+                        payload, int(user_id_str), self.get_db_session
+                    )
+                    if refreshed:
+                        # Persist the corrected payload so the global rehydrate
+                        # layer and any later restart start from this copy
+                        # instead of replaying the stale one again. A failure
+                        # here must never abort the loop: the remaining
+                        # strategies are more important than this cache write.
+                        try:
+                            await self.redis_client.set(
+                                f"running_strategy_payload:{user_id_str}:{cid}",
+                                json.dumps(payload, default=str),
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                f"{log_prefix} Could not write back the refreshed "
+                                f"payload for config_id={cid}: {exc}; continuing with "
+                                f"the in-memory copy."
+                            )
                     command = {"command": "START_STRATEGY", "payload": payload}
                     await self.redis_client.publish(
                         redis_command_channel,
