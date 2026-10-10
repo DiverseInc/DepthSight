@@ -156,6 +156,24 @@ async def main():
     )
     if not rows:
         print("No matching strategies found. Check the ids against the live DB.")
+        print(f"  requested: {args.ids}")
+        # Guessing an id is easy and wrong (this happened: an id was assembled
+        # by copying another strategy's tail). List the real candidates so the
+        # next run does not have to go hunting for them.
+        cands = await conn.fetch(
+            "SELECT id::text AS id, name FROM strategy_configs "
+            "WHERE jsonb_exists(config_data::jsonb, 'blocks') ORDER BY name"
+        )
+        if cands:
+            print(f"\n  {len(cands)} strategy(ies) still carry a legacy 'blocks' key:")
+            for c in cands:
+                print(f"    {c['id']}  {c['name']}")
+            print("\n  Re-run with one of the ids above.")
+        else:
+            print(
+                "\n  No strategy carries a legacy 'blocks' key -- every row is "
+                "already converted."
+            )
         await conn.close()
         return 1
 
