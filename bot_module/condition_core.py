@@ -903,9 +903,20 @@ def evaluate_ma_cross_scalar(
     """
     fast_p = int(params.get("fast_period", 9))
     slow_p = int(params.get("slow_period", 21))
+    # Mirrors _check_condition_ma_cross's default so both paths agree when
+    # no direction is configured.
+    direction = params.get("direction", params.get("operator", "Above"))
 
     if df is None or df.empty:
         return False, {"error": "No data"}
+
+    # A CROSS is a transition between two candles, so iloc[-2] needs at least
+    # two rows. On a one-row frame that raised IndexError and was swallowed by
+    # the except below, which reported it as an ordinary "condition false".
+    if len(df) < 2:
+        return False, {
+            "error": f"Not enough data for a cross: {len(df)} candle(s), need 2"
+        }
 
     try:
         slice_df = df.tail(max(250, max(fast_p, slow_p) + 5)).copy()
@@ -918,13 +929,28 @@ def evaluate_ma_cross_scalar(
         f0, f1 = float(ema_fast.iloc[-1]), float(ema_fast.iloc[-2])
         s0, s1 = float(ema_slow.iloc[-1]), float(ema_slow.iloc[-2])
 
-        result = (f0 > s0) and (f1 <= s1)
+        # HONOUR `direction` (2026-10-10).
+        #
+        # This was hardcoded to `(f0 > s0) and (f1 <= s1)` -- a golden cross,
+        # always. A strategy whose EXIT was a cross_below (death cross) had it
+        # evaluated as a cross_above, so the exit fired on the same event as
+        # the entry and the position closed almost immediately.
+        #
+        # An unrecognised direction returns False rather than defaulting to a
+        # golden cross, matching _check_condition_ma_cross.
+        if direction in ("Below", "cross_below", "crosses_below"):
+            result = (f0 < s0) and (f1 >= s1)
+        elif direction in ("Above", "cross_above", "crosses_above"):
+            result = (f0 > s0) and (f1 <= s1)
+        else:
+            return False, {"error": f"Unknown ma_cross direction: {direction!r}"}
 
         return bool(result), {
             "fast": f0,
             "slow": s0,
             "fast_period": fast_p,
             "slow_period": slow_p,
+            "direction": direction,
         }
 
     except Exception as e:

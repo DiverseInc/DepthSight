@@ -9247,8 +9247,17 @@ class VisualBuilderStrategy(BaseStrategy):
         elif node_type == "ma_cross_condition":
             fast = params.get("fast_period", 9)
             slow = params.get("slow_period", 21)
-            required.add(f"SMA_{fast}")
-            required.add(f"SMA_{slow}")
+            # EMA, not SMA (2026-10-10).
+            #
+            # _check_condition_ma_cross (this file, key_fast/key_slow) reads
+            # EMA_<period> columns off the kline DataFrame. Declaring SMA here
+            # meant the runtime never computed them, the lookup returned None,
+            # and EVERY cross fell through to evaluate_ma_cross_scalar -- which
+            # ignores `direction` entirely and always evaluates a golden cross.
+            # A cross_below EXIT therefore fired on a cross_above, i.e. the
+            # same event as the entry.
+            required.add(f"EMA_{fast}")
+            required.add(f"EMA_{slow}")
         elif node_type == "tape_analysis":
             window = params.get("time_window_sec", 5)
             metric_suffixes = [

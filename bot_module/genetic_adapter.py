@@ -200,12 +200,22 @@ class GeneticCompatibleStrategy(VisualBuilderStrategy):
     ) -> Tuple[bool, Dict]:
         fast_p = int(params.get("fast_period", 9))
         slow_p = int(params.get("slow_period", 21))
+        # Same fix as condition_core.evaluate_ma_cross_scalar (2026-10-10):
+        # this was hardcoded to a golden cross with `direction` never read, so
+        # a cross_below exit scored as a cross_above during genetic search.
+        direction = params.get("direction", params.get("operator", "Above"))
 
         candle_tf = pair_info.get("candle_timeframe", "1m")
         df = market_data.get(f"kline_{candle_tf}")
 
-        if df is None:
+        if df is None or df.empty:
             return False, {"error": "No data"}
+
+        # A cross needs two candles; iloc[-2] would raise on a single row.
+        if len(df) < 2:
+            return False, {
+                "error": f"Not enough data for a cross: {len(df)} candle(s), need 2"
+            }
 
         slice_df = df.tail(max(fast_p, slow_p) + 5).copy()
         ema_fast = slice_df.ta.ema(length=fast_p)
@@ -214,12 +224,19 @@ class GeneticCompatibleStrategy(VisualBuilderStrategy):
         f0, f1 = ema_fast.iloc[-1], ema_fast.iloc[-2]
         s0, s1 = ema_slow.iloc[-1], ema_slow.iloc[-2]
 
-        result = (f0 > s0) and (f1 <= s1)
+        if direction in ("Below", "cross_below", "crosses_below"):
+            result = (f0 < s0) and (f1 >= s1)
+        elif direction in ("Above", "cross_above", "crosses_above"):
+            result = (f0 > s0) and (f1 <= s1)
+        else:
+            return False, {"error": f"Unknown ma_cross direction: {direction!r}"}
+
         return bool(result), {
             "fast": float(f0),
             "slow": float(s0),
             "fast_period": fast_p,
             "slow_period": slow_p,
+            "direction": direction,
         }
 
     def _check_condition_bb(
