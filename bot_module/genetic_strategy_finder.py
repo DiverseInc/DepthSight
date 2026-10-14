@@ -505,8 +505,13 @@ def resample_to_timeframes(
 
     result = {"1m": df_1m}  # Always include the base 1m
 
-    # Resampling rules for pandas
-    tf_rules = {"5m": "5T", "15m": "15T", "1h": "1H", "4h": "4H"}
+    # Resampling rules for pandas.
+    # FIX 2026-10-14: the uppercase aliases "5T"/"15T"/"1H"/"4H" were deprecated in
+    # pandas 2.2 and REMOVED in pandas 3.0 ("Invalid frequency: T ... Did you mean
+    # min?"). On pandas 3 every resample() through this table raised, so the whole
+    # genetic search path was dead — silently, since it is an offline tool nobody
+    # watches. Do NOT pin pandas to hide this; fix the aliases.
+    tf_rules = {"5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h"}
 
     for tf in timeframes:
         if tf == "1m":
