@@ -6318,6 +6318,68 @@ class TradingController:
 
         return mode, [], False
 
+    @staticmethod
+    def _symbols_refer_to_same_market(pinned: Optional[str], event: Optional[str]) -> bool:
+        """Do two symbol strings denote the same trading market?
+
+        A pinned strategy must match only its own market -- but the SAME market
+        can arrive spelled differently. Live evidence 2026-10-14:
+
+            [SignalCheck:BTC-USDT] 2 running instance(s) all rejected:
+              VisualBuilderStrategy: pinned to BTCUSDT, event symbol=BTC-USDT
+
+        The config stores the legacy form ("BTCUSDT") while the event carries
+        the exchange-native form the subscription was created with
+        ("BTC-USDT"). Comparing them verbatim discarded every candle, so the
+        strategy ran, received data, and still never traded.
+
+        This is the same defect as the valid-symbols gate in data_consumer
+        (fixed in 74086cd) -- a verbatim comparison between a legacy-keyed
+        value and an exchange-native one. Canonicalise with the SAME production
+        helper rather than reimplementing it; a second copy of this rule is how
+        the two call sites drift apart in the first place.
+
+        Deliberately CANONICAL-AND-EQUAL, never a prefix or substring test:
+        "BTCUSDT" must not match "BTC-USDC", and a pinned BTCUSDT strategy
+        must still refuse ETHUSDT. The over-matching this guards against is
+        described above at the pinned-symbol check -- a BTCUSDT-pinned strategy
+        once swallowed ETHUSDT candles and silenced a correct strategy.
+
+        NOTE: a *missed* match is the safe direction here. A pin spelled with a
+        suffix this helper does not strip (e.g. "BTC-USDT-PERP") still rejects
+        its own event. That costs a trade; it never trades the wrong market.
+        """
+        if not pinned or not event:
+            return False
+        p = str(pinned).strip()
+        e = str(event).strip()
+        if p == e:
+            return True
+        try:
+            # Imported lazily: controller.py is imported by the bot bootstrap
+            # and a module-level import here risks a cycle.
+            from bot_module.exchanges.ccxt_executor import CcxtExecutor
+
+            return CcxtExecutor._to_legacy_symbol(p).strip().upper() == (
+                CcxtExecutor._to_legacy_symbol(e).strip().upper()
+            )
+        except Exception:
+            # Never let a canonicalisation failure widen the match. Falling
+            # back to exact comparison preserves the old, stricter behaviour.
+            #
+            # This must NOT be silent: an exception here disables canonical
+            # matching for EVERY pinned strategy, which would look exactly like
+            # the bug this fixes. Log loudly.
+            logger.error(
+                "Could not canonicalise symbol comparison %r vs %r; falling back "
+                "to exact match. Pinned strategies whose symbol is spelled "
+                "differently from their event will NOT match until this is fixed.",
+                p,
+                e,
+                exc_info=True,
+            )
+            return False
+
     def _select_applicable_instances(
         self,
         running_instances: List[Tuple[BaseStrategy, dict]],
@@ -6384,7 +6446,7 @@ class TradingController:
             # So: a pinned symbol is a CONSTRAINT, not a pass.
             pinned_symbol = config_data.get("symbol")
             if pinned_symbol:
-                if symbol != pinned_symbol:
+                if not self._symbols_refer_to_same_market(pinned_symbol, symbol):
                     rejections.append(
                         f"{strategy_name}: pinned to {pinned_symbol}, "
                         f"event symbol={symbol}"
