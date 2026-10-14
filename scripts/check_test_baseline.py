@@ -56,28 +56,45 @@ BASELINE_FILE = REPO_ROOT / "tests" / "baseline_failures.json"
 # optional " - AssertionError..." detail, so that detail is not captured.
 #
 # The lookbehind stops this matching inside a longer word ("XFAILED",
-# "NOTFAILED"). Requiring "tests/" after the whitespace keeps it off traceback
-# prose that merely contains the word FAILED.
-FAILED_RE = re.compile(r"(?<![A-Za-z0-9_])FAILED\s+(tests/\S+)")
+# "NOTFAILED"). Requiring a ".py::" node id keeps it off traceback prose that
+# merely contains the word FAILED.
+#
+# ⚠️ Measured against real `pytest -q -rf` output, NOT assumed: the node id is
+# matched as "\S+\.py::\S+", not as "tests/...". Running `pytest tests/` does
+# produce tests/... ids, but hard-coding the directory silently ignores every
+# failure if the suite is ever invoked on a path outside tests/.
+FAILED_RE = re.compile(r"(?<![A-Za-z0-9_])FAILED\s+(\S+\.py::\S+)")
 
 # Collection/import failures are reported as ERROR, not FAILED. They must also
 # break the gate, otherwise a broken import would show up as "no failures".
-ERROR_RE = re.compile(r"(?<![A-Za-z0-9_])ERROR\s+(tests/\S+)")
+#
+# Unlike FAILED, an ERROR may be file-level -- a module that fails to import
+# has no runnable node id and pytest reports "ERROR tests/test_broken.py" or
+# "ERROR collecting tests/test_broken.py". So the "::node" part is optional
+# here. A file-level id never matches a baseline key (those all carry "::"),
+# which is correct: a broken import should always fail the gate.
+ERROR_RE = re.compile(r"(?<![A-Za-z0-9_])ERROR\s+(\S+\.py(?:::\S+)?)")
 
-# A pytest run that produced a real summary ends with something like:
-#   "==== 20 failed, 1345 passed, 45 skipped in 14m50s ===="
-#   "=== 1 failed, 4 passed in 0.5s ===="
-#   "=== no tests ran in 0.1s ===="
+# A pytest run that produced a real epilogue ends with a line like:
+#   "1 failed, 1 passed in 0.06s"
+#   "20 failed, 1345 passed, 45 skipped, 2 warnings in 14m50.12s"
+#   "34 passed, 2 warnings in 25.70s"
+#   "no tests ran in 0.1s"
+#
+# 🚨 MEASURED, NOT ASSUMED. An earlier version required "=" decoration, which is
+# WRONG for `-q`: pytest does NOT wrap the -q epilogue in equals signs. That
+# version reported "no pytest summary line found" against real pytest output and
+# would have turned a completely clean CI run red. The decoration is optional
+# here so both the -q and the verbose forms are accepted.
 SUMMARY_RE = re.compile(
-    r"=+\s*(?:no tests ran|\d+\s+(?:failed|passed|error|errors|skipped))", re.IGNORECASE
+    r"^\s*=*\s*(?:no tests ran|\d+\s+(?:failed|passed|error|errors|skipped|xfailed|xpassed))",
+    re.IGNORECASE | re.MULTILINE,
 )
 
-# pytest's final epilogue states how many tests failed, e.g.
-#   "===== 20 failed, 1345 passed, 45 skipped, 2 warnings in 14m50s ====="
-# It is the ONLY place the run states its own failure total, so it is the only
-# thing that can catch a log whose per-test FAILED lines never reached disk.
-# Only the tail is searched -- a 15-minute run produces a large log, and the
-# epilogue is always last.
+# The epilogue states how many tests failed. It is the ONLY place the run states
+# its own failure total, so it is the only thing that can catch a log whose
+# per-test FAILED lines never reached disk. Applied ONLY to the final line --
+# see epilogue_line() for why "search the tail" was wrong.
 FAILED_COUNT_RE = re.compile(r"(\d+)\s+failed\b", re.IGNORECASE)
 
 # pytest's own catastrophic failures. Each is ANCHORED, not a bare substring:
@@ -101,6 +118,9 @@ FATAL_RES = (
 # keeps matching when the parameter list changes shape.
 PARAM_SUFFIX_RE = re.compile(r"\[.*\]$")
 
+# ANSI SGR colour sequences, e.g. the "\x1b[31m" pytest puts before FAILED.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 
 def parse_failures(output: str) -> Counter[str]:
     """Count failing test ids, per canonical id.
@@ -112,7 +132,7 @@ def parse_failures(output: str) -> Counter[str]:
     """
     seen: set[str] = set()
     counts: Counter[str] = Counter()
-    for match in FAILED_RE.finditer(output):
+    for match in FAILED_RE.finditer(strip_ansi(output)):
         if match.group(0) in seen:
             continue
         seen.add(match.group(0))
@@ -128,7 +148,7 @@ def parse_errors(output: str) -> set[str]:
     Ignoring those would mean a broken import shows up as zero failures, i.e.
     green.
     """
-    return {canonical(m.group(1)) for m in ERROR_RE.finditer(output)}
+    return {canonical(m.group(1)) for m in ERROR_RE.finditer(strip_ansi(output))}
 
 
 def reported_failure_count(output: str) -> int | None:
@@ -137,16 +157,59 @@ def reported_failure_count(output: str) -> int | None:
     This exists to close a real hole. Every other check in this file asks "does
     the log LOOK complete?". This one asks the only question that actually
     matters: does the log AGREE WITH ITSELF? A log whose epilogue says
-    "20 failed" while zero `FAILED tests/...` lines are present is a log that
-    lost its failure lines -- and grading it as zero failures would report a
-    green gate on a suite that broke. A partial flush or a post-processed log
-    both produce exactly that shape.
+    "20 failed" while zero `FAILED ...` lines are present is a log that lost
+    its failure lines -- and grading it as zero failures would report a green
+    gate on a suite that broke. A partial flush or a post-processed log both
+    produce exactly that shape.
 
-    Only the tail is searched: the epilogue is last, and scanning a 15-minute
-    log for the first "N failed" would pick up unrelated text.
+    Returns 0, not None, when the epilogue exists but states no failure count:
+    a clean run really does end "34 passed, 2 warnings in 25.70s". Treating a
+    missing count as "cannot verify" would turn every green run red.
+
+Returns None when the last line is not an epilogue at all -- that is a log
+    which never reported, not a log reporting zero failures.
     """
-    match = FAILED_COUNT_RE.search(output[-4000:])
-    return int(match.group(1)) if match else None
+    line = epilogue_line(output)
+    if line is None or not SUMMARY_RE.match(strip_ansi(line)):
+        return None
+    match = FAILED_COUNT_RE.search(strip_ansi(line))
+    return int(match.group(1)) if match else 0
+
+
+def epilogue_line(output: str) -> str | None:
+    """The final non-empty line, or None if there is no output.
+
+    ⚠️ Anchoring to the LAST line, not "the tail", is load-bearing. An earlier
+    version searched the last 4000 characters for "N failed" and found none of
+    these are avoided by anchoring:
+
+      * a test printing "after 5 failed attempts..." near the end of the log
+        would be read as pytest's own total and fail a perfectly good run;
+      * a fixture printing a fake "===== 5 passed =====" mid-log could satisfy a
+        "does a summary exist anywhere?" check after the real epilogue was lost.
+
+    pytest's epilogue is the last thing it writes, so requiring it to be the
+    last line rejects both.
+    """
+    lines = [line for line in output.splitlines() if line.strip()]
+    return lines[-1] if lines else None
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI SGR colour codes.
+
+    Measured, not assumed: without this, a coloured `FAILED` is invisible to
+    FAILED_RE. The escape sequence ends in a letter ('m' in "\\x1b[31m"), which
+    trips the `(?<![A-Za-z0-9_])` lookbehind that deliberately excludes
+    XFAILED. The failure COUNT in the epilogue would still parse, so the result
+    is a false RED on a genuinely failing run -- the gate grading itself wrong
+    in the direction that costs the most trust.
+
+    pytest disables colour automatically when output is not a terminal, so CI
+    redirecting to a file should never hit this. Stripping anyway means a
+    plugin that forces colour cannot silently disarm the gate.
+    """
+    return ANSI_RE.sub("", text)
 
 
 def output_is_trustworthy(output: str) -> tuple[bool, str]:
@@ -159,11 +222,12 @@ def output_is_trustworthy(output: str) -> tuple[bool, str]:
     """
     if not output.strip():
         return False, "pytest output is empty -- pytest produced nothing."
-    if not SUMMARY_RE.search(output):
+    line = epilogue_line(output)
+    if line is None or not SUMMARY_RE.match(line):
         return False, (
-            "no pytest summary line found -- pytest crashed before reporting. "
-            "A crashed run prints no FAILED lines, which would otherwise look "
-            "like a clean pass."
+            "the last line of pytest_output.txt is not a pytest epilogue "
+            f"(got {line!r}). pytest crashed before reporting. A crashed run "
+            "prints no FAILED lines, which would otherwise look like a clean pass."
         )
     for pattern in FATAL_RES:
         match = pattern.search(output)
@@ -293,6 +357,10 @@ def main(argv: list[str]) -> int:
         for line in output.strip().splitlines()[-30:]:
             print(f"       {line}")
         return 1
+
+    # Colour codes are stripped once, up front, so every check below -- trust,
+    # failure parsing, epilogue reading -- sees the same clean text.
+    output = strip_ansi(output)
 
     observed = parse_failures(output)
     errored = parse_errors(output)

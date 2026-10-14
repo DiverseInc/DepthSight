@@ -36,8 +36,25 @@ gate = _load_gate()
 
 
 def summary(passed: int = 100, failed: int = 1, skipped: int = 0) -> str:
-    """A pytest short-summary block, shaped like the real thing."""
-    return f"===== {failed} failed, {passed} passed, {skipped} skipped in 3.2s =====\n"
+    """pytest's REAL `-q` epilogue.
+
+    🚨 CAPTURED FROM AN ACTUAL RUN, NOT INVENTED. An earlier version of this
+    helper wrote "===== 1 failed, 4 passed in 0.5s =====" -- the VERBOSE format.
+    Real `pytest -q` does NOT wrap its epilogue in equals signs; it writes a bare
+    "1 failed, 4 passed in 0.5s". The gate shipped a regex that required the
+    decoration, and every test built on the invented format happily agreed with
+    it. Thirty-four green tests hid a gate that would turn a clean CI run red.
+
+    Lesson: for any gate that parses another tool's output, capture that tool's
+    real output and pin it as a fixture. Do not reconstruct it from memory.
+    """
+    parts = []
+    if failed:
+        parts.append(f"{failed} failed")
+    if skipped:
+        parts.append(f"{skipped} skipped")
+    parts.append(f"{passed} passed")
+    return f"{', '.join(parts)} in 3.2s\n"
 
 
 def failed_line(test_id: str) -> str:
@@ -235,7 +252,7 @@ def test_summary_reporting_more_failures_than_are_present_is_red(tmp_path, basel
         tmp_path,
         baseline_file,
         {},
-        "collected 900 items\n===== 20 failed, 1345 passed, 45 skipped in 14m50s =====\n",
+        "collected 900 items\n20 failed, 1345 passed, 45 skipped in 14m50s\n",
         expected=1,
     )
 
@@ -260,10 +277,80 @@ def test_reported_failure_count_reads_the_epilogue():
     assert gate.reported_failure_count("collected 900 items\n") is None
 
 
-def test_reported_failure_count_only_reads_the_tail():
-    """A huge log's earlier text must not be mistaken for the epilogue."""
-    log = "===== 999 failed, 0 passed in 1s =====\n" + ("noise line\n" * 20000) + summary(failed=2)
+def test_reported_failure_count_ignores_earlier_text():
+    """A huge log's earlier text must not be mistaken for the epilogue.
+
+    This used to search the last 4000 characters, which meant a test printing
+    "after 5 failed attempts..." near the end could be read as pytest's own
+    total and fail an otherwise good run.
+    """
+    log = "999 failed, 0 passed in 1s\n" + ("noise line\n" * 20000) + summary(failed=2)
     assert gate.reported_failure_count(log) == 2
+
+
+# --- real captured pytest output ------------------------------------------
+#
+# These are the exact bytes two real `pytest -q -rf` runs produced on this repo,
+# captured not reconstructed. They exist because a hand-written "realistic"
+# fixture agreed with a wrong parser for 34 green tests straight through.
+
+REAL_CLEAN_RUN = (
+    ".F                                                                       [100%]\n"
+    "=========================== short test summary info ===========================\n"
+    "FAILED _failing_test.py::test_demo[b] - AssertionError: boom on b\n"
+    "1 failed, 1 passed in 0.06s\n"
+)
+
+REAL_ALL_PASS_RUN = (
+    ".................................................................        [100%]\n"
+    "<-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html>\n"
+    "34 passed, 2 warnings in 25.70s\n"
+)
+
+
+def test_real_pytest_output_is_recognised():
+    """The -q epilogue carries NO '=' decoration. An earlier regex required it
+    and reported "no pytest summary line found" against this exact text --
+    which would have turned a clean CI run red."""
+    assert gate.output_is_trustworthy(REAL_CLEAN_RUN) == (True, "")
+    assert gate.output_is_trustworthy(REAL_ALL_PASS_RUN) == (True, "")
+
+
+def test_real_pytest_failures_are_parsed():
+    counts = gate.parse_failures(REAL_CLEAN_RUN)
+    assert counts == {"_failing_test.py::test_demo": 1}
+    assert gate.reported_failure_count(REAL_CLEAN_RUN) == 1
+
+
+def test_real_all_pass_run_reports_zero_not_none():
+    """A clean run's epilogue states no failure count. That means ZERO, not
+    "cannot verify" -- treating it as unknown would fail every green run."""
+    assert gate.reported_failure_count(REAL_ALL_PASS_RUN) == 0
+    assert gate.parse_failures(REAL_ALL_PASS_RUN) == {}
+
+
+def test_a_fake_summary_mid_log_does_not_satisfy_the_epilogue_check():
+    """A fixture printing a summary-shaped line must not stand in for pytest's
+    real epilogue if that epilogue was lost."""
+    spoofed = "===== 5 passed, 95 skipped in 1s =====\nmore output after it\n"
+    ok, why = gate.output_is_trustworthy(spoofed)
+    assert not ok
+    assert "epilogue" in why
+
+
+def test_ansi_colour_codes_do_not_hide_failures(tmp_path, baseline_file):
+    """A coloured FAILED is invisible without stripping: the escape sequence
+    ends in a letter, which trips the lookbehind that excludes XFAILED. The
+    epilogue count would still parse, so the result is a false RED."""
+    coloured = (
+        "\x1b[31;1mFAILED\x1b[0m tests/test_a.py::test_one - AssertionError\n"
+        + summary(failed=1)
+    )
+    assert gate.parse_failures(coloured) != {}
+    assert gate.strip_ansi(coloured) == (
+        "FAILED tests/test_a.py::test_one - AssertionError\n" + summary(failed=1)
+    )
+    run_gate(tmp_path, baseline_file, {"tests/test_a.py::test_one": 1}, coloured, expected=0)
 
 
 # --- false positives the gate must NOT raise ------------------------------
