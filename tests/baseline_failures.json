@@ -1,0 +1,41 @@
+{
+  "_comment": [
+    "Known-failing tests, recorded 2026-10-14 from CI run 2624184 (20 failures).",
+    "",
+    "The CI gate compares observed failures against this file, so a PR that REDUCES",
+    "failures shows green and only a NEW or INCREASED failure turns CI red.",
+    "Without this, every PR was permanently red and the badge meant nothing.",
+    "",
+    "Each key is a pytest node id CANONICALISED by stripping the [parametrisation]",
+    "suffix. Each value is the MAXIMUM number of failing instances allowed for that",
+    "node id -- this matters: two entries below have 2 failing params each, and 16",
+    "have 1. Counting is per canonical id, so adding a NEW failing parametrised case",
+    "to an already-baselined function still trips the gate.",
+    "",
+    "TO UPDATE: remove an entry when the underlying bug is fixed; lower a count when",
+    "only some params are fixed. Never ADD an entry merely to turn the badge green."
+  ],
+  "recorded_at": "2026-10-14",
+  "source_run": "2624184",
+  "expected_failure_count": 20,
+  "failures": {
+    "tests/test_account_environment_isolation.py::test_data_consumer_subscription_isolation": 1,
+    "tests/test_api.py::test_get_status": 1,
+    "tests/test_api.py::test_strategies_workflow": 1,
+    "tests/test_api_full_coverage.py::TestAuthentication::test_unprotected_endpoint_is_accessible": 1,
+    "tests/test_api_full_coverage.py::TestLiveStrategyEndpoints::test_start_strategy_publishes_command_to_redis": 1,
+    "tests/test_data_pipeline_e2e.py::TestDataPipelineMDS::test_candle_close_triggers_signal_check": 1,
+    "tests/test_data_pipeline_e2e.py::TestDataPipelineMDS::test_handle_event_calls_signal_check": 1,
+    "tests/test_data_processing_refactor.py::test_full_integration_visual_strategy": 1,
+    "tests/test_e2e_controller_orderbook.py::test_e2e_signal_approved_on_companion_density": 1,
+    "tests/test_locking_logic.py::test_concurrency_limit_integrity_with_fine_grained_locks": 1,
+    "tests/test_plans.py::TestUserPlans::test_free_user_bybit_trading": 1,
+    "tests/test_plans.py::TestUserPlans::test_permission_enforcement": 2,
+    "tests/test_portfolio_backtester.py::test_l2_impact_changes_fill_price": 1,
+    "tests/test_portfolio_backtester.py::test_run_backtest_and_generate_trades": 1,
+    "tests/test_return_to_level_parity.py::test_return_to_level_parity": 2,
+    "tests/test_risk_manager.py::test_assess_signal_normal_long": 1,
+    "tests/test_risk_manager.py::test_assess_signal_normal_short": 1,
+    "tests/test_risk_manager.py::test_assess_signal_uses_risk_multiplier": 1
+  }
+}

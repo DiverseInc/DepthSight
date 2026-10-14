@@ -5,6 +5,9 @@ on:
     branches: [ main, master, dev ]
   pull_request:
     branches: [ main, master, dev ]
+  # Added 2026-10-14: this repo produced ZERO runs for its whole history, so
+  # there was no way to confirm CI actually executes without pushing to main.
+  workflow_dispatch:
 
 jobs:
   test:
@@ -25,6 +28,42 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    # Run pytest and ALWAYS capture its output. The exit code is deliberately
+    # ignored here: this repo carries long-standing failures, so the gate is
+    # "did anything NEW break?", not "is the suite clean?". See the next step.
+    #
+    # Before this, every commit was red -- including the ones that fixed real
+    # bugs -- because a plain `pytest tests/` cannot express "132 -> 20".
+    #
+    # 🚨 DO NOT ADD `--maxfail` / `-x` TO THIS LINE. The gate can only detect a
+    # regression in tests that actually RAN. Stopping at the first failure would
+    # let a regression sitting later in the suite pass unnoticed, and would also
+    # report untouched baseline failures as "[FIXED]" simply because they never
+    # executed. Full-suite completion is a correctness requirement here, not a
+    # preference.
     - name: Run tests
+      run: python -m pytest tests/ --tb=no -q -rf > pytest_output.txt 2>&1 || true
+
+    # The next step grades pytest_output.txt itself, but a reviewer looking at
+    # the log should not have to scroll to find the verdict. `tail` alone was not
+    # enough: warnings can print after the summary and push it out of a short
+    # window, so the counts are re-printed explicitly on their own line.
+    - name: Show test summary
       run: |
-        python -m pytest tests/
+        echo "--- last failing tests ---"
+        grep -E '(FAILED|ERROR) tests/' pytest_output.txt | tail -40 || true
+        echo "--- pytest verdict ---"
+        grep -E '^=+' pytest_output.txt | tail -1 || echo "(no pytest summary line found)"
+
+    # Fails ONLY on a test that is not in tests/baseline_failures.json.
+    # A PR that reduces failures is green; a PR that introduces one is red.
+    - name: Check for new failures against the recorded baseline
+      run: python scripts/check_test_baseline.py pytest_output.txt
+
+    - name: Upload test output
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pytest-output
+        path: pytest_output.txt
+        retention-days: 14
