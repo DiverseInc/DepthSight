@@ -368,6 +368,33 @@ def test_word_interrupted_inside_a_test_name_is_not_fatal(tmp_path, baseline_fil
     )
 
 
+def test_the_words_no_tests_ran_in_a_test_log_are_not_fatal(tmp_path, baseline_file):
+    """A test logging "===== no tests ran in the integration suite =====" must
+    not be read as pytest's own catastrophic condition.
+
+    Note anchoring was NOT enough here: that fake line and pytest's real
+    "===== no tests ran in 0.01s =====" are the same shape. The condition is
+    only meaningful as the EPILOGUE, so it is checked only there."""
+    log = "===== no tests ran in the integration suite (skipped, no DB) =====\n"
+    log += failed_line("tests/test_a.py::test_one") + summary(failed=1)
+    run_gate(
+        tmp_path,
+        baseline_file,
+        {"tests/test_a.py::test_one": 1},
+        log,
+        expected=0,
+    )
+
+
+def test_output_appended_after_the_epilogue_is_reported_clearly(tmp_path, baseline_file):
+    """A plugin trailer would make the last line not-an-epilogue. Failing is
+    the SAFE direction here, so this is intentional -- but the message has to
+    name the likely cause or it reads as a mystery."""
+    log = failed_line("tests/test_a.py::test_one") + summary(failed=1)
+    log += "---------- coverage: platform linux, python 3.12.15 ----------\n"
+    run_gate(tmp_path, baseline_file, {"tests/test_a.py::test_one": 1}, log, expected=1)
+
+
 def test_duplicate_reporter_lines_do_not_inflate_the_count(tmp_path, baseline_file):
     """Enabling two pytest reporters prints each failure twice. Counting raw
     occurrences would report a 1->2 regression that does not exist."""

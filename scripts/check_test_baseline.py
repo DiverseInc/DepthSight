@@ -104,8 +104,16 @@ FAILED_COUNT_RE = re.compile(r"(\d+)\s+failed\b", re.IGNORECASE)
 FATAL_RES = (
     re.compile(r"(?m)^\s*INTERNALERROR\b"),
     re.compile(r"(?m)^\s*!+\s*:?\s*Interrupted\b"),
-    re.compile(r"=+\s*no tests ran", re.IGNORECASE),
+    # "no tests ran" is deliberately NOT in this list. Scanned anywhere in a
+    # log it cannot be told apart from a test that logs
+    # "===== no tests ran in the integration suite =====" -- both are a line
+    # starting with '=' followed by those exact words. Anchoring does not help.
+    # It is checked against the EPILOGUE only, in output_is_trustworthy(),
+    # which is the only place the condition is actually meaningful.
 )
+
+# "pytest collected nothing" -- valid only as the final epilogue line.
+NO_TESTS_RAN_RE = re.compile(r"^\s*=*\s*no tests ran", re.IGNORECASE)
 
 # ⚠️ XPASS is deliberately NOT treated as a failure. A strict-xfail test that
 # unexpectedly passes IS a pytest failure, but this repo does not set
@@ -225,9 +233,20 @@ def output_is_trustworthy(output: str) -> tuple[bool, str]:
     line = epilogue_line(output)
     if line is None or not SUMMARY_RE.match(line):
         return False, (
-            "the last line of pytest_output.txt is not a pytest epilogue "
-            f"(got {line!r}). pytest crashed before reporting. A crashed run "
-            "prints no FAILED lines, which would otherwise look like a clean pass."
+            f"the last line of pytest_output.txt is not a pytest epilogue "
+            f"(got {line!r}). Either pytest crashed before reporting -- a "
+            "crashed run prints no FAILED lines, which would otherwise look "
+            "like a clean pass -- or something appended output AFTER the "
+            "summary (a plugin, a coverage footer). Check pytest.ini and "
+            "requirements.txt for a plugin that writes a trailer."
+        )
+    # "no tests ran" is a real failure, but it is only meaningful as the
+    # epilogue. Scanned anywhere in a log it is indistinguishable from a test
+    # that merely logs a line shaped like pytest's own -- so it is scoped here.
+    if NO_TESTS_RAN_RE.match(line):
+        return False, (
+            "pytest ran no tests at all. A suite that collected nothing proves "
+            "nothing about regressions and must not read as a clean pass."
         )
     for pattern in FATAL_RES:
         match = pattern.search(output)
