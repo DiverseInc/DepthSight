@@ -2055,7 +2055,39 @@ class DataConsumer:
             valid_symbols = await self._get_valid_symbols_from_exchange_info(
                 market_type_sub
             )
-            if uc_symbol not in valid_symbols:
+            # FIX 2026-10-14: `valid_symbols` is keyed by LEGACY symbol
+            # ("BTCUSDT") -- fetch_exchange_info builds it as base+"USDT" plus a
+            # hardcoded top-volume safety net. Stored strategy configs, however,
+            # carry whatever form the exchange/UI showed them: "BTC-USDT",
+            # "BTC-USDT-SWAP", "BTC/USDT:USDT". Comparing verbatim rejected every
+            # dashed config with "Subscription SKIPPED", so the stream was never
+            # created and the strategy received ZERO candles while still reporting
+            # `running` -- a silent failure with no error anywhere.
+            #
+            # This gate runs BEFORE _normalize_symbol (applied later, at the
+            # watch_ohlcv call), which is why 189600b's dashed-symbol fix could
+            # never help: control never reached it.
+            #
+            # `_to_legacy_symbol` already encodes exactly this canonicalization
+            # (BTC-USDT / BTC-USDT-SWAP / BTC/USDT:USDT -> BTCUSDT). Compare
+            # canonically. The raw form is still accepted, so nothing that
+            # subscribed before this change can stop subscribing.
+            symbol_candidates = {uc_symbol}
+            _to_legacy = getattr(executor_for_market, "_to_legacy_symbol", None)
+            if callable(_to_legacy):
+                try:
+                    canonical = str(_to_legacy(uc_symbol) or "").strip().upper()
+                    if canonical:
+                        symbol_candidates.add(canonical)
+                except Exception:
+                    logger.debug(
+                        "%s Could not canonicalise '%s' for the valid-symbols check; "
+                        "falling back to the literal form.",
+                        log_prefix,
+                        uc_symbol,
+                        exc_info=True,
+                    )
+            if not (symbol_candidates & valid_symbols):
                 logger.warning(
                     f"{log_prefix} Symbol '{uc_symbol}' is NOT valid for market '{market_type_sub}'. Subscription SKIPPED."
                 )
