@@ -8,6 +8,7 @@ from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone, timedelta
 
 try:
+    from bot_module import config as global_bot_config
     from bot_module.risk_manager import RiskManager, SymbolStrategyPerformanceStats
     from bot_module.strategy import StrategySignal, SignalDirection, OrderMode
     from bot_module.exchanges import ExchangeExecutor
@@ -76,6 +77,37 @@ async def risk_manager(mock_executor, db_session, test_user):
     yield rm
 
 
+@pytest_asyncio.fixture
+async def risk_manager_uncapped_notional(risk_manager, monkeypatch):
+    """A RiskManager whose live notional cap cannot bind.
+
+    MAX_REAL_POSITION_SIZE_PCT_BALANCE is 0.10 (bot_module/config.py:1369) -- a
+    deliberate pre-mainnet safety limit added because, while it was undefined,
+    "every live trade was bounded only by available leverage". It is correct, and
+    it is not what these tests are measuring.
+
+    With this fixture's numbers (balance $10,000, entry $50,000, stop distance
+    $500, risk 1%) pure risk sizing asks for 0.20 BTC = $10,000 notional = 100%
+    of equity. The cap correctly refuses and hands back 0.02 BTC instead, so the
+    risk arithmetic under test is never reached.
+
+    Raising the cap here restores visibility of the risk-sizing path. The cap's
+    OWN behaviour is pinned separately by
+    test_max_notional_cap_bounds_risk_sized_quantity -- so this cannot quietly
+    become a way to stop testing the safety limit.
+    """
+    monkeypatch.setattr(
+        global_bot_config, "MAX_REAL_POSITION_SIZE_PCT_BALANCE", 100.0
+    )
+    # No `raising=False` on purpose: if the constant is ever renamed or moved,
+    # an AttributeError here should fail loudly rather than silently create a
+    # stray module attribute and leave the cap in force at its old value.
+    assert (
+        global_bot_config.MAX_REAL_POSITION_SIZE_PCT_BALANCE == 100.0
+    ), "cap patch did not take effect; the three tests below would silently re-test the cap"
+    return risk_manager
+
+
 @pytest.fixture
 def sample_signal_long():
     return StrategySignal(
@@ -106,7 +138,10 @@ def sample_signal_short():
 
 
 @pytest.mark.asyncio
-async def test_assess_signal_normal_long(risk_manager, sample_signal_long):
+async def test_assess_signal_normal_long(
+    risk_manager_uncapped_notional, sample_signal_long
+):
+    risk_manager = risk_manager_uncapped_notional
     lot_params = {"minQty": 0.0001, "maxQty": 9000.0, "stepSize": 0.00001}
     min_notional = 10.0
     expected_base_risk_usd = 10000.0 * risk_manager.risk_per_trade
@@ -133,7 +168,10 @@ async def test_assess_signal_normal_long(risk_manager, sample_signal_long):
 
 
 @pytest.mark.asyncio
-async def test_assess_signal_normal_short(risk_manager, sample_signal_short):
+async def test_assess_signal_normal_short(
+    risk_manager_uncapped_notional, sample_signal_short
+):
+    risk_manager = risk_manager_uncapped_notional
     lot_params = {"minQty": 0.0001, "maxQty": 9000.0, "stepSize": 0.00001}
     min_notional = 10.0
     expected_base_risk_usd = 10000.0 * risk_manager.risk_per_trade
@@ -255,8 +293,9 @@ async def test_assess_signal_zero_stop_distance(risk_manager, sample_signal_long
 
 @pytest.mark.asyncio
 async def test_assess_signal_uses_risk_multiplier(
-    risk_manager, sample_signal_long, mock_executor
+    risk_manager_uncapped_notional, sample_signal_long, mock_executor
 ):
+    risk_manager = risk_manager_uncapped_notional
     symbol = sample_signal_long.symbol
     strategy_name = sample_signal_long.strategy_name
     perf_key = (symbol, strategy_name)
@@ -292,6 +331,99 @@ async def test_assess_signal_uses_risk_multiplier(
     assert initial_risk_planned is not None
     assert math.isclose(initial_risk_planned, expected_base_risk_usd, rel_tol=1e-9)
     stats_obj.current_risk_multiplier_index = risk_manager._s_s_default_risk_idx
+
+
+@pytest.mark.asyncio
+async def test_max_notional_cap_bounds_risk_sized_quantity(
+    risk_manager, sample_signal_long
+):
+    """The live notional cap is a real safety limit, and it must stay one.
+
+    This is the counterpart to risk_manager_uncapped_notional. The same signal
+    that risk-sizing answers with 0.20 BTC ($10,000 notional = 100% of a $10,000
+    balance) must come back at 0.02 BTC once
+    MAX_REAL_POSITION_SIZE_PCT_BALANCE = 0.10 is in force.
+
+    Pinning this matters because the three sizing tests above raise that cap to
+    reach the risk arithmetic. If the cap were ever deleted or widened without
+    thought, those three would keep passing and only this one would notice.
+    """
+    lot_params = {"minQty": 0.0001, "maxQty": 9000.0, "stepSize": 0.00001}
+    min_notional = 10.0
+
+    assert (
+        global_bot_config.MAX_REAL_POSITION_SIZE_PCT_BALANCE == 0.10
+    ), "The live cap is a deliberate safety default; changing it needs a test update"
+
+    balance = risk_manager.stats.current_balance
+    max_notional = balance * global_bot_config.MAX_REAL_POSITION_SIZE_PCT_BALANCE
+    entry_price = sample_signal_long.trigger_price
+    expected_capped_qty = float(
+        (
+            (Decimal(str(max_notional)) / Decimal(str(entry_price)))
+            / Decimal(str(lot_params["stepSize"]))
+        ).quantize(Decimal("0"), rounding=ROUND_DOWN)
+        * Decimal(str(lot_params["stepSize"]))
+    )
+
+    approved, quantity, _risk_planned, _ = await risk_manager.assess_signal(
+        sample_signal_long, lot_params, min_notional
+    )
+    assert approved is True
+    assert quantity is not None
+    assert math.isclose(quantity, expected_capped_qty, rel_tol=1e-9)
+
+    # And the cap must actually be the binding constraint, not a coincidence of
+    # rounding: pure risk sizing wanted 10x this, so a regression that ignored
+    # the cap would be caught here rather than hiding behind a near-equal value.
+    uncapped_risk_qty = (
+        balance * risk_manager.risk_per_trade / (entry_price - sample_signal_long.stop_loss)
+    )
+    assert uncapped_risk_qty > expected_capped_qty * 5
+
+
+@pytest.mark.asyncio
+async def test_max_notional_cap_does_not_scale_with_risk_multiplier(
+    risk_manager, sample_signal_long
+):
+    """The notional cap is a SAFETY ceiling, so it must NOT follow the risk knob.
+
+    The whole reason this fix did not change product behaviour is that the cap is
+    deliberately absolute (config.py:1369). Pinning it only at the default
+    multiplier of 1.0 would leave the most tempting regression completely
+    invisible: someone "improving" the sizing by scaling the cap with the
+    per-strategy risk multiplier. That would shrink the ceiling exactly when a
+    strategy is being penalised -- the opposite of what a safety limit is for.
+
+    So: with the multiplier dialled down, the capped quantity must not move.
+    """
+    lot_params = {"minQty": 0.0001, "maxQty": 9000.0, "stepSize": 0.00001}
+    min_notional = 10.0
+
+    approved_at_default, qty_at_default, _, _ = await risk_manager.assess_signal(
+        sample_signal_long, lot_params, min_notional
+    )
+    assert approved_at_default is True
+    assert qty_at_default is not None
+
+    perf_key = (sample_signal_long.symbol, sample_signal_long.strategy_name)
+    stats_obj = risk_manager._symbol_strategy_performance[perf_key]
+    target_idx_reduced = 1
+    stats_obj.current_risk_multiplier_index = target_idx_reduced
+    applied_multiplier = risk_manager._strategy_symbol_risk_multipliers[
+        target_idx_reduced
+    ]
+    assert applied_multiplier != 1.0, "the multiplier must actually differ for this to test anything"
+
+    approved_reduced, qty_reduced, _, _ = await risk_manager.assess_signal(
+        sample_signal_long, lot_params, min_notional
+    )
+    stats_obj.current_risk_multiplier_index = risk_manager._s_s_default_risk_idx
+
+    assert approved_reduced is True
+    assert qty_reduced is not None
+    # The cap is holding both times, so a reduced risk multiplier cannot move it.
+    assert math.isclose(qty_reduced, qty_at_default, rel_tol=1e-9)
 
 
 @pytest.mark.asyncio
