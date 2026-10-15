@@ -140,6 +140,11 @@ def controller_and_strategy():
     ctrl.market_executors = {}
     ctrl._market_info_lock = asyncio.Lock()
     ctrl._market_info_cache = {}
+    # Read by _gather_market_data_for_required_keys (controller.py:6222) to log
+    # the insufficient-history ERROR once per (strategy, key). __init__ sets it
+    # at controller.py:487, but this fixture builds the controller with
+    # __new__ and so skips __init__ entirely.
+    ctrl._insufficient_history_seen = {}
 
     # Register a running strategy instance
     strategy = MagicMock(spec=BaseStrategy)
@@ -589,6 +594,9 @@ class TestDataPipelineMDS:
         ctrl.market_executors = {}
         ctrl._market_info_lock = asyncio.Lock()
         ctrl._market_info_cache = {}
+        # Same as the fixture above: read at controller.py:6222, initialised in
+        # __init__ (controller.py:487), which this fixture bypasses via __new__.
+        ctrl._insufficient_history_seen = {}
 
         # Register a minimal strategy
         strategy = MagicMock(spec=BaseStrategy)
