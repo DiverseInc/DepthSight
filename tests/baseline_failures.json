@@ -81,18 +81,37 @@
     "That test was mutation-checked: making the cap scale by the multiplier makes",
     "it fail, while test_max_notional_cap_bounds_risk_sized_quantity still passes.",
     "Measured on Linux (the grading platform): tests/test_risk_manager.py",
-    "34 passed, 0 failed (was 29 passed / 3 failed, plus 2 new tests)."
+    "34 passed, 0 failed (was 29 passed / 3 failed, plus 2 new tests).",
+
+    "2026-10-15 (portfolio_backtester): removed 2 instances.",
+    "test_run_backtest_and_generate_trades and test_l2_impact_changes_fill_price",
+    "both failed with 0 trades. These were baselined as 'Binance 451 => 0",
+    "candles => 0 trades'. THAT LABEL WAS WRONG. Measured on Linux:",
+    "  portfolio_backtester.py:183 Successfully loaded and processed klines",
+    "  portfolio_backtester.py:260 Strategy initialization completed. 2/2 created.",
+    "  portfolio_backtester.py:692 Unified timeline created with 4 timestamps",
+    "  portfolio_backtester.py:1200 Portfolio backtest finished. (zero trades)",
+    "download_klines is mocked by the tests, both symbols load, both strategies",
+    "instantiate, the timeline is built -- and no signal is ever produced, with",
+    "no exception logged. The assertion is 'assert 0 == 1', not an HTTP error.",
+    "Actual cause: mock_market_data declared prices as bare int literals, so",
+    "pandas inferred int64 and kline['close'] came back as np.int64. The signal",
+    "stubs guarded on isinstance(close, (int, float)) -- and np.int64 is NOT a",
+    "subclass of Python int (np.float64 IS a subclass of float, which is why the",
+    "bug looked arbitrary). Every close silently failed the guard, so zero",
+    "signals, so zero trades.",
+    "Fix: prices are floats in the fixture (real exchange OHLCV is float), and the",
+    "three guards now use numbers.Real so a numpy int/float both pass.",
+    "Measured on Linux: tests/test_portfolio_backtester.py 3 passed, 0 failed."
   ],
   "recorded_at": "2026-10-15",
   "source_run": "2624184",
-  "expected_failure_count": 8,
+  "expected_failure_count": 6,
   "failures": {
     "tests/test_account_environment_isolation.py::test_data_consumer_subscription_isolation": 1,
     "tests/test_data_processing_refactor.py::test_full_integration_visual_strategy": 1,
     "tests/test_e2e_controller_orderbook.py::test_e2e_signal_approved_on_companion_density": 1,
     "tests/test_locking_logic.py::test_concurrency_limit_integrity_with_fine_grained_locks": 1,
-    "tests/test_portfolio_backtester.py::test_l2_impact_changes_fill_price": 1,
-    "tests/test_portfolio_backtester.py::test_run_backtest_and_generate_trades": 1,
     "tests/test_return_to_level_parity.py::test_return_to_level_parity": 2
   }
 }
