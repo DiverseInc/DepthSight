@@ -146,6 +146,7 @@ class TestUserPlans:
         standard_user_client,
         pro_user_client,
         mock_celery_tasks,
+        mocker,
     ):
         clients = {
             "free_user": free_user_client,
@@ -153,6 +154,41 @@ class TestUserPlans:
             "pro_user": pro_user_client,
         }
         client = clients[user_fixture]
+
+        # THIS TEST WAS UNSATISFIABLE AS WRITTEN, and a 503 was hiding it.
+        #
+        # It shares one mocked config (`existing_config_id`, config_data
+        # {"param": 1}) across every param. But the two /api/v1/strategies cases
+        # need OPPOSITE configs:
+        #
+        #   free_user     -> expects 403, so the config must contain a Pro-only block
+        #   standard_user -> expects 202, so the config must NOT contain one
+        #
+        # Giving it a Pro-only config to satisfy free_user would also 403 the
+        # standard_user case, because `standard` has run_kline_backtest_per_day
+        # = 0 and therefore no Pro-tier access -- exactly like `free`. One
+        # shared config cannot satisfy both. So each case gets the config it
+        # actually needs, scoped to this test only.
+        #
+        # Note this was never a permission bug: _enforce_strategy_plan_restrictions
+        # was correct, and `correlation` is a genuine Pro-only block.
+        if user_fixture == "free_user" and endpoint == "/api/v1/strategies":
+            mocker.patch(
+                "api.crud.get_strategy_config",
+                new_callable=AsyncMock,
+                return_value=models.StrategyConfig(
+                    id="existing_config_id",
+                    name="Mocked Pro Strategy",
+                    # 'correlation' is in plans pro_only block restrictions.
+                    config_data={"blocks": [{"type": "correlation"}]},
+                    symbol_selection_mode="STATIC",
+                    symbols=["BTCUSDT"],
+                    use_ml_confirmation=False,
+                    user_id=1,
+                    created_at=datetime.now(timezone.utc),
+                    updated_at=datetime.now(timezone.utc),
+                ),
+            )
 
         # mocker.patch('sqlalchemy.ext.asyncio.AsyncSession.refresh', new_callable=AsyncMock) # This patch might not be needed
 
