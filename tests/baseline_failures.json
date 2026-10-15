@@ -68,11 +68,20 @@
     "  breakout_retest/from_below FAST=1 LIVE=1 agree bars=[150]",
     "The engines agree exactly and fire on the intended touch bar, so the test",
     "is now strictly MORE meaningful, not weaker.",
-    "Confirmed independently by Claude Code and Hermes, both CONFIRMED-DEGENERATE-TEST."
+    "Confirmed independently by Claude Code and Hermes, both CONFIRMED-DEGENERATE-TEST.",
+
+    "2026-10-15 LATER, CORRECTION: the fixture above DOES make the dataset",
+    "well-posed, but it does NOT fix this test on CI. Measured on Windows all",
+    "four parametrisations pass (FAST=1 LIVE=1 bars=[150]). On the ubuntu",
+    "runner the failure is IDENTICAL in shape to before the change:",
+    "  assert [1 item] == [many items]  for touch/any and touch/from_above.",
+    "So this is a WINDOWS-vs-LINUX behavioural difference in the LIVE engine",
+    "that I have not isolated. **Do not read the passing Windows run as a fix.**",
+    "The entry stays until it passes on the CI platform."
   ],
   "recorded_at": "2026-10-15",
   "source_run": "2624184",
-  "expected_failure_count": 9,
+  "expected_failure_count": 11,
   "failures": {
     "tests/test_account_environment_isolation.py::test_data_consumer_subscription_isolation": 1,
     "tests/test_data_processing_refactor.py::test_full_integration_visual_strategy": 1,
@@ -80,6 +89,7 @@
     "tests/test_locking_logic.py::test_concurrency_limit_integrity_with_fine_grained_locks": 1,
     "tests/test_portfolio_backtester.py::test_l2_impact_changes_fill_price": 1,
     "tests/test_portfolio_backtester.py::test_run_backtest_and_generate_trades": 1,
+    "tests/test_return_to_level_parity.py::test_return_to_level_parity": 2,
     "tests/test_risk_manager.py::test_assess_signal_normal_long": 1,
     "tests/test_risk_manager.py::test_assess_signal_normal_short": 1,
     "tests/test_risk_manager.py::test_assess_signal_uses_risk_multiplier": 1
