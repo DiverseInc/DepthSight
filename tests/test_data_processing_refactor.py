@@ -138,6 +138,14 @@ async def test_full_integration_visual_strategy(mocker):
     strategy_config = {
         "id": "visual_rsi_strategy_1",
         "user_id": 1,
+        # REQUIRED. The controller above is built with no api_key_id, so
+        # self.api_key_id is None and it is a PAPER-ONLY controller.
+        # controller.py:2051-2058 then rejects any command whose mode is not
+        # "paper" outright ("Paper-only controller skipping non-paper command
+        # (mode=live)") -- the strategy never starts, no instance is registered,
+        # and ensure_subscription is never called, which surfaced as
+        # "Expected 'ensure_subscription' to have been called."
+        "mode": "paper",
         "symbol_selection_mode": "STATIC",
         "symbols": ["TESTUSDT"],
         "config_data": {
@@ -210,6 +218,13 @@ async def test_full_integration_visual_strategy(mocker):
         )
 
         # --- Step 3: Mocking data collection and firing an event ---
+        # 205 rows, not 20. controller.py:6226 enforces a per-strategy history
+        # requirement and refuses to evaluate when the cache is short:
+        #   "Insufficient history for kline_1m: got 20, need 205."
+        # That gate is deliberate (added so a strategy cannot silently trade on
+        # too little data), so the fix is to give the strategy enough history,
+        # NOT to lower the gate. The rows stay identical, so RSI_14 is still
+        # 75.0 and still satisfies the rsi gt 60 entry condition.
         mock_kline_df = pd.DataFrame(
             [
                 {
@@ -221,7 +236,7 @@ async def test_full_integration_visual_strategy(mocker):
                     "open": 100.0,
                 }
             ]
-            * 20
+            * 205
         )
 
         async def mock_gather_market_data(strategy_instance, sym):

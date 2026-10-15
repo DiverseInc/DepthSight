@@ -67,6 +67,14 @@ async def test_concurrency_limit_integrity_with_fine_grained_locks():
     mock_rm.assess_signal = AsyncMock(return_value=(True, 1.0, 100.0, None))
 
     mock_executor = AsyncMock()
+    # REQUIRED: without this, getattr(executor, "market_type") returns a child
+    # Mock instead of the string, so _executor_for_market_type's fallback at
+    # controller.py:882-887 fails its comparison and returns None. Every signal
+    # is then dropped at controller.py:8178 with "No executor found for
+    # mode='live', market='futures_usdtm'", and the RESERVING placeholder is
+    # released on exit -- which is why this test saw 0 positions rather than 1.
+    # AsyncMock auto-creates ANY attribute, so this must be set explicitly.
+    mock_executor.market_type = "futures_usdtm"
 
     # Simulate slightly slow order placement to increase race condition window
     async def slow_place_order(*args, **kwargs):

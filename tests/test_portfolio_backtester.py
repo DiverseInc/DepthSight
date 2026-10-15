@@ -2,6 +2,7 @@
 
 import pytest
 import pandas as pd
+import numbers
 from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock, AsyncMock
 
@@ -66,12 +67,20 @@ def sample_risk_limits():
 
 @pytest.fixture
 def mock_market_data():
+    # Prices are floats deliberately. With bare int literals pandas infers an
+    # int64 dtype, so `kline["close"]` comes back as np.int64 -- and
+    # np.int64 is NOT a subclass of Python int (np.float64 IS a subclass of
+    # float, which is why only some of these columns ever worked). The signal
+    # stubs below guarded on isinstance(close, (int, float)), so every close
+    # silently failed the guard, no signal was emitted, and both tests reported
+    # "0 trades" for what looked like an engine failure. Real exchange OHLCV is
+    # float, so this is both the fix and the realistic shape.
     btc_data = pd.DataFrame(
         {
-            "open": [20000, 20100, 20050, 20200],
-            "high": [20200, 20150, 20100, 20300],
-            "low": [19900, 20000, 20000, 20150],
-            "close": [20100, 20050, 20080, 20250],
+            "open": [20000.0, 20100.0, 20050.0, 20200.0],
+            "high": [20200.0, 20150.0, 20100.0, 20300.0],
+            "low": [19900.0, 20000.0, 20000.0, 20150.0],
+            "close": [20100.0, 20050.0, 20080.0, 20250.0],
             "volume": [100, 110, 120, 130],
         },
         index=pd.to_datetime(
@@ -87,10 +96,10 @@ def mock_market_data():
 
     eth_data = pd.DataFrame(
         {
-            "open": [1500, 1510, 1505, 1520],
-            "high": [1520, 1515, 1510, 1530],
-            "low": [1490, 1500, 1500, 1515],
-            "close": [1510, 1505, 1508, 1525],
+            "open": [1500.0, 1510.0, 1505.0, 1520.0],
+            "high": [1520.0, 1515.0, 1510.0, 1530.0],
+            "low": [1490.0, 1500.0, 1500.0, 1515.0],
+            "close": [1510.0, 1505.0, 1508.0, 1525.0],
             "volume": [200, 210, 220, 230],
         },
         index=pd.to_datetime(
@@ -166,7 +175,7 @@ async def test_run_backtest_and_generate_trades(
         kline = kwargs.get("kline")
         if (
             kline is not None
-            and isinstance(kline.get("close"), (int, float))
+            and isinstance(kline.get("close"), numbers.Real)
             and abs(kline["close"] - 20100.0) < 1e-9
         ):
             return [mock_btc_signal]
@@ -176,7 +185,7 @@ async def test_run_backtest_and_generate_trades(
         kline = kwargs.get("kline")
         if (
             kline is not None
-            and isinstance(kline.get("close"), (int, float))
+            and isinstance(kline.get("close"), numbers.Real)
             and abs(kline["close"] - 1510.0) < 1e-9
         ):
             return [mock_eth_signal]
@@ -256,7 +265,7 @@ async def test_l2_impact_changes_fill_price(
             if (
                 self.emitted_count == 0
                 and kline is not None
-                and isinstance(kline.get("close"), (int, float))
+                and isinstance(kline.get("close"), numbers.Real)
                 and abs(kline["close"] - self.trigger_kline_close_price) < 1e-9
             ):
                 self.emitted_count += 1

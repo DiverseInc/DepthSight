@@ -495,6 +495,20 @@ def test_real_baseline_file_is_self_consistent():
     confusing message instead of grading anything.
     """
     baseline, data = gate.load_baseline()
-    assert baseline, "the committed baseline should not be empty"
+    # "The baseline must never be empty" was the right rule while entries
+    # existed: emptying it silently is the easiest way to turn a real regression
+    # green. That is still true, so the protection is kept -- but emptiness is
+    # now the INTENDED end state (all 11 known failures were fixed on
+    # 2026-10-15), so it has to be provable rather than merely forbidden.
+    # An empty baseline must therefore carry an explicit "resolution" key
+    # saying why. Accidental or hand-made emptiness fails here; deliberate
+    # emptiness passes and the gate then fails on ANY failure, which is
+    # precisely what a regression gate should do.
+    if not baseline:
+        assert data.get("resolution"), (
+            "baseline_failures.json is empty but carries no 'resolution' key. "
+            "An empty baseline must say on its face that it is deliberate; "
+            "otherwise restore the entries."
+        )
     assert sum(baseline.values()) == data["expected_failure_count"]
     assert all(isinstance(v, int) and v >= 1 for v in baseline.values())

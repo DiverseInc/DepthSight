@@ -23,16 +23,25 @@ def _build_rtl_dataset(rows: int = 200, logic_type: str = "touch") -> pd.DataFra
 
     if logic_type == "touch":
         # Level will be 100.0
-        # First 50 bars: price near 100.5 (above 100.0)
-        open_vals[:50] = 100.5
-        close_vals[:50] = 100.5
-        high_vals[:50] = 100.6
-        low_vals[:50] = 100.4
+        #
+        # The warm-up price MUST sit strictly OUTSIDE the proximity band, not on
+        # its boundary. Proximity defaults to 0.1 x ATR (see strategy.py:6771),
+        # and ATR_14 is 5.0 below, so the band is 0.5. The old fixture parked
+        # these bars at 100.5 -- distance exactly 0.5, i.e. ON the inclusive
+        # boundary at strategy.py:6786 (`abs(last_price - level_price) <=
+        # proximity`). Both engines then matched the warm-up bars as "near
+        # level", which made this test unable to distinguish a correct engine
+        # from a broken one and produced the 1-vs-100 signal divergence.
+        # 101.0 is distance 1.0 -- comfortably outside the 0.5 band.
+        open_vals[:50] = 101.0
+        close_vals[:50] = 101.0
+        high_vals[:50] = 101.1
+        low_vals[:50] = 100.9
 
         # 50-100: price moves away to 110
         for i in range(50, 100):
-            open_vals[i] = 100.5 + (i - 50) * 0.2
-            close_vals[i] = 100.5 + (i - 49) * 0.2
+            open_vals[i] = 101.0 + (i - 50) * 0.2
+            close_vals[i] = 101.0 + (i - 49) * 0.2
             high_vals[i] = close_vals[i] + 0.1
             low_vals[i] = open_vals[i] - 0.1
 
@@ -47,6 +56,18 @@ def _build_rtl_dataset(rows: int = 200, logic_type: str = "touch") -> pd.DataFra
         close_vals[150] = 100.1
         high_vals[150] = 110.1
         low_vals[150] = 100.0
+
+        # 151+: price departs IMMEDIATELY and stays away. Without this the tail
+        # keeps the default fill (close = 100.0), which sits exactly ON the
+        # level, so `price_is_near_level` stays true for the rest of the
+        # series and the live engine re-fires on every remaining bar. That
+        # left the touch at bar 150 unisolated for the `touch/any` case.
+        for i in range(151, rows):
+            v = 110.0 + (i - 151) * 0.1
+            open_vals[i] = v
+            close_vals[i] = v
+            high_vals[i] = v + 0.1
+            low_vals[i] = v - 0.1
 
     elif logic_type == "breakout_retest":
         # Level will be 100.0
