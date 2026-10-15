@@ -68,7 +68,11 @@
     "  breakout_retest/from_below FAST=1 LIVE=1 agree bars=[150]",
     "The engines agree exactly and fire on the intended touch bar, so the test",
     "is now strictly MORE meaningful, not weaker.",
-    "Confirmed independently by Claude Code and Hermes, both CONFIRMED-DEGENERATE-TEST.",
+    "Reviewed by Claude Code and OpenCode, both APPROVE.",
+    "⚠️ An earlier revision of this note credited Hermes with the same",
+    "confirmation. Hermes never produced a review -- it timed out at 900s on",
+    "every attempt -- so that attribution was false. A reviewer that did not",
+    "return must never be recorded as having confirmed anything.",
 
     "2026-10-15 LATER, CORRECTION 1 (WRONG, now superseded): commit 33fd296",
     "added the 'warm-up moved to 101.0' comment above but never actually",
