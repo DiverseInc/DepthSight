@@ -33,10 +33,10 @@ def _build_rtl_dataset(rows: int = 200, logic_type: str = "touch") -> pd.DataFra
         # level", which made this test unable to distinguish a correct engine
         # from a broken one and produced the 1-vs-100 signal divergence.
         # 101.0 is distance 1.0 -- comfortably outside the 0.5 band.
-        open_vals[:50] = 100.5
-        close_vals[:50] = 100.5
-        high_vals[:50] = 100.6
-        low_vals[:50] = 100.4
+        open_vals[:50] = 101.0
+        close_vals[:50] = 101.0
+        high_vals[:50] = 101.1
+        low_vals[:50] = 100.9
 
         # 50-100: price moves away to 110
         for i in range(50, 100):
