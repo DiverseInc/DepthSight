@@ -1013,6 +1013,35 @@ TestAsyncSessionLocal = async_sessionmaker(
 
 # This fixture will be automatically applied to each test
 @pytest.fixture(scope="function", autouse=True)
+def allow_dynamic_symbol_selection_in_tests():
+    """Let tests start DYNAMIC-selector strategies.
+
+    Why this is needed. api/routes/strategies.py refuses to start a DYNAMIC
+    strategy with a 503 unless SYMBOL_SELECTION_ALLOW_DYNAMIC is set, because a
+    DYNAMIC strategy cannot trade without a reachable symbol screener. That
+    guard is CORRECT for this deployment and is left completely untouched.
+
+    It fires BEFORE the permission checks (strategies.py:566, permission checks
+    start at :581), so in the test environment it masked everything downstream:
+    five tests that were written to verify other things were failing with 503
+    where they expected 202 or 403. The worst of these is
+    test_permission_enforcement, whose entire purpose is to verify that a free
+    user is refused -- it could not reach the permission code at all.
+
+    Enabling it for tests models "an operator running their own screener",
+    which is exactly the configuration the 503 message tells operators to use.
+    The production guard keeps its real default of False, and
+    tests/test_dynamic_symbol_guard.py covers that path so this cannot quietly
+    switch the guard off.
+    """
+    original = getattr(bot_config, "SYMBOL_SELECTION_ALLOW_DYNAMIC", False)
+    bot_config.SYMBOL_SELECTION_ALLOW_DYNAMIC = True
+    yield
+    bot_config.SYMBOL_SELECTION_ALLOW_DYNAMIC = original
+
+
+# This fixture will be automatically applied to each test
+@pytest.fixture(scope="function", autouse=True)
 async def setup_database():
     """
     Fixture for creating and cleaning up tables for each test.
