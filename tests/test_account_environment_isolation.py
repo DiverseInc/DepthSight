@@ -151,11 +151,30 @@ async def test_data_consumer_subscription_isolation(mock_session, mock_data_load
         return_value={"BTCUSDT"}
     )
 
+    # A stream loop that stays pending forever. Returning immediately is NOT
+    # good enough: data_consumer.py:4822-4828 removes a registry entry whose
+    # task has already finished ("Removing stale global registry entry for
+    # finished stream task"), so an instantly-returning loop deletes its own
+    # entry and the registry assertion below fails nondeterministically.
+    async def _stream_forever(*args, **kwargs):
+        await asyncio.Event().wait()
+
     with (
         patch("bot_module.data_consumer._global_ws_registry", {}) as registry,
         patch("bot_module.data_consumer._global_ws_registry_lock", asyncio.Lock()),
         patch("bot_module.data_consumer._global_event_queues", defaultdict(set)),
         patch("bot_module.data_consumer._global_event_queues_lock", asyncio.Lock()),
+        # This path spawns _ccxt_pro_data_ws_loop, NOT _binance_data_ws_loop.
+        # Patching only the latter left the real CCXT Pro loop running, where it
+        # exited at once and self-removed the mainnet registry entry -- which is
+        # why only the testnet key survived. The old name is kept patched too so
+        # the direct path cannot start a real socket either.
+        patch.object(
+            consumer_main, "_ccxt_pro_data_ws_loop", side_effect=_stream_forever
+        ),
+        patch.object(
+            consumer_test, "_ccxt_pro_data_ws_loop", side_effect=_stream_forever
+        ),
         patch.object(consumer_main, "_binance_data_ws_loop", return_value=AsyncMock()),
         patch.object(consumer_test, "_binance_data_ws_loop", return_value=AsyncMock()),
     ):

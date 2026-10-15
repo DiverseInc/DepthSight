@@ -128,13 +128,33 @@
     "to 205 rows. The gates stay -- a strategy must not trade on too little",
     "history, and a paper-only controller must not accept a live command.",
     "Measured on Linux: test_data_processing_refactor.py 1 passed,",
-    "test_e2e_controller_orderbook.py 2 passed, both 0 failed."
+    "test_e2e_controller_orderbook.py 2 passed, both 0 failed.",
+
+    "2026-10-15 (data_consumer subscription isolation): removed 1 instance.",
+    "test_data_consumer_subscription_isolation failed 'assert 1 == 2' -- the",
+    "registry held only the testnet key. Baselined as 'Binance 451'. THAT WAS",
+    "WRONG TWICE OVER: there is no network call at all (download_klines is",
+    "mocked by the mock_data_loader fixture, and the empty DataFrame it returns",
+    "is exactly what the 'No historical data downloaded' log line reports),",
+    "and the real cause is a RACE plus a stale patch target.",
+    "The test patched _binance_data_ws_loop, but this path spawns",
+    "_ccxt_pro_data_ws_loop. The real CCXT Pro loop therefore ran, exited",
+    "immediately, and data_consumer.py:4822-4828 then removed the registry",
+    "entry whose task had finished ('Removing stale global registry entry for",
+    "finished stream task'). Which key survived depended on scheduling.",
+    "Fix: patch _ccxt_pro_data_ws_loop (keeping the old name patched too) with",
+    "a loop that awaits an Event forever, so the task stays pending and the",
+    "stale-entry cleanup cannot fire mid-assert.",
+    "Because the original symptom was a race, verified with 5 consecutive runs,",
+    "not one: 5/5 '4 passed'. Measured on Linux.",
+    "NOTE: this also corrects an earlier claim of mine that this test made a",
+    "live Binance call. The 'binance:' prefix in those log lines is a cache-key",
+    "namespace, not evidence of a network request."
   ],
   "recorded_at": "2026-10-15",
   "source_run": "2624184",
-  "expected_failure_count": 4,
+  "expected_failure_count": 3,
   "failures": {
-    "tests/test_account_environment_isolation.py::test_data_consumer_subscription_isolation": 1,
     "tests/test_locking_logic.py::test_concurrency_limit_integrity_with_fine_grained_locks": 1,
     "tests/test_return_to_level_parity.py::test_return_to_level_parity": 2
   }
