@@ -54,14 +54,20 @@ async def setup_controller_system(monkeypatch):
     mock_consumer.get_active_pairs.return_value = active_pairs_data
     mock_consumer.get_active_pair_by_symbol.return_value = active_pairs_data[0]
 
-    # Create at least 25 klines to satisfy MIN_STRATEGY_HISTORY_CANDLES (default 20)
+    # 205 klines, not 25. The old comment said "MIN_STRATEGY_HISTORY_CANDLES
+    # (default 20)", but the requirement is now derived per strategy and this
+    # one needs 205. controller.py:6226 refuses to evaluate a strategy short of
+    # it ("Insufficient history for kline_1m: got 25, need 205"), the signal
+    # check is skipped, and place_order is never awaited -- which surfaced as
+    # "Expected place_order to have been awaited once. Awaited 0 times."
+    # The gate is deliberate, so the fixture grows rather than the gate dropping.
     kline_data = {
-        "open_time": pd.date_range(start="2023-01-01 12:00", periods=25, freq="1min"),
-        "open": [49800.0] * 25,
-        "high": [50200.0] * 25,
-        "low": [49700.0] * 25,
-        "close": [50150.0] * 25,
-        "volume": [10.0] * 25,
+        "open_time": pd.date_range(start="2023-01-01 12:00", periods=205, freq="1min"),
+        "open": [49800.0] * 205,
+        "high": [50200.0] * 205,
+        "low": [49700.0] * 205,
+        "close": [50150.0] * 205,
+        "volume": [10.0] * 205,
     }
     mock_kline_df = pd.DataFrame(kline_data)
     mock_consumer.get_kline_history.return_value = mock_kline_df
@@ -205,6 +211,13 @@ async def test_e2e_signal_approved_on_companion_density(
     mock_config_payload = {
         "id": "test-config-volume-breakout",
         "user_id": 1,
+        # REQUIRED. This controller is constructed without an api_key_id, so
+        # self.api_key_id is None and it is a PAPER-ONLY controller.
+        # controller.py:2051-2058 rejects any command whose mode is not "paper"
+        # ("Paper-only controller skipping non-paper command (mode=live)"), so
+        # the instance never starts and the test fails with
+        # "Strategy instance was not started".
+        "mode": "paper",
         "config_data": {"strategy_name": "VolumeBreakout", "params": {}},
         "use_ml_confirmation": False,
     }
