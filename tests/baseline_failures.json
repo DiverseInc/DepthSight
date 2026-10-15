@@ -39,15 +39,22 @@
     "correct; the mock simply had config_data {\"param\": 1}, which contains no",
     "Pro-only block, so is_strategy_pro_only() correctly returned False. The",
     "guard also had ZERO test coverage, which is how all of this stayed hidden",
-    "for so long. tests/test_dynamic_symbol_guard.py now covers it."
+    "for so long. tests/test_dynamic_symbol_guard.py now covers it.",
+
+    "2026-10-15 (data_pipeline_e2e AttributeError): removed 2 instances.",
+    "Both died on AttributeError: 'TradingController' object has no attribute",
+    "'_insufficient_history_seen' at controller.py:6222. NOT a product defect:",
+    "__init__ sets it at controller.py:487 and has no early return before it,",
+    "so a real controller always has it. Both fixtures build the controller with",
+    "TradingController.__new__(TradingController) and set state by hand, so when",
+    "_insufficient_history_seen was added to __init__ they were never updated.",
+    "Fixed in the fixtures. Measured: test_data_pipeline_e2e.py 5 passed, 0 failed."
   ],
   "recorded_at": "2026-10-15",
   "source_run": "2624184",
-  "expected_failure_count": 13,
+  "expected_failure_count": 11,
   "failures": {
     "tests/test_account_environment_isolation.py::test_data_consumer_subscription_isolation": 1,
-    "tests/test_data_pipeline_e2e.py::TestDataPipelineMDS::test_candle_close_triggers_signal_check": 1,
-    "tests/test_data_pipeline_e2e.py::TestDataPipelineMDS::test_handle_event_calls_signal_check": 1,
     "tests/test_data_processing_refactor.py::test_full_integration_visual_strategy": 1,
     "tests/test_e2e_controller_orderbook.py::test_e2e_signal_approved_on_companion_density": 1,
     "tests/test_locking_logic.py::test_concurrency_limit_integrity_with_fine_grained_locks": 1,
