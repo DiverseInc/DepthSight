@@ -30,6 +30,7 @@ os.environ["API_KEY_SECRET"] = "test_api_key_secret_1234567890"
 
 # Now the import will pass without errors
 import logging
+import inspect
 import pytest
 
 # from dotenv import load_dotenv # Removed
@@ -245,6 +246,87 @@ async def mock_redis_client():
     mock._data = {}
     mock.publish_calls = []
 
+    # 🚨 Promote EVERY callable redis method to AsyncMock, not just the ten
+    # listed further down.
+    #
+    # Why this is needed. redis-py 6 defines its command methods as plain
+    # functions that RETURN an awaitable -- they are not `async def`. So
+    # asyncio.iscoroutinefunction() is False for every one of them, and
+    # unittest.mock cannot detect any as async. Measured on this repo's
+    # redis 6.2.0: both MagicMock(spec=redis.asyncio.Redis) and
+    # AsyncMock(spec=redis.asyncio.Redis) still hand back SYNC MagicMock
+    # children, so neither "fix" works on its own.
+    #
+    # The consequence was silent and expensive. Any awaited redis method that
+    # was not on the hand-written list returned a sync MagicMock, and the call
+    # site raised:
+    #     TypeError: object MagicMock can't be used in 'await' expression
+    # That is exactly what broke /api/v1/status: summarize_kline_stream_health()
+    # awaits smembers(), which was never on the list, so the health panel
+    # rendered status "error" and test_get_status failed. Adding methods one at
+    # a time is the wrong fix -- the next unlisted method breaks it again.
+    #
+    # Note `redis` here is the `redis.asyncio` module (see the module-level
+    # `import redis.asyncio as redis` below), so this spec is already the async
+    # client that api/redis_client.py builds.
+    #
+    # Only PLAIN COROUTINE FUNCTIONS are promoted. Three categories are
+    # skipped, each for a measured reason -- see the comment above for the
+    # redis-py 6 background.
+    #
+    # 1. Descriptors. A `property` is callable(), so promoting one would replace
+    #    the descriptor with an awaitable and any code that READS it (rather
+    #    than awaiting it) would get a mock of the wrong shape. Measured on the
+    #    pinned redis 6.2.0 there are currently zero on redis.asyncio.Redis.
+    # 2. Async generator functions (scan_iter, hscan_iter, sscan_iter,
+    #    zscan_iter). isasyncgenfunction() is True for these while
+    #    iscoroutinefunction() is False. Production does
+    #    `async for k in redis.scan_iter(...)`, which needs __aiter__; an
+    #    AsyncMock returns a coroutine, which does not have it.
+    # 3. Builder factories, which return a sub-object rather than an
+    #    awaitable. Production calls these WITHOUT await:
+    #        pubsub = redis_client.pubsub()          (controller.py:1459,1756)
+    #        pipeline = redis_client.pipeline()      (redis_handler.py:74)
+    #    Promoting them would turn a PubSub/Pipeline object into a bare
+    #    coroutine.
+    #
+    # Deliberately NOT skipped: close, aclose, initialize, execute_command.
+    # They are defined on the Redis class alongside the builders, but
+    # production AWAITS them (4 call sites for close alone).
+    _non_awaitable_factories = frozenset(
+        {
+            "client",
+            "from_pool",
+            "from_url",
+            "get_connection_kwargs",
+            "get_encoder",
+            "get_retry",
+            "load_external_module",
+            "lock",
+            "monitor",
+            "parse_response",
+            "pipeline",
+            "pubsub",
+            "set_response_callback",
+            "set_retry",
+            "transaction",
+        }
+    )
+
+    # `redis` here is the `redis.asyncio` module (see the module-level
+    # `import redis.asyncio as redis` below), so this spec is already the async
+    # client that api/redis_client.py builds.
+    for _name in dir(redis.Redis):
+        if _name.startswith("_") or _name in _non_awaitable_factories:
+            continue
+        _attr = getattr(redis.Redis, _name, None)
+        if isinstance(_attr, (property, staticmethod, classmethod)):
+            continue
+        if inspect.isasyncgenfunction(_attr):
+            continue
+        if callable(_attr):
+            setattr(mock, _name, AsyncMock(name=_name))
+
     async def _publish_mock(channel, message):
         mock.publish_calls.append((channel, message))
         return 1
@@ -302,6 +384,12 @@ async def mock_redis_client():
     mock.keys = AsyncMock(side_effect=_keys_mock)
     mock.mget = AsyncMock(side_effect=_mget_mock)
     mock.ping = AsyncMock(return_value=True)
+    # Called by summarize_kline_stream_health() for the market-data health
+    # panel. Returning a real empty set makes it report "idle", which maps to
+    # severity 0 -- the same verdict as "ok". A bare AsyncMock would return a
+    # MagicMock here, and `for sk in raw_streams or []` would iterate a mock
+    # instead of a set.
+    mock.smembers = AsyncMock(return_value=set())
     mock.set_initial_data = _set_initial_data
     yield mock
     # Cleanup is not required as the mock is local to the test
