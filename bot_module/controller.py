@@ -57,6 +57,12 @@ except ImportError:
 
 logger = logging.getLogger("bot_module.controller")
 
+# Upper bound on the Redis write that mirrors the emergency-stop latch.
+# The write happens between latching the stop and flattening positions, so it
+# must never be able to hang the kill switch. Deliberately short: the API
+# writes the authoritative key independently, so this mirror is a backstop.
+EMERGENCY_STOP_PERSIST_TIMEOUT_SECONDS = 5.0
+
 # Per-strategy evaluation state, written by the bot on every evaluation and
 # read by the API. Deliberately its OWN namespace, not nested under
 # REDIS_STATE_KEY_STRATEGIES -- see the comment at its use site.
@@ -1146,6 +1152,13 @@ class TradingController:
         # gives a comfortable margin across hiccups.
         await asyncio.sleep(1.0)
 
+        # Restore a persisted emergency stop BEFORE anything can trade.
+        # This must run ahead of rehydrate: rehydrate replays START_STRATEGY
+        # for strategies that were live before the restart, and those would
+        # otherwise come straight back up while the user believes trading is
+        # halted. Fail-closed -- see _restore_emergency_stop().
+        await self._restore_emergency_stop()
+
         # Auto-rehydrate: re-publish START_STRATEGY for any strategy that was
         # running before this bot died. The API persists running state to
         # Redis (running_strategies:{user_id} set + running_strategy_payload:*
@@ -1639,6 +1652,15 @@ class TradingController:
                                 self.rm.trigger_emergency_stop(
                                     reason=f"EMERGENCY_STOP command from user {user_id}"
                                 )
+                                # Mirror it into Redis immediately. Without
+                                # this the latch lives only in this process and
+                                # a restart -- the very thing most likely to
+                                # follow a panic-stop -- silently re-arms
+                                # trading. Persisting before we flatten means
+                                # a crash mid-flatten still comes back stopped.
+                                await self._persist_emergency_stop(
+                                    f"EMERGENCY_STOP command from user {user_id}"
+                                )
                             except Exception as e:
                                 logger.critical(
                                     f"Failed to latch emergency stop: {e}",
@@ -1686,6 +1708,30 @@ class TradingController:
                                         f"({sym_market_type}): {e}",
                                         exc_info=True,
                                     )
+
+                        elif command_type == "CLEAR_EMERGENCY_STOP":
+                            # The deliberate counterpart to EMERGENCY_STOP.
+                            # Before this existed the only way to release the
+                            # latch was a bot restart, which is precisely the
+                            # event that must NOT clear it. An operator now
+                            # resumes by asking, not by bouncing the bot.
+                            user_id = payload.get("user_id")
+                            if str(user_id) != str(self.user_id):
+                                continue
+                            logger.critical(
+                                f"Handling CLEAR_EMERGENCY_STOP for user_id: {user_id}"
+                            )
+                            if not self.rm.is_emergency_stop_active():
+                                logger.warning(
+                                    f"CLEAR_EMERGENCY_STOP for user {user_id} but no "
+                                    "latch was active; still clearing any persisted key."
+                                )
+                            self.rm.clear_emergency_stop()
+                            await self._clear_emergency_stop_persisted()
+                            logger.critical(
+                                f"CLEAR_EMERGENCY_STOP complete for user {user_id}; "
+                                "new entries re-enabled."
+                            )
 
                         elif command_type == "TEST_NOTIFICATION":
                             user_id = payload.get("user_id")
@@ -3364,6 +3410,132 @@ class TradingController:
         except Exception as e:
             logger.error(
                 f"{log_prefix} Failed to save runtime state: {e}", exc_info=True
+            )
+
+    # ------------------------------------------------------------------
+    # Emergency-stop persistence
+    # ------------------------------------------------------------------
+    #
+    # RiskManager._emergency_stop_active is a plain instance attribute, so it
+    # is born False on every controller start. And clear_emergency_stop() had
+    # NO callers anywhere in the repo, so before this change the ONLY way to
+    # release the latch was a bot restart -- which is the same event that
+    # silently re-armed it. A kill switch that disarms itself on every deploy
+    # is not a kill switch.
+    #
+    # The latch is now mirrored into Redis so an engaged stop survives a
+    # restart, and CLEAR_EMERGENCY_STOP is a first-class command so an
+    # operator releases it deliberately instead of by bouncing the bot.
+
+    def _emergency_stop_redis_key(self) -> str:
+        return f"emergency_stop:{self.user_id}"
+
+    async def _persist_emergency_stop(self, reason: str) -> None:
+        """Mirror an engaged latch into Redis so it survives a bot restart."""
+        if not self.redis_client:
+            logger.critical(
+                "[EmergencyStop] Engaged but there is no redis_client; the latch "
+                "will NOT survive a restart. Fix the Redis connection."
+            )
+            return
+        try:
+            # Hard timeout. This await sits BETWEEN latching the stop and
+            # flattening the positions, so a Redis that accepts the connection
+            # and then hangs would stall the flatten -- turning a kill switch
+            # into a no-op under exactly the conditions where it is needed.
+            # Timing out is safe: the in-memory latch is already engaged, and
+            # the API has written the authoritative key independently.
+            await asyncio.wait_for(
+                self.redis_client.set(
+                    self._emergency_stop_redis_key(),
+                    json.dumps(
+                        {
+                            "reason": reason,
+                            "engaged_at_utc": datetime.now(timezone.utc).isoformat(),
+                        },
+                        default=str,
+                    ),
+                ),
+                timeout=EMERGENCY_STOP_PERSIST_TIMEOUT_SECONDS,
+            )
+            logger.critical(
+                f"[EmergencyStop] Persisted emergency stop for user {self.user_id}."
+            )
+        except Exception as exc:
+            logger.critical(
+                f"[EmergencyStop] FAILED to persist latch for user {self.user_id}: "
+                f"{exc}. The latch will NOT survive a restart.",
+                exc_info=True,
+            )
+
+    async def _restore_emergency_stop(self) -> None:
+        """
+        Re-engage the latch on startup if one was persisted.
+
+        Fail-CLOSED: if the latch cannot be read, this controller stays
+        stopped. A kill switch that can be lost is not a kill switch. To
+        prefer fail-open instead, replace the trigger_emergency_stop() calls in
+        the two failure branches below with a logger.critical().
+        """
+        if not self.redis_client:
+            logger.critical(
+                "[EmergencyStop] No redis_client; cannot confirm the latch is "
+                "clear. Staying STOPPED (fail-closed)."
+            )
+            self.rm.trigger_emergency_stop(
+                reason="redis unavailable at startup - cannot verify emergency-stop state"
+            )
+            return
+        try:
+            raw = await self.redis_client.get(self._emergency_stop_redis_key())
+        except Exception as exc:
+            logger.critical(
+                f"[EmergencyStop] FAILED to read the latch for user "
+                f"{self.user_id}: {exc}. Staying STOPPED (fail-closed).",
+                exc_info=True,
+            )
+            self.rm.trigger_emergency_stop(
+                reason=(
+                    "redis read failed at startup - cannot verify emergency-stop "
+                    f"state ({exc})"
+                )
+            )
+            return
+
+        if not raw:
+            return
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+
+        # Stored as JSON, but tolerate a bare string so a hand-written key
+        # (or an older writer) still restores rather than silently reading as
+        # no stop at all.
+        reason = raw
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                reason = parsed.get("reason") or raw
+        except (ValueError, TypeError):
+            pass
+
+        self.rm.trigger_emergency_stop(reason=reason)
+        logger.critical(
+            f"[EmergencyStop] RESTORED an active emergency stop for user "
+            f"{self.user_id}: {reason}"
+        )
+
+    async def _clear_emergency_stop_persisted(self) -> None:
+        """Drop the persisted latch after the in-memory release."""
+        if not self.redis_client:
+            return
+        try:
+            await self.redis_client.delete(self._emergency_stop_redis_key())
+        except Exception as exc:
+            logger.critical(
+                f"[EmergencyStop] In-memory latch cleared but FAILED to delete "
+                f"the Redis key for user {self.user_id}: {exc}. The stop will "
+                "return on the next restart.",
+                exc_info=True,
             )
 
     async def _rehydrate_running_strategies_from_redis(self):

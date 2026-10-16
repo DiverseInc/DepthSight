@@ -9,7 +9,11 @@ from api import crud, models, schemas
 from api.routes.account import reset_paper_wallet
 from api.routes.diagnostics import preview_foundation
 from api.routes.backtests import create_shareable_backtest_link
-from api.routes.portfolio import close_position, emergency_stop
+from api.routes.portfolio import (
+    clear_emergency_stop,
+    close_position,
+    emergency_stop,
+)
 from tasks import (
     _async_backtest_logic,
     train_model_task,
@@ -281,16 +285,57 @@ async def test_pulling_the_plug_achievement(
     auto_mock_grant_achievement: AsyncMock,
 ):
     """Tests that 'pulling_the_plug' is granted on emergency stop."""
-    mock_redis_instance = MagicMock()
-    mock_redis_instance.publish = AsyncMock()
+    # AsyncMock wholesale, not MagicMock with `publish` hand-promoted. The
+    # endpoint awaits more than one redis command (it writes the authoritative
+    # emergency-stop key before publishing), and a hand-picked mock silently
+    # breaks the moment a second `await redis.<cmd>` is added -- that is
+    # exactly what broke here. Same fix as PR #5, applied here.
+    mock_redis_instance = AsyncMock()
 
     await emergency_stop(
         redis_client=mock_redis_instance, current_user=test_user, db=db_session
     )
 
+    # The stop must be recorded durably, not just announced over pub/sub.
+    # Redis pub/sub is at-most-once, so without this write a bot that was down
+    # would never learn about the stop.
+    mock_redis_instance.set.assert_any_call(
+        f"emergency_stop:{test_user.id}", ANY
+    )
+
     # The achievement is granted inside the endpoint
     auto_mock_grant_achievement.assert_called_once_with(
         ANY, test_user.id, "pulling_the_plug"
+    )
+
+
+async def test_resume_deletes_the_emergency_stop_key_before_publishing(
+    test_user: models.User,
+):
+    """
+    The resume endpoint must delete the key ITSELF, not ask the bot to.
+
+    Redis pub/sub is at-most-once. If the bot cleared the key over pub/sub and
+    the bot happened to be down, this endpoint would still answer 202
+    "resumed" while the key survived, and the next bot restart would re-engage
+    the stop -- a permanent unscheduled lockout for a user who had just been
+    told they were trading again.
+
+    So the delete has to be in this function, and it has to happen before the
+    publish. That ordering is the fix; this test pins it.
+    """
+    mock_redis = AsyncMock()
+
+    await clear_emergency_stop(redis_client=mock_redis, current_user=test_user)
+
+    mock_redis.delete.assert_any_call(f"emergency_stop:{test_user.id}")
+
+    # Ordering matters: the durable state must be settled before we tell the
+    # bot anything.
+    method_names = [c[0] for c in mock_redis.mock_calls]
+    assert method_names.index("delete") < method_names.index("publish"), (
+        "delete must precede publish so the key is authoritative before the bot "
+        "is notified"
     )
 
 

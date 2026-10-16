@@ -40,3 +40,6 @@ docker-compose.legacy.yml
 # Local backups created before risky edits (.bak-YYYY-MM-DD-HHMM suffix)
 *.bak-*
 .scratch/
+# tools/ scratch output
+.review/
+.prepush_pytest_output.txt
