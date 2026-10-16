@@ -44,6 +44,12 @@ except ImportError:
 REDIS_COMMAND_CHANNEL = getattr(
     bot_config, "REDIS_COMMAND_CHANNEL", "depthsight:commands"
 )
+# Authoritative record of the emergency-stop latch, owned by the API so that
+# engaging and releasing it do not depend on the bot being online. The bot
+# mirrors this key and restores from it on startup (see
+# TradingController._restore_emergency_stop). Keep the format string in sync
+# with TradingController._emergency_stop_redis_key.
+EMERGENCY_STOP_KEY = "emergency_stop:{user_id}"
 REDIS_STATE_KEY_PORTFOLIO = getattr(
     bot_config, "REDIS_STATE_KEY_PORTFOLIO", "depthsight:state:portfolio"
 )
@@ -527,6 +533,23 @@ async def emergency_stop(
         },
     }
     try:
+        # Record the stop in Redis FIRST, and make that the source of truth.
+        #
+        # Redis pub/sub is at-most-once: if the bot is down or mid-restart,
+        # the publish below is silently dropped and nothing flattens, nothing
+        # latches, and the user is told (202) that they stopped when they did
+        # not. Writing the key here means the stop survives regardless of
+        # whether the bot is listening -- the running bot picks it up on its
+        # next _restore_emergency_stop().
+        await redis_client.set(
+            EMERGENCY_STOP_KEY.format(user_id=current_user.id),
+            json.dumps(
+                {
+                    "reason": f"EMERGENCY_STOP command from user {current_user.id}",
+                    "engaged_at_utc": datetime.now(timezone.utc).isoformat(),
+                }
+            ),
+        )
         await redis_client.publish(REDIS_COMMAND_CHANNEL, json.dumps(command))
         logger.info(
             f"EMERGENCY_STOP command sent to the bot by user '{current_user.username}' (ID: {current_user.id})."
@@ -542,6 +565,61 @@ async def emergency_stop(
             detail=f"Could not send command to Redis: {e}",
         )
     return {"data": {"message": "EMERGENCY_STOP command has been sent to the bot."}}
+
+
+@portfolio_router.post(
+    "/portfolio/positions/resume",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=schemas.ApiResponseData,
+    summary="Clear Emergency Stop. Re-enable new entries.",
+)
+async def clear_emergency_stop(
+    redis_client: redis.Redis = Depends(get_redis_client),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Deliberate counterpart to DELETE /portfolio/positions.
+
+    Releases the emergency-stop latch so NEW entries are allowed again. It
+    does NOT reopen anything: strategies must be started again explicitly, and
+    it does not undo the flatten that the stop already performed.
+    """
+    logger.info(
+        f"User '{current_user.username}' (ID: {current_user.id}) initiated CLEAR_EMERGENCY_STOP."
+    )
+    command = {
+        "type": "CLEAR_EMERGENCY_STOP",
+        "payload": {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "user_id": str(current_user.id),
+        },
+    }
+    try:
+        # Delete the authoritative key FIRST. Relying on the bot to do it
+        # over pub/sub is the bug this closes: pub/sub is at-most-once, so if
+        # the bot is down the command is dropped, the API still returns 202
+        # ("resumed"), and the next restart re-engages the stop -- a permanent
+        # unscheduled lockout for a user who was told they were trading again.
+        # Deleting here makes the resume durable regardless of bot liveness;
+        # the publish below is only a nudge so a live bot drops its in-memory
+        # latch immediately instead of waiting for a restart.
+        await redis_client.delete(EMERGENCY_STOP_KEY.format(user_id=current_user.id))
+        await redis_client.publish(REDIS_COMMAND_CHANNEL, json.dumps(command))
+        logger.info(
+            f"CLEAR_EMERGENCY_STOP command sent to the bot by user '{current_user.username}' (ID: {current_user.id})."
+        )
+    except (redis_exceptions.ConnectionError, redis_exceptions.TimeoutError) as e:
+        logger.error(
+            f"Could not clear the emergency stop for user '{current_user.username}' (ID: {current_user.id}): {e}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Could not clear the emergency stop. The user is still "
+                f"stopped and the request was NOT applied: {e}"
+            ),
+        )
+    return {"data": {"message": "CLEAR_EMERGENCY_STOP command has been sent to the bot."}}
 
 
 @portfolio_router.post(
