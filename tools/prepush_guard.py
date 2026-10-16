@@ -50,9 +50,16 @@ FULL_SUITE_TIMEOUT_S = 45 * 60
 
 
 def windows_repo_to_wsl(path: Path) -> str:
+    """C:\\Users\\x -> /mnt/c/Users/x .
+
+    WSL mounts Windows drives under /mnt/<drive>. The obvious-looking
+    "/c/Users/..." is NOT valid and fails with 'No such file or directory',
+    which is exactly how the first two versions of this guard failed while
+    reporting a misleading "pytest output file not found".
+    """
     s = str(path).replace("\\", "/")
-    if s.startswith("C:"):
-        s = "/" + s[0].lower() + s[2:]
+    if len(s) >= 2 and s[1] == ":":
+        return "/mnt/" + s[0].lower() + s[2:]
     return s
 
 
@@ -61,32 +68,31 @@ def in_wsl() -> bool:
 
 
 def run_suite(target: str, timeout_s: int) -> tuple[int, str]:
-    """Run pytest, tee output to a file, then apply the CI baseline gate."""
-    out_file = REPO / ".prepush_pytest_output.txt"
-    if in_wsl():
-        py = WSL_VENV
-        cwd = str(REPO)
-        cmd = f"export PATH=\"$HOME/dstest/bin:$PATH\"; {py} -m pytest {target} -q --tb=short"
-        full = f"{cmd} 2>&1 | tee {out_file.name}; python scripts/check_test_baseline.py {out_file.name}"
-        proc = subprocess.run(
-            ["bash", "-lc", f"cd {cwd} && {full}"],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
-    else:
-        wsl_repo = windows_repo_to_wsl(REPO)
-        inner = (
-            f"cd {wsl_repo} && export PATH=\"$HOME/dstest/bin:$PATH\" && "
-            f"{WSL_VENV} -m pytest {target} -q --tb=short 2>&1 | tee {out_file.name}; "
-            f"{WSL_VENV} scripts/check_test_baseline.py {out_file.name}"
-        )
-        proc = subprocess.run(
-            ["wsl", "bash", "-lc", inner],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
+    """Run pytest, write output to a file, then apply the CI baseline gate.
+
+    No double quotes anywhere in the command string. Windows `subprocess`
+    mangles embedded `"` when forwarding an argument into WSL, which is why
+    the first version of this script silently failed to produce its output
+    file and reported "output file not found". Redirect to a file instead of
+    piping through `tee` so there is nothing to quote.
+    """
+    out_name = ".prepush_pytest_output.txt"
+    # A Windows path like C:\Users\... is NOT a valid `cd` target in bash.
+    # It must become /mnt/c/Users/... . Dropping this conversion is what made
+    # the whole guard silently fail to produce its output file.
+    repo = (
+        str(REPO).replace("\\", "/")
+        if in_wsl()
+        else windows_repo_to_wsl(REPO)
+    )
+    inner = (
+        f"cd {repo} && "
+        f"{WSL_VENV} -m pytest {target} -q --tb=short > {out_name} 2>&1; "
+        f"cat {out_name}; "
+        f"{WSL_VENV} scripts/check_test_baseline.py {out_name}"
+    )
+    argv = ["bash", "-lc", inner] if in_wsl() else ["wsl", "bash", "-lc", inner]
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 

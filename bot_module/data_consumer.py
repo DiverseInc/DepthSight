@@ -3429,18 +3429,45 @@ class DataConsumer:
                 # A dead symbol source is therefore not a WARNING, it is a
                 # trading outage for DYNAMIC strategies. Say so, periodically,
                 # instead of leaving it buried under throttled reconnects.
+                # A dead symbol source is only a trading outage if a DYNAMIC
+                # strategy can actually EXIST. It usually cannot:
+                # SYMBOL_SELECTION_ALLOW_DYNAMIC defaults to false and DYNAMIC
+                # starts are refused outright, so in the default configuration
+                # there is no DYNAMIC strategy to starve.
+                #
+                # Escalating anyway produced a CRITICAL that had been firing
+                # every ~25 minutes for four consecutive days describing a
+                # state that cannot occur. For an operator who does not read
+                # the code, a permanent CRITICAL alarm means "the platform is
+                # broken" -- and it trains them to ignore the alarms that
+                # matter. Escalate only when DYNAMIC is actually enabled.
+                dynamic_possible = bool(
+                    getattr(config, "SYMBOL_SELECTION_ALLOW_DYNAMIC", False)
+                )
                 threshold = getattr(
                     config, "MAIN_APP_WS_CRITICAL_AFTER_FAILURES", 10
                 )
                 if should_escalate_ws_failure(consecutive_failures, threshold):
-                    logger.critical(
-                        f"Main_app_ws has failed {consecutive_failures} consecutive "
-                        f"times ({err_key}: {e_conn}). The symbol source is DOWN: "
-                        f"DYNAMIC-mode strategies cannot trade — they have no symbols "
-                        f"to subscribe to or match against. Pinned-symbol strategies "
-                        f"are unaffected. The static list is NOT used automatically; "
-                        f"set SYMBOL_SOURCE_MODE='STATIC_LIST' to fall back deliberately."
-                    )
+                    if dynamic_possible:
+                        logger.critical(
+                            f"Main_app_ws has failed {consecutive_failures} consecutive "
+                            f"times ({err_key}: {e_conn}). The symbol source is DOWN: "
+                            f"DYNAMIC-mode strategies cannot trade — they have no symbols "
+                            f"to subscribe to or match against. Pinned-symbol strategies "
+                            f"are unaffected. The static list is NOT used automatically; "
+                            f"set SYMBOL_SOURCE_MODE='STATIC_LIST' to fall back deliberately."
+                        )
+                    else:
+                        logger.info(
+                            f"Main_app_ws has failed {consecutive_failures} consecutive "
+                            f"times ({err_key}: {e_conn}). Not escalated: DYNAMIC "
+                            f"strategies are disabled "
+                            f"(SYMBOL_SELECTION_ALLOW_DYNAMIC=false), so none can run "
+                            f"and no trading is affected by this feed. Pinned / STATIC / "
+                            f"FIXED strategies are unaffected. This third-party screener "
+                            f"being down is expected; enable DYNAMIC only if you also "
+                            f"control this endpoint."
+                        )
             except asyncio.CancelledError:
                 logger.info("Main_app_ws_loop cancelled.")
                 break
