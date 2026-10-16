@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "Mutations that reintroduce the ORIGINAL emergency-stop defect, one at a time.",
+    "All seven were observed KILLED on 2026-10-16 except E, which survives by",
+    "design: the test monkeypatches EMERGENCY_STOP_PERSIST_TIMEOUT_SECONDS so the",
+    "suite stays fast, which means it defends the timeout WRAPPER (see G) and not",
+    "the production VALUE. That is a deliberate trade, recorded here so a future",
+    "reader does not 'fix' E into the list expecting it to fail.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/emergency_stop.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_emergency_stop_latch_persistence.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: no persistence at all (the original defect)",
+      "file": "bot_module/controller.py",
+      "needle": "        if not self.redis_client:\n            logger.critical(\n                \"[EmergencyStop] Engaged but there is no redis_client; the latch \"\n",
+      "replace": "        return  # MUTANT: never persisted\n        if not self.redis_client:\n            logger.critical(\n                \"[EmergencyStop] Engaged but there is no redis_client; the latch \"\n"
+    },
+    {
+      "label": "B: clear does not erase the Redis key",
+      "file": "bot_module/controller.py",
+      "needle": "            await self.redis_client.delete(self._emergency_stop_redis_key())\n",
+      "replace": "            pass  # MUTANT: key left behind\n"
+    },
+    {
+      "label": "C: restore fails OPEN when Redis is unreadable",
+      "file": "bot_module/controller.py",
+      "needle": "            self.rm.trigger_emergency_stop(\n                reason=\"redis unavailable at startup - cannot verify emergency-stop state\"\n            )\n",
+      "replace": "            return  # MUTANT: fail-open\n"
+    },
+    {
+      "label": "D: restore reads the key but ignores it",
+      "file": "bot_module/controller.py",
+      "needle": "        self.rm.trigger_emergency_stop(reason=reason)\n",
+      "replace": "        return  # MUTANT: read the key, ignored it\n"
+    },
+    {
+      "label": "E: production timeout VALUE raised (survives by design -- see G)",
+      "file": "bot_module/controller.py",
+      "expected_survivor": true,
+      "expected_survivor_reason": "The suite monkeypatches EMERGENCY_STOP_PERSIST_TIMEOUT_SECONDS so the tests stay fast, so it defends the timeout WRAPPER (mutation G) and deliberately does not pin the production VALUE.",
+      "needle": "EMERGENCY_STOP_PERSIST_TIMEOUT_SECONDS = 5.0\n",
+      "replace": "EMERGENCY_STOP_PERSIST_TIMEOUT_SECONDS = 300.0  # MUTANT\n"
+    },
+    {
+      "label": "F: API key drifts from the key the bot reads",
+      "file": "api/routes/portfolio.py",
+      "needle": "EMERGENCY_STOP_KEY = \"emergency_stop:{user_id}\"\n",
+      "replace": "EMERGENCY_STOP_KEY = \"estop:{user_id}\"  # MUTANT\n"
+    },
+    {
+      "label": "G: timeout wrapper waits forever (this is what defends the kill switch)",
+      "file": "bot_module/controller.py",
+      "needle": "                timeout=EMERGENCY_STOP_PERSIST_TIMEOUT_SECONDS,\n",
+      "replace": "                timeout=None,  # MUTANT: wait forever\n"
+    }
+  ]
+}
