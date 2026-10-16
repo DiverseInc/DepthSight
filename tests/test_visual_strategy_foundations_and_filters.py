@@ -12,8 +12,31 @@ from datetime import datetime, timezone
 
 
 def create_test_kline_df(num_candles=60, base_price=100.0) -> pd.DataFrame:
-    """Creates a test candlestick DataFrame."""
-    now = pd.Timestamp.now(tz="UTC")
+    """Creates a test candlestick DataFrame.
+
+    FIX 2026-10-15 -- the end timestamp is ANCHORED, not `pd.Timestamp.now()`.
+
+    `get_default_market_data()` resamples this series to "1D", and
+    `resolve_significant_levels()` (strategy.py:916-921) reads the last
+    *closed* daily bar via `_get_recent_closed_candles(..., include_current=
+    False)`. The level tests then write to `df_1d.iloc[-2]`, which only IS
+    that bar while `now - 24min` is still inside the same UTC day.
+
+    Between 00:00 and 00:24 UTC it is not. The 1m series steps back into the
+    previous day, the resolver selects `iloc[-3]`, and the 102.0 written to
+    `iloc[-2]` lands outside the window it actually reads. `daily_high` then
+    comes back as ~100.999 instead of 102.0, a distance of 0.90 against an
+    `atr * 0.25 = 0.125` tolerance, and the test fails.
+
+    Measured, not inferred: sweeping five-minute samples across a full UTC day
+    gave 5/288 failures, every one of them in 00:00-00:20. CI run 38827031979
+    failed at 00:21 UTC for exactly this reason, while the PR-branch run and a
+    full local run at 00:0x UTC both passed.
+
+    No other test in this file depends on the anchor: every `trading_session`
+    case supplies its own explicit `timestamp_dt`.
+    """
+    now = pd.Timestamp("2026-01-15 12:00:00", tz="UTC")
     index = pd.to_datetime(
         [now - pd.Timedelta(minutes=i) for i in range(num_candles - 1, -1, -1)]
     )
