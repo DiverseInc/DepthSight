@@ -42,9 +42,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import subprocess
 import sys
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -95,22 +96,102 @@ def export_diff() -> Path:
     return target
 
 
+def _resolve_argv(cmd: list[str]) -> tuple[list[str], str] | None:
+    """Make a bare tool name actually launchable on Windows.
+
+    Windows CreateProcess does NOT resolve `.cmd`/`.bat` from a bare name --
+    only `.exe`. So `subprocess.run(["dsh", ...])` raises FileNotFoundError and
+    a naive handler reports "not installed / not on PATH" for a tool that is
+    present and working. `shutil.which` finds `dsh.CMD` happily; the launch
+    is what fails. So: resolve to an absolute path, then dispatch on kind.
+
+      .exe                -> run directly
+      .cmd / .bat         -> cmd /c <path>
+      .ps1                -> powershell -NoProfile -File <path>
+
+    Returns (argv, why) or None when the tool genuinely is absent.
+    """
+    exe = cmd[0]
+    path = shutil.which(exe)
+    if path is None:
+        for ext in (".cmd", ".exe", ".ps1", ".bat"):
+            path = shutil.which(exe + ext)
+            if path:
+                break
+    if path is None:
+        return None
+
+    low = path.lower()
+    if low.endswith(".ps1"):
+        return (
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                path,
+            ]
+            + cmd[1:],
+            "powershell -File",
+        )
+    if low.endswith((".cmd", ".bat")):
+        return ["cmd", "/c", path] + cmd[1:], "cmd /c"
+    return [path] + cmd[1:], "direct"
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
+
+
+def _meaningful(text: str) -> str:
+    """Strip terminal control codes and judge whether there is a real answer.
+
+    `ollama run` paints a braille spinner to the same stream it writes the
+    answer to. Non-empty stdout therefore proves NOTHING -- the first working
+    run scored 5/5 with three of them returning pure spinner glyphs. Requiring
+    actual words is the whole point: a reviewer that produced no prose has not
+    approved anything.
+    """
+    cleaned = _ANSI.sub("", text or "")
+    # Drop the spinner glyphs themselves (U+2800 braille block).
+    cleaned = "".join(ch for ch in cleaned if not (0x2800 <= ord(ch) <= 0x28FF))
+    return cleaned.strip()
+
+
 def _run(name: str, cmd: list[str], cwd: Path | None = None, timeout: int = 900):
+    resolved = _resolve_argv(cmd)
+    if resolved is None:
+        return name, f"{name} is genuinely not installed / not on PATH", False
+    argv, how = resolved
     try:
         p = subprocess.run(
-            cmd,
+            argv,
             cwd=str(cwd or REPO),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
-            shell=isinstance(cmd, str),
         )
-        return name, (p.stdout or "") + (p.stderr or ""), True
+        raw = (p.stdout or "") + (p.stderr or "")
+        out = _meaningful(raw)
+        # Require a real sentence, not just any character.
+        words = len(re.findall(r"[A-Za-z0-9]{2,}", out))
+        if words < 5:
+            return name, (
+                f"no usable verdict (exit {p.returncode}, {words} words after "
+                f"stripping control codes) -- NO VERDICT"
+            ), False
+        return name, out, True
     except FileNotFoundError:
-        return name, f"{name} is not installed / not on PATH", False
+        return name, (
+            f"launch failed (FileNotFoundError) via {how}; the binary exists at "
+            f"{argv[0] if argv else '?'} but could not be started"
+        ), False
     except subprocess.TimeoutExpired:
-        # A reviewer that timed out has NOT approved anything. Say so loudly.
+        # A reviewer that timed out has NOT approved anything.
         return name, f"TIMED OUT after {timeout}s -- NO VERDICT", False
+    except Exception as exc:
+        return name, f"{name} runner crashed: {type(exc).__name__}: {exc}", False
 
 
 def reviewers(diff: Path, question: str) -> dict:
@@ -148,6 +229,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--question", default=DEFAULT_QUESTION)
     args = ap.parse_args()
+
+    # Reviewers emit UTF-8 (Ollama alone produces braille spinner glyphs).
+    # The Windows console defaults to cp1252 and raises UnicodeEncodeError on
+    # print -- which killed the fan-out AFTER the reviews had run. Reconfigure
+    # stdout/stderr so a successful review cannot crash the reporter.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     os.environ["PATH"] = os.environ.get("PATH", "")
     # hermes refuses the system temp dir.
