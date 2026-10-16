@@ -194,9 +194,31 @@ def _run(name: str, cmd: list[str], cwd: Path | None = None, timeout: int = 900)
         return name, f"{name} runner crashed: {type(exc).__name__}: {exc}", False
 
 
-def reviewers(diff: Path, question: str) -> dict:
+def reviewers(diff: Path, question: str, include_paid: bool = False) -> dict:
+    """Build the reviewer set.
+
+    Cost matters here. The DEFAULT set is the free/local tier only:
+
+      ollama  - local model, zero tokens, zero subscription
+      dsh     - no cloud key configured on this box
+
+    Claude Code and Codex are third-party subscriptions. They are genuinely
+    good reviewers -- but each call spends money that does not come from the
+    plan this work is already paid for. They are opt-in behind --with-paid so
+    that a routine safety review never quietly bills anything.
+
+    `opencode` is included by default because it resolves without a cloud key
+    here; if it starts reporting auth errors, move it behind the flag.
+    """
     diff_s = str(diff)
     jobs = {
+        "ollama": [
+            "ollama",
+            "run",
+            "qwen2.5-coder:7b",
+            f"{question}\n\nThe diff is at {diff_s}. Read it first.",
+        ],
+        "dsh": ["dsh", "headless", f"{question} Diff at {diff_s}"],
         "opencode": [
             "opencode",
             "run",
@@ -204,16 +226,14 @@ def reviewers(diff: Path, question: str) -> dict:
             "-f",
             diff_s,
         ],
-        "claude": ["claude", "-p", f"{question} Repo: {REPO}. Diff: {diff_s}"],
-        "dsh": ["dsh", "headless", f"{question} Diff at {diff_s}"],
-        "hermes": ["hermes", "-z", f"{question} Diff at {diff_s}"],
-        "ollama": [
-            "ollama",
-            "run",
-            "qwen2.5-coder:7b",
-            f"{question}\n\nThe diff is at {diff_s}. Read it first.",
-        ],
     }
+    if include_paid:
+        jobs["claude"] = [
+            "claude",
+            "-p",
+            f"{question} Repo: {REPO}. Diff: {diff_s}",
+        ]
+    return jobs
     results = {}
     with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         futures = [
@@ -225,9 +245,25 @@ def reviewers(diff: Path, question: str) -> dict:
     return results
 
 
+def run_all(jobs: dict) -> dict:
+    results = {}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = [pool.submit(_run, name, cmd) for name, cmd in jobs.items()]
+        for f in futures:
+            name, out, ok = f.result()
+            results[name] = (out, ok)
+    return results
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--question", default=DEFAULT_QUESTION)
+    ap.add_argument(
+        "--with-paid",
+        action="store_true",
+        help="also run Claude Code (separate Anthropic subscription). Off by "
+        "default so a routine review never spends another plan's budget.",
+    )
     args = ap.parse_args()
 
     # Reviewers emit UTF-8 (Ollama alone produces braille spinner glyphs).
@@ -251,8 +287,15 @@ def main() -> int:
         print("[review] nothing to review -- working tree is clean.")
         return 0
 
-    print(f"[review] fanning out to 5 reviewers...\n")
-    results = reviewers(diff, args.question)
+    jobs = reviewers(diff, args.question, include_paid=args.with_paid)
+    tier = (
+        "FREE (local / no cloud key)"
+        if not args.with_paid
+        else "INCLUDING PAID SUBSCRIPTION REVIEWERS"
+    )
+    print(f"[review] reviewer tier: {tier}")
+    print(f"[review] fanning out to {len(jobs)}: {', '.join(jobs)}\n")
+    results = run_all(jobs)
 
     print("=" * 70)
     verdicts = []
