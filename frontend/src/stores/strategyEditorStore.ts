@@ -6,6 +6,7 @@ import { create } from "zustand";
 import { migrateStrategy } from "@/components/strategy-editor/migration";
 import {
 	CONDITIONAL_MANAGEMENT_ACTION_TYPES,
+	type ActionBlock,
 	type ComponentType,
 	type ConditionalManagementBlock,
 	type ConditionBlock,
@@ -16,6 +17,7 @@ import {
 	type PlanTier,
 	type StrategyState,
 	type TrailingStopBlock,
+	type TriggerState,
 } from "@/components/strategy-editor/types";
 import i18n from "@/i18n";
 import type { StrategyConfigData } from "@/types/api";
@@ -642,11 +644,49 @@ const createCompositeBlock = (
 	};
 };
 
+// The API hands back strategy rows and config blobs that keep the backend's
+// snake_case keys (oracle_regime, natr_settings, foundation_weights, ...).
+// That is deliberately NOT the camelCase StrategyState the editor stores --
+// the two casings are correct in their own domain, so these are never renamed.
+// natr_settings is narrowed because the editor reads a numeric min_natr out of
+// it, and symbol_selection_mode stays a plain string because the code casts it
+// to the StrategyState union further down.
+type IncomingStrategy = Omit<Partial<StrategyConfigData>, "natr_settings"> & {
+	natr_settings?: { min_natr?: number } | null;
+	id?: string;
+	name?: string;
+	description?: string;
+	min_natr?: number;
+	symbol_selection_mode?: string;
+	foundationWeights?: Record<string, number>;
+	config_data?: Partial<StrategyConfigData>;
+};
+
+// A discovered/optimized strategy JSON handed to loadDiscoveredStrategy.
+type DiscoveredStrategy = Partial<
+	Pick<
+		StrategyState,
+		| "strategy_name"
+		| "signal_source"
+		| "name"
+		| "symbol"
+		| "marketType"
+		| "entryTrigger"
+		| "entryConditions"
+		| "initialization"
+		| "positionManagement"
+	>
+> & {
+	trigger?: TriggerState;
+	conditions?: ConditionBlock;
+	action?: ActionBlock;
+};
+
 interface EditorActions {
 	toJson: () => StrategyConfigData;
 	loadState: (strategy: unknown) => void;
 	loadStrategy: (strategy: unknown) => void;
-	loadDiscoveredStrategy: (strategy: Record<string, unknown>) => void;
+	loadDiscoveredStrategy: (strategy: DiscoveredStrategy) => void;
 	setStrategyField: <
 		K extends keyof Omit<
 			StrategyState,
@@ -780,14 +820,11 @@ export const useStrategyEditorStore = create<StrategyState & EditorActions>(
 					console.log("=== START LOADING STRATEGY ===");
 					console.log("Strategy received:", strategy);
 
-					const strat = strategy as Record<string, unknown>;
-					const configData =
-						(strat.config_data as Record<string, unknown>) || {};
+					const strat = strategy as IncomingStrategy;
+					const configData = strat.config_data || {};
 					const flattenedData = migrateStrategy(
-						strat.config_data
-							? { ...strat, ...(strat.config_data as Record<string, unknown>) }
-							: strat,
-					) as StrategyState;
+						strat.config_data ? { ...strat, ...strat.config_data } : strat,
+					) as IncomingStrategy;
 					const defaults = getDefaultInitialState();
 
 					draft.id = strat.id || null;
@@ -1162,10 +1199,11 @@ export const useStrategyEditorStore = create<StrategyState & EditorActions>(
 					switch (parentBlock.compositeType) {
 						case "tape_condition":
 							if (provider?.params && consumer?.params) {
-								const leftOp = consumer.params.leftOperand as Record<
-									string,
-									unknown
-								>;
+								// The tape operand carries a string `key`; that is the
+								// only field this branch touches.
+								const leftOp = consumer.params.leftOperand as {
+									key?: string;
+								};
 								if (newSimpleParams.metric !== undefined)
 									leftOp.key = normalizeTapeOutputKey(
 										newSimpleParams.metric as string,

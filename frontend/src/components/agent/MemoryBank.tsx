@@ -3,14 +3,27 @@ import { useEffect, useState } from "react";
 import { Brain, RefreshCw, Eye, EyeOff, Trash2, Sparkles } from "lucide-react";
 import { useGetAgentMemories, useDeleteAgentMemories, useDeleteAgentMemory, useDeduplicateAgentMemories } from "@/lib/api";
 import ReactMarkdown from "react-markdown";
+import type { AgentMemory } from "@/types/api";
 
 interface MemoryBankProps {
 	isAutopilotRunning?: boolean;
 	activeIteration?: number;
 }
 
+// The /ai/memories endpoint returns these extra fields alongside the columns
+// declared on AgentMemory. They are optional here because the shared type in
+// @/types/api does not describe them.
+type AgentMemoryView = AgentMemory & {
+	tags?: string[];
+	symbol?: string;
+	strategy_type?: string;
+	outcome?: string;
+	confidence?: number;
+};
+
 export const MemoryBank: React.FC<MemoryBankProps> = ({ isAutopilotRunning, activeIteration }) => {
-	const { data: memories = [], isLoading, refetch } = useGetAgentMemories();
+	const { data: fetchedMemories, isLoading, refetch } = useGetAgentMemories();
+	const memories: AgentMemoryView[] = fetchedMemories ?? [];
 	const deleteMemories = useDeleteAgentMemories();
 	const deleteMemory = useDeleteAgentMemory();
 	const deduplicateMemories = useDeduplicateAgentMemories();

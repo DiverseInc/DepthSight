@@ -791,7 +791,7 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 	}, [position]);
 
 	const extractIndicatorsFromTrace = useCallback(
-		(node: TraceNode, indicators: any) => {
+		(node: Record<string, unknown>, indicators: any) => {
 			if (!node || typeof node !== "object") return;
 
 			const type = String(node.type || "").toLowerCase();
@@ -986,7 +986,7 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 
 			if (node.children && Array.isArray(node.children)) {
 				node.children.forEach((child) => {
-					extractIndicatorsFromTrace(child as TraceNode, indicators);
+					extractIndicatorsFromTrace(child as Record<string, unknown>, indicators);
 				});
 			}
 		},
@@ -1022,14 +1022,18 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 
 		if (!decisionTrace) return indicators;
 
-		const entryTrace = decisionTrace.decision_trace || decisionTrace;
+		const entryTrace = (decisionTrace.decision_trace ||
+			decisionTrace) as Record<string, unknown> | undefined;
 		if (entryTrace && typeof entryTrace === "object") {
 			extractIndicatorsFromTrace(entryTrace, indicators);
 		}
 
 		const filtersTrace = entryTrace?.filters_trace;
 		if (filtersTrace && typeof filtersTrace === "object") {
-			extractIndicatorsFromTrace(filtersTrace, indicators);
+			extractIndicatorsFromTrace(
+				filtersTrace as Record<string, unknown>,
+				indicators,
+			);
 		}
 
 		return indicators;
@@ -1117,7 +1121,8 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 				);
 		};
 
-		const traceRoot = decisionTrace?.decision_trace || decisionTrace;
+		const traceRoot = (decisionTrace?.decision_trace ||
+			decisionTrace) as Record<string, unknown> | undefined;
 		if (traceRoot) collectFromNode(traceRoot, true);
 
 		return paramsByType;
@@ -1183,10 +1188,16 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 	const buildTraceFoundationData = useCallback((): FoundationChartProps | null => {
 		if (!decisionTrace || klines.length === 0) return null;
 
-		const traceRoot = decisionTrace.decision_trace || decisionTrace;
+		const traceRoot = (decisionTrace.decision_trace ||
+			decisionTrace) as Record<string, unknown> | undefined;
+		const traceDetails =
+			traceRoot?.details && typeof traceRoot.details === "object"
+				? (traceRoot.details as Record<string, unknown>)
+				: undefined;
 		const signalTime =
-			toTimestampSeconds(traceRoot?.details?.signal_time) ??
-			entryTime;
+			toTimestampSeconds(
+				traceDetails?.signal_time as string | number | null | undefined,
+			) ?? entryTime;
 		const foundationKlines: KlineData[] = normalizeChartKlines(klines);
 
 		const makePointSeries = (value: unknown) => {
@@ -1280,7 +1291,7 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 				type,
 				label,
 				color,
-			} as Record<string, unknown>);
+			});
 		};
 
 		const lookbackWindow = (
@@ -1310,7 +1321,7 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 			return recent[Math.trunc(numericIndex)] || null;
 		};
 
-		const traverse = (node: TraceNode) => {
+		const traverse = (node: Record<string, unknown>) => {
 			if (!node || typeof node !== "object") return;
 
 			const nodeType = String(node.type || "").toLowerCase();
@@ -1443,7 +1454,10 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 					);
 				}
 			} else if (nodeType.includes("price_vs_level")) {
-				const right = details.right?.actual ?? details.right_value_resolved;
+				const right =
+					(details.right && typeof details.right === "object"
+						? (details.right as Record<string, unknown>).actual
+						: undefined) ?? details.right_value_resolved;
 				addLevel(
 					right,
 					"price_vs_level",
@@ -1486,10 +1500,14 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 						"1m",
 				);
 				const startTime =
-					toTimestampSeconds(details.zone_start_time) ??
+					toTimestampSeconds(
+						details.zone_start_time as string | number | null | undefined,
+					) ??
 					signalTime - lookback * timeframeToSeconds(tf);
 				const endTime =
-					toTimestampSeconds(details.zone_end_time) ?? signalTime;
+					toTimestampSeconds(
+						details.zone_end_time as string | number | null | undefined,
+					) ?? signalTime;
 
 				addZone(
 					"price_consolidation",
@@ -1500,7 +1518,7 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 				);
 				const latestZone = visualizations.zones[
 					visualizations.zones.length - 1
-				] as Record<string, unknown>;
+				] as unknown as Record<string, unknown>;
 				if (latestZone?.type === "price_consolidation") {
 					latestZone.top_price = topPrice;
 					latestZone.bottom_price = bottomPrice;
@@ -1664,7 +1682,12 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 							(marker.text as string) || "",
 							(marker.position as "aboveBar" | "belowBar" | "inBar") ||
 								"inBar",
-							(marker.shape as string) || "circle",
+							(marker.shape as
+									| "square"
+									| "circle"
+									| "arrowUp"
+									| "arrowDown") ||
+								"circle",
 							(marker.color as string) || "#3b82f6",
 							"price_action_analyzer",
 						);
@@ -1676,13 +1699,14 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 
 			if (node.children && Array.isArray(node.children)) {
 				node.children.forEach((child: unknown) => {
-					traverse(child as TraceNode);
+					traverse(child as Record<string, unknown>);
 				});
 			}
-			if (node.filters_trace) traverse(node.filters_trace as TraceNode);
+			if (node.filters_trace)
+				traverse(node.filters_trace as Record<string, unknown>);
 		};
 
-		traverse(traceRoot as TraceNode);
+		traverse(traceRoot as Record<string, unknown>);
 
 		return {
 			klines: foundationKlines,
@@ -2260,7 +2284,7 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 
 					if (x1 === null && x2 === null) return;
 
-					const zoneRec = zone as Record<string, unknown>;
+					const zoneRec = zone as unknown as Record<string, unknown>;
 					const level =
 						(zoneRec.detectedLevel as number) ??
 						(zoneRec.price as number) ??
@@ -2582,7 +2606,7 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 								: Number(d.time)) as Time,
 							value: Number(d.value),
 						}))
-						.sort((a, b) => a.time - b.time),
+						.sort((a, b) => Number(a.time) - Number(b.time)),
 				);
 			});
 
@@ -2665,13 +2689,13 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 							const data = viz.subcharts[key];
 							if (!data) return;
 							const sData = data
-								.map((d) => ({
-									time: (Number(d.time) > 1000000000000
-										? Math.floor(Number(d.time) / 1000)
-										: Number(d.time)) as Time,
-									value: Number(d.value),
-								}))
-								.sort((a, b) => a.time - b.time);
+							.map((d) => ({
+								time: (Number(d.time) > 1000000000000
+									? Math.floor(Number(d.time) / 1000)
+									: Number(d.time)) as Time,
+								value: Number(d.value),
+							}))
+							.sort((a, b) => Number(a.time) - Number(b.time));
 
 							if (key.includes("Hist")) {
 								const s = indChart?.addSeries(HistogramSeries, {
@@ -2679,7 +2703,7 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 									color: "#26a69a",
 									title: key,
 								});
-								s.setData(
+								s!.setData(
 									sData.map((d) => ({
 										...d,
 										color: d.value >= 0 ? "#22c55e" : "#ef4444",
@@ -2694,7 +2718,7 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 									pointMarkersRadius: sData.length <= 1 ? 5 : 3,
 									title: key,
 								});
-								s.setData(sData);
+								s!.setData(sData);
 							}
 						});
 					});
@@ -3068,13 +3092,14 @@ export const PositionChartModal: React.FC<PositionChartModalProps> = ({
 											<ScrollArea className="h-full w-full">
 												<div className="p-3 space-y-3">
 													{/* Filters Section */}
-													{potentialTrace.filters_trace && (
+													{(potentialTrace.filters_trace as
+													Record<string, unknown> | undefined) && (
 														<div className="border border-amber-500/30 rounded-lg p-2 bg-amber-500/5">
 															<div className="flex items-center gap-2 mb-2">
 																<span className="text-xs font-semibold uppercase tracking-wider text-amber-500">
 																	{t("filters", "Filters")}
 																</span>
-																{potentialTrace.filters_trace.result ? (
+																{(potentialTrace.filters_trace as Record<string, unknown>).result ? (
 																	<span className="text-xs text-profit">
 																		✓ {t("passed", "Passed")}
 																	</span>

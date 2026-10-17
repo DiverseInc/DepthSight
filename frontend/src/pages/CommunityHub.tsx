@@ -124,6 +124,32 @@ interface HubCommentResponse {
 	is_admin?: boolean;
 }
 
+// Locally-kept feedback tickets: built from the submit response and persisted
+// to localStorage, so this is the shape constructed in the submit handler.
+interface LocalFeedbackTicket {
+	id: string;
+	category: string;
+	text: string;
+	createdAt: string;
+}
+
+// Messages returned by GET /tickets/{id}/messages.
+interface HubTicketMessage {
+	id: string | number;
+	text?: string;
+	image?: string;
+	isAdmin: boolean;
+	createdAt: string;
+}
+
+// Comments listed for the selected news item.
+interface NewsComment {
+	id: string | number;
+	author_name: string;
+	text: string;
+	created_at: string;
+}
+
 interface HubNodeResponse {
 	name: string;
 	latitude?: number;
@@ -889,7 +915,7 @@ const CommunityHub = () => {
 	const [contactEmail, setContactEmail] = useState("");
 	const [submittingFeedback, setSubmittingFeedback] = useState(false);
 	const [localFeedbackTickets, setLocalFeedbackTickets] = useState<
-		Record<string, unknown>[]
+		LocalFeedbackTicket[]
 	>([]);
 
 	useEffect(() => {
@@ -904,14 +930,13 @@ const CommunityHub = () => {
 	}, []);
 
 	// Selected Hub Ticket (for chat dialogue modal)
-	const [selectedHubTicket, setSelectedHubTicket] = useState<Record<
-		string,
-		unknown
-	> | null>(null);
+	const [selectedHubTicket, setSelectedHubTicket] = useState<LocalFeedbackTicket | null>(
+		null,
+	);
 	const [hubTicketStatus, setHubTicketStatus] = useState<string>("OPEN");
-	const [hubTicketMessages, setHubTicketMessages] = useState<
-		Record<string, unknown>[]
-	>([]);
+	const [hubTicketMessages, setHubTicketMessages] = useState<HubTicketMessage[]>(
+		[],
+	);
 	const [loadingHubMessages, setLoadingHubMessages] = useState(false);
 	const [newHubReply, setNewHubReply] = useState("");
 	const [submittingHubReply, setSubmittingHubReply] = useState(false);
@@ -1040,9 +1065,7 @@ const CommunityHub = () => {
 
 	// News detailed view and comments state
 	const [selectedNews, setSelectedNews] = useState<NewsItem | null>(null);
-	const [newsComments, setNewsComments] = useState<Record<string, unknown>[]>(
-		[],
-	);
+	const [newsComments, setNewsComments] = useState<NewsComment[]>([]);
 	const [loadingNewsComments, setLoadingNewsComments] = useState(false);
 	const [newNewsCommentText, setNewNewsCommentText] = useState("");
 	const [submittingNewsComment, setSubmittingNewsComment] = useState(false);
@@ -1282,7 +1305,7 @@ const CommunityHub = () => {
 	const handleImport = (
 		name: string,
 		description: string,
-		config: Record<string, unknown>,
+		config: Record<string, unknown> | undefined,
 		riskProfile?: Record<string, unknown>,
 	) => {
 		if (!config) {
