@@ -62,14 +62,33 @@ DEFAULT_QUESTION = (
 HERMES_SCRATCH = "~/hermes/cache/scratch/"
 
 
-def export_diff() -> Path:
-    """Write the working-tree diff as UTF-8. Never via shell redirection."""
+def export_diff(base: str | None = None) -> Path:
+    """Write the change under review as UTF-8. Never via shell redirection.
+
+    Without `base` this reviews only the uncommitted working tree -- which
+    silently reviews NOTHING the moment the work is committed, i.e. exactly
+    when a pre-merge review matters most. Pass `--base origin/main` to review
+    the committed branch AND any working-tree changes on top of it.
+    """
     OUT_DIR.mkdir(exist_ok=True)
     target = OUT_DIR / "review.diff"
 
-    tracked = subprocess.run(
+    chunks: list[str] = []
+    if base:
+        committed = subprocess.run(
+            ["git", "diff", f"{base}...HEAD"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if committed:
+            chunks.append(f"=== COMMITTED: {base}...HEAD ===\n{committed}")
+    uncommitted = subprocess.run(
         ["git", "diff", "HEAD"], cwd=REPO, capture_output=True, text=True
     ).stdout
+    if uncommitted:
+        chunks.append(f"=== UNCOMMITTED: git diff HEAD ===\n{uncommitted}")
+    tracked = "\n".join(chunks)
 
     # Untracked test files are part of the change and must be reviewed too.
     extra = []
@@ -259,6 +278,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--question", default=DEFAULT_QUESTION)
     ap.add_argument(
+        "--base",
+        default=None,
+        help="git ref to review against, e.g. origin/main. Reviews the committed "
+        "branch plus working-tree changes. Without it, only uncommitted work is "
+        "reviewed -- which is empty right after a commit.",
+    )
+    ap.add_argument(
         "--with-paid",
         action="store_true",
         help="also run Claude Code (separate Anthropic subscription). Off by "
@@ -280,7 +306,7 @@ def main() -> int:
     # hermes refuses the system temp dir.
     os.environ.setdefault("HOME", os.path.expanduser("~"))
 
-    diff = export_diff()
+    diff = export_diff(args.base)
     size = diff.stat().st_size
     print(f"[review] diff exported: {diff} ({size} bytes, UTF-8)")
     if size == 0:
