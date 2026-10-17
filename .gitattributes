@@ -1,2 +1,13 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts MUST stay LF on every platform. With only `* text=auto` above,
+# a checkout on Windows converts them to CRLF, and bash then fails on the
+# shebang with a confusing error. `text eol=lf` forces LF in the working tree
+# regardless of the host OS.
+*.sh text eol=lf
+tools/*.sh text eol=lf
+
+# Repo scripts are executed on Linux (CI, Elestio, WSL harness). Keep them LF.
+scripts/** text eol=lf
+bot_module/**/*.sh text eol=lf
