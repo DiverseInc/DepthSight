@@ -50,6 +50,7 @@ import type {
 	ProgressEventData,
 	ProgressInfoData,
 	ProgressKpiData,
+	StrategyConfigData,
 	TradeData,
 } from "@/types/api";
 import NotFound from "./NotFound";

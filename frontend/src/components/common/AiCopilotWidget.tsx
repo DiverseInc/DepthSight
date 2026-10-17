@@ -58,7 +58,7 @@ const ALLOWED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 type SelectedImage = { base64: string; type: string };
 
-const getImageSrc = (base64: string, mimeType = "image/jpeg") =>
+const getImageSrc = (base64: string, mimeType: string | undefined = "image/jpeg") =>
 	base64.startsWith("data:") ? base64 : `data:${mimeType};base64,${base64}`;
 
 const processImageFile = (file: File): Promise<SelectedImage> => {
@@ -552,6 +552,8 @@ const AiCopilotChatWindow: React.FC<AiCopilotChatWindowProps> = ({
 									(msg.role === "assistant" && msg.strategy_json) ||
 									isStrategyContent;
 
+								const { image_base64 } = msg;
+
 								return (
 									<div key={index}>
 										{/* Don't show content if it's a strategy JSON response */}
@@ -575,7 +577,7 @@ const AiCopilotChatWindow: React.FC<AiCopilotChatWindowProps> = ({
 															: "bg-muted",
 													)}
 												>
-													{msg.image_base64 && (
+													{image_base64 && (
 														<div className="mb-2 overflow-hidden rounded-md border border-border/50 bg-background/50">
 															<button
 																type="button"
@@ -587,7 +589,7 @@ const AiCopilotChatWindow: React.FC<AiCopilotChatWindowProps> = ({
 																onClick={() =>
 																	window.open(
 																		getImageSrc(
-																			msg.image_base64,
+																			image_base64,
 																			msg.image_mime_type,
 																		),
 																		"_blank",
@@ -596,7 +598,7 @@ const AiCopilotChatWindow: React.FC<AiCopilotChatWindowProps> = ({
 															>
 																<img
 																	src={getImageSrc(
-																		msg.image_base64,
+																		image_base64,
 																		msg.image_mime_type,
 																	)}
 																	alt="Uploaded chart"

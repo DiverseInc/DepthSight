@@ -691,7 +691,7 @@ const SupportPage = () => {
 														<div className="mt-3 flex items-center gap-2 text-[10px] text-primary/60 font-mono">
 															<AlertCircle className="w-3 h-3" />
 															{t("history.attachedContext")}: STRATEGY #
-															{ticket.context.strategyId?.slice(0, 8)}
+															{(ticket.context as { strategyId?: string }).strategyId?.slice(0, 8)}
 														</div>
 													)}
 												</CardContent>
@@ -835,7 +835,7 @@ const SupportPage = () => {
 											{"Technical Context"}
 										</h4>
 										<div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
-											{(activeTicket.context as Record<string, unknown>)
+											{(activeTicket.context as { strategyId?: string })
 												.strategyId && (
 												<div className="p-3 bg-card/50 border border-border/30 rounded-xl">
 													<span className="text-muted-foreground block mb-0.5">
@@ -849,7 +849,7 @@ const SupportPage = () => {
 													</code>
 												</div>
 											)}
-											{(activeTicket.context as Record<string, unknown>)
+											{(activeTicket.context as { appVersion?: string })
 												.appVersion && (
 												<div className="p-3 bg-card/50 border border-border/30 rounded-xl">
 													<span className="text-muted-foreground block mb-0.5">
@@ -863,7 +863,7 @@ const SupportPage = () => {
 													</code>
 												</div>
 											)}
-											{(activeTicket.context as Record<string, unknown>)
+											{(activeTicket.context as { url?: string })
 												.url && (
 												<div className="p-3 bg-card/50 border border-border/30 rounded-xl md:col-span-2">
 													<span className="text-muted-foreground block mb-0.5">
