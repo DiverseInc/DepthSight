@@ -7,9 +7,15 @@ Endpoints:
     Used in onboarding wizard step 1 ("pick a template, click Start").
 
 - POST /onboarding/validate-okx-key
-    Test an OKX API key/secret/passphrase without saving it.
-    Returns { valid: bool, error?: str }. The user then saves the key via
-    the normal /api/v1/config/api-keys flow.
+    Test an OKX API key/secret/passphrase WITHOUT saving it. Returns
+    { valid: bool, error?: str }. For "check before I commit" flows.
+
+- POST /onboarding/connect-okx-key
+    Test AND save an OKX key, returning its id. This is what the wizard uses:
+    the wizard used to call validate-okx-key and then promise the user that live
+    trading "will be enabled", but validation-only never stored the credential,
+    so the very next step failed with "No active OKX key". Delegates to the
+    canonical /config/api-keys handler so there is exactly one persist path.
 
 - POST /onboarding/convert-to-live
     Convert an existing paper strategy to live. Validates the user has at
@@ -21,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import ccxt.async_support as ccxt_async
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -95,6 +101,15 @@ class ConvertToLiveResponse(BaseModel):
     run_mode: str
     api_key_id: Optional[int]
     status: str
+
+
+class ConnectOkxKeyResponse(BaseModel):
+    """`api_key_id` is set only when the credential was actually stored."""
+    valid: bool
+    error: Optional[str] = None
+    account_type: Optional[str] = None
+    api_key_id: Optional[int] = None
+    exchange: Optional[str] = None
 
 
 # -----------------------------------------------------------------------------
@@ -195,24 +210,21 @@ async def start_paper_strategy(
     }
 
 
-@onboarding_router.post(
-    "/validate-okx-key",
-    response_model=schemas.ApiResponseData[ValidateOkxKeyResponse],
-)
-async def validate_okx_key(
-    req: ValidateOkxKeyRequest,
-    current_user: models.User = Depends(get_current_user),
-):
+async def _validate_okx_credentials(req: ValidateOkxKeyRequest, user_id) -> dict:
     """
-    Test an OKX API key by attempting a public-balance read. Does NOT
-    persist the key — user must save it via the normal Settings flow after
-    validation passes.
+    Sanity-read the credentials against the environment they were issued for.
 
-    Common failure modes:
-    - Wrong secret / passphrase → ccxt.AuthenticationError
-    - Key was deleted on OKX → 50119 "API key doesn't exist"
-    - IP not whitelisted → 50118 or similar
+    Returns {"valid": bool, "error": str|None, "account_type": str|None}.
+    Never raises — an unreachable exchange is reported as invalid, not a 500.
+
+    `user_id` is used only to make the warning line attributable; without it a
+    failed validation is untraceable back to the account that hit it.
+
+    NOTE: `exchange` is initialised to None before the try because the
+    constructor itself can raise; the old inline version referenced it in the
+    except handlers and would have raised NameError, masking the real error.
     """
+    exchange = None
     try:
         exchange = ccxt_async.okx({
             "apiKey": req.api_key,
@@ -228,43 +240,140 @@ async def validate_okx_key(
             exchange.set_sandbox_mode(True)
         # Sanity read — does NOT require trade permission
         balance = await exchange.fetch_balance()
-        await exchange.close()
+        await _safe_close_exchange(exchange)
 
         # Best-effort: get account type for the response (helps UI labeling)
-        account_types = balance.get("info", {}).get("data", [{}])[0].get("acctGrp", None)
+        account_type = balance.get("info", {}).get("data", [{}])[0].get("acctGrp", None)
 
-        return {
-            "data": ValidateOkxKeyResponse(
-                valid=True,
-                error=None,
-                account_type=account_types,
-            )
-        }
+        return {"valid": True, "error": None, "account_type": account_type}
     except ccxt_async.AuthenticationError as e:
         await _safe_close_exchange(exchange)
         return {
-            "data": ValidateOkxKeyResponse(
-                valid=False,
-                error=f"Authentication failed: {str(e)[:120]}",
-            )
+            "valid": False,
+            "error": f"Authentication failed: {str(e)[:120]}",
+            "account_type": None,
         }
     except Exception as e:
         await _safe_close_exchange(exchange)
-        logger.warning(f"OKX key validation failed for user {current_user.id}: {e}")
+        logger.warning(f"OKX key validation failed for user {user_id}: {e}")
         return {
-            "data": ValidateOkxKeyResponse(
-                valid=False,
-                error=f"Could not reach OKX: {type(e).__name__}: {str(e)[:120]}",
-            )
+            "valid": False,
+            "error": f"Could not reach OKX: {type(e).__name__}: {str(e)[:120]}",
+            "account_type": None,
         }
+
+
+@onboarding_router.post(
+    "/validate-okx-key",
+    response_model=schemas.ApiResponseData[ValidateOkxKeyResponse],
+)
+async def validate_okx_key(
+    req: ValidateOkxKeyRequest,
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Test an OKX API key/secret/passphrase WITHOUT saving it.
+
+    Prefer `POST /onboarding/connect-okx-key` for the wizard: it validates and
+    then persists through the canonical `/config/api-keys` path. This endpoint
+    remains for "check before I commit to saving" flows.
+
+    Common failure modes:
+    - Wrong secret / passphrase → ccxt.AuthenticationError
+    - Key was deleted on OKX → 50119 "API key doesn't exist"
+    - IP not whitelisted → 50118 or similar
+    """
+    result = await _validate_okx_credentials(req, current_user.id)
+    return {
+        "data": ValidateOkxKeyResponse(
+            valid=result["valid"],
+            error=result["error"],
+            account_type=result["account_type"],
+        )
+    }
 
 
 async def _safe_close_exchange(exchange):
     """Tolerant exchange.close() — never raise during cleanup."""
+    if exchange is None:
+        return
     try:
         await exchange.close()
     except Exception:
         pass
+
+
+@onboarding_router.post(
+    "/connect-okx-key",
+    response_model=schemas.ApiResponseData[ConnectOkxKeyResponse],
+)
+async def connect_okx_key(
+    request: Request,
+    req: ValidateOkxKeyRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Validate AND persist an OKX key, then hand back its id.
+
+    WHY THIS EXISTS: the wizard used to call `validate-okx-key` and then promise
+    the user "Live trading on OKX will be enabled" — but validation-only never
+    stored the credential. Step 3 ("Go live") then hit `convert-to-live`, which
+    found no active key and refused with 400. A user who followed the wizard
+    perfectly still could not finish. The UI promised something the backend
+    never did.
+
+    Validated first, so a dead credential is never stored. Then delegates to the
+    canonical `add_api_key` handler rather than reimplementing persistence, so
+    this path inherits — for free and cannot drift from — duplicate detection,
+    the first-key achievement, referral-bonus activation, active-key selection,
+    the ACTIVATE_API_KEY bot command, and the audit log.
+
+    Returns api_key_id so the wizard can hand it explicitly to `convert-to-live`,
+    which also sidesteps the "both mainnet and testnet keys" ambiguity refusal.
+    """
+    exchange_id = "okx_testnet" if req.is_testnet else "okx"
+
+    result = await _validate_okx_credentials(req, current_user.id)
+    if not result["valid"]:
+        # Nothing is stored on failure — a dead key must never reach the DB.
+        return {
+            "data": ConnectOkxKeyResponse(
+                valid=False, error=result["error"], account_type=None,
+                api_key_id=None, exchange=exchange_id,
+            )
+        }
+
+    from .api_keys import add_api_key
+
+    # `name` is validated against ^[a-zA-Z0-9_\s.-]*$ — no parentheses.
+    key_create = schemas.ApiKeyCreate(
+        name="OKX Demo onboarding" if req.is_testnet else "OKX Live onboarding",
+        exchange=exchange_id,
+        api_key=req.api_key,
+        api_secret=req.api_secret,
+        api_password=req.passphrase,
+    )
+
+    # A duplicate (409) or any other canonical-path rejection propagates as-is,
+    # so the wizard shows the same message Settings would have shown.
+    created = await add_api_key(
+        request=request,
+        api_key_data=key_create,
+        db=db,
+        current_user=current_user,
+        redis_client=await get_redis_client(),
+    )
+
+    return {
+        "data": ConnectOkxKeyResponse(
+            valid=True,
+            error=None,
+            account_type=result["account_type"],
+            api_key_id=created["data"].id,
+            exchange=exchange_id,
+        )
+    }
 
 
 @onboarding_router.post(

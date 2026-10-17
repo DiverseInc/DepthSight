@@ -58,13 +58,17 @@ async function startPaperStrategy(payload: {
   };
 }
 
-async function validateOkxKey(payload: {
+async function connectOkxKey(payload: {
   api_key: string;
   api_secret: string;
   passphrase: string;
   is_testnet: boolean;
 }) {
-  const res = await fetch("/api/v1/onboarding/validate-okx-key", {
+  // Validates AND persists through the canonical /config/api-keys path.
+  // The old validate-only endpoint left the credential unsaved, so the very
+  // next step ("Go live") failed with "No active OKX key" for a user who had
+  // done everything the wizard asked.
+  const res = await fetch("/api/v1/onboarding/connect-okx-key", {
     method: "POST",
     credentials: "include",
     headers: {
@@ -82,10 +86,15 @@ async function validateOkxKey(payload: {
     valid: boolean;
     error: string | null;
     account_type: string | null;
+    api_key_id: number | null;
+    exchange: string | null;
   };
 }
 
-async function convertToLive(payload: { config_id: string }) {
+async function convertToLive(payload: {
+  config_id: string;
+  api_key_id?: number | null;
+}) {
   const res = await fetch("/api/v1/onboarding/convert-to-live", {
     method: "POST",
     credentials: "include",
@@ -123,6 +132,9 @@ export const OnboardingWizard = ({
   // testnet so reaching mainnet is a deliberate choice, not the default.
   const [okxKey, setOkxKey] = useState({ api_key: "", api_secret: "", passphrase: "", is_testnet: true });
   const [okxValid, setOkxValid] = useState<boolean | null>(null);
+  // The id of the key we actually stored, so step 3 trades with that exact
+  // credential instead of asking the server to guess between environments.
+  const [apiKeyId, setApiKeyId] = useState<number | null>(null);
 
   // ---- Mutations -------------------------------------------------------------
   const startPaper = useMutation({
@@ -146,31 +158,35 @@ export const OnboardingWizard = ({
     },
   });
 
-  const validateOkx = useMutation({
-    mutationFn: validateOkxKey,
+  const connectOkx = useMutation({
+    mutationFn: connectOkxKey,
     onSuccess: (data) => {
-      if (data.valid) {
+      if (data.valid && data.api_key_id !== null) {
         setOkxValid(true);
+        setApiKeyId(data.api_key_id);
         setStep(3);
         toast({
-          title: "OKX key validated",
-          description:
-            data.account_type
-              ? `Live trading on OKX (${data.account_type}) will be enabled.`
-              : "Live trading on OKX will be enabled.",
+          title: "OKX key saved",
+          description: data.account_type
+            ? `Connected to OKX (${data.account_type}) and ready for live trading.`
+            : "Connected to OKX and ready for live trading.",
         });
       } else {
+        // valid but no id would mean the backend promised a save it did not do.
         setOkxValid(false);
         toast({
-          title: "OKX key validation failed",
-          description: data.error ?? "Check key / secret / passphrase.",
+          title: "OKX key not saved",
+          description:
+            data.error ??
+            "The key could not be verified, so nothing was saved. Check key / secret / passphrase.",
           variant: "destructive",
         });
       }
     },
     onError: (err: Error) => {
+      setOkxValid(false);
       toast({
-        title: "Could not reach OKX",
+        title: "Could not save OKX key",
         description: err.message,
         variant: "destructive",
       });
@@ -266,8 +282,8 @@ export const OnboardingWizard = ({
               okxKey={okxKey}
               setOkxKey={setOkxKey}
               valid={okxValid}
-              loading={validateOkx.isPending}
-              onValidate={() => validateOkx.mutate(okxKey)}
+              loading={connectOkx.isPending}
+              onValidate={() => connectOkx.mutate(okxKey)}
               onSkip={skipOkx}
               onBack={() => setStep(1)}
             />
@@ -277,8 +293,12 @@ export const OnboardingWizard = ({
           {step === 3 && (
             <Step3
               configId={configId}
+              apiKeyId={apiKeyId}
               loading={convertLive.isPending}
-              onConvert={() => configId && convertLive.mutate({ config_id: configId })}
+              onConvert={() =>
+                configId &&
+                convertLive.mutate({ config_id: configId, api_key_id: apiKeyId })
+              }
               onBack={() => setStep(2)}
               onFinish={goDashboard}
               onSkip={finish}
@@ -368,7 +388,7 @@ const Step2 = ({
     <StepHeader
       icon={KeyRound}
       title="Connect your OKX key (optional)"
-      body="Paste your OKX API key to enable live trading. We validate by reading your balance — never enable Withdraw on the OKX side."
+      body="Paste your OKX API key to enable live trading. We check it by reading your balance, then save it to your account. Never enable Withdraw on the OKX side."
     />
     <p className="mb-4 text-sm text-muted-foreground">
       Don't have an OKX account yet?{" "}
@@ -446,12 +466,13 @@ const Step2 = ({
     </div>
     {valid === false && (
       <p className="mt-3 text-sm text-destructive">
-        Validation failed. Check key/secret/passphrase and try again.
+        Couldn't verify that key, so nothing was saved. Check key / secret /
+        passphrase and try again.
       </p>
     )}
     <div className="mt-6 flex items-center gap-3">
       <Button onClick={onValidate} disabled={loading || !okxKey.api_key || !okxKey.api_secret || !okxKey.passphrase} size="lg">
-        {loading ? "Validating…" : "Validate key"}
+        {loading ? "Checking…" : "Save & continue"}
       </Button>
       <Button variant="ghost" onClick={onSkip} disabled={loading}>
         Skip — I'll add later
@@ -465,6 +486,7 @@ const Step2 = ({
 
 const Step3 = ({
   configId,
+  apiKeyId,
   loading,
   onConvert,
   onBack,
@@ -472,6 +494,7 @@ const Step3 = ({
   onSkip,
 }: {
   configId: string | null;
+  apiKeyId: number | null;
   loading: boolean;
   onConvert: () => void;
   onBack: () => void;
@@ -484,21 +507,44 @@ const Step3 = ({
       title="Ready to go live?"
       body="Swap your paper strategy to live with one click. You can roll back to paper at any time."
     />
-    <p className="mb-6 text-sm text-muted-foreground">
-      Live trading uses real money. We'll attach your most-recent active OKX key and update your plan's quota accordingly.
-    </p>
-    <div className="flex items-center gap-3">
-      <Button onClick={onConvert} disabled={loading || !configId} size="lg">
-        {loading ? "Converting…" : "Go live"}
-        <ArrowRight className="ml-2 h-4 w-4" />
-      </Button>
-      <Button variant="ghost" onClick={onFinish} disabled={loading}>
-        Stay on paper — finish
-      </Button>
-      <Button variant="ghost" onClick={onBack} disabled={loading}>
-        Back
-      </Button>
-    </div>
+    {apiKeyId === null ? (
+      // Previously this rendered an enabled "Go live" button that was guaranteed
+      // to fail with "No active OKX key" — the user skipped the step that saves it.
+      <>
+        <p className="mb-6 text-sm text-muted-foreground">
+          Live trading needs a connected exchange account, and there's no OKX key
+          saved on your account yet. Go back and save one — it takes about a minute.
+        </p>
+        <div className="flex items-center gap-3">
+          <Button onClick={onBack} disabled={loading} size="lg">
+            Back to OKX key
+            <ArrowRight className="ml-2 h-4 w-4" />
+          </Button>
+          <Button variant="ghost" onClick={onFinish} disabled={loading}>
+            Stay on paper — finish
+          </Button>
+        </div>
+      </>
+    ) : (
+      <>
+        <p className="mb-6 text-sm text-muted-foreground">
+          Live trading uses real money. We'll trade with the OKX key you just
+          saved and update your plan's quota accordingly.
+        </p>
+        <div className="flex items-center gap-3">
+          <Button onClick={onConvert} disabled={loading || !configId} size="lg">
+            {loading ? "Converting…" : "Go live"}
+            <ArrowRight className="ml-2 h-4 w-4" />
+          </Button>
+          <Button variant="ghost" onClick={onFinish} disabled={loading}>
+            Stay on paper — finish
+          </Button>
+          <Button variant="ghost" onClick={onBack} disabled={loading}>
+            Back
+          </Button>
+        </div>
+      </>
+    )}
   </div>
 );
 
