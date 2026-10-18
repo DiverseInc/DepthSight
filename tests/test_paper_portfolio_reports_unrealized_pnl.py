@@ -179,6 +179,68 @@ def test_paper_portfolio_reports_unrealized_pnl_from_bot_state():
     assert abs(data.balance - 9995.50497923637) < 1e-9
 
 
+def test_paper_portfolio_reports_a_blocked_paper_account():
+    """Paper-mode requests must be able to report trading as switched OFF.
+
+    Found by two reviewers after the multi-controller aggregation was fixed:
+    `?mode=paper` takes a dedicated early-return branch that returned BEFORE
+    that aggregation ran, and it hardcoded `is_trading_allowed=True`. So the
+    one population this whole fix is about -- a paper account whose signals are
+    being rejected by the risk gate -- still could not be shown as blocked.
+    """
+    published = {
+        "depthsight:state:portfolio:10:None": json.dumps(
+            {
+                "user_id": 10,
+                "total_wallet_balance": 2645.55,
+                "total_unrealized_pnl": 0.0,
+                "total_equity": 2645.55,
+                "today_pnl": 0.0,
+                "is_trading_allowed": False,
+            }
+        )
+    }
+    data = _call(published)["data"]
+
+    assert data.is_trading_allowed is False, (
+        "the paper branch hardcoded True, so a paper account blocked by the "
+        "risk gate was indistinguishable from a healthy one"
+    )
+
+
+def test_paper_portfolio_reports_allowed_when_every_controller_is_allowed():
+    """Positive control: the fix is not 'always report blocked'."""
+    published = {
+        "depthsight:state:portfolio:10:None": json.dumps(
+            {
+                "user_id": 10,
+                "total_wallet_balance": 2645.55,
+                "total_unrealized_pnl": 0.0,
+                "total_equity": 2645.55,
+                "today_pnl": 0.0,
+                "is_trading_allowed": True,
+            }
+        )
+    }
+    data = _call(published)["data"]
+
+    assert data.is_trading_allowed is True
+
+
+def test_paper_portfolio_treats_one_blocked_controller_as_blocked():
+    published = {
+        "depthsight:state:portfolio:10:None": json.dumps(
+            {"total_equity": 2645.55, "is_trading_allowed": True}
+        ),
+        "depthsight:state:portfolio:10:paper-2": json.dumps(
+            {"total_equity": 100.0, "is_trading_allowed": False}
+        ),
+    }
+    data = _call(published)["data"]
+
+    assert data.is_trading_allowed is False
+
+
 def test_paper_portfolio_ignores_live_keys_by_numeric_api_key_id():
     """Live controllers publish a numeric api_key_id suffix; paper has none."""
     published = {

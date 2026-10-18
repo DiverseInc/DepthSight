@@ -250,6 +250,13 @@ async def get_portfolio_status(
         # Read the same Redis keys the fallback branch aggregates, and treat an
         # unreachable bot as zero rather than failing the whole response.
         total_unrealized_pnl = 0.0
+        # The controllers publish the real RiskManager gate as
+        # "is_trading_allowed". This branch used to hardcode True and return
+        # before the multi-controller aggregation below, so a paper account --
+        # the exact population whose signals were being rejected -- could never
+        # be shown as blocked. Collect it from the same paper-only keys this
+        # loop already reads and AND across them.
+        paper_gate_values: List[bool] = []
         try:
             base_portfolio_key = (
                 f"{bot_config.REDIS_STATE_KEY_PORTFOLIO}:{current_user.id}"
@@ -274,6 +281,9 @@ async def get_portfolio_status(
                 total_unrealized_pnl += float(
                     state.get("total_unrealized_pnl", 0) or 0
                 )
+                paper_gate_values.append(
+                    bool(state.get("is_trading_allowed", True))
+                )
         except Exception as e:
             logger.warning(
                 f"User '{current_user.username}' - could not read paper unrealized PnL "
@@ -283,7 +293,9 @@ async def get_portfolio_status(
         paper_portfolio_status = schemas.PortfolioStatus(
             balance=total_balance,
             today_pnl=today_pnl,  # Real PnL for today
-            is_trading_allowed=True,
+            is_trading_allowed=(
+                all(paper_gate_values) if paper_gate_values else True
+            ),
             consecutive_losses=0,  # Not tracked yet
             timestamp_utc=datetime.now(timezone.utc),
             total_unrealized_pnl=round(total_unrealized_pnl, 2),
@@ -407,10 +419,43 @@ async def get_portfolio_status(
 
         # Construct a PortfolioStatus object from the live data.
         market_breakdown = build_market_balance_breakdown(account_balances)
+        # The exchange knows the balances but not whether the BOT is allowed to
+        # trade -- only the controller's RiskManager does, and it publishes that
+        # flag to Redis. Hardcoding True here made this the one remaining branch
+        # that could never report a blocked account. Reporting field only: it
+        # cannot cause or prevent a trade.
+        live_gate_values: List[bool] = []
+        try:
+            live_keys = await redis_client.keys(
+                f"{bot_config.REDIS_STATE_KEY_PORTFOLIO}:{current_user.id}:*"
+            )
+            # Mirror of the paper branch: read ONLY the live controllers. The
+            # balances above come from the exchange for this user's API keys, so
+            # the gate must describe that same population. Without the filter a
+            # blocked PAPER controller (suffix "None") would mark a healthy LIVE
+            # account as blocked while the reported money was live-only.
+            for live_key, live_raw in zip(
+                live_keys, await redis_client.mget(live_keys)
+            ):
+                if not live_raw:
+                    continue
+                if not str(live_key).rsplit(":", 1)[-1].isdigit():
+                    continue
+                try:
+                    live_gate_values.append(
+                        bool(json.loads(live_raw).get("is_trading_allowed", True))
+                    )
+                except (TypeError, ValueError):
+                    continue
+        except Exception:
+            # An unreachable Redis must not break the live balance fetch.
+            live_gate_values = []
         live_portfolio_status = schemas.PortfolioStatus(
             balance=total_equity,  # Use Equity for dashboard "Balance"
             today_pnl=today_pnl_live,
-            is_trading_allowed=True,
+            is_trading_allowed=(
+                all(live_gate_values) if live_gate_values else True
+            ),
             consecutive_losses=0,
             timestamp_utc=datetime.now(timezone.utc),
             market_type=normalized_market_type,
@@ -448,6 +493,19 @@ async def get_portfolio_status(
 
         found_data = False
 
+        # The controllers publish the REAL RiskManager gate as
+        # "is_trading_allowed" (see controller.py's portfolio_status_data).
+        # The aggregation below summed only the money fields, so this dict
+        # never contained that key and the mapping further down fell through to
+        # its `True` default: the API could not report a blocked account even
+        # when every controller had trading switched off. That is exactly the
+        # state a user cannot see -- the dashboard showed "running" while every
+        # signal was being rejected.
+        #
+        # Collect it explicitly and AND it across controllers: if ANY controller
+        # is blocked, the account is not fully tradable.
+        controller_gate_values: List[bool] = []
+
         if api_key_id is not None:
             # Specific Key
             specific_key = f"{base_portfolio_key}:{api_key_id}"
@@ -477,11 +535,17 @@ async def get_portfolio_status(
                         aggregated_status["today_pnl"] += float(
                             data.get("today_pnl", 0)
                         )
+                        controller_gate_values.append(
+                            bool(data.get("is_trading_allowed", True))
+                        )
                         found_data = True
         if not found_data:
             raise ValueError(
                 f"Portfolio keys associated with '{base_portfolio_key}' not found in Redis."
             )
+
+        if controller_gate_values:
+            aggregated_status["is_trading_allowed"] = all(controller_gate_values)
 
         # Map to Schema
         # IMPORTANT: Frontend uses balance field as "Total Equity" to show total balance.
