@@ -12,24 +12,55 @@ from datetime import datetime, timezone
 # --- Helpers ---
 
 
-def create_test_kline_df(num_candles=60, base_price=100.0) -> pd.DataFrame:
-    """Creates a test candle DataFrame."""
-    now = pd.Timestamp.now(tz="UTC")
+CANDLE_SEED = 20261018
+ANCHORED_CANDLE_END = pd.Timestamp("2024-01-10 12:00:00", tz="UTC")
+
+
+def create_test_kline_df(num_candles=60, base_price=100.0):
+    """Creates a test candle DataFrame.
+
+    FIX 2026-10-18 -- this fixture is now DETERMINISTIC. It had two independent
+    sources of non-determinism, and tests that assert an exact number on its
+    output were coin flips:
+
+    1. `np.random.*` with no seed. Two calls in the SAME process returned
+       different closes, so any assertion like
+       `trade["pnl"] == approx(60.0, abs=1e-6)` was decided by the global RNG
+       state rather than by the code under test.
+    2. `pd.Timestamp.now(tz="UTC")` for the index, which also moves with the
+       wall clock and shifts every resampled higher-timeframe bar.
+
+    Measured, not inferred: `test_visual_strategy_position_management.py::
+    test_pm_partial_take_profit` failed in CI run 39148024288 with
+    `assert 59.5 == 60.0`, while a full local run of the same tree passed. It is
+    imported from here, so its data came from here.
+
+    This is the same species of bug already fixed once in this repo -- see the
+    2026-10-15 note in `test_visual_strategy_foundations_and_filters.py`, where a
+    `pd.Timestamp.now()` index made CI fail at 00:21 UTC while local runs passed,
+    and the sibling `test_visual_strategy.py` already anchors its timestamp.
+
+    A LOCAL generator is used rather than `np.random.seed()`, so these tests no
+    longer mutate global RNG state for whatever runs after them -- the same
+    cross-test contamination that made this hard to diagnose in the first place.
+    """
+    now = ANCHORED_CANDLE_END
     index = pd.to_datetime(
         [now - pd.Timedelta(minutes=i) for i in range(num_candles - 1, -1, -1)]
     )
 
-    closes = base_price + np.cumsum(np.random.normal(0, 0.5, num_candles))
-    highs = closes + np.abs(np.random.normal(2, 1, num_candles))
-    lows = closes - np.abs(np.random.normal(2, 1, num_candles))
-    opens = (highs + lows) / 2 + np.random.normal(0, 0.5, num_candles)
+    rng = np.random.default_rng(CANDLE_SEED)
+    closes = base_price + np.cumsum(rng.normal(0, 0.5, num_candles))
+    highs = closes + np.abs(rng.normal(2, 1, num_candles))
+    lows = closes - np.abs(rng.normal(2, 1, num_candles))
+    opens = (highs + lows) / 2 + rng.normal(0, 0.5, num_candles)
 
     data = {
         "open": opens,
         "high": highs,
         "low": lows,
         "close": closes,
-        "volume": np.random.uniform(100, 200, num_candles),
+        "volume": rng.uniform(100, 200, num_candles),
     }
     df = pd.DataFrame(data, index=index)
     df["SMA_10"] = df["close"].rolling(10).mean()
