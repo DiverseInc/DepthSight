@@ -555,7 +555,14 @@ class RiskManager:
                 current_trading_day_start_ts_float_actual
             )
             self.stats.last_known_day_str = current_trading_day_str_utc_actual
-            self._is_trading_allowed = True
+            # Never re-open the global gate while the emergency-stop latch is
+            # engaged. That latch is the operator's kill switch and is released
+            # only by clear_emergency_stop(). Entries were already refused
+            # correctly (the latch is checked first), but this flag is what the
+            # controller publishes and the API now surfaces, so leaving it True
+            # would report "trading allowed" during a kill switch.
+            if not self._emergency_stop_active:
+                self._is_trading_allowed = True
 
             logger.info(
                 f"Daily stats reset for new day {current_trading_day_str_utc_actual}. Start of day balance: ${self.stats.start_of_day_balance:.2f}."
@@ -658,6 +665,33 @@ class RiskManager:
                         logger.debug(
                             f"{log_prefix} Balance unchanged: ${self.stats.current_balance:.2f}"
                         )
+
+                    # A successful balance read is the only trustworthy evidence
+                    # available about whether the global gate should be open, so
+                    # re-validate it here rather than only at startup.
+                    #
+                    # `initialize_balance()` already does this once
+                    # (`if success_fetch: self._check_risk_limits()`), but that
+                    # is the ONLY place it happened on the paper path. Combined
+                    # with `_check_and_reset_daily_stats()` -- which is likewise
+                    # only called from `update_trade_result()` and the LIVE
+                    # branch of `assess_signal()` -- a paper account that has not
+                    # closed a trade never re-evaluated the gate again.
+                    #
+                    # So a single transient fetch failure at bot start latched
+                    # `_is_trading_allowed = False` for the entire life of the
+                    # process: the controller's own gate rejects the signal
+                    # before `assess_signal()` is reached, so nothing could heal
+                    # it. Observed live 2026-10-18 as one
+                    # "Signal REJECTED by rm.is_symbol_trading_allowed (general
+                    # block)" per minute against a perfectly healthy $2,645.55
+                    # paper balance.
+                    #
+                    # This also closes the mirror hole: without it, an account
+                    # that genuinely fell below `min_balance_threshold` was
+                    # never re-checked either, so the breach went unseen until
+                    # the next trade closed.
+                    self._check_risk_limits()
                     return True
                 else:
                     logger.warning(
@@ -700,7 +734,14 @@ class RiskManager:
                 logger.info(
                     "Global risk limits have been reset. Resuming trading capability for a new day."
                 )
-            self._is_trading_allowed = True
+            # A new UTC day is not an operator action, so it must not clear a
+            # kill switch the operator pulled. Entries stay refused either way
+            # (the latch is checked first), but this flag is published to Redis
+            # and surfaced by the API, so flipping it here would report
+            # "trading allowed" from midnight onward. Found by two reviewers:
+            # the _check_risk_limits() re-enable was guarded, this one was not.
+            if not self._emergency_stop_active:
+                self._is_trading_allowed = True
             logger.info(
                 f"Balance at the start of a new day set: ${self.stats.start_of_day_balance:.2f}"
             )
@@ -1373,7 +1414,18 @@ class RiskManager:
                 except Exception as e:
                     logger.error(f"Failed to schedule Telegram notification: {e}")
 
-        elif should_be_allowed and not self._is_trading_allowed:
+        elif (
+            should_be_allowed
+            and not self._is_trading_allowed
+            and not self._emergency_stop_active
+        ):
+            # The emergency-stop latch owns this flag while it is engaged.
+            # Re-enabling here on healthy limits would leave `_is_trading_allowed`
+            # True while `_emergency_stop_active` is still True -- entries stay
+            # correctly refused (the latch is checked first), but the controller
+            # publishes `getattr(self.rm, "_is_trading_allowed", True)` to Redis
+            # and the API surfaces it, so the dashboard would report "trading
+            # allowed" during a kill switch the operator pulled.
             logger.info(
                 "Global risk limits are now within acceptable range. Re-enabling trading globally."
             )

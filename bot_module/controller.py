@@ -4663,6 +4663,24 @@ class TradingController:
         last_paper_exit_ensure_time = 0
         paper_exit_ensure_interval = 60
 
+        # Refresh the balance so the RiskManager's global trading gate is
+        # re-evaluated on a timer.
+        #
+        # A LIVE controller gets this for free: `assess_signal()` re-runs
+        # `_check_risk_limits()` on every signal it assesses. A PAPER-ONLY
+        # controller (api_key_id is None -- exactly the keyless demo/paper
+        # account) never reaches that code, and `update_trade_result()` only
+        # runs when a trade CLOSES. With no trades there is no other caller of
+        # `update_balance()`, so after startup the paper balance -- and with it
+        # the global gate -- was never refreshed again.
+        #
+        # Deliberately scoped to paper-only controllers: a live account
+        # already re-checks on every signal, and adding a per-minute exchange
+        # REST call to live money is a change that has to be made on purpose,
+        # not smuggled in beside a safety fix.
+        last_rm_gate_refresh_time = 0
+        rm_gate_refresh_interval = 60
+
         while self._running:
             token = user_id_context.set(self.user_id)
             try:
@@ -4730,6 +4748,24 @@ class TradingController:
                         name=f"PeriodicReconcile_{self.user_id}",
                     )
                     last_reconcile_time = now
+
+                # 7. Refresh the paper balance, which re-validates the global
+                #    trading gate (RiskManager.update_balance ->
+                #    _check_risk_limits). Paper-only controllers only; see the
+                #    comment where the interval is defined.
+                if (
+                    self.api_key_id is None
+                    and now - last_rm_gate_refresh_time >= rm_gate_refresh_interval
+                ):
+                    last_rm_gate_refresh_time = now
+                    try:
+                        await self.rm.update_balance()
+                    except Exception as gate_refresh_err:
+                        logger.error(
+                            f"[RiskGateRefresh:{self._log_scope}] Periodic balance "
+                            f"refresh failed: {gate_refresh_err}",
+                            exc_info=True,
+                        )
 
             except Exception as e:
                 logger.error(f"Error in periodic tasks loop: {e}", exc_info=True)
