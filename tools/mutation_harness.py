@@ -47,6 +47,20 @@ def load_spec(spec_path: Path) -> dict:
     return json.loads(spec_path.read_text(encoding="utf-8"))
 
 
+def _wsl_path(p: Path) -> str:
+    """Convert a Windows path into the path WSL can actually cd into.
+
+    `C:/Users/x` is not a valid Linux path, so `cd C:/Users/x` fails inside
+    WSL and pytest never runs. WSL mounts the C: drive at /mnt/c. A path
+    that is already a Linux path is returned unchanged, so this is a no-op
+    when the harness itself runs inside WSL.
+    """
+    s = str(p.resolve())
+    if len(s) > 2 and s[1] == ":" and s[0].isalpha():
+        return "/mnt/" + s[0].lower() + s[2:].replace("\\", "/")
+    return s
+
+
 def run_pytest(target: str, timeout: int = 1800) -> tuple[int, str]:
     """Run pytest under the grading-platform interpreter.
 
@@ -56,7 +70,7 @@ def run_pytest(target: str, timeout: int = 1800) -> tuple[int, str]:
     curl's help text where pytest's summary should be. Every mutant then reads
     as SURVIVED, and the run reports confident, total nonsense.
     """
-    repo = str(REPO).replace("\\", "/")
+    repo = _wsl_path(REPO)
     inner = (
         f"cd {repo} && export PATH=\"$HOME/dstest/bin:$PATH\" && "
         f"{WSL_PY} -m pytest {target} --tb=no -q"

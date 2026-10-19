@@ -56,6 +56,16 @@ OUT_DIR = REPO / ".review"
 # so tokens are free; this only bounds prompt size and wall time.
 OLLAMA_DIFF_CHARS = 12000
 
+# MEASURED 2026-10-19: the `hermes` CLI truncates a long inline prompt at about
+# 12,000 characters, and it does so SILENTLY -- the prompt's own words "It is
+# the complete diff" become false. In that round the `tools/prepush_guard.py`
+# hunk began at byte 13,679 of a 20,797-byte diff, so hermes never saw the file
+# it was asked about. It answered NO anyway -- confidently, and about the wrong
+# code. A reviewer that never received the change must never be recorded as
+# having reviewed it, so: cap the inline text here, MARK it as truncated, and
+# point hermes at the diff file for the rest.
+HERMES_DIFF_CHARS = 11500
+
 # MEASURED 2026-10-18 on a real diff whose correct answer was already known:
 # 7b answered both questions CORRECTLY, and also answered both correctly with
 # NO DIFF IN THE PROMPT AT ALL. Its accuracy therefore carries no information --
@@ -180,6 +190,41 @@ def _resolve_argv(cmd: list[str]) -> tuple[list[str], str] | None:
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
 
+# A reviewer that asks for the question instead of answering it has confirmed
+# NOTHING. On 2026-10-19 two of five reviewers (dsh, opencode) replied "What is
+# the question?" and the >=5-words test scored both as RETURNED -- the same
+# false green this tool exists to prevent, reproduced inside the tool. A
+# non-answer must be scored as NO VERDICT even though it is full of words.
+_NO_ANSWER = re.compile(
+    r"what is the question"
+    r"|what would you like me to answer"
+    r"|no question was included"
+    r"|did ?n'?t (?:actually )?(?:ask|include|provide) a question"
+    r"|you (?:did ?n'?t|have not|haven'?t) (?:ask|include|provide|state) a question"
+    r"|please (?:provide|clarify|re-?state|specify) the question"
+    r"|could you (?:please )?(?:clarify|re-?state|provide|specify)"
+    r"|i (?:don'?t|do not) see a question"
+    r"|i'?m not sure what you(?:'re| are) asking"
+    r"|(?:please )?(?:re-?)?state (?:your |the )?question",
+    re.IGNORECASE,
+)
+
+# A reviewer that says it never received the change has confirmed nothing,
+# however confidently it words the rest. On 2026-10-19 hermes was silently
+# truncated at ~12,000 chars, the file it was asked about started at byte
+# 13,679, and it answered NO about the wrong code. A diff-related truncation
+# complaint is therefore a NO VERDICT, not a disagreement.
+_TRUNCATED = re.compile(
+    r"diff truncated"
+    r"|truncat(?:ed|ion)[^.!?]{0,40}diff"
+    r"|diff[^.!?]{0,40}truncat(?:ed|ion)"
+    r"|is not in what you were given"
+    r"|not present in the diff"
+    r"|does not appear in the diff"
+    r"|diff you (?:were|are) given",
+    re.IGNORECASE,
+)
+
 
 def _meaningful(text: str) -> str:
     """Strip terminal control codes and judge whether there is a real answer.
@@ -240,6 +285,22 @@ def _run(name: str, cmd: list[str], cwd: Path | None = None, timeout: int = 900)
                 f"no usable verdict (exit {p.returncode}, {words} words after "
                 f"stripping control codes) -- NO VERDICT"
             ), False
+        if _NO_ANSWER.search(out):
+            # Full of words, but it asked for the question instead of
+            # answering it. Counting that as a returned verdict is exactly the
+            # false green this tool exists to prevent.
+            return name, (
+                f"the reviewer ASKED FOR THE QUESTION instead of answering it "
+                f"-- NO VERDICT. Its reply was:\n{out[:800]}"
+            ), False
+        if _TRUNCATED.search(out):
+            # It never saw all of the diff, so whatever it concluded is about
+            # a partial view. That is not a verdict on the change.
+            return name, (
+                f"the reviewer reported the diff was TRUNCATED for it -- it "
+                f"reviewed only part of the change, so this is NO VERDICT. "
+                f"Its reply was:\n{out[:800]}"
+            ), False
         return name, out, True
     except FileNotFoundError:
         return name, (
@@ -271,6 +332,17 @@ def reviewers(diff: Path, question: str, include_paid: bool = False) -> dict:
     here; if it starts reporting auth errors, move it behind the flag.
     """
     diff_s = str(diff)
+
+    # A MULTI-LINE question is truncated at its first newline for the two
+    # reviewers that are PowerShell wrappers (`dsh`, `opencode`): they are
+    # launched as `powershell -NoProfile -File <script.ps1> <question>`, and
+    # PowerShell's -File argument parsing stops the argument at the newline.
+    # On 2026-10-19 those two received only the first line of a 40-line
+    # question and answered "What is the question?" -- which the old verdict
+    # test scored as a returned review. Collapse the question onto ONE line so
+    # every reviewer receives all of it.
+    question = " ".join(question.split())
+
     # `ollama run` has NO file-reading tool. Handed only a path -- which is what
     # this did until 2026-10-18 -- it answers from an empty context, which is
     # worse than no reviewer at all: it produces a confident, grounded-sounding
@@ -278,11 +350,26 @@ def reviewers(diff: Path, question: str, include_paid: bool = False) -> dict:
     # for a diff that contained a stop-loss-disabling bug. Ollama is local and
     # free, so inlining the diff costs nothing but text.
     diff_text = diff.read_text(encoding="utf-8", errors="replace")
+    full_len = len(diff_text)
     if len(diff_text) > OLLAMA_DIFF_CHARS:
         diff_text = (
             diff_text[:OLLAMA_DIFF_CHARS]
             + f"\n\n... [TRUNCATED: showing the first "
-            f"{OLLAMA_DIFF_CHARS} of {len(diff_text)} characters] ...\n"
+            f"{OLLAMA_DIFF_CHARS} of {full_len} characters] ...\n"
+        )
+
+    # hermes gets its own copy, capped and MARKED, because its CLI truncates
+    # silently around 12,000 characters. A marked truncation is recoverable
+    # (it can read the rest from the file); a silent one is not.
+    hermes_text = diff.read_text(encoding="utf-8", errors="replace")
+    hermes_truncated = len(hermes_text) > HERMES_DIFF_CHARS
+    if hermes_truncated:
+        hermes_text = (
+            hermes_text[:HERMES_DIFF_CHARS]
+            + f"\n\n... [TRUNCATED: showing the first "
+            f"{HERMES_DIFF_CHARS} of {len(hermes_text)} characters. The "
+            f"COMPLETE diff is on disk at {diff_s} -- read that file for the "
+            f"rest.] ...\n"
         )
 
     jobs = {
@@ -300,9 +387,20 @@ def reviewers(diff: Path, question: str, include_paid: bool = False) -> dict:
             "hermes",
             "-z",
             f"{question}\n\n"
-            f"Review THIS diff, pasted inline. It is the complete diff:\n\n"
-            f"```diff\n{diff_text}\n```\n\n"
-            f"Answer only from the diff above.",
+            f"Review THIS diff, pasted inline"
+            + (" (TRUNCATED -- see the note at the end)" if hermes_truncated else "")
+            + f":\n\n"
+            f"```diff\n{hermes_text}\n```\n\n"
+            f"Answer only from the diff above"
+            + (
+                f". The inline copy above is TRUNCATED. The COMPLETE diff is on "
+                f"disk at {diff_s} -- READ THAT FILE for the part you need. If "
+                f"you still cannot see it, answer exactly "
+                f"'DIFF TRUNCATED: <file> is not in what you were given', "
+                f"naming the file, and do NOT answer about a different file."
+                if hermes_truncated
+                else "."
+            ),
         ],
         "dsh": ["dsh", "headless", f"{question} Diff at {diff_s}"],
         "opencode": [

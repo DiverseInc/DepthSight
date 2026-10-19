@@ -41,6 +41,10 @@ REPO = Path(__file__).resolve().parent.parent
 # so the suite has to run under WSL to match. See the handoff index for why the
 # venv lives in $HOME and not /tmp.
 WSL_VENV = "$HOME/dstest/bin/python"
+# The venv's bin/ directory. It must be on PATH, not just the interpreter:
+# console scripts that live beside the interpreter (uvicorn) are launched by
+# bare name from the test fixtures.
+WSL_VENV_BIN = "$HOME/dstest/bin"
 WSL_REPO_MOUNT_PREFIX = "/mnt/c/"
 
 # The suite takes ~22 min. Allow more, because a cold run on a loaded box is
@@ -70,11 +74,18 @@ def in_wsl() -> bool:
 def run_suite(target: str, timeout_s: int) -> tuple[int, str]:
     """Run pytest, write output to a file, then apply the CI baseline gate.
 
-    No double quotes anywhere in the command string. Windows `subprocess`
-    mangles embedded `"` when forwarding an argument into WSL, which is why
-    the first version of this script silently failed to produce its output
-    file and reported "output file not found". Redirect to a file instead of
-    piping through `tee` so there is nothing to quote.
+    The command is REDIRECTED to a file instead of piped through `tee` so that
+    there is nothing to quote on the shell side.
+
+    A note on quoting: an earlier version of this script avoided double
+    quotes entirely, believing Windows `subprocess` mangles an embedded `"`
+    when forwarding an argument into WSL. That is true of a command string
+    handed over as ONE already-quoted argument, but NOT of the argv form used
+    here (`["wsl", "bash", "-lc", inner]`). Measured 2026-10-19 through the
+    real Windows->WSL hop: unquoted FAILS, single-quoted FAILS, double-quoted
+    WORKS. Double quotes are now required, because the inherited WSL PATH
+    contains "/mnt/c/Program Files (x86)/..." and an unquoted $PATH expansion
+    hands bash a literal "(" and it dies with a syntax error.
     """
     out_name = ".prepush_pytest_output.txt"
     # A Windows path like C:\Users\... is NOT a valid `cd` target in bash.
@@ -87,6 +98,24 @@ def run_suite(target: str, timeout_s: int) -> tuple[int, str]:
     )
     inner = (
         f"cd {repo} && "
+        # The venv's bin/ MUST be on PATH, not just the interpreter.
+        # Calling `$HOME/dstest/bin/python` puts the interpreter on PATH but
+        # NOT the console scripts beside it. The e2e fixture
+        # `mock_binance_server` (tests/conftest.py) launches `uvicorn` by bare
+        # name, and with the venv's bin/ absent from PATH that call fails with
+        # a misleading `PermissionError: [Errno 13] Permission denied:
+        # 'uvicorn'` -- three e2e tests then error at setup and the guard goes
+        # RED for a reason that has nothing to do with the code under test.
+        # Measured 2026-10-19: with the export, `shutil.which('uvicorn')`
+        # resolves to $HOME/dstest/bin/uvicorn and the Popen succeeds.
+        #
+        # The DOUBLE QUOTES are required, not optional: the inherited WSL PATH
+        # contains "/mnt/c/Program Files (x86)/...", so an unquoted $PATH
+        # expansion hands bash a literal "(" and it dies with
+        # "syntax error near unexpected token '('". Measured all three forms
+        # through the Windows->WSL argv hop: unquoted FAILS, single-quoted
+        # FAILS, double-quoted WORKS.
+        f'export PATH="{WSL_VENV_BIN}:$PATH" && '
         f"{WSL_VENV} -m pytest {target} -q --tb=short > {out_name} 2>&1; "
         f"cat {out_name}; "
         f"{WSL_VENV} scripts/check_test_baseline.py {out_name}"
