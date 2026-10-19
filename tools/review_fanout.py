@@ -52,6 +52,25 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 OUT_DIR = REPO / ".review"
 
+# How much diff text to paste inline for `ollama`. It runs a 7B model locally,
+# so tokens are free; this only bounds prompt size and wall time.
+OLLAMA_DIFF_CHARS = 12000
+
+# MEASURED 2026-10-18 on a real diff whose correct answer was already known:
+# 7b answered both questions CORRECTLY, and also answered both correctly with
+# NO DIFF IN THE PROMPT AT ALL. Its accuracy therefore carries no information --
+# it is indistinguishable from a coin flip, and on 2026-10-18 it returned a
+# confident "I found no issues" about a diff that disabled a stop-loss.
+# qwen2.5-coder:14b was tried as the upgrade: 4x slower (94s vs 23s) and got the
+# central question WRONG. There is no trustworthy local reviewer at this VRAM
+# budget, so keep the fast one for triage and never treat it as a verdict.
+OLLAMA_MODEL = "qwen2.5-coder:7b"
+
+# Reviewers whose output is triage, not a verdict. Printed with that label so a
+# confident-but-ungrounded local answer cannot sit in a column that reads like
+# an approval from a model that can actually see the diff.
+ADVISORY_REVIEWERS = {"ollama"}
+
 DEFAULT_QUESTION = (
     "This diff changes live-money safety code. ONE question, max 20 lines, "
     "no summary: is there any path where trading resumes while a safety stop "
@@ -182,6 +201,26 @@ def _run(name: str, cmd: list[str], cwd: Path | None = None, timeout: int = 900)
     if resolved is None:
         return name, f"{name} is genuinely not installed / not on PATH", False
     argv, how = resolved
+    # This box exports OLLAMA_HOST=0.0.0.0:11434. Ollama answers on
+    # 127.0.0.1; the wildcard address makes the CLI drop connections under
+    # parallel load and every ollama review came back `EOF`. Pin it per
+    # subprocess rather than trusting the ambient environment.
+    env = dict(os.environ)
+    if "OLLAMA_HOST" in env or name == "ollama":
+        env["OLLAMA_HOST"] = "http://127.0.0.1:11434"
+    if name == "hermes":
+        # `hermes -z` is the only working form; there is no `hermes run`. It
+        # refuses to read the system temp dir and wants a scratch dir under the
+        # user's own tree, so give it one that exists rather than letting it
+        # fail and be scored as "no verdict".
+        home = Path(env.get("USERPROFILE") or env.get("HOME") or Path.home())
+        scratch = home / "hermes" / "cache" / "scratch"
+        try:
+            scratch.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
     try:
         p = subprocess.run(
             argv,
@@ -190,6 +229,7 @@ def _run(name: str, cmd: list[str], cwd: Path | None = None, timeout: int = 900)
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
+            env=env,
         )
         raw = (p.stdout or "") + (p.stderr or "")
         out = _meaningful(raw)
@@ -219,6 +259,7 @@ def reviewers(diff: Path, question: str, include_paid: bool = False) -> dict:
     Cost matters here. The DEFAULT set is the free/local tier only:
 
       ollama  - local model, zero tokens, zero subscription
+      hermes  - local, zero tokens, zero subscription
       dsh     - no cloud key configured on this box
 
     Claude Code and Codex are third-party subscriptions. They are genuinely
@@ -230,12 +271,38 @@ def reviewers(diff: Path, question: str, include_paid: bool = False) -> dict:
     here; if it starts reporting auth errors, move it behind the flag.
     """
     diff_s = str(diff)
+    # `ollama run` has NO file-reading tool. Handed only a path -- which is what
+    # this did until 2026-10-18 -- it answers from an empty context, which is
+    # worse than no reviewer at all: it produces a confident, grounded-sounding
+    # verdict about code it never saw. It returned "I found no issues with..."
+    # for a diff that contained a stop-loss-disabling bug. Ollama is local and
+    # free, so inlining the diff costs nothing but text.
+    diff_text = diff.read_text(encoding="utf-8", errors="replace")
+    if len(diff_text) > OLLAMA_DIFF_CHARS:
+        diff_text = (
+            diff_text[:OLLAMA_DIFF_CHARS]
+            + f"\n\n... [TRUNCATED: showing the first "
+            f"{OLLAMA_DIFF_CHARS} of {len(diff_text)} characters] ...\n"
+        )
+
     jobs = {
         "ollama": [
             "ollama",
             "run",
-            "qwen2.5-coder:7b",
-            f"{question}\n\nThe diff is at {diff_s}. Read it first.",
+            OLLAMA_MODEL,
+            f"{question}\n\n"
+            f"Review THIS diff, pasted inline. It is the complete diff:\n\n"
+            f"```diff\n{diff_text}\n```\n\n"
+            f"Answer only from the diff above. If it does not contain enough "
+            f"to answer, say exactly that.",
+        ],
+        "hermes": [
+            "hermes",
+            "-z",
+            f"{question}\n\n"
+            f"Review THIS diff, pasted inline. It is the complete diff:\n\n"
+            f"```diff\n{diff_text}\n```\n\n"
+            f"Answer only from the diff above.",
         ],
         "dsh": ["dsh", "headless", f"{question} Diff at {diff_s}"],
         "opencode": [
@@ -253,15 +320,6 @@ def reviewers(diff: Path, question: str, include_paid: bool = False) -> dict:
             f"{question} Repo: {REPO}. Diff: {diff_s}",
         ]
     return jobs
-    results = {}
-    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = [
-            pool.submit(_run, name, cmd) for name, cmd in jobs.items()
-        ]
-        for f in futures:
-            name, out, ok = f.result()
-            results[name] = (out, ok)
-    return results
 
 
 def run_all(jobs: dict) -> dict:
@@ -327,10 +385,14 @@ def main() -> int:
     verdicts = []
     for name, (out, ok) in results.items():
         flag = "RETURNED" if ok else "NO VERDICT"
+        if name in ADVISORY_REVIEWERS:
+            flag += " / TRIAGE ONLY - NOT A VERDICT"
         print(f"\n--- {name}  [{flag}] ---")
         print(out.strip()[-1800:] if out.strip() else "(empty response)")
         if not ok:
             verdicts.append(f"{name}: no verdict")
+        elif name in ADVISORY_REVIEWERS:
+            verdicts.append(f"{name}: triage only, not counted as a verdict")
         OUT_DIR.mkdir(exist_ok=True)
         (OUT_DIR / f"{name}.txt").write_text(out, encoding="utf-8")
 
@@ -344,6 +406,13 @@ def main() -> int:
         "\nReminder: check each verdict against the code before acting on it. "
         "A reviewer handed the answer in prose confirms your arithmetic, not "
         "reality."
+    )
+    print(
+        "\nTRIAGE ONLY (see ADVISORY_REVIEWERS): the local ollama model was "
+        "measured scoring CORRECTLY on a diff and CORRECTLY with no diff at "
+        "all. Its accuracy is indistinguishable from a coin flip, so it is "
+        "reported but never counted as approval. A reviewer that agrees with "
+        "you about a diff it cannot see is worse than no reviewer."
     )
     return 0
 
