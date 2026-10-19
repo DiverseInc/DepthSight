@@ -3237,6 +3237,36 @@ class DataConsumer:
                 name="SendClearSubMainApp",
             )
 
+    def _regime_change_controls_at_risk(self) -> bool:
+        """True if a running strategy depends on this feed for a risk control.
+
+        `breakeven_on_regime_change` is implemented in `check_on_screener_update`
+        (strategy.py:3070-3079), which is only ever reached from
+        `_dynamic_symbol_selection_loop` -- fed exclusively by this socket. With
+        the feed down, any such strategy's regime-change stop is inert.
+
+        Deliberately total. This runs inside the reconnect failure handler: an
+        exception here must never propagate into the WS loop or take down market
+        data, so every lookup is guarded and the answer degrades to False. A
+        logger must never be able to break trading -- the same rule the codebase
+        already applies around position re-checks.
+        """
+        try:
+            controller = getattr(self, "controller", None)
+            instances = getattr(controller, "running_strategy_instances", None)
+            if not instances:
+                return False
+            for entry in list(instances.values()):
+                # The controller stores `(strategy_instance, ...)` tuples. An
+                # empty tuple would IndexError below, so test it explicitly
+                # rather than leaning on the outer except.
+                strategy = entry[0] if isinstance(entry, tuple) and entry else entry
+                if getattr(strategy, "breakeven_on_regime_change", False):
+                    return True
+            return False
+        except Exception:  # noqa: BLE001 - logging must never break trading
+            return False
+
     async def _main_app_ws_loop(self):
         reconnect_delay = BINANCE_WS_RECONNECT_DELAY_BASE
         # FIX 2026-09-23: track consecutive failures + last warning timestamp
@@ -3448,15 +3478,36 @@ class DataConsumer:
                     config, "MAIN_APP_WS_CRITICAL_AFTER_FAILURES", 10
                 )
                 if should_escalate_ws_failure(consecutive_failures, threshold):
-                    if dynamic_possible:
-                        logger.critical(
-                            f"Main_app_ws has failed {consecutive_failures} consecutive "
-                            f"times ({err_key}: {e_conn}). The symbol source is DOWN: "
-                            f"DYNAMIC-mode strategies cannot trade — they have no symbols "
-                            f"to subscribe to or match against. Pinned-symbol strategies "
-                            f"are unaffected. The static list is NOT used automatically; "
-                            f"set SYMBOL_SOURCE_MODE='STATIC_LIST' to fall back deliberately."
-                        )
+                    # The CRITICAL used to key off DYNAMIC alone. That was
+                    # wrong: this feed is not symbol-discovery-only.
+                    # `_dynamic_symbol_selection_loop` (controller.py:1236)
+                    # runs for EVERY controller and calls
+                    # `check_on_screener_update()` on open positions, which
+                    # is what implements `breakeven_on_regime_change`
+                    # (strategy.py:3070-3079). So an outage silently disarms
+                    # that stop on any STATIC/FIXED strategy using it.
+                    regime_at_risk = self._regime_change_controls_at_risk()
+                    if dynamic_possible or regime_at_risk:
+                        if regime_at_risk:
+                            logger.critical(
+                                f"Main_app_ws has failed {consecutive_failures} consecutive "
+                                f"times ({err_key}: {e_conn}). THIS IS A RISK-CONTROL "
+                                f"OUTAGE: at least one running strategy has "
+                                f"breakeven_on_regime_change=true, and that regime-change "
+                                f"stop (MOVE_SL / CLOSE_POSITION) is fed ONLY by this "
+                                f"socket. Those positions are currently UNPROTECTED by it. "
+                                f"Restore the feed or disable the option on those "
+                                f"strategies."
+                            )
+                        else:
+                            logger.critical(
+                                f"Main_app_ws has failed {consecutive_failures} consecutive "
+                                f"times ({err_key}: {e_conn}). The symbol source is DOWN: "
+                                f"DYNAMIC-mode strategies cannot trade — they have no symbols "
+                                f"to subscribe to or match against. Pinned-symbol strategies "
+                                f"are unaffected. The static list is NOT used automatically; "
+                                f"set SYMBOL_SOURCE_MODE='STATIC_LIST' to fall back deliberately."
+                            )
                     else:
                         logger.info(
                             f"Main_app_ws has failed {consecutive_failures} consecutive "
