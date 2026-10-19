@@ -480,6 +480,53 @@ async def test_risk_manager_release_refuses_an_operator_latch_on_its_own():
     assert rm._is_trading_allowed is False
 
 
+async def test_controller_refuses_to_release_an_operator_latch_on_its_own():
+    """The controller's OWN refusal must hold, not only the RiskManager's.
+
+    Two independent guards stand between an operator's kill switch and an
+    automatic release: the controller checks the latch's origin before it
+    delegates anything, and the RiskManager refuses to release an operator
+    latch on its own.
+    `test_risk_manager_release_refuses_an_operator_latch_on_its_own` pins the
+    second. This pins the first.
+
+    To pin the first it must be tested with the second taken away, so the
+    RiskManager's release is stubbed to SUCCEED. Otherwise the two guards
+    mask each other: the controller's guard is never exercised, and deleting
+    it changes nothing observable -- which is exactly what mutation A in
+    tools/mutations/trading_gate_reasons.json demonstrated before this test
+    existed. If the controller ever came to lean on the RiskManager alone, a
+    routine Redis-recovery check would release the operator's kill switch
+    with nobody clearing it.
+    """
+    rm = _real_risk_manager()
+    rm.trigger_emergency_stop("EMERGENCY_STOP command from user 1")
+    controller = _controller(rm, FakeRedis())
+
+    # Assume the RiskManager's own guard is gone.
+    rm_calls = []
+
+    def _release_without_a_guard():
+        rm_calls.append(True)
+        return True
+
+    rm.release_unverified_emergency_stop = _release_without_a_guard
+
+    released = await controller._maybe_release_unverified_emergency_stop()
+
+    assert released is False, (
+        "the controller released an operator-initiated latch on the strength "
+        "of the RiskManager alone -- the controller's own guard must refuse "
+        "independently"
+    )
+    assert rm_calls == [], (
+        "the controller handed an operator's latch to the RiskManager's "
+        "release path -- it must refuse BEFORE delegating"
+    )
+    assert rm.is_emergency_stop_active() is True
+    assert rm._is_trading_allowed is False
+
+
 async def test_self_heal_does_not_reopen_the_gate_past_a_tripped_risk_limit():
     """The self-heal releases the LATCH only -- never a risk limit.
 
