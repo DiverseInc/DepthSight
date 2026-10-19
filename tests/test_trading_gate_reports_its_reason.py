@@ -250,6 +250,27 @@ async def test_blacklist_reason_names_the_symbol_and_the_until(monkeypatch):
     assert "2099-01-01" in reason
 
 
+async def test_gate_reports_the_reason_even_if_the_latch_was_set_directly():
+    """The gate must derive the reason from the latch state ITSELF.
+
+    The reason is recorded in two places: when the latch is engaged, and when
+    the gate refuses. A latch that was engaged by any other route (a restored
+    RiskManager, a test double) must still produce a reason, or the operator
+    is back to "general block".
+    """
+    rm = _real_risk_manager()
+    rm._emergency_stop_active = True
+    rm._emergency_stop_reason = "redis unavailable at startup - cannot verify"
+
+    allowed = await rm.is_symbol_trading_allowed("BTCUSDT")
+
+    assert allowed is False
+    reason = rm.get_trading_disabled_reason()
+    assert reason is not None
+    assert "EMERGENCY STOP" in reason
+    assert "redis unavailable at startup" in reason
+
+
 async def test_a_healthy_gate_records_no_block_reason():
     """Nothing blocked -> nothing to report."""
     rm = _real_risk_manager()
@@ -398,6 +419,65 @@ async def test_self_heal_keeps_the_latch_when_an_operator_stop_appears_later():
     assert controller.rm._is_trading_allowed is False
     assert controller.rm.is_emergency_stop_operator_initiated() is True
     assert "EMERGENCY_STOP command from user 1" in controller.rm._emergency_stop_reason
+
+
+async def test_startup_without_any_redis_client_blocks_and_self_heals():
+    """The OTHER fail-closed branch: the controller has no Redis client at all.
+
+    `_restore_emergency_stop()` has two fail-closed branches -- "no redis
+    client" and "the redis read raised". Both are infrastructure failures and
+    both must self-heal once Redis is available again. This covers the first
+    one; `test_startup_redis_failure_blocks_initially_then_self_heals` covers
+    the second.
+    """
+    rm = _real_risk_manager()
+    controller = _controller(rm, None)
+
+    await controller._restore_emergency_stop()
+
+    assert controller.rm.is_emergency_stop_active() is True, (
+        "with no way to verify the emergency-stop state the controller must "
+        "stay STOPPED (fail-closed)"
+    )
+    assert controller.rm._is_trading_allowed is False
+    assert controller.rm.is_emergency_stop_operator_initiated() is False, (
+        "a missing Redis client is an INFRASTRUCTURE failure, not an operator "
+        "decision"
+    )
+    assert await controller.rm.is_symbol_trading_allowed("BTCUSDT") is False
+
+    # Still no Redis: the self-heal cannot verify anything, so it must not
+    # release the latch.
+    released = await controller._maybe_release_unverified_emergency_stop()
+    assert released is False
+    assert controller.rm.is_emergency_stop_active() is True
+    assert controller.rm._is_trading_allowed is False
+
+    # Redis comes back and no emergency stop is recorded.
+    controller.redis_client = FakeRedis()
+    released = await controller._maybe_release_unverified_emergency_stop()
+    assert released is True
+    assert controller.rm.is_emergency_stop_active() is False
+    assert controller.rm._is_trading_allowed is True
+
+
+async def test_risk_manager_release_refuses_an_operator_latch_on_its_own():
+    """The RiskManager's own release path must refuse an operator's latch.
+
+    The controller checks the latch's origin before it calls this, so this is
+    the second, independent line of defence. It has to hold on its own.
+    """
+    rm = _real_risk_manager()
+    rm.trigger_emergency_stop("EMERGENCY_STOP command from user 1")
+
+    released = rm.release_unverified_emergency_stop()
+
+    assert released is False, (
+        "the RiskManager released an operator-initiated latch on its own -- "
+        "the operator's decision must only be reversible by the operator"
+    )
+    assert rm.is_emergency_stop_active() is True
+    assert rm._is_trading_allowed is False
 
 
 async def test_self_heal_does_not_reopen_the_gate_past_a_tripped_risk_limit():
