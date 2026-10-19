@@ -3476,6 +3476,17 @@ class TradingController:
         stopped. A kill switch that can be lost is not a kill switch. To
         prefer fail-open instead, replace the trigger_emergency_stop() calls in
         the two failure branches below with a logger.critical().
+
+        The two failure branches engage the latch with
+        `operator_initiated=False`. They are INFRASTRUCTURE failures -- Redis
+        was unreachable, so the controller could not prove the latch was clear
+        -- and they are NOT the operator's decision. Observed live on
+        2026-10-19: a momentary Redis blip at bot start latched the stop for
+        the whole trading day, and every signal was rejected with an
+        indistinguishable "general block". Those latches are released
+        automatically once Redis can be read again and the key is absent (see
+        _maybe_release_unverified_emergency_stop); an operator stop is NOT, and
+        still requires an explicit clear.
         """
         if not self.redis_client:
             logger.critical(
@@ -3483,7 +3494,8 @@ class TradingController:
                 "clear. Staying STOPPED (fail-closed)."
             )
             self.rm.trigger_emergency_stop(
-                reason="redis unavailable at startup - cannot verify emergency-stop state"
+                reason="redis unavailable at startup - cannot verify emergency-stop state",
+                operator_initiated=False,
             )
             return
         try:
@@ -3498,7 +3510,8 @@ class TradingController:
                 reason=(
                     "redis read failed at startup - cannot verify emergency-stop "
                     f"state ({exc})"
-                )
+                ),
+                operator_initiated=False,
             )
             return
 
@@ -3518,11 +3531,83 @@ class TradingController:
         except (ValueError, TypeError):
             pass
 
-        self.rm.trigger_emergency_stop(reason=reason)
+        # A persisted key is an OPERATOR stop: it was written by the API's
+        # EMERGENCY_STOP endpoint or by _persist_emergency_stop(). It keeps
+        # requiring an explicit clear.
+        self.rm.trigger_emergency_stop(reason=reason, operator_initiated=True)
         logger.critical(
             f"[EmergencyStop] RESTORED an active emergency stop for user "
             f"{self.user_id}: {reason}"
         )
+
+    async def _maybe_release_unverified_emergency_stop(self) -> bool:
+        """
+        Release a start-up fail-closed latch once Redis can be read again.
+
+        The latch is only released when ALL of the following hold:
+
+          * a latch is engaged,
+          * it was engaged by an INFRASTRUCTURE failure (the start-up
+            fail-closed branch), not by an operator,
+          * Redis can be read RIGHT NOW, and
+          * the authoritative key `emergency_stop:{user_id}` is ABSENT.
+
+        The key check is what keeps an operator's kill switch safe: the API
+        writes that key before it publishes the command, so an operator stop is
+        always visible there even if the bot missed the pub/sub message. If the
+        key is present the latch is kept (and upgraded to the operator's
+        reason).
+
+        Fail-CLOSED: if Redis is still unreachable the latch stays engaged.
+        A verification failure must never turn into permission to trade.
+
+        Returns True if the latch was released.
+        """
+        if not self.rm.is_emergency_stop_active():
+            return False
+        if self.rm.is_emergency_stop_operator_initiated():
+            # An operator's kill switch. Only an explicit clear releases it.
+            return False
+        if not self.redis_client:
+            # Still no way to verify the state. Stay stopped.
+            return False
+        try:
+            raw = await self.redis_client.get(self._emergency_stop_redis_key())
+        except Exception as exc:
+            logger.critical(
+                f"[EmergencyStop] Still cannot verify the emergency-stop state "
+                f"for user {self.user_id}: {exc}. Staying STOPPED (fail-closed).",
+                exc_info=True,
+            )
+            return False
+
+        if raw:
+            # An operator stop exists. Keep the latch and make the reason the
+            # operator's, not the stale infrastructure message.
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            reason = raw
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    reason = parsed.get("reason") or raw
+            except (ValueError, TypeError):
+                pass
+            logger.critical(
+                f"[EmergencyStop] An emergency stop IS recorded in Redis for "
+                f"user {self.user_id}: {reason}. Keeping the latch engaged."
+            )
+            self.rm.trigger_emergency_stop(reason=reason, operator_initiated=True)
+            return False
+
+        if not self.rm.release_unverified_emergency_stop():
+            return False
+        logger.warning(
+            f"[EmergencyStop] Released the UNVERIFIED start-up emergency stop "
+            f"for user {self.user_id}: Redis is reachable again and no "
+            f"emergency stop is recorded. New entries are re-enabled."
+        )
+        return True
 
     async def _clear_emergency_stop_persisted(self) -> None:
         """Drop the persisted latch after the in-memory release."""
@@ -4154,6 +4239,35 @@ class TradingController:
                 f"nothing to repair."
             )
 
+    def _emergency_stop_state_for_publish(self) -> Dict[str, Any]:
+        """The live emergency-stop latch, as published for the API to report.
+
+        The persisted key `emergency_stop:{user_id}` is the OPERATOR's stop.
+        It does NOT exist for a start-up fail-closed latch -- that one is
+        in-memory only -- so without publishing the live latch the operator
+        would see "not stopped" during exactly the incident this exists to
+        explain.
+
+        Read defensively: `self.rm` is a real RiskManager in production but a
+        mock in some tests, and a Mock's attribute is truthy.
+        """
+        _es_active = getattr(self.rm, "_emergency_stop_active", False)
+        emergency_stop_active = _es_active if isinstance(_es_active, bool) else False
+        _es_reason = getattr(self.rm, "_emergency_stop_reason", None)
+        emergency_stop_reason = _es_reason if isinstance(_es_reason, str) else None
+        _es_operator = getattr(self.rm, "_emergency_stop_operator_initiated", False)
+        _es_operator = _es_operator if isinstance(_es_operator, bool) else False
+        emergency_stop_source = (
+            ("operator" if _es_operator else "startup_unverified")
+            if emergency_stop_active
+            else None
+        )
+        return {
+            "emergency_stop_active": emergency_stop_active,
+            "emergency_stop_reason": emergency_stop_reason,
+            "emergency_stop_source": emergency_stop_source,
+        }
+
     async def _publish_state_to_redis(self):
         """
         Collects data on running strategies, active positions, and the OVERALL portfolio state,
@@ -4382,6 +4496,7 @@ class TradingController:
         wallet_balance = self.rm.stats.current_balance  # Wallet balance (without PnL)
         equity = wallet_balance + total_unrealized_pnl  # Equity (including PnL)
 
+        # The live emergency-stop latch, published so the API can report it.
         portfolio_status_data = {
             "user_id": self.user_id,
             "total_wallet_balance": round(wallet_balance, 2),
@@ -4390,6 +4505,7 @@ class TradingController:
             "today_pnl": round(self.rm.stats.today_pnl, 2),
             "consecutive_losses": self.rm.stats.consecutive_losses,
             "is_trading_allowed": getattr(self.rm, "_is_trading_allowed", True),
+            **self._emergency_stop_state_for_publish(),
             "margin_usage_percent": 0.0,
             "active_positions_count": len(positions_to_publish),
             "active_strategies_count": len(strategies_to_publish),
@@ -4681,6 +4797,18 @@ class TradingController:
         last_rm_gate_refresh_time = 0
         rm_gate_refresh_interval = 60
 
+        # Re-verify the emergency-stop latch on a timer.
+        #
+        # If this controller came up while Redis was unreachable it engaged the
+        # fail-closed latch, which used to mean "trading off until the next
+        # restart". That is a Redis blip being treated as an operator kill
+        # switch. This loop releases the latch as soon as Redis can be read
+        # again and no emergency stop is recorded -- without waiting for a
+        # signal to arrive, and without an operator action. An operator's
+        # kill switch is never released here.
+        last_emergency_stop_recheck_time = 0
+        emergency_stop_recheck_interval = 30
+
         while self._running:
             token = user_id_context.set(self.user_id)
             try:
@@ -4764,6 +4892,23 @@ class TradingController:
                         logger.error(
                             f"[RiskGateRefresh:{self._log_scope}] Periodic balance "
                             f"refresh failed: {gate_refresh_err}",
+                            exc_info=True,
+                        )
+
+                # 8. Re-verify the emergency-stop latch. Releases a start-up
+                #    fail-closed latch once Redis is reachable again; never
+                #    touches an operator's kill switch.
+                if (
+                    now - last_emergency_stop_recheck_time
+                    >= emergency_stop_recheck_interval
+                ):
+                    last_emergency_stop_recheck_time = now
+                    try:
+                        await self._maybe_release_unverified_emergency_stop()
+                    except Exception as es_recheck_err:
+                        logger.error(
+                            f"[EmergencyStop:{self._log_scope}] Periodic "
+                            f"emergency-stop re-check failed: {es_recheck_err}",
                             exc_info=True,
                         )
 
@@ -8316,9 +8461,26 @@ class TradingController:
                     logger.warning(f"{log_prefix} Placeholder position lost. Aborting.")
                     return
 
+                # A start-up fail-closed latch (Redis was unreachable when this
+                # controller came up) is an infrastructure fault, not an
+                # operator decision. Release it as soon as Redis can be read
+                # again and no emergency stop is recorded -- no restart and no
+                # operator action required. An operator's kill switch is NOT
+                # affected: _maybe_release_unverified_emergency_stop() refuses
+                # to touch it.
+                await self._maybe_release_unverified_emergency_stop()
+
                 if not await self.rm.is_symbol_trading_allowed(signal.symbol):
+                    # Name the cause. The gate used to return a bare False and
+                    # every cause was logged as "(general block)", which is how
+                    # a full trading day was lost to an invisible latch on
+                    # 2026-10-19. The original wording is kept as a prefix so
+                    # existing log greps still match; the reason is APPENDED.
+                    block_reason = self.rm.get_trading_disabled_reason()
+                    block_reason_text = block_reason or "reason not recorded"
                     logger.warning(
-                        f"{log_prefix} Signal REJECTED by rm.is_symbol_trading_allowed (general block)."
+                        f"{log_prefix} Signal REJECTED by rm.is_symbol_trading_allowed (general block). "
+                        f"Reason: {block_reason_text}"
                     )
                     self.trade_logger.log_event(
                         event_type="SIGNAL_REJECTED_RISK_BLOCK",
@@ -8326,7 +8488,10 @@ class TradingController:
                             "symbol": signal.symbol,
                             "strategy": signal.strategy_name,
                             "direction": signal.direction.name,
-                            "reason": "Symbol blocked by RiskManager (general block)",
+                            "reason": (
+                                "Symbol blocked by RiskManager (general block): "
+                                f"{block_reason_text}"
+                            ),
                             "details": signal.details,
                         },
                     )
