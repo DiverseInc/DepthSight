@@ -814,6 +814,63 @@ async def test_a_lost_liquidation_pnl_booking_is_logged_loudly(money, caplog):
     )
 
 
+@pytest.mark.asyncio
+async def test_the_liquidation_path_books_the_NET_pnl_not_the_gross_one(money):
+    """MUTATION KILLER: the liquidation path must book the NET result.
+
+    The liquidation path computes its OWN commission
+    (`exit_price * qty * BACKTEST_COMMISSION_PCT`), credits the wallet
+    `realized_pnl - commission`, and must hand the risk manager THE SAME
+    number.
+
+    Before this was pinned, replacing the net with the gross SURVIVED this
+    whole file: the liquidation test only asserted that a FAILED booking was
+    logged loudly -- it never checked what number a SUCCESSFUL one booked.
+    The gross and the net differ by the commission, and the risk manager
+    must be given the NET -- the same number the wallet moved. In this
+    fixture the gross is already negative, so what is pinned here is the
+    exact NUMBER, not the sign: the sibling test
+    `test_commission_can_turn_a_gross_profit_into_a_loss` is the one that
+    pins the sign, on the MARKET branch.
+    """
+    controller, paper_executor, rm = _build_controller(price=90.0)
+    position = _seed_long(paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY)
+    # leverage 10 puts the liquidation price at 100 * 0.9 / 0.995 = 90.45,
+    # so a mark of 90.0 liquidates the position.
+    paper_executor._positions[SYMBOL]["leverage"] = 10.0
+
+    await paper_executor.check_open_orders()
+
+    assert len(money["trades"]) == 1, (
+        f"expected exactly one closed trade, got {money['trades']}"
+    )
+    gross = float(money["trades"][0]["pnl"])
+    commission = float(money["trades"][0]["commission"])
+    assert commission > 0, (
+        f"the liquidation must pay a commission, got {commission}"
+    )
+    expected_net = gross - commission
+
+    # The MONEY is the oracle: the wallet moved by the NET result.
+    assert len(money["wallet"]) == 1, (
+        f"expected exactly one wallet movement, got {money['wallet']}"
+    )
+    wallet_delta = money["wallet"][0]["amount"]
+    assert wallet_delta == pytest.approx(expected_net, abs=1e-9), (
+        f"the wallet moved {wallet_delta} but gross-commission is {expected_net}"
+    )
+
+    # The risk manager is told the position's booked PnL, so THAT is what has
+    # to be the net result too. This is the object the controller's
+    # finalization reads and hands to `update_trade_result`.
+    booked = float(position.pnl or 0.0)
+    assert booked == pytest.approx(expected_net, abs=1e-9), (
+        f"the liquidation booked {booked} on the position; the risk manager "
+        f"must be given the NET result {expected_net} (gross {gross} minus "
+        f"commission {commission}), never the gross one"
+    )
+
+
 # --- 6. The live path is unchanged -------------------------------------------
 
 

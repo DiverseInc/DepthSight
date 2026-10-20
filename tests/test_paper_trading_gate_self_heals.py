@@ -85,7 +85,7 @@ def _make_rm(paper_executor, *, balance_threshold=5.0, trading_allowed=False):
     rm._emergency_stop_reason = None
     rm._balance_lock = asyncio.Lock()
     # _check_and_reset_daily_stats reads these. _reset_time_utc must match the
-    # production value exactly -- risk_manager.py:251 uses a tz-AWARE time,
+    # production value exactly -- risk_manager.py:281 uses a tz-AWARE time,
     # because _get_current_day_start_info compares it against an aware now_utc
     # and a naive datetime.time raises TypeError there.
     rm._reset_time_utc = datetime.time(0, 1, 0, tzinfo=datetime.timezone.utc)
