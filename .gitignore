@@ -43,3 +43,5 @@ docker-compose.legacy.yml
 # tools/ scratch output
 .review/
 .prepush_pytest_output.txt
+# written into the working tree by the strategy-search tests
+found_strategies_mtf/

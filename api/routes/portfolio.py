@@ -686,6 +686,124 @@ async def clear_emergency_stop(
     return {"data": {"message": "CLEAR_EMERGENCY_STOP command has been sent to the bot."}}
 
 
+@portfolio_router.get(
+    "/portfolio/emergency-stop",
+    response_model=schemas.ApiResponseData,
+    summary="Report the emergency-stop state for the current user (read-only).",
+)
+async def get_emergency_stop_state(
+    redis_client: redis.Redis = Depends(get_redis_client),
+    current_user: models.User = Depends(get_current_user),
+):
+    """
+    Report whether trading is stopped by an emergency stop, and why.
+
+    READ-ONLY. This endpoint never engages, clears or persists a stop.
+
+    Two sources are combined, because neither one alone is sufficient:
+
+      * `emergency_stop:{user_id}` is the AUTHORITATIVE OPERATOR stop. The API
+        writes it before it publishes the EMERGENCY_STOP command, so it
+        survives the bot being down and is what the bot restores from on
+        restart.
+      * The controllers publish their LIVE in-memory latch in the portfolio
+        state payload. That is the only place a start-up fail-closed latch
+        exists -- it is deliberately never persisted, because it is an
+        infrastructure fault (Redis was unreachable when the bot came up) and
+        not an operator decision. Reading only the key would therefore report
+        "not stopped" during exactly the incident this endpoint exists to
+        explain.
+
+    Response `data`:
+        stopped         -- True when an emergency stop is in force.
+        reason          -- Why, in the words of whatever engaged it.
+        source          -- "operator" | "startup_unverified" | None.
+        engaged_at_utc  -- When the operator stop was recorded (may be None).
+        persisted       -- True when the authoritative Redis key exists.
+    """
+    persisted_raw = None
+    persisted_reason = None
+    engaged_at_utc = None
+    try:
+        persisted_raw = await redis_client.get(
+            EMERGENCY_STOP_KEY.format(user_id=current_user.id)
+        )
+    except Exception as exc:
+        logger.error(
+            f"[EmergencyStopState] Failed to read the emergency-stop key for "
+            f"user {current_user.id}: {exc}",
+            exc_info=True,
+        )
+    if persisted_raw:
+        raw = (
+            persisted_raw.decode("utf-8", errors="replace")
+            if isinstance(persisted_raw, bytes)
+            else persisted_raw
+        )
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            persisted_reason = parsed.get("reason") or raw
+            engaged_at_utc = parsed.get("engaged_at_utc")
+        else:
+            persisted_reason = raw
+
+    # The live latch, as published by each controller for this user.
+    live_stopped = False
+    live_reason = None
+    live_source = None
+    try:
+        base_portfolio_key = f"{REDIS_STATE_KEY_PORTFOLIO}:{current_user.id}"
+        portfolio_keys = await redis_client.keys(f"{base_portfolio_key}:*")
+        if portfolio_keys:
+            for _key, raw_state in zip(
+                portfolio_keys, await redis_client.mget(portfolio_keys)
+            ):
+                if not raw_state:
+                    continue
+                try:
+                    state = json.loads(raw_state)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(state, dict):
+                    continue
+                if state.get("emergency_stop_active"):
+                    live_stopped = True
+                    live_reason = state.get("emergency_stop_reason") or live_reason
+                    live_source = state.get("emergency_stop_source") or live_source
+    except Exception as exc:
+        logger.error(
+            f"[EmergencyStopState] Failed to read the published controller "
+            f"state for user {current_user.id}: {exc}",
+            exc_info=True,
+        )
+
+    if persisted_raw:
+        stopped = True
+        reason = persisted_reason
+        source = "operator"
+    elif live_stopped:
+        stopped = True
+        reason = live_reason
+        source = live_source or "unknown"
+    else:
+        stopped = False
+        reason = None
+        source = None
+
+    return {
+        "data": {
+            "stopped": stopped,
+            "reason": reason,
+            "source": source,
+            "engaged_at_utc": engaged_at_utc,
+            "persisted": bool(persisted_raw),
+        }
+    }
+
+
 @portfolio_router.post(
     "/portfolio-backtests",
     status_code=status.HTTP_202_ACCEPTED,

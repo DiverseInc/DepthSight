@@ -1,0 +1,118 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the trading-gate fix:",
+    "the gate must NAME its cause, and an unverifiable start-up latch must",
+    "self-heal while an operator's kill switch must not.",
+    "",
+    "K, L and M are the fail-closed branches in",
+    "TradingController._restore_emergency_stop() -- the branch that",
+    "latched production's trading off for a whole day on 2026-10-19 after a",
+    "momentary Redis blip at bot start.",
+    "",
+    "A and B are the SAME guarantee guarded in two places: the controller",
+    "checks the latch's origin before it delegates, and the RiskManager",
+    "refuses to release an operator latch on its own. B is pinned by a test",
+    "that calls the RiskManager directly. A was NOT pinned: with B still",
+    "in place, removing A changes no observable behaviour, so mutation A",
+    "SURVIVED the first run of this spec on 2026-10-19. That was a real gap",
+    "in the suite, not a false positive -- the controller's guard was",
+    "unexercised. It is now pinned by",
+    "test_controller_refuses_to_release_an_operator_latch_on_its_own, which",
+    "stubs the RiskManager's release to SUCCEED so the controller's own",
+    "refusal has to hold on its own.",
+    "",
+    "All 14 are expected KILLED.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/trading_gate_reasons.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_trading_gate_reports_its_reason.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the controller's operator-initiated guard is removed",
+      "file": "bot_module/controller.py",
+      "needle": "        if self.rm.is_emergency_stop_operator_initiated():\n            # An operator's kill switch. Only an explicit clear releases it.\n            return False\n",
+      "replace": "        # MUTANT: the operator-initiated guard was removed.\n"
+    },
+    {
+      "label": "B: the RiskManager's own operator-initiated guard is removed",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        if self._emergency_stop_operator_initiated:\n            # An operator's kill switch. Only clear_emergency_stop() may\n            # release it.\n            return False\n",
+      "replace": "        # MUTANT: the RiskManager-side operator guard was removed.\n"
+    },
+    {
+      "label": "C: the self-heal fails OPEN when Redis cannot be read",
+      "file": "bot_module/controller.py",
+      "needle": "        except Exception as exc:\n            logger.critical(\n                f\"[EmergencyStop] Still cannot verify the emergency-stop state \"\n                f\"for user {self.user_id}: {exc}. Staying STOPPED (fail-closed).\",\n                exc_info=True,\n            )\n            return False\n",
+      "replace": "        except Exception as exc:\n            # MUTANT: a failed verification is now treated as \"no stop recorded\".\n            raw = None\n"
+    },
+    {
+      "label": "D: the gate no longer records the emergency-stop reason",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            self._set_trading_disabled_reason(\n                f\"EMERGENCY STOP active ({self._emergency_stop_reason})\"\n            )\n",
+      "replace": "            # MUTANT: the reason is no longer recorded.\n"
+    },
+    {
+      "label": "E: the breached risk limit's numbers are not recorded",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            breach_reason = f\"global risk limit breached: {disable_reason}\"\n",
+      "replace": "            # MUTANT: the breached limit and its numbers are not recorded.\n            breach_reason = \"\"\n"
+    },
+    {
+      "label": "F: the blacklist reason is not recorded",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                                            self._set_trading_disabled_reason(\n                                                f\"symbol {symbol} is BLACKLISTED until \"\n                                                f\"{until_dt.isoformat()} (reason: {reason})\"\n                                            )\n",
+      "replace": "                                            # MUTANT: the blacklist reason is not recorded.\n"
+    },
+    {
+      "label": "G: a recorded operator stop is no longer honoured by the self-heal",
+      "file": "bot_module/controller.py",
+      "needle": "        if raw:\n            # An operator stop exists. Keep the latch and make the reason the\n            # operator's, not the stale infrastructure message.\n",
+      "replace": "        if False:\n            # MUTANT: a recorded operator stop is no longer honoured.\n"
+    },
+    {
+      "label": "H: the start-up latch is mislabelled as operator-initiated",
+      "file": "bot_module/controller.py",
+      "needle": "                reason=\"redis unavailable at startup - cannot verify emergency-stop state\",\n                operator_initiated=False,\n",
+      "replace": "                reason=\"redis unavailable at startup - cannot verify emergency-stop state\",\n                operator_initiated=True,\n"
+    },
+    {
+      "label": "I: the self-heal re-opens the gate while a risk limit is still in force",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        if self._global_gate_disable_reason is None:\n            # Nothing else is holding the gate closed.\n            self._is_trading_allowed = True\n            self._trading_disabled_reason = None\n",
+      "replace": "        # MUTANT: the release re-opens the global gate unconditionally, even\n        # while a risk limit is still in force.\n        self._is_trading_allowed = True\n        self._trading_disabled_reason = None\n"
+    },
+    {
+      "label": "J: a limit that breaches while the latch is engaged is not recorded",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            self._global_gate_disable_reason = breach_reason\n",
+      "replace": "            # MUTANT: a limit that breaches while the latch is engaged is\n            # not recorded at all.\n"
+    },
+    {
+      "label": "K: the start-up READ-FAILURE latch is mislabelled as operator-initiated",
+      "file": "bot_module/controller.py",
+      "needle": "            self.rm.trigger_emergency_stop(\n                reason=(\n                    \"redis read failed at startup - cannot verify emergency-stop \"\n                    f\"state ({exc})\"\n                ),\n                operator_initiated=False,\n            )\n",
+      "replace": "            self.rm.trigger_emergency_stop(\n                reason=(\n                    \"redis read failed at startup - cannot verify emergency-stop \"\n                    f\"state ({exc})\"\n                ),\n                operator_initiated=True,\n            )\n"
+    },
+    {
+      "label": "L: the start-up READ-FAILURE branch fails OPEN (the 2026-10-19 incident)",
+      "file": "bot_module/controller.py",
+      "needle": "            self.rm.trigger_emergency_stop(\n                reason=(\n                    \"redis read failed at startup - cannot verify emergency-stop \"\n                    f\"state ({exc})\"\n                ),\n                operator_initiated=False,\n            )\n",
+      "replace": "            # MUTANT: the fail-closed latch is gone; startup proceeds fail-open.\n            logger.critical(\n                f\"[EmergencyStop] MUTANT: cannot verify the latch for user \"\n                f\"{self.user_id}: {exc}. Proceeding fail-OPEN.\"\n            )\n"
+    },
+    {
+      "label": "M: the start-up NO-REDIS-CLIENT branch fails OPEN",
+      "file": "bot_module/controller.py",
+      "needle": "            self.rm.trigger_emergency_stop(\n                reason=\"redis unavailable at startup - cannot verify emergency-stop state\",\n                operator_initiated=False,\n            )\n",
+      "replace": "            # MUTANT: the fail-closed latch is gone; startup proceeds fail-open.\n            logger.critical(\n                \"[EmergencyStop] MUTANT: no redis_client. Proceeding fail-OPEN.\"\n            )\n"
+    },
+    {
+      "label": "N: the new endpoint ignores the controller's published live latch",
+      "file": "api/routes/portfolio.py",
+      "needle": "                if state.get(\"emergency_stop_active\"):\n                    live_stopped = True\n                    live_reason = state.get(\"emergency_stop_reason\") or live_reason\n                    live_source = state.get(\"emergency_stop_source\") or live_source\n",
+      "replace": "                # MUTANT: the published live latch is ignored.\n"
+    }
+  ]
+}

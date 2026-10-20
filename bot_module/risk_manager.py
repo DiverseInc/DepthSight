@@ -247,6 +247,36 @@ class RiskManager:
         # This latch is only cleared by an explicit clear_emergency_stop().
         self._emergency_stop_active = False
         self._emergency_stop_reason: Optional[str] = None
+        # Was this latch engaged by an OPERATOR (the EMERGENCY_STOP command, or
+        # a stop restored from Redis) or by an INFRASTRUCTURE failure (the
+        # start-up fail-closed branches, where Redis could not be read and the
+        # controller therefore could not prove the latch was clear)?
+        #
+        # The two are NOT the same thing and must not share semantics. An
+        # operator stop is a decision and may only be released deliberately. A
+        # start-up verification failure is a Redis blip: it says nothing about
+        # what the operator wanted, and latching it as a kill switch silently
+        # stops all trading until the next restart. See
+        # TradingController._maybe_release_unverified_emergency_stop().
+        self._emergency_stop_operator_initiated: bool = False
+        # WHY the trading gate is closed, in words an operator can act on.
+        #
+        # `is_symbol_trading_allowed()` used to return a bare False, so a
+        # rejection was logged as "Signal REJECTED by rm.is_symbol_trading_allowed
+        # (general block)" -- four completely different causes, one
+        # indistinguishable message. On 2026-10-19 that cost a full trading day:
+        # the gate was closed by the emergency-stop latch and the operator was
+        # told "general block".
+        #
+        # This holds the reason for the MOST RECENT refusal. It is not cleared
+        # on success, so a concurrent successful check cannot blank the reason
+        # a blocked caller is about to log.
+        self._trading_disabled_reason: Optional[str] = None
+        # Why the GLOBAL flag (`_is_trading_allowed`) is off, when it is off for
+        # a reason other than the emergency stop (e.g. "Max drawdown (12.34%) >=
+        # limit (10.00%)"). The risk limits are computed in _check_risk_limits()
+        # and recorded here so the gate can name the number that tripped.
+        self._global_gate_disable_reason: Optional[str] = None
         self._balance_lock = asyncio.Lock()
         self._reset_time_utc = dt_time(0, 1, 0, tzinfo=timezone.utc)
 
@@ -563,6 +593,7 @@ class RiskManager:
             # would report "trading allowed" during a kill switch.
             if not self._emergency_stop_active:
                 self._is_trading_allowed = True
+                self._global_gate_disable_reason = None
 
             logger.info(
                 f"Daily stats reset for new day {current_trading_day_str_utc_actual}. Start of day balance: ${self.stats.start_of_day_balance:.2f}."
@@ -572,11 +603,19 @@ class RiskManager:
                 f"Failed to initialize balance (FetchSuccess={success_fetch}, BalanceFromExecutor={self.stats.current_balance}). Trading may be disabled."
             )
             self._is_trading_allowed = False
+            self._global_gate_disable_reason = (
+                "balance could not be fetched at start-up — trading disabled"
+            )
+            self._trading_disabled_reason = self._global_gate_disable_reason
 
         if success_fetch:
             self._check_risk_limits()
         else:
             self._is_trading_allowed = False
+            self._global_gate_disable_reason = (
+                "balance could not be fetched at start-up — trading disabled"
+            )
+            self._trading_disabled_reason = self._global_gate_disable_reason
             logger.warning(
                 "[InitializeBalance] Trading disabled: failed to fetch balance."
             )
@@ -742,6 +781,7 @@ class RiskManager:
             # the _check_risk_limits() re-enable was guarded, this one was not.
             if not self._emergency_stop_active:
                 self._is_trading_allowed = True
+                self._global_gate_disable_reason = None
             logger.info(
                 f"Balance at the start of a new day set: ${self.stats.start_of_day_balance:.2f}"
             )
@@ -991,7 +1031,12 @@ class RiskManager:
                     f"{log_prefix} Improvement check: Cooldown period not yet passed for index {stats.current_risk_multiplier_index}."
                 )
 
-    def trigger_emergency_stop(self, reason: str = "manual emergency stop") -> None:
+    def trigger_emergency_stop(
+        self,
+        reason: str = "manual emergency stop",
+        *,
+        operator_initiated: bool = True,
+    ) -> None:
         """
         Latch trading OFF. Blocks every new entry until an operator explicitly
         clears it.
@@ -999,21 +1044,92 @@ class RiskManager:
         This deliberately does NOT flatten positions — the controller owns the
         exchange calls needed to do that. Splitting the two keeps this method
         safe to call from any context (including a failed command handler).
+
+        `operator_initiated` distinguishes the operator's kill switch (the
+        default: the EMERGENCY_STOP command, or a stop restored from Redis)
+        from an INFRASTRUCTURE failure -- the start-up branch where Redis could
+        not be read and the controller could not prove the latch was clear.
+        Only an operator stop may require a deliberate clear; an
+        infrastructure failure must be releasable as soon as the state can be
+        verified again. See `is_emergency_stop_operator_initiated()`.
         """
         self._emergency_stop_active = True
         self._emergency_stop_reason = reason
+        self._emergency_stop_operator_initiated = bool(operator_initiated)
         self._is_trading_allowed = False
+        self._trading_disabled_reason = f"EMERGENCY STOP active ({reason})"
         logger.critical(f"EMERGENCY STOP engaged: {reason}")
 
     def clear_emergency_stop(self) -> None:
         """Release the emergency-stop latch. Operator action only."""
         self._emergency_stop_active = False
         self._emergency_stop_reason = None
+        self._emergency_stop_operator_initiated = False
         self._is_trading_allowed = True
+        self._trading_disabled_reason = None
         logger.warning("EMERGENCY STOP cleared. New entries re-enabled.")
+
+    def release_unverified_emergency_stop(self) -> bool:
+        """Release a latch that was engaged because the state was UNVERIFIABLE.
+
+        This is NOT the operator's kill switch, so it may be released without
+        a human decision -- but it may only release the LATCH. It never
+        re-opens the global gate while a risk limit is still in force: if
+        `_global_gate_disable_reason` is set (a breached drawdown / daily
+        loss / consecutive-loss limit, or a balance that could not be
+        fetched), the gate stays closed and keeps reporting that reason.
+
+        `clear_emergency_stop()` is the operator's path and deliberately
+        keeps its existing, unconditional behaviour.
+
+        Returns True if a latch was released.
+        """
+        if not self._emergency_stop_active:
+            return False
+        if self._emergency_stop_operator_initiated:
+            # An operator's kill switch. Only clear_emergency_stop() may
+            # release it.
+            return False
+        self._emergency_stop_active = False
+        self._emergency_stop_reason = None
+        self._emergency_stop_operator_initiated = False
+        if self._global_gate_disable_reason is None:
+            # Nothing else is holding the gate closed.
+            self._is_trading_allowed = True
+            self._trading_disabled_reason = None
+        # else: a risk limit is still in force. Leave the gate closed and
+        # leave the limit's reason visible -- releasing the latch must not
+        # loosen a risk control.
+        logger.warning(
+            "EMERGENCY STOP (unverified start-up) released. New entries "
+            "re-enabled unless a risk limit still applies."
+        )
+        return True
 
     def is_emergency_stop_active(self) -> bool:
         return bool(self._emergency_stop_active)
+
+    def is_emergency_stop_operator_initiated(self) -> bool:
+        """True when the latch was engaged by an operator, not by a failure.
+
+        An operator stop keeps requiring an explicit clear. A latch engaged
+        because the emergency-stop state could not be VERIFIED (Redis was
+        unreachable at start-up) is an infrastructure fault and is releasable
+        automatically once Redis can be read again.
+        """
+        return bool(getattr(self, "_emergency_stop_operator_initiated", False))
+
+    def get_trading_disabled_reason(self) -> Optional[str]:
+        """Why the gate last refused a symbol, in operator-readable words.
+
+        Returns None only if the gate has never refused anything since this
+        RiskManager was created.
+        """
+        return getattr(self, "_trading_disabled_reason", None)
+
+    def _set_trading_disabled_reason(self, reason: str) -> None:
+        """Record why the gate is refusing, for the log line and the API."""
+        self._trading_disabled_reason = reason
 
     async def is_symbol_trading_allowed(self, symbol: str) -> bool:
         """
@@ -1024,6 +1140,9 @@ class RiskManager:
         # 0. Emergency stop latch. Checked before everything else so that no
         # other path can re-enable trading while an emergency stop is active.
         if self._emergency_stop_active:
+            self._set_trading_disabled_reason(
+                f"EMERGENCY STOP active ({self._emergency_stop_reason})"
+            )
             logger.warning(
                 f"[Blacklist:{symbol}] Trading blocked: EMERGENCY STOP active "
                 f"({self._emergency_stop_reason})"
@@ -1032,6 +1151,10 @@ class RiskManager:
 
         # 1. Check global flag (drawdown, consecutive losses, etc.)
         if not self._is_trading_allowed:
+            self._set_trading_disabled_reason(
+                getattr(self, "_global_gate_disable_reason", None)
+                or "trading disabled globally by the risk manager (reason not recorded)"
+            )
             logger.debug(f"[Blacklist:{symbol}] Trading globally disabled")
             return False
 
@@ -1098,6 +1221,10 @@ class RiskManager:
                                                 symbol, reason, until_dt
                                             )
 
+                                            self._set_trading_disabled_reason(
+                                                f"symbol {symbol} is BLACKLISTED until "
+                                                f"{until_dt.isoformat()} (reason: {reason})"
+                                            )
                                             return False
                                         # else: period expired, symbol allowed
                                     except (ValueError, TypeError) as e:
@@ -1112,6 +1239,11 @@ class RiskManager:
                                             None,
                                         )
 
+                                        self._set_trading_disabled_reason(
+                                            f"symbol {symbol} is BLACKLISTED "
+                                            f"(invalid 'until' date {until_val!r}, "
+                                            "treated as permanent)"
+                                        )
                                         return False
                                 else:
                                     # until is None = permanent blacklist
@@ -1129,6 +1261,10 @@ class RiskManager:
                                     # Sending notification to Telegram
                                     await self._notify_blacklist(symbol, reason, None)
 
+                                    self._set_trading_disabled_reason(
+                                        f"symbol {symbol} is PERMANENTLY BLACKLISTED "
+                                        f"(reason: {reason})"
+                                    )
                                     return False
             except Exception as e:
                 # FAIL CLOSED. This used to log and fall through to
@@ -1159,6 +1295,10 @@ class RiskManager:
                     )
                 except Exception:
                     pass
+                self._set_trading_disabled_reason(
+                    f"blacklist check failed (DB error) — new entries for {symbol} "
+                    f"are blocked until the query succeeds: {e}"
+                )
                 return False
 
         return True
@@ -1394,42 +1534,53 @@ class RiskManager:
             if self.stats.consecutive_losses >= self.max_consecutive_losses:
                 should_be_allowed = False
                 disable_reason = f"Max consec losses ({self.stats.consecutive_losses}) >= limit ({self.max_consecutive_losses})"
-        if not should_be_allowed and self._is_trading_allowed:
-            logger.critical(f"Trading disabled globally! Reason: {disable_reason}")
-            self._is_trading_allowed = False
-            # Added check for self.loop_from_controller
-            if self.telegram_notifier and self.loop_from_controller:
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        self.telegram_notifier.risk_manager_alert(
-                            reason=disable_reason,
-                            alert_type="TRADE_DISABLED",
-                            current_balance=self.stats.current_balance,
-                            daily_pnl=self.stats.today_pnl,
-                            chat_id=self.user_telegram_chat_id,
-                            api_key_name=self.api_key_name,
-                        ),
-                        self.loop_from_controller,
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to schedule Telegram notification: {e}")
-
-        elif (
-            should_be_allowed
-            and not self._is_trading_allowed
-            and not self._emergency_stop_active
-        ):
-            # The emergency-stop latch owns this flag while it is engaged.
-            # Re-enabling here on healthy limits would leave `_is_trading_allowed`
-            # True while `_emergency_stop_active` is still True -- entries stay
-            # correctly refused (the latch is checked first), but the controller
-            # publishes `getattr(self.rm, "_is_trading_allowed", True)` to Redis
-            # and the API surfaces it, so the dashboard would report "trading
-            # allowed" during a kill switch the operator pulled.
-            logger.info(
-                "Global risk limits are now within acceptable range. Re-enabling trading globally."
-            )
-            self._is_trading_allowed = True
+        if not should_be_allowed:
+            # Record WHICH limit tripped, with the measured value and the
+            # threshold. `disable_reason` already carries both numbers
+            # (e.g. "Max drawdown (12.34%) >= limit (10.00%)"), so the gate
+            # can name the breach instead of reporting a bare "general block".
+            #
+            # This is recorded even when the global flag was ALREADY closed by
+            # something else (e.g. the emergency-stop latch). Otherwise a limit
+            # that breaches DURING a stop is invisible, and releasing that
+            # stop would silently re-open the gate past a tripped limit.
+            breach_reason = f"global risk limit breached: {disable_reason}"
+            if self._is_trading_allowed:
+                logger.critical(f"Trading disabled globally! Reason: {disable_reason}")
+                self._is_trading_allowed = False
+                self._trading_disabled_reason = breach_reason
+                # Added check for self.loop_from_controller
+                if self.telegram_notifier and self.loop_from_controller:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self.telegram_notifier.risk_manager_alert(
+                                reason=disable_reason,
+                                alert_type="TRADE_DISABLED",
+                                current_balance=self.stats.current_balance,
+                                daily_pnl=self.stats.today_pnl,
+                                chat_id=self.user_telegram_chat_id,
+                                api_key_name=self.api_key_name,
+                            ),
+                            self.loop_from_controller,
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to schedule Telegram notification: {e}")
+            self._global_gate_disable_reason = breach_reason
+        elif should_be_allowed:
+            # The limits are within range again.
+            self._global_gate_disable_reason = None
+            if self._emergency_stop_active:
+                # The latch owns the gate while it is engaged; it is released
+                # only by clear_emergency_stop() or by the start-up self-heal.
+                # Clearing the stale limit reason here is what lets that
+                # release re-open the gate -- but only once no limit is
+                # actually in force.
+                pass
+            elif not self._is_trading_allowed:
+                logger.info(
+                    "Global risk limits are now within acceptable range. Re-enabling trading globally."
+                )
+                self._is_trading_allowed = True
 
     async def assess_signal(
         self,
