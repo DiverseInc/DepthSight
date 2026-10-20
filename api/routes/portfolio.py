@@ -98,9 +98,24 @@ def _risk_state_from_states(states: List[dict]) -> Tuple[int, Optional[str]]:
     * The reason is taken only from controllers that are actually BLOCKED. The
       RiskManager deliberately KEEPS the last refusal reason after the gate
       re-opens, so a stale reason on an allowed controller must not be
-      reported -- it would make a healthy account look broken.
+      reported -- it would make a healthy account look broken. The controller
+      no longer publishes a reason while its gate is open, so this is
+      belt-and-braces: it also protects against a payload published by an OLD
+      controller during a rolling deploy.
     * Several blocked controllers with DIFFERENT reasons are joined with "; "
       (deduplicated, order preserved) so that no cause is lost.
+
+    THE TWO FIELDS CAN DESCRIBE DIFFERENT CONTROLLERS, ON PURPOSE.
+    `consecutive_losses` answers "how close is this account to the loss
+    limit"; the reason answers "why can this account not trade". Worked
+    example: controller `:1` is blocked by the emergency stop at 0 losses and
+    controller `:2` is allowed at 9 losses -> the response carries
+    `consecutive_losses = 9`, `is_trading_allowed = false` and the reason
+    "EMERGENCY STOP ...". That is correct: 9 is how close the account is to
+    the limit, and the emergency stop is why it cannot trade right now.
+    Reporting 0 (the blocked controller's counter) would understate the
+    account's exposure to the limit; reporting 9 as the reason's subject
+    would be nonsense.
 
     Reporting only: nothing here can allow or refuse a trade.
     """

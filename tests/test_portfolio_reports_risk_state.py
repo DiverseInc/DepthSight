@@ -222,19 +222,29 @@ def _extract_publish_statements():
     """
     source = (REPO_ROOT / CONTROLLER).read_text(encoding="utf-8")
     tree = ast.parse(source, CONTROLLER)
-    wanted = {"_reason_getter", "_disabled_reason", "portfolio_status_data"}
+    wanted = {
+        "_gate_open",
+        "_reason_getter",
+        "_disabled_reason",
+        "_candidate",
+        "portfolio_status_data",
+    }
+
+    def _stmt_ok(stmt) -> bool:
+        """Only assignments to the wanted names (and their `if` blocks)."""
+        if isinstance(stmt, ast.Assign):
+            return all(
+                isinstance(t, ast.Name) and t.id in wanted for t in stmt.targets
+            )
+        if isinstance(stmt, ast.If):
+            return not stmt.orelse and all(_stmt_ok(s) for s in stmt.body)
+        return False
+
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
             node.name == "_publish_state_to_redis"
         ):
-            body = []
-            for stmt in node.body:
-                if not isinstance(stmt, ast.Assign):
-                    continue
-                names = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
-                if not names or not set(names) & wanted:
-                    continue
-                body.append(stmt)
+            body = [stmt for stmt in node.body if _stmt_ok(stmt)]
             if not any(
                 isinstance(s, ast.Assign)
                 and any(
@@ -354,6 +364,74 @@ def test_the_controller_publishes_no_reason_when_nothing_is_blocked():
 
     assert payload["is_trading_allowed"] is True
     assert payload.get("trading_disabled_reason") is None
+
+
+def test_the_controller_publishes_no_reason_while_the_gate_is_open():
+    """A STALE or SYMBOL-LEVEL reason must not be published.
+
+    The RiskManager overwrites `_trading_disabled_reason` on ANY refusal --
+    including a PER-SYMBOL blacklist hit -- and never clears it when the
+    block lifts. Publishing it next to an OPEN gate would claim "this is why
+    you cannot trade" about an account that CAN trade, which is the same
+    confusion this whole change exists to remove.
+    """
+    rm = _real_risk_manager()
+    rm._is_trading_allowed = True
+    # A stale refusal reason: the account traded again after the block.
+    rm._trading_disabled_reason = (
+        "symbol ETHUSDT is BLACKLISTED until 2099-01-01T00:00:00+00:00 "
+        "(reason: operator blacklisted after a bad trade)"
+    )
+
+    payload = _controller_payload(rm)
+
+    assert payload["is_trading_allowed"] is True
+    assert payload["trading_disabled_reason"] is None, (
+        "the account can trade -- a stale or symbol-level reason must not be "
+        "published as if it were why the account is blocked"
+    )
+
+
+def test_the_controller_publishes_the_emergency_stop_reason():
+    """A blocked controller DOES publish the reason."""
+    rm = _real_risk_manager()
+    rm.trigger_emergency_stop("operator hit the kill switch")
+
+    payload = _controller_payload(rm)
+
+    assert payload["is_trading_allowed"] is False
+    assert payload["trading_disabled_reason"] == (
+        "EMERGENCY STOP active (operator hit the kill switch)"
+    )
+
+
+def test_a_non_string_reason_never_reaches_the_published_payload():
+    """json.dumps must not explode on a mock RiskManager.
+
+    `self.rm` is a real RiskManager in production but a mock in some tests.
+    A Mock's `get_trading_disabled_reason` is a callable child mock, so
+    calling it returns a Mock -- which json.dumps cannot serialize. The whole
+    portfolio payload would then fail to publish, taking the dashboard down
+    with it.
+    """
+    from unittest.mock import MagicMock
+
+    rm = SimpleNamespace(
+        stats=SimpleNamespace(
+            current_balance=1000.0, today_pnl=0.0, consecutive_losses=0
+        ),
+        _is_trading_allowed=False,
+        get_trading_disabled_reason=MagicMock(return_value=MagicMock()),
+    )
+
+    payload = _controller_payload(rm)
+
+    assert payload["trading_disabled_reason"] is None, (
+        "a reason that is not a string must never be published"
+    )
+    # The whole payload must still serialize -- this is what the controller
+    # does with it.
+    json.dumps(payload)
 
 
 def test_the_published_payload_survives_a_risk_manager_without_the_accessor():
@@ -559,6 +637,38 @@ def test_a_paper_counter_never_overrides_the_live_figure():
 
     assert data.consecutive_losses == 7, (
         f"the live figure was 7 and the API reported {data.consecutive_losses!r}"
+    )
+
+
+def test_the_counter_and_the_reason_may_describe_different_controllers():
+    """Pinned, so the documented asymmetry cannot drift silently.
+
+    Controller `:1` is blocked by the emergency stop at 0 losses; controller
+    `:2` is allowed at 9 losses. The counter answers "how close is this
+    account to the loss limit" (9); the reason answers "why can this account
+    not trade right now" (the emergency stop). Reporting 0 -- the blocked
+    controller's counter -- would understate the account's exposure to the
+    limit.
+    """
+    payloads = {
+        f"{PORTFOLIO_KEY}:1": _published(
+            equity=1000.0,
+            allowed=False,
+            losses=0,
+            reason="EMERGENCY STOP active (operator hit the kill switch)",
+        ),
+        f"{PORTFOLIO_KEY}:2": _published(equity=1000.0, allowed=True, losses=9),
+    }
+
+    data = _call(mode="live", payloads=payloads)["data"]
+
+    assert data.consecutive_losses == 9, (
+        "the counter is the MAX across the population -- it measures how close "
+        "the account is to the loss limit, not which controller is blocked"
+    )
+    assert data.is_trading_allowed is False
+    assert data.trading_disabled_reason == (
+        "EMERGENCY STOP active (operator hit the kill switch)"
     )
 
 
