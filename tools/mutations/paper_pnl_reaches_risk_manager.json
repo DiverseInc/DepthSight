@@ -1,0 +1,88 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the paper-PnL fix:",
+    "a paper close must reach the RiskManager with its real NET PnL, and the",
+    "UTC-day rollover must run before the limit check.",
+    "",
+    "A is the net-PnL helper ignoring the commission. Without it a close that",
+    "is profitable before commission and a LOSS after it would be counted as a",
+    "win -- the exact blindness that made the daily-loss guard unable to fire.",
+    "",
+    "B is the fill notification not ACCUMULATING onto the position. A position",
+    "closed in several partial fills would keep only the last fill's PnL.",
+    "",
+    "C is the MARKET branch computing a GROSS net_pnl, so the wallet and the",
+    "risk manager are told different numbers for the same fill.",
+    "",
+    "D is the order result no longer carrying the net PnL out to the caller.",
+    "",
+    "E is the liquidation path handing the risk manager the GROSS PnL.",
+    "",
+    "F is the check_open_orders call site passing 0.0 instead of the net PnL.",
+    "",
+    "G is the rollover running AFTER the limit check. The reverse order judges",
+    "the new day against the old day's counters and can leave the gate open",
+    "past a real breach.",
+    "",
+    "H is the rollover call removed from update_balance() entirely -- which is",
+    "the deadlock this change exists to break: the paper branch of",
+    "assess_signal() returns before the rollover, so without this call a",
+    "blocked paper account can never recover.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/paper_pnl_reaches_risk_manager.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_paper_pnl_reaches_risk_manager.py tests/test_paper_trading_gate_self_heals.py tests/test_paper_only_account_can_trade.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the net-PnL helper ignores the commission actually paid",
+      "file": "bot_module/paper_executor.py",
+      "needle": "    return float(gross_realized_pnl) - float(commission)\n",
+      "replace": "    return float(gross_realized_pnl)\n"
+    },
+    {
+      "label": "B: the fill no longer accumulates onto the position's PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "            position.pnl = previous_pnl + float(net_pnl or 0.0)\n",
+      "replace": "            position.pnl = previous_pnl\n"
+    },
+    {
+      "label": "C: the MARKET branch computes a GROSS net_pnl",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        net_pnl = net_realized_pnl(\n                            realized_pnl, sim_result.actual_commission_paid\n                        )\n",
+      "replace": "                        net_pnl = realized_pnl\n"
+    },
+    {
+      "label": "D: the order result no longer carries the net PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        \"net_realized_pnl\": net_pnl,\n",
+      "replace": "                        \"net_realized_pnl\": 0.0,\n"
+    },
+    {
+      "label": "E: the liquidation path hands the risk manager the GROSS PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                net_pnl=net_realized_pnl(realized_pnl, commission),\n",
+      "replace": "                net_pnl=realized_pnl,\n"
+    },
+    {
+      "label": "F: the check_open_orders call site passes 0.0 instead of the net PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                            net_pnl=float(fill_result.get(\"net_realized_pnl\") or 0.0),\n",
+      "replace": "                            net_pnl=0.0,\n"
+    },
+    {
+      "label": "G: the rollover runs AFTER the limit check",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                    self._check_and_reset_daily_stats()\n                    self._check_risk_limits()\n",
+      "replace": "                    self._check_risk_limits()\n                    self._check_and_reset_daily_stats()\n"
+    },
+    {
+      "label": "H: the rollover is not called from update_balance at all",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                    self._check_and_reset_daily_stats()\n                    self._check_risk_limits()\n",
+      "replace": "                    self._check_risk_limits()\n"
+    }
+  ]
+}
