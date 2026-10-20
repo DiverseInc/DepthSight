@@ -20,6 +20,7 @@ This asserts the OUTCOME (trading becomes allowed), not the shape of the fix,
 so re-ordering the fallback inside update_balance cannot make it pass vacuously.
 """
 import asyncio
+import datetime
 import os
 import sys
 
@@ -66,6 +67,14 @@ def _make_rm(paper_executor):
 
     import asyncio as _a
     rm._balance_lock = _a.Lock()
+    # _check_and_reset_daily_stats reads these, and `update_balance()` now
+    # calls it (the daily rollover must not depend on a trade close). The
+    # real RiskManager always has them -- `__init__` sets them -- so a stub
+    # that omits them is not a RiskManager. `_reset_time_utc` must be
+    # tz-AWARE, because _get_current_day_start_info compares it against an
+    # aware now_utc and a naive time raises TypeError there.
+    rm._reset_time_utc = datetime.time(0, 1, 0, tzinfo=datetime.timezone.utc)
+    rm._strategy_symbol_adjustment_enabled = False
     return rm
 
 

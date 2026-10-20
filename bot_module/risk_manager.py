@@ -730,6 +730,33 @@ class RiskManager:
                     # that genuinely fell below `min_balance_threshold` was
                     # never re-checked either, so the breach went unseen until
                     # the next trade closed.
+                    #
+                    # The DAILY ROLLOVER belongs on this same trigger, not
+                    # only on a trade close. `_check_and_reset_daily_stats()`
+                    # was reachable only from `update_trade_result()` and from
+                    # the LIVE branch of `assess_signal()`. The PAPER branch
+                    # of `assess_signal()` returns before the live branch's
+                    # call, so on the paper path the rollover ran only when a
+                    # position closed -- but the daily-loss guard closes the
+                    # gate precisely when no position can be opened, so no
+                    # close can fire, and the rollover never came. The paper
+                    # bot stayed deadlocked (gate shut, no trade, no rollover)
+                    # until the process restarted.
+                    #
+                    # It must run BEFORE `_check_risk_limits()` below. The
+                    # reset clears the day-scoped counters and re-opens the
+                    # gate; the limit check that follows re-detects a breach
+                    # that is still in force (a balance below the minimum, for
+                    # one) and closes the gate again. The reverse order would
+                    # judge the new day against the old day's counters and
+                    # leave the gate open past a real breach.
+                    #
+                    # It is idempotent within a UTC day: the body only runs
+                    # when the day key has changed, so running it on this
+                    # timer cannot clear a counter inside the same day. The
+                    # emergency-stop latch is still checked before the gate is
+                    # re-opened.
+                    self._check_and_reset_daily_stats()
                     self._check_risk_limits()
                     return True
                 else:

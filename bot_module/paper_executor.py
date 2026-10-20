@@ -28,6 +28,21 @@ from bot_module.config import (
 logger = logging.getLogger(__name__)
 
 
+def net_realized_pnl(gross_realized_pnl: float, commission: float) -> float:
+    """The PnL the paper account actually KEEPS on a closing fill.
+
+    This is the single number the paper wallet is credited/debited by
+    (`total_balance_change = realized_pnl - actual_commission_paid`) and the
+    single number `api/routes/portfolio.py` reports to the user
+    (`sum(pnl - commission)` over today's closed PAPER trades).
+
+    The risk manager must be given THIS number, not the gross one. A close
+    that is profitable before commission and a loss after it IS a loss, and a
+    daily-loss guard that cannot see that is a guard that cannot fire.
+    """
+    return float(gross_realized_pnl) - float(commission)
+
+
 class PaperTradingExecutor:
     def __init__(
         self,
@@ -218,6 +233,12 @@ class PaperTradingExecutor:
                         total_balance_change = (
                             realized_pnl - sim_result.actual_commission_paid
                         )
+                        # The NET result of this fill: what the wallet keeps and
+                        # what the risk manager must be told. Carried out of the
+                        # fill so the controller can book it on the LivePosition.
+                        net_pnl = net_realized_pnl(
+                            realized_pnl, sim_result.actual_commission_paid
+                        )
 
                         await crud.update_paper_wallet_balance(
                             self.db, self.user_id, asset_to_update, total_balance_change
@@ -403,6 +424,9 @@ class PaperTradingExecutor:
                             "timeInForce": "GTC",
                             "type": "MARKET",
                             "side": side,
+                            # The net realized PnL of THIS fill (gross minus the
+                            # commission actually paid). 0.0 for an entry.
+                            "net_realized_pnl": net_pnl,
                             "fills": [
                                 {
                                     "price": str(sim_result.avg_fill_price),
@@ -1000,7 +1024,15 @@ class PaperTradingExecutor:
         # does not keep showing a position that no longer exists.
         try:
             await self._notify_controller_about_fill(
-                symbol, exit_type, "SELL" if qty > 0 else "BUY", abs(qty), exit_price
+                symbol,
+                exit_type,
+                "SELL" if qty > 0 else "BUY",
+                abs(qty),
+                exit_price,
+                # The net result of this close: gross realized PnL minus the
+                # commission actually paid. This is what the risk manager must
+                # be told, and until it is told the daily-loss guard is blind.
+                net_pnl=net_realized_pnl(realized_pnl, commission),
             )
         except Exception as e:
             logger.debug(
@@ -1164,6 +1196,9 @@ class PaperTradingExecutor:
                             side=order_side,
                             quantity=float(order["origQty"]),
                             price=current_price,
+                            # The net PnL of this fill, carried out of the fill
+                            # itself so the risk manager is told the truth.
+                            net_pnl=float(fill_result.get("net_realized_pnl") or 0.0),
                         )
                     except Exception as e:
                         logger.error(
@@ -1225,11 +1260,27 @@ class PaperTradingExecutor:
         return {"symbols": symbols_data}
 
     async def _notify_controller_about_fill(
-        self, symbol: str, order_type: str, side: str, quantity: float, price: float
+        self,
+        symbol: str,
+        order_type: str,
+        side: str,
+        quantity: float,
+        price: float,
+        net_pnl: float = 0.0,
     ):
         """
         Notifies the controller about a partial position closure when TP/SL is executed.
         This is necessary to synchronize remaining_quantity in LivePosition.
+
+        It also books the NET realized PnL of the fill (gross minus the
+        commission actually paid) onto the LivePosition, in the same place and
+        under the same guard as the quantity update. The controller's
+        finalization then reads `position.pnl` and hands THAT number to the
+        risk manager -- which is the only place the risk manager is told
+        about a close. Without this, a paper close reaches the risk manager
+        as 0.0, so the daily-loss and drawdown guards (which read
+        `today_pnl`) can never fire and a winning close can never reset the
+        consecutive-loss streak.
         """
         if not self.controller:
             logger.warning(
@@ -1268,6 +1319,18 @@ class PaperTradingExecutor:
 
             logger.info(
                 f"{log_prefix} Updated remaining_quantity: {old_remaining:.8f} -> {position.remaining_quantity:.8f}"
+            )
+
+            # Book the realized PnL of this fill. It ACCUMULATES across the
+            # partial closes of one position and is read once, at
+            # finalization, by the controller. A position that is not OPEN has
+            # already been finalized (and already reported to the risk
+            # manager), so it is never booked twice.
+            previous_pnl = float(position.pnl or 0.0)
+            position.pnl = previous_pnl + float(net_pnl or 0.0)
+            logger.info(
+                f"{log_prefix} Booked realized PnL for this fill: {float(net_pnl or 0.0):.4f} "
+                f"(position.pnl {previous_pnl:.4f} -> {position.pnl:.4f})"
             )
 
             # If the position is fully closed, changing the status
