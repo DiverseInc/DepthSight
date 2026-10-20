@@ -1035,8 +1035,17 @@ class PaperTradingExecutor:
                 net_pnl=net_realized_pnl(realized_pnl, commission),
             )
         except Exception as e:
-            logger.debug(
-                f"[PaperClose:{symbol}] Controller notify failed (non-fatal): {e}"
+            # The wallet was ALREADY credited above (`balance_change`), so a
+            # failure here does not lose the money -- it loses the REPORTING
+            # of it. The risk manager is never told this close happened, so
+            # `today_pnl` and the consecutive-loss streak stay wrong and the
+            # daily-loss guard stays blind. Say so loudly.
+            logger.error(
+                f"[PaperClose:{symbol}] Controller notify failed AFTER the wallet "
+                f"was credited {balance_change:.8f} USDT: the risk manager was NOT "
+                f"told about this close, so today's PnL and the consecutive-loss "
+                f"streak are now wrong. {e}",
+                exc_info=True,
             )
 
     async def check_open_orders(self):
@@ -1201,8 +1210,20 @@ class PaperTradingExecutor:
                             net_pnl=float(fill_result.get("net_realized_pnl") or 0.0),
                         )
                     except Exception as e:
+                        # The fill already moved the wallet: `place_order`
+                        # credited it above. A failure here does not lose the
+                        # money -- it loses the REPORTING of it. The risk
+                        # manager is never told this close happened, so
+                        # `today_pnl` and the consecutive-loss streak stay
+                        # wrong and the daily-loss guard stays blind. Say so
+                        # loudly.
                         logger.error(
-                            f"{log_prefix_exec} Error notifying controller about fill: {e}",
+                            f"{log_prefix_exec} Error notifying controller about fill "
+                            f"(the wallet was already credited "
+                            f"{float(fill_result.get('net_realized_pnl') or 0.0):.8f} USDT): "
+                            f"the risk manager was NOT told about this close, so "
+                            f"today's PnL and the consecutive-loss streak are now "
+                            f"wrong. {e}",
                             exc_info=True,
                         )
 

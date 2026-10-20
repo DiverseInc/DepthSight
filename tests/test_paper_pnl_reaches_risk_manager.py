@@ -50,6 +50,7 @@ while the live-path test stays green (it is the control).
 """
 
 import asyncio
+import logging
 import sys
 import time
 import types
@@ -705,6 +706,111 @@ async def test_new_day_balance_update_still_leaves_a_breached_gate_closed(money)
     assert "Balance" in (rm._global_gate_disable_reason or ""), (
         f"the gate must name the balance breach, got "
         f"{rm._global_gate_disable_reason!r}"
+    )
+
+
+# --- 7. A LOST PnL booking must be LOUD --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_lost_pnl_booking_is_logged_loudly(money, caplog):
+    """The wallet moves BEFORE the risk manager is told. If the booking
+    fails, the money is gone from the account but the risk manager still
+    believes the trade never closed -- so the loss must be logged at ERROR
+    with that fact, not swallowed.
+
+    This is the fail-OPEN direction: the PnL is LOST, not double-counted.
+    The control flow is unchanged (the fill still succeeds), but the loss
+    must be visible.
+    """
+    controller, paper_executor, rm = _build_controller(price=90.0)
+    _seed_long(paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY)
+
+    # Make the fill NOTIFICATION blow up, and only that. The first
+    # `_active_position_get` call is the executor reading the entry CID
+    # before the fill; the second is the notification booking the PnL.
+    # Failing the second one is the case under test: the wallet has already
+    # been credited by `place_order`, and the risk manager is never told.
+    real_get = controller._active_position_get
+    calls = {"n": 0}
+
+    def _explode_on_the_notify(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return real_get(*args, **kwargs)
+        raise RuntimeError("simulated notify failure")
+
+    controller._active_position_get = _explode_on_the_notify
+
+    _rest_exit_order(
+        paper_executor, qty=QTY, price=90.0, order_type="STOP_MARKET"
+    )
+
+    with caplog.at_level(logging.ERROR, logger="bot_module.paper_executor"):
+        await paper_executor.check_open_orders()
+
+    assert calls["n"] >= 2, "the notification must have been attempted"
+
+    # The MONEY moved: place_order credited the wallet before the notify.
+    assert len(money["wallet"]) == 1, (
+        f"expected exactly one wallet movement, got {money['wallet']}"
+    )
+    wallet_delta = money["wallet"][0]["amount"]
+    assert wallet_delta < 0, f"a stop-out must debit the wallet, got {wallet_delta}"
+
+    # The risk manager was NOT told -- and that must be LOUD.
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, (
+        "a lost PnL booking must be logged at ERROR; the wallet moved but the "
+        "risk manager was not told, so today's PnL and the consecutive-loss "
+        "streak are now wrong"
+    )
+    text = "\n".join(r.getMessage() for r in errors)
+    assert "risk manager was NOT told" in text, (
+        f"the log must say the risk manager was not told; got: {text}"
+    )
+    assert "already credited" in text, (
+        f"the log must say the wallet was already credited; got: {text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_lost_liquidation_pnl_booking_is_logged_loudly(money, caplog):
+    """The LIQUIDATION path is the one that logged at DEBUG.
+
+    A lost PnL booking there was invisible: the wallet was credited and
+    nothing said so. It must be an ERROR, like the TP/SL path, and it must
+    say that the risk manager was not told.
+    """
+    controller, paper_executor, rm = _build_controller(price=90.0)
+    _seed_long(paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY)
+    # leverage 10 puts the liquidation price at 100 * 0.9 / 0.995 = 90.45,
+    # so a mark of 90.0 liquidates the position.
+    paper_executor._positions[SYMBOL]["leverage"] = 10.0
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("simulated notify failure")
+
+    controller._active_position_get = _explode
+
+    with caplog.at_level(logging.ERROR, logger="bot_module.paper_executor"):
+        await paper_executor.check_open_orders()
+
+    # The MONEY moved: the liquidation credited the wallet before the notify.
+    assert len(money["wallet"]) == 1, (
+        f"expected exactly one wallet movement, got {money['wallet']}"
+    )
+    wallet_delta = money["wallet"][0]["amount"]
+    assert wallet_delta < 0, f"a liquidation must debit the wallet, got {wallet_delta}"
+
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert errors, (
+        "a lost PnL booking on the liquidation path must be logged at ERROR, "
+        "not DEBUG: the wallet moved but the risk manager was not told"
+    )
+    text = "\n".join(r.getMessage() for r in errors)
+    assert "risk manager was NOT told" in text, (
+        f"the log must say the risk manager was not told; got: {text}"
     )
 
 

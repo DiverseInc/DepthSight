@@ -732,16 +732,31 @@ class RiskManager:
                     # the next trade closed.
                     #
                     # The DAILY ROLLOVER belongs on this same trigger, not
-                    # only on a trade close. `_check_and_reset_daily_stats()`
-                    # was reachable only from `update_trade_result()` and from
-                    # the LIVE branch of `assess_signal()`. The PAPER branch
-                    # of `assess_signal()` returns before the live branch's
-                    # call, so on the paper path the rollover ran only when a
-                    # position closed -- but the daily-loss guard closes the
+                    # only on a trade close.
+                    #
+                    # `_check_and_reset_daily_stats()` was reachable from
+                    # `update_trade_result()` and from the LIVE branch of
+                    # `assess_signal()` -- but NOT from the balance update,
+                    # in EITHER mode. The LIVE branch of `assess_signal()`
+                    # called it on every signal, so a live account rolled
+                    # over at its next signal. The PAPER branch of
+                    # `assess_signal()` returns before the live branch's
+                    # call, so on the paper path the rollover ran ONLY when a
+                    # position closed -- and the daily-loss guard closes the
                     # gate precisely when no position can be opened, so no
                     # close can fire, and the rollover never came. The paper
-                    # bot stayed deadlocked (gate shut, no trade, no rollover)
-                    # until the process restarted.
+                    # bot stayed deadlocked (gate shut, no trade, no
+                    # rollover) until the process restarted.
+                    #
+                    # So the gap was the same in both modes -- the rollover
+                    # did not ride the balance update -- but only the PAPER
+                    # path could DEADLOCK on it, because the live path had a
+                    # second, independent trigger. This is NOT a
+                    # permissiveness change on the live path: the live
+                    # branch of `assess_signal()` already performed the same
+                    # daily reset, the rollover is idempotent within a UTC
+                    # day, and the emergency-stop latch still blocks the
+                    # gate across it.
                     #
                     # It must run BEFORE `_check_risk_limits()` below. The
                     # reset clears the day-scoped counters and re-opens the
