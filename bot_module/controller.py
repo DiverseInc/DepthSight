@@ -4497,6 +4497,14 @@ class TradingController:
         equity = wallet_balance + total_unrealized_pnl  # Equity (including PnL)
 
         # The live emergency-stop latch, published so the API can report it.
+        # The RiskManager also records WHY it refuses a trade
+        # (get_trading_disabled_reason). Publishing it here is the only way the
+        # API can name the cause of a block: without it the dashboard can say
+        # "trading is switched off" but never why, which is the same blind spot
+        # the emergency-stop latch had. Read defensively -- `self.rm` is a real
+        # RiskManager in production but a mock in some tests.
+        _reason_getter = getattr(self.rm, "get_trading_disabled_reason", None)
+        _disabled_reason = _reason_getter() if callable(_reason_getter) else None
         portfolio_status_data = {
             "user_id": self.user_id,
             "total_wallet_balance": round(wallet_balance, 2),
@@ -4505,6 +4513,7 @@ class TradingController:
             "today_pnl": round(self.rm.stats.today_pnl, 2),
             "consecutive_losses": self.rm.stats.consecutive_losses,
             "is_trading_allowed": getattr(self.rm, "_is_trading_allowed", True),
+            "trading_disabled_reason": _disabled_reason,
             **self._emergency_stop_state_for_publish(),
             "margin_usage_percent": 0.0,
             "active_positions_count": len(positions_to_publish),

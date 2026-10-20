@@ -67,10 +67,22 @@ async def test_a_blocked_account_is_reported_as_blocked(
 
     On the unfixed code this returns `true` regardless of what the bot
     published, which is how a fully-blocked account looked healthy.
+
+    The key is a LIVE one (numeric api_key_id suffix). This request is in LIVE
+    mode, and the Redis fallback now aggregates the LIVE controllers only: a
+    PAPER controller's state (suffix "None") is a different account's, and
+    bot_runner.py starts a paper controller for every user who does not have
+    one -- so a ":None" key sits next to the live keys for most users. Reading
+    it here made `?mode=live` report the paper account's balance and gate as
+    the live ones. A live request with no live controller now takes the
+    existing 404 path instead (see
+    tests/test_portfolio_reports_risk_state.py), and the PAPER-mode
+    equivalent is covered by
+    tests/test_paper_portfolio_reports_unrealized_pnl.py.
     """
     await _force_redis_fallback(db_session, pro_user)
     await override_redis_client.set_initial_data(
-        f"{REDIS_STATE_KEY_PORTFOLIO}:{pro_user.id}:None",
+        f"{REDIS_STATE_KEY_PORTFOLIO}:{pro_user.id}:1",
         _state(2645.55, allowed=False),
     )
 

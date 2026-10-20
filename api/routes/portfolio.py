@@ -87,6 +87,40 @@ def _parse_equity_member(member: str) -> Optional[float]:
         return None
 
 
+def _risk_state_from_states(states: List[dict]) -> Tuple[int, Optional[str]]:
+    """The risk state that a population of published controllers reports.
+
+    Returns `(max_consecutive_losses, trading_disabled_reason)`.
+
+    * `consecutive_losses` is PER CONTROLLER, so the honest single number for
+      a population is the MAX: the account is blocked when ANY controller is
+      over the limit, and reporting the smallest one would hide the breach.
+    * The reason is taken only from controllers that are actually BLOCKED. The
+      RiskManager deliberately KEEPS the last refusal reason after the gate
+      re-opens, so a stale reason on an allowed controller must not be
+      reported -- it would make a healthy account look broken.
+    * Several blocked controllers with DIFFERENT reasons are joined with "; "
+      (deduplicated, order preserved) so that no cause is lost.
+
+    Reporting only: nothing here can allow or refuse a trade.
+    """
+    max_losses = 0
+    reasons: List[str] = []
+    for state in states:
+        raw_losses = state.get("consecutive_losses", 0) or 0
+        try:
+            max_losses = max(max_losses, int(raw_losses))
+        except (TypeError, ValueError):
+            # A corrupt counter must not hide the other controllers' numbers.
+            pass
+        if bool(state.get("is_trading_allowed", True)):
+            continue
+        reason = state.get("trading_disabled_reason")
+        if reason and str(reason) not in reasons:
+            reasons.append(str(reason))
+    return max_losses, ("; ".join(reasons) if reasons else None)
+
+
 @portfolio_router.get(
     "/portfolio/equity",
     response_model=schemas.ApiResponseData[List[Tuple[int, float]]],
@@ -257,6 +291,11 @@ async def get_portfolio_status(
         # be shown as blocked. Collect it from the same paper-only keys this
         # loop already reads and AND across them.
         paper_gate_values: List[bool] = []
+        # The same loop collects the controllers' published RISK state: the
+        # consecutive-loss counter and the reason the gate refused. Both were
+        # discarded before, so the API reported "0 consecutive losses" while
+        # the trading gate was actually blocked at the loss limit.
+        paper_states: List[dict] = []
         try:
             base_portfolio_key = (
                 f"{bot_config.REDIS_STATE_KEY_PORTFOLIO}:{current_user.id}"
@@ -278,6 +317,7 @@ async def get_portfolio_status(
                     state = json.loads(raw)
                 except (TypeError, ValueError):
                     continue
+                paper_states.append(state)
                 total_unrealized_pnl += float(
                     state.get("total_unrealized_pnl", 0) or 0
                 )
@@ -290,16 +330,21 @@ async def get_portfolio_status(
                 f"from Redis: {e}"
             )
 
+        paper_losses, paper_reason = _risk_state_from_states(paper_states)
         paper_portfolio_status = schemas.PortfolioStatus(
             balance=total_balance,
             today_pnl=today_pnl,  # Real PnL for today
             is_trading_allowed=(
                 all(paper_gate_values) if paper_gate_values else True
             ),
-            consecutive_losses=0,  # Not tracked yet
+            # The REAL counter the controllers publish -- not a hardcoded 0.
+            consecutive_losses=paper_losses,
             timestamp_utc=datetime.now(timezone.utc),
             total_unrealized_pnl=round(total_unrealized_pnl, 2),
             market_type=normalized_market_type,
+            # WHY trading is blocked, in the operator's words. None when no
+            # controller is blocked.
+            trading_disabled_reason=paper_reason,
         )
         return {"data": paper_portfolio_status}
 
@@ -425,6 +470,9 @@ async def get_portfolio_status(
         # that could never report a blocked account. Reporting field only: it
         # cannot cause or prevent a trade.
         live_gate_values: List[bool] = []
+        # Same as the paper branch: the published risk state (counter + reason)
+        # is read from the same controllers the balances describe.
+        live_states: List[dict] = []
         try:
             live_keys = await redis_client.keys(
                 f"{bot_config.REDIS_STATE_KEY_PORTFOLIO}:{current_user.id}:*"
@@ -442,21 +490,26 @@ async def get_portfolio_status(
                 if not str(live_key).rsplit(":", 1)[-1].isdigit():
                     continue
                 try:
-                    live_gate_values.append(
-                        bool(json.loads(live_raw).get("is_trading_allowed", True))
-                    )
+                    live_state = json.loads(live_raw)
                 except (TypeError, ValueError):
                     continue
+                live_states.append(live_state)
+                live_gate_values.append(
+                    bool(live_state.get("is_trading_allowed", True))
+                )
         except Exception:
             # An unreachable Redis must not break the live balance fetch.
             live_gate_values = []
+            live_states = []
+        live_losses, live_reason = _risk_state_from_states(live_states)
         live_portfolio_status = schemas.PortfolioStatus(
             balance=total_equity,  # Use Equity for dashboard "Balance"
             today_pnl=today_pnl_live,
             is_trading_allowed=(
                 all(live_gate_values) if live_gate_values else True
             ),
-            consecutive_losses=0,
+            # The REAL counter the live controllers publish.
+            consecutive_losses=live_losses,
             timestamp_utc=datetime.now(timezone.utc),
             market_type=normalized_market_type,
             total_available=sum(
@@ -467,6 +520,9 @@ async def get_portfolio_status(
             ),
             total_margin_used=sum(account.margin_used for account in dedup_balances),
             market_breakdown=market_breakdown,
+            # WHY trading is blocked, in the operator's words. None when no
+            # live controller is blocked.
+            trading_disabled_reason=live_reason,
         )
         logger.info(
             f"Successfully fetched live portfolio status from exchange for user '{current_user.username}'."
@@ -502,9 +558,15 @@ async def get_portfolio_status(
         # state a user cannot see -- the dashboard showed "running" while every
         # signal was being rejected.
         #
-        # Collect it explicitly and AND it across controllers: if ANY controller
-        # is blocked, the account is not fully tradable.
+        # Collect it explicitly and AND it across the LIVE controllers (the
+        # mode filter is below): if ANY live controller is blocked, the live
+        # account is not fully tradable.
         controller_gate_values: List[bool] = []
+        # The published payloads this response is built from. Their risk state
+        # (consecutive-loss counter + the reason the gate refused) is read from
+        # here, so the counter and the reason describe the SAME population as
+        # the money.
+        published_states: List[dict] = []
 
         if api_key_id is not None:
             # Specific Key
@@ -513,39 +575,66 @@ async def get_portfolio_status(
             if port_json:
                 data = json.loads(port_json)
                 aggregated_status = data
+                published_states.append(data)
                 found_data = True
         else:
-            # Aggregate All
+            # Aggregate All -- LIVE controllers only.
             pattern = f"{base_portfolio_key}:*"
             keys = await redis_client.keys(pattern)
             if keys:
                 values = await redis_client.mget(keys)
-                for v in values:
-                    if v:
-                        data = json.loads(v)
-                        aggregated_status["total_wallet_balance"] += float(
-                            data.get("total_wallet_balance", 0)
-                        )
-                        aggregated_status["total_unrealized_pnl"] += float(
-                            data.get("total_unrealized_pnl", 0)
-                        )
-                        aggregated_status["total_equity"] += float(
-                            data.get("total_equity", 0)
-                        )
-                        aggregated_status["today_pnl"] += float(
-                            data.get("today_pnl", 0)
-                        )
-                        controller_gate_values.append(
-                            bool(data.get("is_trading_allowed", True))
-                        )
-                        found_data = True
+                for key, v in zip(keys, values):
+                    if not v:
+                        continue
+                    # The key suffix is the api_key_id: live controllers publish
+                    # a numeric id, paper controllers have none and publish a
+                    # non-numeric suffix. A PAPER controller's equity is not
+                    # LIVE money, and bot_runner.py starts a paper controller
+                    # for every user who does not have one, so a ":None" key
+                    # next to the live keys is the NORMAL case, not an edge
+                    # case. Aggregating it here made ?mode=live report the
+                    # paper account's balance as the live one.
+                    if not str(key).rsplit(":", 1)[-1].isdigit():
+                        continue
+                    data = json.loads(v)
+                    aggregated_status["total_wallet_balance"] += float(
+                        data.get("total_wallet_balance", 0)
+                    )
+                    aggregated_status["total_unrealized_pnl"] += float(
+                        data.get("total_unrealized_pnl", 0)
+                    )
+                    aggregated_status["total_equity"] += float(
+                        data.get("total_equity", 0)
+                    )
+                    aggregated_status["today_pnl"] += float(
+                        data.get("today_pnl", 0)
+                    )
+                    published_states.append(data)
+                    controller_gate_values.append(
+                        bool(data.get("is_trading_allowed", True))
+                    )
+                    found_data = True
         if not found_data:
+            # No state for the requested mode. In LIVE mode this means there is
+            # no live controller publishing -- the honest answer is that the
+            # live state is not in cache, NOT a zero balance: the authoritative
+            # live balance comes from the exchange, and this fallback only
+            # runs when that fetch FAILED.
             raise ValueError(
                 f"Portfolio keys associated with '{base_portfolio_key}' not found in Redis."
             )
 
         if controller_gate_values:
             aggregated_status["is_trading_allowed"] = all(controller_gate_values)
+
+        # The risk state the published controllers actually report. The
+        # aggregation above summed only the money fields, so this dict never
+        # contained the counter or the reason and the mapping below fell
+        # through to its defaults: the API said "0 consecutive losses" while
+        # the gate was blocked at the loss limit, and it could never say WHY.
+        risk_losses, risk_reason = _risk_state_from_states(published_states)
+        aggregated_status["consecutive_losses"] = risk_losses
+        aggregated_status["trading_disabled_reason"] = risk_reason
 
         # Map to Schema
         # IMPORTANT: Frontend uses balance field as "Total Equity" to show total balance.
@@ -558,6 +647,13 @@ async def get_portfolio_status(
             is_trading_allowed=aggregated_status.get("is_trading_allowed", True),
             consecutive_losses=aggregated_status.get("consecutive_losses", 0),
             timestamp_utc=datetime.now(timezone.utc),
+            # The published payload DOES carry the unrealized PnL; it was
+            # dropped on the floor here and fell back to the schema default of
+            # 0.0, so a cached portfolio reported no open-position PnL.
+            total_unrealized_pnl=aggregated_status.get("total_unrealized_pnl", 0.0),
+            # WHY trading is blocked, in the operator's words. None when no
+            # controller is blocked.
+            trading_disabled_reason=aggregated_status.get("trading_disabled_reason"),
         )
         logger.info(
             f"Returning cached portfolio status for user '{current_user.username}'."
