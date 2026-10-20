@@ -526,6 +526,44 @@ def test_paper_branch_reports_the_highest_counter_of_the_paper_controllers():
     assert data.is_trading_allowed is False
 
 
+def test_the_counter_is_the_worst_controller_not_the_last_one_read():
+    """MUTATION KILLER: the counter is the MAX, not the last value read.
+
+    Every other multi-controller fixture in this file puts the HIGHEST
+    counter on the LAST controller, so "take the max" and "take the last
+    one" produce the SAME number and the tests cannot tell them apart.
+    The mutation harness proved it: replacing `max(max_losses, ...)` with a
+    plain assignment SURVIVED this entire file. A green suite is not
+    evidence that the guarantee holds.
+
+    The account is blocked when ANY controller is over the limit, so
+    reporting only the last controller's counter UNDERSTATES the breach --
+    and if that last controller happened to be a healthy one, the API would
+    say "1 consecutive loss" while a controller sat at 10.
+
+    The population order is deterministic: the fake Redis returns keys in
+    insertion order and the endpoint walks them in that order. The blocked
+    controller is deliberately FIRST, so "last" != "max".
+    """
+    payloads = {
+        f"{PORTFOLIO_KEY}:aaa": _published(
+            equity=100.0,
+            allowed=False,
+            losses=10,
+            reason="Max consec losses (10) >= limit (10)",
+        ),
+        f"{PORTFOLIO_KEY}:zzz": _published(equity=100.0, allowed=True, losses=1),
+    }
+
+    data = _call(mode="paper", payloads=payloads)["data"]
+
+    assert data.consecutive_losses == 10, (
+        f"the worst controller published 10 consecutive losses and the API "
+        f"reported {data.consecutive_losses!r} -- the counter is the LAST "
+        f"controller's value, not the MAX across the population"
+    )
+
+
 def test_paper_branch_joins_distinct_blocked_reasons():
     """Two blocked controllers, two causes: neither may be lost."""
     payloads = {
@@ -545,6 +583,12 @@ def test_paper_branch_joins_distinct_blocked_reasons():
     assert data.trading_disabled_reason == (
         "Max consec losses (10) >= limit (10); EMERGENCY STOP active (operator stop)"
     ), f"both causes must survive, got {data.trading_disabled_reason!r}"
+    # The same population also has the MAX first and the LAST controller at 1,
+    # so this pins the aggregation rule as well as the reason joining.
+    assert data.consecutive_losses == 10, (
+        f"the worst controller published 10 consecutive losses and the API "
+        f"reported {data.consecutive_losses!r}"
+    )
 
 
 def test_paper_branch_ignores_a_stale_reason_on_an_allowed_controller():
