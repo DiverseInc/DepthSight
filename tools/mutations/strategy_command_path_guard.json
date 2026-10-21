@@ -1,0 +1,63 @@
+{
+  "_comment": [
+    "Mutations that reintroduce the START_STRATEGY command-path hole.",
+    "",
+    "The bot starts a strategy through a SECOND door than the HTTP route:",
+    "the Redis command channel. `_handle_start_strategy_command` is the only",
+    "consumer of the START_STRATEGY command, and it must refuse to start a",
+    "strategy that arms 'breakeven_on_regime_change' on a deployment whose",
+    "screener feed cannot deliver the regime data.",
+    "",
+    "M1 is the HOLE re-opened: the refusal never fires. The refusal tests",
+    "    must fail.",
+    "M2 is the FALSE POSITIVE: the feed check is dropped, so the guard refuses",
+    "    a protection that WOULD have worked. The positive control must fail.",
+    "M3 drops the REHYDRATE EXEMPTION: a replay of an already-approved",
+    "    strategy is refused, and the user's running strategy vanishes after a",
+    "    restart. The rehydrate test must fail.",
+    "M4 drops the REPLAY ALARM: the replay is still exempt from the refusal,",
+    "    but nothing says its stop is inert. The replay-alarm test must fail.",
+    "M5 drops the APPROVAL-TIME check: an arming that appeared after the",
+    "    approval (the API's PUT /config route does not apply the guard, and",
+    "    the replay refreshes config_data from Postgres) inherits the",
+    "    exemption. The armed-after-approval test must fail.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/strategy_command_path_guard.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_strategy_command_regime_change_guard.py tests/test_regime_change_arm_guard.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: the command-path guard never refuses anything (the hole, re-opened)",
+      "file": "bot_module/controller.py",
+      "needle": "            if not replay_of_approved_arming:\n",
+      "replace": "            if False:  # MUTANT: the command path never refuses\n"
+    },
+    {
+      "label": "M2: the feed check is dropped, so the guard refuses a protection that WOULD have worked",
+      "file": "bot_module/controller.py",
+      "needle": "        if regime_stop_armed and not feed_can_deliver:\n",
+      "replace": "        if regime_stop_armed:  # MUTANT: the feed check is dropped\n"
+    },
+    {
+      "label": "M3: the rehydrate exemption is dropped, so a replay of an already-approved strategy is refused",
+      "file": "bot_module/controller.py",
+      "needle": "        replay_of_approved_arming = is_rehydrate and (\n",
+      "replace": "        replay_of_approved_arming = False and (\n"
+    },
+    {
+      "label": "M4: the replay alarm is never raised, so an inert replayed stop is silent",
+      "file": "bot_module/controller.py",
+      "needle": "            logger.critical(\n                f\"{log_prefix} REPLAYED a strategy that arms \"\n",
+      "replace": "            logger.info(\n                f\"{log_prefix} REPLAYED a strategy that arms \"\n"
+    },
+    {
+      "label": "M5: the approval-time check is dropped, so an arming made AFTER the approval inherits the exemption",
+      "file": "bot_module/controller.py",
+      "needle": "            not regime_stop_armed or armed_at_approval\n",
+      "replace": "            not regime_stop_armed or True  # MUTANT: the approval-time check is dropped\n"
+    }
+  ]
+}

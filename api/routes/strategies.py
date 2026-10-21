@@ -14,6 +14,22 @@ from ..redis_client import get_redis_client
 from ..dependencies import require_permission, is_strategy_kline_only
 from ..gamification import grant_achievement
 
+# The regime-change stop can only be delivered by the screener WebSocket feed,
+# and the bot's Redis command path can start a strategy too -- so BOTH paths
+# must ask the SAME predicate. It is therefore defined ONCE, in
+# bot_module/regime_feed.py, and imported here under the private names this
+# module already used. The aliases keep the call site text unchanged, so the
+# HTTP guard cannot drift away from the bot-side guard.
+#
+# `bot_module` is already a hard dependency of this module (api/crud.py:21
+# imports bot_module.config unguarded, and api/crud.py is imported at line 10
+# above), so this import introduces no new failure mode. The helpers
+# themselves degrade safely if bot_module.config cannot be imported.
+from bot_module.regime_feed import (
+    arms_breakeven_on_regime_change as _arms_breakeven_on_regime_change,
+    screener_feed_can_deliver_regime_data as _screener_feed_can_deliver_regime_data,
+)
+
 try:
     from bot_module import config as bot_config
 except ImportError:
@@ -28,81 +44,6 @@ REDIS_COMMAND_CHANNEL = getattr(
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _arms_breakeven_on_regime_change(
-    config_data: Any, request_params: Optional[Dict[str, Any]]
-) -> bool:
-    """True when this launch would ARM `breakeven_on_regime_change`.
-
-    The option lives at the TOP LEVEL of the strategy's config_data. That is
-    where the schema puts it (api/schemas.py:1666), where the frontend writes
-    it (frontend/src/pages/Strategies.tsx:650) and where the bot reads it:
-    the controller copies config_data into the strategy instance's params
-    (controller.py:2205-2206) and `_get_param` finds it at the top level
-    (strategy.py:2387-2393).
-
-    A launch can also override it through `params`, which this endpoint
-    merges into config_data ("Apply Dynamic Overrides from Request").
-
-    Never raises. A malformed config must not become a 500 here, and it must
-    not be read as "armed" either.
-    """
-    effective: Dict[str, Any] = {}
-    if isinstance(config_data, dict):
-        effective.update(config_data)
-    elif isinstance(config_data, str):
-        try:
-            decoded = json.loads(config_data)
-        except (TypeError, ValueError):
-            return False
-        if isinstance(decoded, dict):
-            effective.update(decoded)
-    if isinstance(request_params, dict):
-        effective.update(request_params)
-    return bool(effective.get("breakeven_on_regime_change"))
-
-
-def _screener_feed_can_deliver_regime_data() -> bool:
-    """True when this deployment's screener feed can deliver regime data.
-
-    DERIVED FROM THE REAL CODE PATH -- read this before widening it.
-
-    Regime data arrives as `active_pairs_update` messages on the main_app
-    WebSocket. data_consumer.py:3428 is the only place that puts them on the
-    controller's screener-update queue, and that socket only exists when
-    data_consumer.py:453-525 creates the task, which needs ALL THREE of:
-
-      1. SYMBOL_SOURCE_MODE == "MAIN_APP"   (data_consumer.py:453, 456)
-      2. MAIN_APP_WS_ENABLED is true         (data_consumer.py:463)
-      3. MAIN_APP_WS_URL is a ws:// / wss:// URL
-                                            (data_consumer.py:519-522)
-
-    (The `websockets` import at data_consumer.py:520 is a packaging
-    invariant -- `websockets>=10.0,<15.0` is a hard requirement in
-    requirements.txt -- not a deployment setting, so it is not part of the
-    predicate.)
-
-    This is a CONFIGURATION test, not a reachability test. MAIN_APP_WS_URL
-    has a code default (config.py:507) and nothing here can tell whether that
-    host is answering. The honest claim is "this deployment cannot deliver
-    the regime data", NOT "the feed is down".
-
-    It is deliberately NOT broader than the feed's own condition: a
-    deployment that satisfies all three keeps the protection, so this guard
-    can never refuse a stop that would have worked.
-    """
-    source_mode = str(
-        getattr(bot_config, "SYMBOL_SOURCE_MODE", "MAIN_APP")
-    ).strip().upper()
-    if source_mode != "MAIN_APP":
-        return False
-    if not getattr(bot_config, "MAIN_APP_WS_ENABLED", True):
-        return False
-    ws_url = getattr(bot_config, "MAIN_APP_WS_URL", "")
-    if not isinstance(ws_url, str) or not ws_url:
-        return False
-    return ws_url.startswith(("ws://", "wss://"))
 
 
 # Per-strategy evaluation state, written by the bot on every evaluation.
@@ -659,7 +600,7 @@ async def start_strategy_instance(
     # `breakeven_on_regime_change` is implemented in
     # `check_on_screener_update` (strategy.py:3070-3079), which has exactly one
     # production caller: `_dynamic_symbol_selection_loop`
-    # (controller.py:5057). That loop reads the controller's screener-update
+    # (controller.py:5213). That loop reads the controller's screener-update
     # queue, and the ONLY producer of that queue is the `active_pairs_update`
     # message on the main_app WebSocket (data_consumer.py:3428). No screener
     # message, no regime change, no MOVE_SL / CLOSE_POSITION stop -- the

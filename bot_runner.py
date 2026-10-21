@@ -250,6 +250,17 @@ async def _rehydrate_all_strategies_globally(redis_client) -> None:
                 skipped_malformed += 1
                 continue
 
+            # The APPROVAL-TIME arming state, captured BEFORE the DB refresh
+            # below swaps in the CURRENT config_data. The rehydrate exemption
+            # means "this arming was already approved", so the approval-time
+            # state is what decides it -- not the current one. The API's
+            # `PUT /config/{config_id}` route writes config_data without
+            # applying the regime-change guard, so the current config can carry
+            # an arming that was never approved.
+            approved_armed = bool(
+                (payload.get("config_data") or {}).get("breakeven_on_regime_change")
+            )
+
             # The cached payload is a point-in-time snapshot. Re-read config_data
             # from Postgres so a restart cannot resurrect a config that has since
             # been edited or migrated in place.
@@ -268,7 +279,21 @@ async def _rehydrate_all_strategies_globally(redis_client) -> None:
                         f"at {payload_key}: {exc}; continuing with the in-memory copy."
                     )
 
-            command = {"command": "START_STRATEGY", "payload": payload}
+            command = {
+                "command": "START_STRATEGY",
+                "payload": payload,
+                # Marks this as a REPLAY of a strategy that the API already
+                # approved and that was running before this bot restarted --
+                # NOT a new start. The command handler honours this mark:
+                # refusing to replay an already-approved strategy would make
+                # the user's running strategy vanish after a restart, which is
+                # a worse regression than an inert stop.
+                "rehydrate": True,
+                # Whether the option was armed in the APPROVAL-TIME payload. An
+                # arming that appeared AFTER the approval was never approved on
+                # this deployment, so it does not inherit the exemption.
+                "rehydrate_armed_at_approval": approved_armed,
+            }
             await redis_client.publish(
                 config.REDIS_COMMAND_CHANNEL,
                 json.dumps(command, default=str),

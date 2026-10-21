@@ -4,28 +4,28 @@ WHY
 ---
 `breakeven_on_regime_change` is implemented in `check_on_screener_update`
 (bot_module/strategy.py:3070-3079). Its ONLY production caller is
-`_dynamic_symbol_selection_loop` (bot_module/controller.py:5057), and that
+`_dynamic_symbol_selection_loop` (bot_module/controller.py:5213), and that
 loop consumes the controller's screener-update queue. The ONLY producer of
 that queue is the `active_pairs_update` message on the main_app WebSocket
-(bot_module/data_consumer.py:3378).
+(bot_module/data_consumer.py:3428).
 
 So the regime-change stop is delivered by exactly one thing: the screener
 WebSocket feed. No feed, no stop -- but the strategy still starts, still
 reports "running", and the user believes they are protected.
 
-The DYNAMIC guard next door (api/routes/strategies.py:566) already refuses
+The DYNAMIC guard next door (api/routes/strategies.py:583) already refuses
 DYNAMIC for the same reason. This is the identical reasoning applied to the
 identical failure mode.
 
 THE PREDICATE (derived, not guessed)
 ------------------------------------
 The socket that carries the regime data is created in exactly one place --
-bot_module/data_consumer.py:453-478 -- and it needs ALL THREE of:
+bot_module/data_consumer.py:453-526 -- and it needs ALL THREE of:
 
   1. SYMBOL_SOURCE_MODE == "MAIN_APP"    (data_consumer.py:453, 456)
   2. MAIN_APP_WS_ENABLED is true          (data_consumer.py:463)
   3. MAIN_APP_WS_URL is a ws:// / wss:// URL
-                                           (data_consumer.py:469-472)
+                                           (data_consumer.py:519-522)
 
 The guard below fires only when the option is armed AND one of those three
 fails. It is a CONFIGURATION test: MAIN_APP_WS_URL has a code default

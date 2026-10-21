@@ -9,7 +9,7 @@ RISK-CONTROL OUTAGE escalation lives INSIDE the reconnect-failure handler
 
 `breakeven_on_regime_change` is implemented in `check_on_screener_update`
 (bot_module/strategy.py:3070-3079), whose only production caller is
-`_dynamic_symbol_selection_loop` (bot_module/controller.py:5057). That loop is
+`_dynamic_symbol_selection_loop` (bot_module/controller.py:5213). That loop is
 fed exclusively by this socket. So a disabled feed disarms that stop
 permanently, and the old code said so in the WRONG direction: one WARNING
 that claimed "Pinned-symbol and STATIC/FIXED strategies are unaffected".
