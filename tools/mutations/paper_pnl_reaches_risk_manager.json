@@ -1,0 +1,142 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the paper-PnL fix:",
+    "a paper close must reach the RiskManager with its real NET PnL, and the",
+    "UTC-day rollover must run before the limit check.",
+    "",
+    "A is the net-PnL helper ignoring the commission. Without it a close that",
+    "is profitable before commission and a LOSS after it would be counted as a",
+    "win -- the exact blindness that made the daily-loss guard unable to fire.",
+    "",
+    "B is the fill notification not ACCUMULATING onto the position. A position",
+    "closed in several partial fills would keep only the last fill's PnL.",
+    "",
+    "C is the MARKET branch computing a GROSS net_pnl, so the wallet and the",
+    "risk manager are told different numbers for the same fill.",
+    "",
+    "D is the order result no longer carrying the net PnL out to the caller.",
+    "",
+    "E is the liquidation path handing the risk manager the GROSS PnL.",
+    "",
+    "F is the check_open_orders call site passing 0.0 instead of the net PnL.",
+    "",
+    "G is the rollover running AFTER the limit check. The reverse order judges",
+    "the new day against the old day's counters and can leave the gate open",
+    "past a real breach.",
+    "",
+    "H is the rollover call removed from update_balance() entirely -- which is",
+    "the deadlock this change exists to break: the paper branch of",
+    "assess_signal() returns before the rollover, so without this call a",
+    "blocked paper account can never recover.",
+    "",
+    "I is the controller's OWN finalization booking the GROSS result. When the",
+    "exchange reports no realized PnL ('rp' is absent -- SPOT has none, and a",
+    "futures payload can omit it) _handle_final_exit recomputes the PnL from",
+    "the entry and exit prices. That recomputation is GROSS, and the",
+    "commission was computed in the same function and never subtracted from",
+    "it, so the risk manager was handed a number the account never earned.",
+    "",
+    "J is the triggering partial TP's commission charged twice. The same",
+    "commission is stored on the partial TP and passed as the final event's",
+    "commission, so it must be counted ONCE -- it was harmless while the total",
+    "was only recorded, and wrong once the total became the thing subtracted",
+    "from the PnL the risk manager is given.",
+    "",
+    "K is the controller's OWN Trade row storing the NET PnL next to the",
+    "commission. `api/routes/portfolio.py` reports `sum(Trade.pnl -",
+    "Trade.commission)` in BOTH the PAPER branch and the LIVE branch, so the",
+    "row's pnl has to be the GROSS result: the commission is subtracted from",
+    "it THERE. A NET value in the row makes the API subtract the commission a",
+    "SECOND time, and under-reports the PnL of every LIVE fallback close by",
+    "exactly the total commission.",
+    "",
+    "L is the paper executor NOT declaring that it supports positions. The",
+    "paper book is a futures book: positions live in `self._positions` and",
+    "settle into a single USDT wallet. Without the declaration the controller",
+    "classifies the paper executor as SPOT and the SPOT-SYNC block reads a",
+    "base-asset balance a futures paper wallet never has, breaks out before",
+    "`executor.place_order`, and the wallet is never credited. The instance",
+    "attributes mirror the class declaration, so flipping the class attribute",
+    "flips the runtime behaviour too.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/paper_pnl_reaches_risk_manager.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_paper_pnl_reaches_risk_manager.py tests/test_paper_trading_gate_self_heals.py tests/test_paper_only_account_can_trade.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the net-PnL helper ignores the commission actually paid",
+      "file": "bot_module/paper_executor.py",
+      "needle": "    return float(gross_realized_pnl) - float(commission)\n",
+      "replace": "    return float(gross_realized_pnl)\n"
+    },
+    {
+      "label": "B: the fill no longer accumulates onto the position's PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "            position.pnl = previous_pnl + float(net_pnl or 0.0)\n",
+      "replace": "            position.pnl = previous_pnl\n"
+    },
+    {
+      "label": "C: the MARKET branch computes a GROSS net_pnl",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        net_pnl = net_realized_pnl(\n                            realized_pnl, sim_result.actual_commission_paid\n                        )\n",
+      "replace": "                        net_pnl = realized_pnl\n"
+    },
+    {
+      "label": "D: the order result no longer carries the net PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        \"net_realized_pnl\": net_pnl,\n",
+      "replace": "                        \"net_realized_pnl\": 0.0,\n"
+    },
+    {
+      "label": "E: the liquidation path hands the risk manager the GROSS PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                net_pnl=net_realized_pnl(realized_pnl, commission),\n",
+      "replace": "                net_pnl=realized_pnl,\n"
+    },
+    {
+      "label": "F: the check_open_orders call site passes 0.0 instead of the net PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                            net_pnl=float(fill_result.get(\"net_realized_pnl\") or 0.0),\n",
+      "replace": "                            net_pnl=0.0,\n"
+    },
+    {
+      "label": "G: the rollover runs AFTER the limit check",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                    self._check_and_reset_daily_stats()\n                    self._check_risk_limits()\n",
+      "replace": "                    self._check_risk_limits()\n                    self._check_and_reset_daily_stats()\n"
+    },
+    {
+      "label": "H: the rollover is not called from update_balance at all",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                    self._check_and_reset_daily_stats()\n                    self._check_risk_limits()\n",
+      "replace": "                    self._check_risk_limits()\n"
+    },
+    {
+      "label": "I: the final-exit fallback books the GROSS PnL",
+      "file": "bot_module/controller.py",
+      "needle": "                    position.pnl = net_realized_pnl(\n                        total_pnl_calculated, total_commission_calculated\n                    )\n",
+      "replace": "                    position.pnl = float(total_pnl_calculated)\n"
+    },
+    {
+      "label": "J: the triggering partial TP's commission is charged twice",
+      "file": "bot_module/controller.py",
+      "needle": "                if (\n                    order_id is not None\n                    and str(ptp_order.order_id) == str(order_id)\n                ) or (\n                    client_order_id is not None\n                    and ptp_order.client_order_id is not None\n                    and str(ptp_order.client_order_id) == str(client_order_id)\n                ):\n                    continue\n",
+      "replace": "                pass  # MUTATED: the triggering partial TP's commission is charged twice\n"
+    },
+    {
+      "label": "K: the controller's Trade row stores the NET pnl, so the API subtracts the commission twice",
+      "file": "bot_module/controller.py",
+      "needle": "                    \"exit_price\": exit_price,\n                    \"pnl\": gross_pnl_for_sinks,\n                    \"commission\": position_to_process_copy.total_commission,\n",
+      "replace": "                    \"exit_price\": exit_price,\n                    \"pnl\": position_to_process_copy.pnl,\n                    \"commission\": position_to_process_copy.total_commission,\n"
+    },
+    {
+      "label": "L: the paper executor does not declare that it supports positions",
+      "file": "bot_module/paper_executor.py",
+      "needle": "    supports_positions = True\n    supports_shorting = True\n",
+      "replace": "    supports_positions = False\n    supports_shorting = True\n"
+    }
+  ]
+}

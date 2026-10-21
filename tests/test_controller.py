@@ -2030,6 +2030,7 @@ async def test_handle_order_update_sl_filled(
     sl_order_id = 555
     sl_client_order_id = "x-sl-1"
     sl_price = 49500.0
+    sl_commission = 0.1
     tp_target_price = 51000.0
     tp_order_id = 666
     tp_client_order_id = "x-tp-1"
@@ -2080,7 +2081,7 @@ async def test_handle_order_update_sl_filled(
             "l": str(initial_qty),
             "L": str(sl_price),
             "ap": str(sl_price),
-            "n": "0.1",
+            "n": str(sl_commission),
             "N": "USDT",
         },
     }
@@ -2104,22 +2105,176 @@ async def test_handle_order_update_sl_filled(
         is_algo_order=False,
     )
 
-    expected_pnl = (sl_price - entry_price) * initial_qty
+    # TWO CONVENTIONS, SPLIT -- NOT ONE.
+    #
+    # The risk manager is given the NET result: an SL fill is a REAL fill with
+    # a REAL commission (Binance's 'n' field), and what the account lost is
+    # the gross minus that commission. Booking the GROSS would under-count the
+    # loss by exactly the commission, and would book a close that is a gross
+    # profit and a net loss as a WIN -- the daily-loss guard would then never
+    # see the losing trade.
+    #
+    # The Trade row, the trader diary and the trade log store the GROSS
+    # result NEXT TO a separate commission field, because
+    # `api/routes/portfolio.py` computes `sum(Trade.pnl - Trade.commission)`.
+    # A NET value in the row would subtract the commission a SECOND time.
+    expected_gross_pnl = (sl_price - entry_price) * initial_qty
+    expected_net_pnl = expected_gross_pnl - sl_commission
+
     mock_risk_manager.update_trade_result.assert_called_once()
     assert mock_risk_manager.update_trade_result.call_args[0][0] == symbol
     assert math.isclose(
-        mock_risk_manager.update_trade_result.call_args[0][1], expected_pnl
+        mock_risk_manager.update_trade_result.call_args[0][1], expected_net_pnl
     )
 
     mock_risk_manager.update_symbol_strategy_performance.assert_called_once_with(
         symbol=symbol,
         strategy_name=strategy_name,
-        pnl_usd=pytest.approx(expected_pnl),
+        pnl_usd=pytest.approx(expected_net_pnl),
         initial_risk_usd_planned=planned_risk,
     )
     mock_trade_logger.log_event.assert_any_call(
         event_type="POSITION_CLOSED",
-        data=expect({"exit_reason": "STOP_LOSS", "pnl": pytest.approx(expected_pnl)}),
+        data=expect(
+            {
+                "exit_reason": "STOP_LOSS",
+                "pnl": pytest.approx(expected_gross_pnl),
+            }
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_sl_fill_books_the_NET_pnl_to_the_guard_and_the_GROSS_pnl_to_the_sinks(
+    controller, mock_risk_manager, mock_executor, mock_trade_logger
+):
+    """The guard and the API must read the SAME number for an SL fill.
+
+    An SL fill is a REAL fill with a REAL commission. Two consumers read the
+    result of that fill and they use DIFFERENT conventions, on purpose:
+
+      * the risk manager gets the NET -- what the account actually lost --
+        because `RiskManager.update_trade_result` adds it to `today_pnl` and
+        counts it towards the consecutive-loss streak without subtracting
+        anything itself;
+      * the Trade row, the trader diary and the trade log get the GROSS
+        result beside the commission, because
+        `api/routes/portfolio.py` computes `sum(Trade.pnl - Trade.commission)`.
+
+    So the two must agree: `gross - commission == net`. This test pins that
+    identity for the SL-fill path, which is the LIVE path that
+    `_handle_final_exit` recomputes from the entry and the exit price (no
+    'rp' in the execution report).
+
+    The Trade row itself is not observable in this fixture: the row write
+    reuses `r_multiplier_val`, which is computed inside the trader-diary
+    block, and that block is skipped for a position with no `user_id` -- so
+    the row write raises and is swallowed. The trade log is fed from the very
+    same `gross_pnl_for_sinks` value and the same `total_commission`, so
+    pinning it pins the row too.
+    """
+    symbol = "BTCUSDT"
+    qty = 0.01
+    entry_price = 50000.0
+    sl_price = 49500.0
+    sl_commission = 0.1
+    strategy_name = "FirstPullbacksInTrend"
+
+    controller._active_positions[symbol] = Position(
+        symbol=symbol,
+        direction=SignalDirection.LONG,
+        entry_price=entry_price,
+        initial_quantity=qty,
+        remaining_quantity=qty,
+        entry_time=time.time(),
+        strategy=strategy_name,
+        initial_stop_loss=sl_price,
+        current_sl_price=sl_price,
+        status="OPEN",
+        entry_order_id=123,
+        entry_client_order_id="x-entry-slfill-net",
+        current_sl_order_id=555,
+        current_sl_client_order_id="x-sl-net-1",
+        initial_risk_usd_planned=100.0,
+    )
+
+    exec_report_sl = {
+        "e": "ORDER_TRADE_UPDATE",
+        "o": {
+            "s": symbol,
+            "c": "x-sl-net-1",
+            "i": 555,
+            "S": "SELL",
+            "ot": "STOP_MARKET",
+            "x": "TRADE",
+            "X": "FILLED",
+            "q": str(qty),
+            "z": str(qty),
+            "l": str(qty),
+            "L": str(sl_price),
+            "ap": str(sl_price),
+            "n": str(sl_commission),
+            "N": "USDT",
+        },
+    }
+
+    mock_risk_manager.update_trade_result.reset_mock()
+    mock_risk_manager.update_symbol_strategy_performance.reset_mock()
+
+    await controller._handle_order_update(exec_report_sl)
+    await asyncio.sleep(0.1)
+
+    gross = (sl_price - entry_price) * qty
+    expected_net = gross - sl_commission
+
+    # 1. The guard is given the NET: the gross minus the commission actually
+    #    paid on the fill.
+    mock_risk_manager.update_trade_result.assert_called_once()
+    booked = mock_risk_manager.update_trade_result.call_args[0][1]
+    assert math.isclose(
+        booked,
+        expected_net,
+    ), (
+        f"the risk manager was told {booked!r}; an SL fill lost {expected_net!r} "
+        f"(the gross {gross!r} minus the commission {sl_commission!r}). "
+        f"Booking the gross would under-count the loss by exactly the "
+        f"commission"
+    )
+
+    # 2. The sinks store the GROSS beside the commission.
+    closed = [
+        call
+        for call in mock_trade_logger.log_event.call_args_list
+        if call.kwargs.get("event_type") == "POSITION_CLOSED"
+    ]
+    assert len(closed) == 1, (
+        f"expected exactly one POSITION_CLOSED event, got {closed!r}"
+    )
+    data = closed[0].kwargs["data"]
+    assert math.isclose(
+        data["pnl"],
+        gross,
+    ), (
+        f"the trade log stored a pnl of {data['pnl']!r}; it must store the "
+        f"GROSS {gross!r}, because the API computes `sum(pnl - commission)`"
+    )
+    assert math.isclose(
+        data["commission"],
+        sl_commission,
+    ), (
+        f"the trade log stored a commission of {data['commission']!r}; the fill "
+        f"paid {sl_commission!r}"
+    )
+
+    # 3. The identity that makes the two conventions safe: what the API
+    #    computes out of the row is exactly what the guard was given.
+    assert math.isclose(
+        data["pnl"] - data["commission"],
+        booked,
+    ), (
+        f"the API would report {data['pnl'] - data['commission']!r} while the "
+        f"guard was told {booked!r}; the guard and the API must read the same "
+        f"number"
     )
 
 

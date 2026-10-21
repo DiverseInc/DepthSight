@@ -24,7 +24,7 @@ from bot_module.model_pipeline import ModelPipeline
 from bot_module.realtime_ml_logger import RealtimeMLLogger
 from bot_module.data_consumer import DataConsumer
 from bot_module.executor import BinanceExecutor
-from bot_module.paper_executor import PaperTradingExecutor
+from bot_module.paper_executor import PaperTradingExecutor, net_realized_pnl
 from bot_module.risk_manager import RiskManager
 from bot_module.trade_logger import TradeLogger
 from bot_module.telegram_notifier import TelegramNotifier
@@ -320,6 +320,16 @@ class LivePosition(BasePosition):
     original_partial_targets_plan: Optional[List[PartialTarget]] = None
     time_status_open: Optional[float] = None
     pnl: Optional[float] = 0.0
+    # The GROSS realized PnL of the close (before the commission), carried
+    # ALONGSIDE `pnl`. The two conventions are deliberately split:
+    #   * `pnl` is the NET result -- what the account actually earned -- and
+    #     it is what the RiskManager is given.
+    #   * `pnl_gross` is the GROSS result -- what the Trade row, the trader
+    #     diary and the trade log store, because those store the commission
+    #     in a SEPARATE field and `api/routes/portfolio.py` reports
+    #     `sum(Trade.pnl - Trade.commission)`. A NET value in the row would
+    #     subtract the commission a second time.
+    pnl_gross: Optional[float] = None
     closed_time: Optional[float] = None
     exit_reason: Optional[str] = None
     total_commission: Optional[float] = None
@@ -10680,10 +10690,28 @@ class TradingController:
                     commission_asset=commission_asset,
                 )
 
-            # Sum commissions for all partial TPs and the current event
+            # Sum commissions for all partial TPs and the current event.
+            #
+            # The current event's commission is added below. When the trigger
+            # IS one of the partial TPs -- the ALL_TP_CLOSED_BY_TP path, where
+            # `_handle_partial_fill` stored the fill's commission on the
+            # partial TP *and* passed it as this event's commission -- that one
+            # leg's commission is already on the partial TP, so counting it in
+            # both places charges the SAME commission twice. It is skipped
+            # here and counted once, as the event's.
             for ptp_order in position.partial_tp_orders:
-                if ptp_order.commission is not None:
-                    total_commission_calculated += Decimal(str(ptp_order.commission))
+                if ptp_order.commission is None:
+                    continue
+                if (
+                    order_id is not None
+                    and str(ptp_order.order_id) == str(order_id)
+                ) or (
+                    client_order_id is not None
+                    and ptp_order.client_order_id is not None
+                    and str(ptp_order.client_order_id) == str(client_order_id)
+                ):
+                    continue
+                total_commission_calculated += Decimal(str(ptp_order.commission))
             total_commission_calculated += Decimal(str(commission))
 
             # PRIORITY: Real PnL from the exchange ('rp' field from Binance Futures WebSocket)
@@ -10696,6 +10724,10 @@ class TradingController:
             if exchange_pnl_available:
                 # Use PnL from the exchange, even if it is 0.0 (this is a valid result).
                 position.pnl = total_exchange_realized_pnl
+                # The exchange's 'rp' is the GROSS realized PnL -- Binance
+                # reports the commission separately -- so the gross value IS
+                # this number, and it is carried alongside the booked one.
+                position.pnl_gross = float(total_exchange_realized_pnl)
                 logger.info(
                     f"{log_prefix} Using EXCHANGE realized PnL: {position.pnl:.4f} "
                     f"(accumulated={position.accumulated_realized_pnl_from_exchange:.4f}, "
@@ -10749,11 +10781,46 @@ class TradingController:
                         f"{exit_price}); preserving already-booked PnL "
                         f"{position.pnl:.4f} instead of recomputing."
                     )
+                    # The already-booked value is the only number there is. If
+                    # an earlier close of this position already recorded the
+                    # gross, that one is kept; otherwise the booked value is
+                    # carried over, so the row is never written with a None
+                    # pnl. `pnl` itself is left untouched -- it is the
+                    # booked (NET) result the risk manager is given.
+                    if position.pnl_gross is None:
+                        position.pnl_gross = position.pnl
                 else:
-                    position.pnl = float(total_pnl_calculated)
+                    # The value assigned here is a FRESH GROSS recomputation
+                    # of the whole position (the partial TPs' legs plus this
+                    # event's leg), so the commission of those same legs --
+                    # `total_commission_calculated`, which covers the entry,
+                    # every partial TP and this event -- is subtracted here,
+                    # ONCE, to book the NET result.
+                    #
+                    # `net_realized_pnl` is the single source of truth for
+                    # "gross minus the commission actually paid": the same
+                    # helper the paper wallet and the paper trade rows use.
+                    # Booking the GROSS here would hand the risk manager a
+                    # number the account never earned, and a close that is
+                    # profitable before commission and a LOSS after it would
+                    # be counted as a win -- the daily-loss guard would
+                    # under-count the loss and the consecutive-loss guard
+                    # would never see the losing trade.
+                    position.pnl = net_realized_pnl(
+                        total_pnl_calculated, total_commission_calculated
+                    )
+                    # The GROSS result travels separately. The Trade row, the
+                    # trader diary and the trade log store the gross result
+                    # next to a SEPARATE commission field, and
+                    # `api/routes/portfolio.py` reports
+                    # `sum(Trade.pnl - Trade.commission)`: a NET value in the
+                    # row would subtract the commission a SECOND time and
+                    # under-report the PnL by exactly the commission.
+                    position.pnl_gross = float(total_pnl_calculated)
                     logger.warning(
                         f"{log_prefix} Exchange realized PnL ('rp') not available for this close event — "
-                        f"using CALCULATED PnL fallback: {position.pnl:.4f}"
+                        f"using CALCULATED NET PnL fallback (gross {total_pnl_calculated:.4f} "
+                        f"minus commission {total_commission_calculated:.8f}): {position.pnl:.4f}"
                     )
 
             position.total_commission = float(total_commission_calculated)
@@ -10766,6 +10833,18 @@ class TradingController:
             position_to_process_copy = LivePosition(
                 **vars(position)
             )  # Capture state before potential deletion
+
+            # `position.pnl` is the NET result the RiskManager is given. The
+            # Trade row, the trader diary and the trade log store the GROSS
+            # result next to a SEPARATE commission field, so they read
+            # `pnl_gross` instead. `pnl_gross` is set on every branch above,
+            # BEFORE this snapshot, so the copy carries it; the fallback to
+            # `pnl` is only for a position whose gross was never recorded.
+            gross_pnl_for_sinks = (
+                position_to_process_copy.pnl_gross
+                if position_to_process_copy.pnl_gross is not None
+                else position_to_process_copy.pnl
+            )
 
             if self._active_position_get(
                 symbol, self._market_type_for_position(position)
@@ -10907,7 +10986,7 @@ class TradingController:
                 data={
                     "symbol": symbol,
                     "strategy": position_to_process_copy.strategy,
-                    "pnl": position_to_process_copy.pnl,
+                    "pnl": gross_pnl_for_sinks,
                     "exit_reason": reason,
                     "exit_price": exit_price,
                     "order_id": order_id,
@@ -11128,7 +11207,7 @@ class TradingController:
                         "entry_price": position_to_process_copy.entry_price,
                         "exit_price": exit_price,  # Actual exit price
                         "quantity": position_to_process_copy.initial_quantity,  # Total trade volume
-                        "pnl_usd": position_to_process_copy.pnl,
+                        "pnl_usd": gross_pnl_for_sinks,
                         "pnl_percent": pnl_percent_val,
                         "commission_usd": position_to_process_copy.total_commission,  # Total commission
                         "initial_risk_usd_planned": position_to_process_copy.initial_risk_usd_planned,
@@ -11201,7 +11280,7 @@ class TradingController:
                     "direction": position_to_process_copy.direction.name,
                     "entry_price": position_to_process_copy.entry_price,
                     "exit_price": exit_price,
-                    "pnl": position_to_process_copy.pnl,
+                    "pnl": gross_pnl_for_sinks,
                     "commission": position_to_process_copy.total_commission,
                     "exit_reason": reason,
                     "quantity": position_to_process_copy.initial_quantity,
@@ -11261,7 +11340,7 @@ class TradingController:
                     else None,
                     "actual_entry_price": actual_entry_price,
                     "actual_exit_price": exit_price,
-                    "pnl": position_to_process_copy.pnl,
+                    "pnl": gross_pnl_for_sinks,
                     "exit_reason": reason,
                     "commission": position_to_process_copy.total_commission,
                     "y_true": y_true_val,
