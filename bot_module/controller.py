@@ -1159,6 +1159,21 @@ class TradingController:
         # halted. Fail-closed -- see _restore_emergency_stop().
         await self._restore_emergency_stop()
 
+        # Restore the trading-guard state (the consecutive-loss streak and the
+        # day's PnL) BEFORE anything can trade, for the same reason and under
+        # the same fail-closed rule.
+        #
+        # RiskManager.initialize_balance() resets those counters to zero on
+        # every start, so without this a restart silently un-blocks an account
+        # that was correctly blocked by a losing streak. Measured in
+        # production on 2026-10-21: a routine deploy moved consecutive_losses
+        # from 10 to 0 and the gate from blocked to allowed.
+        #
+        # It runs AFTER _restore_emergency_stop() because both are fail-closed
+        # start-up checks and the emergency stop owns the operator-facing
+        # reason while it is engaged.
+        await self.rm.restore_state()
+
         # Auto-rehydrate: re-publish START_STRATEGY for any strategy that was
         # running before this bot died. The API persists running state to
         # Redis (running_strategies:{user_id} set + running_strategy_payload:*
