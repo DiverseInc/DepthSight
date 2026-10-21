@@ -62,6 +62,7 @@ import pytest
 from bot_module.controller import (
     ActivePositionMap,
     LivePosition,
+    PartialTpOrderInfo,
     SignalDirection,
     TradingController,
 )
@@ -915,3 +916,207 @@ async def test_live_close_still_delivers_the_exchange_pnl_unchanged(money):
     # The paper executor's fill notification must not have run: the live
     # path's PnL comes from the exchange, not from the paper book.
     assert position.pnl == pytest.approx(EXCHANGE_PNL, abs=1e-9)
+
+
+# --- 8. The controller's OWN finalization must book the NET too ------------
+#
+# `_handle_final_exit` prefers the exchange's realized PnL (the 'rp' field).
+# When the exchange reported none -- SPOT has no 'rp' at all, and a futures
+# ORDER_TRADE_UPDATE can omit it -- it falls back to recomputing the PnL from
+# the entry and exit prices. That recomputation is GROSS: it is
+# `(exit - entry) * qty`, with no commission term anywhere in it.
+#
+# The commission WAS computed, in the same function, and recorded on
+# `position.total_commission` -- but it was never subtracted from the value
+# that was booked. So the risk manager was handed the GROSS result of a close
+# whose NET result was a loss: `today_pnl` counted a profit the account never
+# made, and `consecutive_losses` never incremented for it.
+#
+# These tests pin the exact NUMBER, and the oracle does NOT depend on the
+# production helper: the gross and the commission are the facts the fixture
+# seeds, and the booked number must be their difference.
+
+
+@pytest.mark.asyncio
+async def test_the_final_exit_fallback_books_the_NET_pnl_not_the_gross_one(money):
+    """MUTATION KILLER: the CALCULATED-PnL fallback must book the NET.
+
+    This is the hole that `opencode-reviewer` and `dsh-reviewer` both found
+    in this branch: the fallback assigned the GROSS to `position.pnl`, and
+    `position.pnl` is what is handed to `rm.update_trade_result`.
+
+    Removing the commission subtraction from that assignment must turn this
+    test RED. It is the only thing that pins it.
+    """
+    controller, paper_executor, rm = _build_controller(price=100.40)
+    position = _seed_long(
+        paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY, mode="live"
+    )
+    # The commission the exchange charged on the opening fill.
+    position.entry_commission = 0.06
+    rm.stats.last_known_day_str = _utc_day_str()
+    rm.stats.current_balance = 1000.0
+    rm.stats.start_of_day_balance = 1000.0
+
+    EXIT_PRICE = 100.40
+    EXIT_COMMISSION = 0.06024  # 100.40 * 1.0 * 0.0006
+
+    # No 'rp' from the exchange: the calculated fallback is taken.
+    await controller._handle_final_exit(
+        SYMBOL,
+        "STOP_LOSS",
+        exit_price=EXIT_PRICE,
+        commission=EXIT_COMMISSION,
+        commission_asset="USDT",
+        order_id=2200861599,
+        client_order_id="x-sl-live-00000001",
+        realized_pnl_from_exchange=0.0,
+        exchange_pnl_available=False,
+        market_type=MARKET_TYPE,
+    )
+
+    gross = (EXIT_PRICE - ENTRY_PRICE) * QTY
+    total_commission = 0.06 + EXIT_COMMISSION
+    expected_net = gross - total_commission
+
+    # The commission of the legs the fallback recomputed must be recorded,
+    # and it must be the commission those legs actually cost.
+    assert position.total_commission == pytest.approx(total_commission, abs=1e-9), (
+        f"the position recorded a commission of {position.total_commission!r}; "
+        f"the entry ({0.06}) plus this close ({EXIT_COMMISSION}) is "
+        f"{total_commission!r}"
+    )
+
+    # The risk manager must be given the NET result, never the gross one.
+    assert rm.stats.today_pnl == pytest.approx(expected_net, abs=1e-9), (
+        f"the risk manager was told {rm.stats.today_pnl!r}; the gross result "
+        f"is {gross!r} and the NET result is {expected_net!r} (gross minus "
+        f"the commission {total_commission!r})"
+    )
+    assert rm.stats.today_pnl != pytest.approx(gross, abs=1e-9), (
+        f"the risk manager was told the GROSS result {gross!r}; a gross "
+        f"number is a number the account never earned"
+    )
+
+
+@pytest.mark.asyncio
+async def test_commission_can_turn_the_fallbacks_gross_profit_into_a_loss(money):
+    """The sign is the point: a gross profit that is a net LOSS is a loss.
+
+    The daily-loss guard reads `today_pnl`, and the consecutive-loss guard
+    reads `pnl <= 0`. Handed the gross, this close reads as a WIN and the
+    guards never fire for it. Handed the net, it reads as the loss it is.
+    """
+    controller, paper_executor, rm = _build_controller(price=100.05)
+    position = _seed_long(
+        paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY, mode="live"
+    )
+    position.entry_commission = 0.06
+    rm.stats.last_known_day_str = _utc_day_str()
+    rm.stats.current_balance = 1000.0
+    rm.stats.start_of_day_balance = 1000.0
+
+    EXIT_PRICE = 100.05
+    EXIT_COMMISSION = 0.06003  # 100.05 * 1.0 * 0.0006
+
+    await controller._handle_final_exit(
+        SYMBOL,
+        "TAKE_PROFIT",
+        exit_price=EXIT_PRICE,
+        commission=EXIT_COMMISSION,
+        commission_asset="USDT",
+        order_id=2200861599,
+        client_order_id="x-tp-live-00000001",
+        realized_pnl_from_exchange=0.0,
+        exchange_pnl_available=False,
+        market_type=MARKET_TYPE,
+    )
+
+    gross = (EXIT_PRICE - ENTRY_PRICE) * QTY
+    expected_net = gross - (0.06 + EXIT_COMMISSION)
+    assert gross > 0, f"the close must be gross profitable, got {gross}"
+    assert expected_net < 0, (
+        f"the close must be a net loss for this test to mean anything, got "
+        f"{expected_net}"
+    )
+
+    assert rm.stats.today_pnl == pytest.approx(expected_net, abs=1e-9), (
+        f"the risk manager was told {rm.stats.today_pnl!r}; the NET result is "
+        f"{expected_net!r} and the gross one is {gross!r}"
+    )
+    assert rm.stats.today_pnl < 0, (
+        "a close that is a loss after commission must be booked as a loss, "
+        "otherwise the daily-loss guard cannot see it"
+    )
+    assert rm.stats.consecutive_losses == 1, (
+        f"a net-losing close must count as one loss, got "
+        f"{rm.stats.consecutive_losses}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_final_exit_does_not_charge_the_triggering_tps_commission_twice(
+    money,
+):
+    """The commission total must count each leg ONCE.
+
+    When a partial TP closes the position, `_handle_partial_fill` stores that
+    fill's commission on the partial TP *and* passes it as the final event's
+    commission. Summing the partial TPs and then adding the event charged the
+    SAME commission twice, so the total was inflated by one exit leg.
+
+    That was harmless while the total was only RECORDED. It stopped being
+    harmless when the total became the thing subtracted from the PnL the
+    risk manager is given.
+    """
+    controller, paper_executor, rm = _build_controller(price=105.0)
+    position = _seed_long(
+        paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY, mode="live"
+    )
+    position.entry_commission = 0.06
+    # The partial TP that closed the position: FILLED, with its commission.
+    position.remaining_quantity = 0.0
+    position.partial_tp_orders = [
+        PartialTpOrderInfo(
+            target_price=105.0,
+            orig_fraction=1.0,
+            quantity=QTY,
+            order_id=2200861700,
+            client_order_id="x-ptp-test-00000001",
+            status="FILLED",
+            fill_price=105.0,
+            commission=0.03,
+        )
+    ]
+    rm.stats.last_known_day_str = _utc_day_str()
+    rm.stats.current_balance = 1000.0
+    rm.stats.start_of_day_balance = 1000.0
+
+    await controller._handle_final_exit(
+        SYMBOL,
+        "ALL_TP_CLOSED_BY_TP_1",
+        exit_price=105.0,
+        commission=0.03,
+        commission_asset="USDT",
+        order_id=2200861700,
+        client_order_id="x-ptp-test-00000001",
+        realized_pnl_from_exchange=0.0,
+        exchange_pnl_available=False,
+        market_type=MARKET_TYPE,
+    )
+
+    gross = (105.0 - ENTRY_PRICE) * QTY
+    # The entry commission plus the ONE exit leg this position had.
+    total_commission = 0.06 + 0.03
+    expected_net = gross - total_commission
+
+    assert position.total_commission == pytest.approx(total_commission, abs=1e-9), (
+        f"the position recorded a commission of {position.total_commission!r}; "
+        f"the entry ({0.06}) plus the single exit leg ({0.03}) is "
+        f"{total_commission!r} -- the triggering partial TP's commission must "
+        f"not be charged twice"
+    )
+    assert rm.stats.today_pnl == pytest.approx(expected_net, abs=1e-9), (
+        f"the risk manager was told {rm.stats.today_pnl!r}; the NET result is "
+        f"{expected_net!r} and the gross one is {gross!r}"
+    )

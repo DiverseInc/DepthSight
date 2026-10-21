@@ -24,7 +24,7 @@ from bot_module.model_pipeline import ModelPipeline
 from bot_module.realtime_ml_logger import RealtimeMLLogger
 from bot_module.data_consumer import DataConsumer
 from bot_module.executor import BinanceExecutor
-from bot_module.paper_executor import PaperTradingExecutor
+from bot_module.paper_executor import PaperTradingExecutor, net_realized_pnl
 from bot_module.risk_manager import RiskManager
 from bot_module.trade_logger import TradeLogger
 from bot_module.telegram_notifier import TelegramNotifier
@@ -10653,10 +10653,28 @@ class TradingController:
                     commission_asset=commission_asset,
                 )
 
-            # Sum commissions for all partial TPs and the current event
+            # Sum commissions for all partial TPs and the current event.
+            #
+            # The current event's commission is added below. When the trigger
+            # IS one of the partial TPs -- the ALL_TP_CLOSED_BY_TP path, where
+            # `_handle_partial_fill` stored the fill's commission on the
+            # partial TP *and* passed it as this event's commission -- that one
+            # leg's commission is already on the partial TP, so counting it in
+            # both places charges the SAME commission twice. It is skipped
+            # here and counted once, as the event's.
             for ptp_order in position.partial_tp_orders:
-                if ptp_order.commission is not None:
-                    total_commission_calculated += Decimal(str(ptp_order.commission))
+                if ptp_order.commission is None:
+                    continue
+                if (
+                    order_id is not None
+                    and str(ptp_order.order_id) == str(order_id)
+                ) or (
+                    client_order_id is not None
+                    and ptp_order.client_order_id is not None
+                    and str(ptp_order.client_order_id) == str(client_order_id)
+                ):
+                    continue
+                total_commission_calculated += Decimal(str(ptp_order.commission))
             total_commission_calculated += Decimal(str(commission))
 
             # PRIORITY: Real PnL from the exchange ('rp' field from Binance Futures WebSocket)
@@ -10723,10 +10741,29 @@ class TradingController:
                         f"{position.pnl:.4f} instead of recomputing."
                     )
                 else:
-                    position.pnl = float(total_pnl_calculated)
+                    # The value assigned here is a FRESH GROSS recomputation
+                    # of the whole position (the partial TPs' legs plus this
+                    # event's leg), so the commission of those same legs --
+                    # `total_commission_calculated`, which covers the entry,
+                    # every partial TP and this event -- is subtracted here,
+                    # ONCE, to book the NET result.
+                    #
+                    # `net_realized_pnl` is the single source of truth for
+                    # "gross minus the commission actually paid": the same
+                    # helper the paper wallet and the paper trade rows use.
+                    # Booking the GROSS here would hand the risk manager a
+                    # number the account never earned, and a close that is
+                    # profitable before commission and a LOSS after it would
+                    # be counted as a win -- the daily-loss guard would
+                    # under-count the loss and the consecutive-loss guard
+                    # would never see the losing trade.
+                    position.pnl = net_realized_pnl(
+                        total_pnl_calculated, total_commission_calculated
+                    )
                     logger.warning(
                         f"{log_prefix} Exchange realized PnL ('rp') not available for this close event — "
-                        f"using CALCULATED PnL fallback: {position.pnl:.4f}"
+                        f"using CALCULATED NET PnL fallback (gross {total_pnl_calculated:.4f} "
+                        f"minus commission {total_commission_calculated:.8f}): {position.pnl:.4f}"
                     )
 
             position.total_commission = float(total_commission_calculated)

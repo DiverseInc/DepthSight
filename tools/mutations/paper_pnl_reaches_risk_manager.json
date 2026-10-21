@@ -29,6 +29,19 @@
     "assess_signal() returns before the rollover, so without this call a",
     "blocked paper account can never recover.",
     "",
+    "I is the controller's OWN finalization booking the GROSS result. When the",
+    "exchange reports no realized PnL ('rp' is absent -- SPOT has none, and a",
+    "futures payload can omit it) _handle_final_exit recomputes the PnL from",
+    "the entry and exit prices. That recomputation is GROSS, and the",
+    "commission was computed in the same function and never subtracted from",
+    "it, so the risk manager was handed a number the account never earned.",
+    "",
+    "J is the triggering partial TP's commission charged twice. The same",
+    "commission is stored on the partial TP and passed as the final event's",
+    "commission, so it must be counted ONCE -- it was harmless while the total",
+    "was only recorded, and wrong once the total became the thing subtracted",
+    "from the PnL the risk manager is given.",
+    "",
     "Run with:  python tools/mutation_harness.py tools/mutations/paper_pnl_reaches_risk_manager.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
     "read a file that is mid-mutation and report on code that does not exist."
@@ -83,6 +96,18 @@
       "file": "bot_module/risk_manager.py",
       "needle": "                    self._check_and_reset_daily_stats()\n                    self._check_risk_limits()\n",
       "replace": "                    self._check_risk_limits()\n"
+    },
+    {
+      "label": "I: the final-exit fallback books the GROSS PnL",
+      "file": "bot_module/controller.py",
+      "needle": "                    position.pnl = net_realized_pnl(\n                        total_pnl_calculated, total_commission_calculated\n                    )\n",
+      "replace": "                    position.pnl = float(total_pnl_calculated)\n"
+    },
+    {
+      "label": "J: the triggering partial TP's commission is charged twice",
+      "file": "bot_module/controller.py",
+      "needle": "                if (\n                    order_id is not None\n                    and str(ptp_order.order_id) == str(order_id)\n                ) or (\n                    client_order_id is not None\n                    and ptp_order.client_order_id is not None\n                    and str(ptp_order.client_order_id) == str(client_order_id)\n                ):\n                    continue\n",
+      "replace": "                pass  # MUTATED: the triggering partial TP's commission is charged twice\n"
     }
   ]
 }
