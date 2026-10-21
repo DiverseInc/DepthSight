@@ -497,6 +497,88 @@ async def test_an_unverifiable_state_is_never_overwritten_with_a_zero(redis_stor
     assert json.loads(redis_store[_guard_key(rm_a)])["consecutive_losses"] == 10
 
 
+async def test_clearing_the_emergency_stop_does_not_resume_a_blocked_account(
+    redis_store,
+):
+    """An operator's "clear the kill switch" must not resume a blocked account.
+
+    Found by the DSH reviewer during the free-tier review fan-out, and
+    verified against the committed tree: ``clear_emergency_stop()`` sets
+    ``_is_trading_allowed = True`` unconditionally, with no re-evaluation of
+    the risk limits. Before the guard state was persisted this was harmless,
+    because the streak was always zero in RAM after a restart. With the
+    streak RESTORED it is not: the operator clears a kill switch and an
+    account that is still over its loss limit resumes trading.
+
+    The latch is still released -- that is what the operator asked for. What
+    must not happen is the RESTORED limit being overridden.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    rm_a.stats.consecutive_losses = 10
+    await rm_a.save_state()
+
+    rm_b = _risk_manager(redis)
+    await rm_b.initialize_balance()
+    await rm_b.restore_state()
+    assert rm_b._is_trading_allowed is False
+
+    rm_b.trigger_emergency_stop("operator pulled the plug")
+    rm_b.clear_emergency_stop()
+
+    assert rm_b.is_emergency_stop_active() is False, (
+        "the operator's clear must still release the latch"
+    )
+    assert rm_b._is_trading_allowed is False, (
+        "clearing the emergency stop must not open a gate that a RESTORED "
+        "loss streak is still holding closed -- the restored streak is the "
+        "account's real history, not an operator decision"
+    )
+    reason = rm_b.get_trading_disabled_reason()
+    assert reason and "consec losses" in reason, (
+        f"the gate must still name the loss streak, got {reason!r}"
+    )
+
+
+async def test_clearing_the_emergency_stop_does_not_open_an_unverified_gate(
+    redis_store,
+):
+    """The fail-closed latch must also survive the operator's clear."""
+    rm = _risk_manager(ExplodingRedis(redis_store))
+    await rm.initialize_balance()
+    await rm.restore_state()
+    assert rm._is_trading_allowed is False
+
+    rm.trigger_emergency_stop("operator pulled the plug")
+    rm.clear_emergency_stop()
+
+    assert rm.is_emergency_stop_active() is False
+    assert rm._is_trading_allowed is False, (
+        "clearing the emergency stop must not open a gate whose guard state "
+        "could not be verified"
+    )
+
+
+async def test_clearing_the_emergency_stop_still_resumes_a_healthy_account(
+    redis_store,
+):
+    """Positive control: the operator's clear must still work.
+
+    Without this, a fix that simply never re-opened the gate would pass the
+    tests above and leave the operator unable to resume trading.
+    """
+    rm = _risk_manager(FakeRedis(redis_store))
+    await rm.initialize_balance()
+    rm.trigger_emergency_stop("operator pulled the plug")
+    assert rm._is_trading_allowed is False
+
+    rm.clear_emergency_stop()
+
+    assert rm.is_emergency_stop_active() is False
+    assert rm._is_trading_allowed is True
+
+
 # ---------------------------------------------------------------------------
 # The invariant must not depend on the order of the start-up calls
 # ---------------------------------------------------------------------------

@@ -1172,6 +1172,25 @@ class RiskManager:
         self._emergency_stop_operator_initiated = False
         self._is_trading_allowed = True
         self._trading_disabled_reason = None
+        # The operator's clear releases the LATCH. It must not open a gate
+        # that the TRADING GUARD is holding closed.
+        #
+        # The guard state is not an operator decision: a loss streak restored
+        # from Redis is the account's real history, and an UNVERIFIED state is
+        # an infrastructure fault. Before the guard state was persisted this
+        # could not matter -- the streak was always zero in RAM after a
+        # restart -- so the unconditional re-enable was harmless. With the
+        # streak restored it is not: clearing a kill switch would resume an
+        # account that is still over its loss limit, which is exactly the
+        # hole this change exists to close, reached by another route.
+        #
+        # The sibling release_unverified_emergency_stop() has always behaved
+        # this way ("it never re-opens the global gate while a risk limit is
+        # still in force"). This keeps the operator path consistent for the
+        # state this change introduced, and leaves its documented behaviour
+        # for everything else untouched.
+        if self._guard_state_restored or self._guard_state_unverified:
+            self._check_risk_limits()
         logger.warning("EMERGENCY STOP cleared. New entries re-enabled.")
 
     def release_unverified_emergency_stop(self) -> bool:
