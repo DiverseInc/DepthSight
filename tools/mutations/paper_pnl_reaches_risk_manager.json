@@ -50,6 +50,15 @@
     "SECOND time, and under-reports the PnL of every LIVE fallback close by",
     "exactly the total commission.",
     "",
+    "L is the paper executor NOT declaring that it supports positions. The",
+    "paper book is a futures book: positions live in `self._positions` and",
+    "settle into a single USDT wallet. Without the declaration the controller",
+    "classifies the paper executor as SPOT and the SPOT-SYNC block reads a",
+    "base-asset balance a futures paper wallet never has, breaks out before",
+    "`executor.place_order`, and the wallet is never credited. The instance",
+    "attributes mirror the class declaration, so flipping the class attribute",
+    "flips the runtime behaviour too.",
+    "",
     "Run with:  python tools/mutation_harness.py tools/mutations/paper_pnl_reaches_risk_manager.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
     "read a file that is mid-mutation and report on code that does not exist."
@@ -122,6 +131,12 @@
       "file": "bot_module/controller.py",
       "needle": "                    \"exit_price\": exit_price,\n                    \"pnl\": gross_pnl_for_sinks,\n                    \"commission\": position_to_process_copy.total_commission,\n",
       "replace": "                    \"exit_price\": exit_price,\n                    \"pnl\": position_to_process_copy.pnl,\n                    \"commission\": position_to_process_copy.total_commission,\n"
+    },
+    {
+      "label": "L: the paper executor does not declare that it supports positions",
+      "file": "bot_module/paper_executor.py",
+      "needle": "    supports_positions = True\n    supports_shorting = True\n",
+      "replace": "    supports_positions = False\n    supports_shorting = True\n"
     }
   ]
 }

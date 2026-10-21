@@ -55,7 +55,7 @@ import sys
 import time
 import types
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -66,6 +66,7 @@ from bot_module.controller import (
     SignalDirection,
     TradingController,
 )
+from bot_module.datatypes import OrderMode, StrategySignal
 from bot_module.paper_executor import PaperTradingExecutor
 from bot_module.risk_manager import RiskManager
 from bot_module.runtime_dependencies import crud
@@ -1148,7 +1149,7 @@ async def test_the_trade_row_the_api_reads_carries_the_GROSS_pnl(money):
 
     `controller.get_db_session` is stubbed here. The shared `_build_controller`
     helper never sets it, so the controller's own Trade row raises an
-    AttributeError that is swallowed at controller.py:11249 -- the row is
+    AttributeError that is swallowed at controller.py:11291 -- the row is
     never visible, and the double subtraction can never be observed. Without
     this stub this test could not exist.
     """
@@ -1237,4 +1238,363 @@ async def test_the_trade_row_the_api_reads_carries_the_GROSS_pnl(money):
         f"the risk manager was told {rm.stats.today_pnl!r}; the NET result is "
         f"{expected_net!r} -- the row holds the GROSS {gross!r} and the risk "
         f"manager holds the NET, and both are correct"
+    )
+
+
+# --- 10. The ROUTINE controller close must reach the wallet and the RM ------
+#
+# THE DEFECT THIS SECTION PINS
+#
+# `PaperTradingExecutor` never declared `supports_positions`, so the
+# controller classified the paper book as a SPOT book
+# (controller.py:15381-15383) and entered the SPOT-SYNC block
+# (controller.py:15560-15643) on every LONG close. That block reads the
+# BASE-asset balance of the wallet -- a `futures_usdtm` paper book holds a
+# single USDT row and has no base asset at all -- so `free_base_qty` is 0.0
+# and `total_qty` is 0.0, and the block set `remaining_quantity = 0.0`,
+# `is_confirmed_closed = True` and BROKE, about 175 lines BEFORE
+# `executor.place_order` (controller.py:15818).
+#
+# Three consequences, all measured below:
+#
+#   1. the wallet was NEVER credited (paper_executor.py:260 never ran);
+#   2. no PAPER trade row was written (paper_executor.py:385-386, :401 never
+#      ran);
+#   3. `remaining_quantity` had already been zeroed before `_handle_final_exit`
+#      read it, so the risk manager was told `-entry_commission` -- a WINNING
+#      close was booked as a small LOSS, `consecutive_losses` went up and the
+#      daily-loss guard under-counted.
+#
+# The SL/TP resting-order fill path (`paper_executor.check_open_orders`) was
+# NEVER affected -- which is exactly why the tests above never caught it.
+#
+# THE FIX
+#
+# The paper executor declares `supports_positions` / `supports_shorting` and
+# sets `self.supports_positions = True`, so the controller treats the paper
+# book as the FUTURES book it is: it syncs the real quantity, closes through
+# `place_order`, and the wallet moves.
+
+_CLOSURE_REASON = "PM_ACTION_CLOSE"
+
+
+def _seed_short(paper_executor, controller, *, entry_price, qty, mode="paper"):
+    """Opens a paper SHORT: the executor's book AND the controller's mirror."""
+    now = datetime.now(timezone.utc)
+    paper_executor._positions[SYMBOL] = {
+        "quantity": -qty,
+        "avg_entry_price": entry_price,
+        "entry_timestamp": now,
+        "leverage": 1.0,
+        # No funding boundary is crossed, so the only wallet movement in the
+        # test is the close itself.
+        "last_funding_timestamp": now,
+        "strategy_config_id": None,
+        "entry_client_order_id": "x-entry-short-test-00000001",
+    }
+    position = LivePosition(
+        symbol=SYMBOL,
+        direction=SignalDirection.SHORT,
+        entry_price=entry_price,
+        initial_quantity=qty,
+        remaining_quantity=qty,
+        entry_time=time.time() - 3600,
+        strategy="TestStrategy",
+        status="OPEN",
+        mode=mode,
+        market_type=MARKET_TYPE,
+        user_id=None,
+        config_id=6999,
+        entry_client_order_id="x-entry-short-test-00000001",
+        entry_order_id="2200861598",
+        entry_order_status="FILLED",
+    )
+    controller._active_position_set(position)
+    return position
+
+
+def _seed_paper_book_only(paper_executor, *, entry_price, qty):
+    """A position the PAPER BOOK holds and the CONTROLLER does not know about.
+
+    This is the orphan case: the book and the controller disagree. The
+    controller's own "an active position already exists" check
+    (controller.py:8410-8415) cannot see it -- only the executor's book can.
+    """
+    now = datetime.now(timezone.utc)
+    paper_executor._positions[SYMBOL] = {
+        "quantity": qty,
+        "avg_entry_price": entry_price,
+        "entry_timestamp": now,
+        "leverage": 1.0,
+        "last_funding_timestamp": now,
+        "strategy_config_id": None,
+        "entry_client_order_id": "x-entry-orphan-test-00000001",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_paper_long_closed_by_the_controller_credits_the_wallet_and_tells_the_risk_manager(
+    money,
+):
+    """MUTATION KILLER: the ROUTINE close must move the wallet AND the RM.
+
+    This is the path the strategy exit (`PM_ACTION_CLOSE`), the regime-change
+    cut, the manual API close and every emergency close take. Before the fix
+    it never reached `executor.place_order`: the wallet was not credited, no
+    PAPER trade row was written, and the risk manager was told
+    `-entry_commission` (a LOSS) for a close that had made money.
+
+    The two numbers are compared with a 2% tolerance, and the tolerance is
+    documented rather than hidden. The wallet books the FILL (the simulator's
+    0.05% slippage included) while the controller's fallback recomputes from
+    the TICKER, and the fallback is told the ENTRY commission but not the
+    EXIT leg's. The residual is therefore
+    `slippage + (exit commission - entry commission)` -- about 0.6% of the
+    result here. What the fix changes is the SIGN: before it the guard said
+    "-0.06" while the wallet said "+9.88".
+    """
+    controller, paper_executor, rm = _build_controller(price=110.0)
+    position = _seed_long(
+        paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY
+    )
+    # The commission the opening fill actually paid. The controller knows it,
+    # so `_handle_final_exit` subtracts it from the gross result.
+    position.entry_commission = 0.06
+    rm.stats.last_known_day_str = _utc_day_str()
+    rm.stats.current_balance = 1000.0
+    rm.stats.start_of_day_balance = 1000.0
+
+    await controller.close_position(
+        SYMBOL, reason=_CLOSURE_REASON, market_type=MARKET_TYPE
+    )
+
+    # 1. THE MONEY moved: the close reached `executor.place_order`. The paper
+    #    book is a FUTURES book -- there is no base-asset balance in it, and
+    #    the controller must not go looking for one.
+    assert len(money["wallet"]) == 1, (
+        f"the close never reached the executor: the wallet was NOT credited "
+        f"({money['wallet']!r})"
+    )
+    wallet_delta = money["wallet"][0]["amount"]
+    assert wallet_delta > 0, (
+        f"a winning close must credit the wallet, got {wallet_delta!r}"
+    )
+
+    # 2. The API's number: the PAPER row the executor wrote for this fill.
+    #    It stores the GROSS result beside the commission, so the API's
+    #    `sum(pnl - commission)` is exactly what the wallet moved.
+    assert len(money["trades"]) == 1, (
+        f"expected exactly one PAPER trade row for one close, got "
+        f"{money['trades']!r}"
+    )
+    row = money["trades"][0]
+    api_number = row["pnl"] - row["commission"]
+    assert api_number == pytest.approx(wallet_delta, abs=1e-9), (
+        f"the API would report {api_number!r} but the wallet moved "
+        f"{wallet_delta!r}"
+    )
+
+    # 3. The guard was told about the close, and about the SAME result.
+    assert rm.stats.today_pnl > 0, (
+        f"the risk manager was told {rm.stats.today_pnl!r}; a winning close "
+        f"must not be booked as a loss"
+    )
+    assert rm.stats.today_pnl == pytest.approx(api_number, rel=0.02), (
+        f"the risk manager was told {rm.stats.today_pnl!r} but the API and the "
+        f"wallet say {api_number!r}; the guard and the API must read the same "
+        f"number"
+    )
+
+    # 4. A WIN must not increment the loss streak.
+    assert rm.stats.consecutive_losses == 0, (
+        f"a winning close must not increment the loss streak, got "
+        f"{rm.stats.consecutive_losses}"
+    )
+
+    # 5. No phantom position is left behind in the paper book.
+    assert SYMBOL not in paper_executor._positions, (
+        f"the paper book still holds {paper_executor._positions.get(SYMBOL)!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_paper_short_closed_by_the_controller_is_not_charged_twice(
+    money, monkeypatch
+):
+    """MUTATION KILLER: the stuck-CLOSING retry must not charge again.
+
+    The close-confirmation block is gated on `supports_positions` too
+    (controller.py:15513). While the paper executor did not declare it, the
+    controller never confirmed the close, ran all 120 attempts and then gave
+    up with "FAILED to confirm position closure" -- leaving the position in
+    CLOSING. The retry of that close re-ran `place_order` against an EMPTY
+    book: the wallet was charged a second time (a commission with no PnL
+    behind it), a second trade row with `pnl=0.0` was written, and the paper
+    book was left holding a brand-new phantom position.
+
+    The 0.5 s delay of the retry loop is NOT behaviour under test -- only the
+    wallet movements are -- so it is clamped here. Without that, the broken
+    path spends 120 attempts x 0.5 s x 2 closes in the suite.
+    """
+    real_sleep = asyncio.sleep
+
+    async def _fast_sleep(delay, *args, **kwargs):
+        return await real_sleep(
+            0 if delay and delay > 0 else delay, *args, **kwargs
+        )
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+    controller, paper_executor, rm = _build_controller(price=90.0)
+    _seed_short(paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY)
+    rm.stats.last_known_day_str = _utc_day_str()
+    rm.stats.current_balance = 1000.0
+    rm.stats.start_of_day_balance = 1000.0
+
+    await controller.close_position(
+        SYMBOL, reason=_CLOSURE_REASON, market_type=MARKET_TYPE
+    )
+    # The retry: the very same close, run again.
+    await controller.close_position(
+        SYMBOL, reason=_CLOSURE_REASON, market_type=MARKET_TYPE
+    )
+
+    # The wallet was charged ONCE.
+    assert len(money["wallet"]) == 1, (
+        f"the wallet was charged {len(money['wallet'])} times for one close: "
+        f"{money['wallet']!r}"
+    )
+    wallet_delta = money["wallet"][0]["amount"]
+    assert wallet_delta > 0, (
+        f"a winning close must credit the wallet, got {wallet_delta!r}"
+    )
+
+    # No second, empty close row.
+    assert len(money["trades"]) == 1, (
+        f"expected exactly one PAPER trade row for one close, got "
+        f"{money['trades']!r}"
+    )
+    zero_rows = [r for r in money["trades"] if float(r.get("pnl") or 0.0) == 0.0]
+    assert not zero_rows, (
+        f"a second close row with pnl=0.0 was written: {zero_rows!r}"
+    )
+
+    # The retry left no phantom position behind in the paper book.
+    assert SYMBOL not in paper_executor._positions, (
+        f"the paper book still holds {paper_executor._positions.get(SYMBOL)!r}"
+    )
+
+    # And the guard was told about the close at all.
+    assert rm.stats.today_pnl > 0, (
+        f"the risk manager was told {rm.stats.today_pnl!r}; the close never "
+        f"reached the risk manager"
+    )
+    assert rm.stats.consecutive_losses == 0, (
+        f"a winning close must not increment the loss streak, got "
+        f"{rm.stats.consecutive_losses}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_new_paper_entry_is_aborted_when_the_paper_book_already_holds_the_symbol(
+    money,
+):
+    """The pre-flight now runs for paper: a duplicate entry is ABORTED.
+
+    With `supports_positions` true, the controller's PRE-FLIGHT API CHECK
+    (controller.py:9045-9075) runs for the paper executor too, exactly as it
+    does for a live futures account: if the book already holds a position for
+    the symbol, the entry is aborted instead of being sent.
+
+    This is a deliberate behaviour change and it is pinned here so it cannot
+    change by accident:
+
+      * the paper book holds a LONG on the symbol, but the CONTROLLER has no
+        position for it -- the orphan case, where the book and the controller
+        disagree. The controller's own "an active position already exists"
+        check (controller.py:8410-8415) cannot see it; only the executor's
+        book can;
+      * before the fix the pre-flight was skipped for paper
+        (`supports_positions` was False), so the entry was SENT and the paper
+        book was silently scaled in -- a second, unplanned unit of exposure;
+      * after the fix the entry is aborted and the book is untouched.
+
+    DCA / grid scale-in is NOT affected: `_execute_dca_grid` places its
+    orders directly (`executor.place_order`, controller.py:6197, :6313,
+    :6382) and never goes through `_process_signal`.
+
+    NOTE on the log line the pre-flight prints. It says "Adopting found
+    position immediately to prevent further spam", and the code underneath
+    it only LOGS that -- it does not create the orphan position the comment
+    above it promises (controller.py:9066-9072). So the ABORT is real and is
+    what this test pins; the "adoption" is a no-op, in the live path too,
+    and is deliberately NOT changed here.
+    """
+    controller, paper_executor, rm = _build_controller(price=110.0)
+
+    # The paper book holds a position the controller does not know about.
+    _seed_paper_book_only(paper_executor, entry_price=ENTRY_PRICE, qty=QTY)
+
+    # The controller surface `_process_signal` touches before the pre-flight.
+    controller._processing_signal_lock = asyncio.Lock()
+    controller._processing_signal_for_symbol = set()
+    controller._recent_signals = {}
+    controller._signal_throttle_period = 0
+    controller._symbol_cooldown_duration = 0
+    controller._maybe_release_unverified_emergency_stop = AsyncMock(
+        return_value=None
+    )
+    # The risk manager is not what is under test here: the pre-flight is.
+    rm.is_symbol_trading_allowed = AsyncMock(return_value=True)
+    rm.assess_signal = AsyncMock(return_value=(True, QTY, 100.0, None))
+
+    strategy_instance = MagicMock()
+    strategy_instance.NAME = "TestStrategy"
+    controller.running_strategy_instances = {
+        "cfg-paper-1": (
+            strategy_instance,
+            {
+                "id": "cfg-paper-1",
+                "user_id": USER_ID,
+                "mode": "paper",
+                "config_data": {"marketType": MARKET_TYPE},
+            },
+        )
+    }
+
+    signal = StrategySignal(
+        strategy_name="TestStrategy",
+        symbol=SYMBOL,
+        direction=SignalDirection.LONG,
+        stop_loss=95.0,
+        take_profit=120.0,
+        entry_price=ENTRY_PRICE,
+        mode=OrderMode.MARKET,
+        trigger_price=110.0,
+        details={
+            "market_type": MARKET_TYPE,
+            "strategy_config_id": "cfg-paper-1",
+        },
+    )
+    pair_info = {
+        "market_type": MARKET_TYPE,
+        "last_price": 110.0,
+        "strategy_config_id": "cfg-paper-1",
+    }
+
+    await controller._process_signal(signal, pair_info)
+
+    # The book is untouched: the entry was ABORTED, not scaled in.
+    assert paper_executor._positions[SYMBOL]["quantity"] == QTY, (
+        f"the paper book was scaled in to "
+        f"{paper_executor._positions.get(SYMBOL)!r}; the pre-flight must abort "
+        f"a duplicate entry"
+    )
+    # No order was sent, so no commission was paid and no row was written.
+    assert money["wallet"] == [], (
+        f"a duplicate entry order was placed and the wallet was charged: "
+        f"{money['wallet']!r}"
+    )
+    assert money["trades"] == [], (
+        f"a duplicate entry trade row was written: {money['trades']!r}"
     )

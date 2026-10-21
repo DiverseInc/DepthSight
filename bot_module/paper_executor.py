@@ -44,6 +44,17 @@ def net_realized_pnl(gross_realized_pnl: float, commission: float) -> float:
 
 
 class PaperTradingExecutor:
+    # The paper book is a FUTURES book: positions live in self._positions and
+    # settle into a single USDT wallet. Without this the controller classifies
+    # the paper executor as SPOT (controller.py:15381-15383) and the SPOT-SYNC
+    # block (controller.py:15560-15643) reads a base-asset balance a futures
+    # paper wallet never has, breaking out before executor.place_order
+    # (controller.py:15818) -- so the wallet is never credited, no PAPER trade
+    # row is written, and the risk manager is told about a close that never
+    # happened.
+    supports_positions = True
+    supports_shorting = True
+
     def __init__(
         self,
         user_id: int,
@@ -58,6 +69,12 @@ class PaperTradingExecutor:
         self._open_orders: Dict[str, Dict[str, Any]] = {}
         self._positions: Dict[str, Dict[str, Any]] = {}
         self.market_type = "futures_usdtm"
+        # The instance attributes MIRROR the class declaration above, so an
+        # instance always carries them and `getattr(executor,
+        # "supports_positions", False)` can never fall back to False for a
+        # paper book. The class attribute stays the single source of truth.
+        self.supports_positions = type(self).supports_positions
+        self.supports_shorting = type(self).supports_shorting
         self._db_lock = asyncio.Lock()
         self.controller = None  # Will be set by the controller after initialization
         self._equity_initialized = False  # Flag for initial point initialization
