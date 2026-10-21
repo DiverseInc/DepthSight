@@ -264,6 +264,14 @@ REDIS_STATE_KEY_STRATEGIES = os.environ.get(
 REDIS_STATE_KEY_POSITIONS = os.environ.get(
     "REDIS_STATE_KEY_POSITIONS", "depthsight:state:positions"
 )
+# The bot's PRIVATE, authoritative record of its trading-guard state (the
+# loss streak and the day's PnL). Deliberately a SEPARATE key from
+# REDIS_STATE_KEY_PORTFOLIO: that key is the PUBLISHED view of the account
+# and PR #25 fixed the API's reading of it, so its shape must not change.
+# This key is written and read only by the bot.
+REDIS_STATE_KEY_RISK = os.environ.get(
+    "REDIS_STATE_KEY_RISK", "depthsight:state:risk"
+)
 
 # Market-data specific Redis (separate instance for fan-out).
 MARKET_REDIS_HOST = os.environ.get("MARKET_REDIS_HOST", REDIS_HOST)

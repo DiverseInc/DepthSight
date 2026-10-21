@@ -21,6 +21,28 @@ import redis.asyncio as redis_asyncio
 
 logger = logging.getLogger("bot_module.risk_manager")
 
+# The trading-guard state -- the consecutive-loss streak and the day's PnL --
+# is persisted to Redis so that a restart cannot silently un-block a
+# correctly blocked account. These constants bound the Redis round trip: a
+# hung Redis must never stall the controller's periodic loop, and a lost
+# write must never stall a trade handler.
+RISK_STATE_PERSIST_TIMEOUT_SECONDS = 5.0
+
+# The version of the persisted payload. Bump it when the shape changes in a
+# way that an older reader would misread.
+RISK_STATE_VERSION = 1
+
+# Why the gate is closed while the guard state is UNVERIFIABLE.
+#
+# This is an INFRASTRUCTURE fault, not an operator decision: unlike the
+# emergency stop it is released automatically as soon as the state can be
+# read again (see RiskManager._reverify_guard_state), so a Redis blip costs
+# availability for as long as Redis is down and not a human decision.
+RISK_GUARD_UNVERIFIED_REASON = (
+    "risk guard state could not be verified at start-up (Redis unreachable) "
+    "- trading disabled until the state can be read"
+)
+
 
 @dataclass
 class TradeStats:
@@ -95,6 +117,18 @@ class RiskManager:
         self.user_id = user_id
         self.db_session = db_session
         self.api_key_name = api_key_name
+        # The api key this controller owns, used to scope the persisted
+        # trading-guard state. The controller fills it in (see
+        # TradingController.__init__), because the RiskManager is constructed
+        # before the controller exists.
+        #
+        # The api_key_NAME is deliberately NOT the scope: names are not
+        # unique per user (the api_keys table has no unique constraint on
+        # (user_id, name)), so two controllers of the same user could share a
+        # name -- and would then share one guard key, so one controller's
+        # write could erase the other controller's loss streak. The api key
+        # ID is unique and stable across a rename.
+        self.api_key_id: Optional[int] = None
         self.stats = TradeStats()
         self.trade_history: List[Dict[str, Any]] = []
 
@@ -259,6 +293,27 @@ class RiskManager:
         # stops all trading until the next restart. See
         # TradingController._maybe_release_unverified_emergency_stop().
         self._emergency_stop_operator_initiated: bool = False
+        # True when the TRADING-GUARD state (the loss streak, the day's PnL)
+        # could NOT be read at start-up.
+        #
+        # While this is set the in-memory counters are NOT trustworthy: the
+        # process was born with a zero streak because the persisted state
+        # could not be fetched, and a zero streak reads as "no losses" -- the
+        # exact state that un-blocks a correctly blocked account. The gate
+        # therefore stays CLOSED until the state can be read again
+        # (RiskManager._reverify_guard_state).
+        self._guard_state_unverified: bool = False
+        # True once a persisted trading-guard state has been APPLIED to this
+        # process. `initialize_balance()` re-baselines the trading day, and
+        # doing that after the restore would wipe the restored loss streak --
+        # so the re-baseline is skipped while this is set. It makes the
+        # guarantee hold regardless of the order in which the controller
+        # calls the two, instead of relying on one particular order.
+        self._guard_state_restored: bool = False
+        # Serialises the read-snapshot + write of the guard state, so a
+        # periodic tick and a trade handler cannot interleave and leave the
+        # OLDER snapshot on disk last.
+        self._risk_state_write_lock = asyncio.Lock()
         # WHY the trading gate is closed, in words an operator can act on.
         #
         # `is_symbol_trading_allowed()` used to return a bare False, so a
@@ -305,6 +360,15 @@ class RiskManager:
         )
 
         # Redis (no changes)
+        # The key namespace is assigned BEFORE the client is created, so it
+        # exists even when the client cannot be: the guard-state code paths
+        # must always be able to NAME the key they failed on.
+        #
+        # This is the DEDICATED guard-state key, NOT
+        # REDIS_STATE_KEY_PORTFOLIO. The portfolio key is the published view
+        # of the account and PR #25 fixed the API's reading of it, so its
+        # shape must not change.
+        self.redis_state_key = config.REDIS_STATE_KEY_RISK
         try:
             self.redis_client = redis_asyncio.Redis(
                 host=config.REDIS_HOST,
@@ -314,7 +378,6 @@ class RiskManager:
                 password=config.REDIS_PASSWORD,
                 decode_responses=True,
             )
-            self.redis_state_key = config.REDIS_STATE_KEY_PORTFOLIO
             logger.info("RiskManager initialized Redis client for state publishing.")
         except Exception as e:
             logger.error(f"Failed to initialize Redis client in RiskManager: {e}")
@@ -578,26 +641,61 @@ class RiskManager:
                 f"Initializing for a new trading day scenario. ActualCurrentDay: {current_trading_day_str_utc_actual}"
             )
 
-            self.stats.start_of_day_balance = self.stats.current_balance
-            self.stats.today_pnl = 0.0
-            self.stats.consecutive_losses = 0
-            self.stats.current_trading_day_start_ts = (
-                current_trading_day_start_ts_float_actual
+            guard_state_unverifiable = bool(
+                getattr(self, "_guard_state_unverified", False)
             )
-            self.stats.last_known_day_str = current_trading_day_str_utc_actual
-            # Never re-open the global gate while the emergency-stop latch is
-            # engaged. That latch is the operator's kill switch and is released
-            # only by clear_emergency_stop(). Entries were already refused
-            # correctly (the latch is checked first), but this flag is what the
-            # controller publishes and the API now surfaces, so leaving it True
-            # would report "trading allowed" during a kill switch.
-            if not self._emergency_stop_active:
-                self._is_trading_allowed = True
-                self._global_gate_disable_reason = None
+            guard_state_restored_today = bool(
+                getattr(self, "_guard_state_restored", False)
+                and self.stats.last_known_day_str == current_trading_day_str_utc_actual
+            )
+            if guard_state_unverifiable or guard_state_restored_today:
+                # The trading-guard state was restored from Redis on this very
+                # start, OR it could not be read at all. Re-baselining the
+                # trading day here would WIPE the restored loss streak and the
+                # day's PnL -- which is the defect the restore exists to fix,
+                # reintroduced one layer down. And in the UNVERIFIED case it
+                # would re-open the gate, which is exactly what the
+                # fail-closed rule forbids.
+                #
+                # This branch runs on EVERY successful initialize_balance()
+                # call, not only on a real day change, and the controller
+                # calls initialize_balance() on the same start as the
+                # restore. The guard state therefore has to survive it --
+                # making the invariant hold regardless of the call order
+                # rather than relying on one.
+                #
+                # The gate is NOT re-opened either: it must reflect the
+                # restored streak. update_balance() above already
+                # re-evaluated the limits against the fresh balance.
+                logger.info(
+                    f"Trading day NOT re-baselined: the trading-guard state "
+                    f"(unverifiable={guard_state_unverifiable}, "
+                    f"restored_today={guard_state_restored_today}) "
+                    f"must not be reset for {current_trading_day_str_utc_actual}. "
+                    f"Start of day balance stays at "
+                    f"${self.stats.start_of_day_balance:.2f}."
+                )
+            else:
+                self.stats.start_of_day_balance = self.stats.current_balance
+                self.stats.today_pnl = 0.0
+                self.stats.consecutive_losses = 0
+                self.stats.current_trading_day_start_ts = (
+                    current_trading_day_start_ts_float_actual
+                )
+                self.stats.last_known_day_str = current_trading_day_str_utc_actual
+                # Never re-open the global gate while the emergency-stop latch is
+                # engaged. That latch is the operator's kill switch and is released
+                # only by clear_emergency_stop(). Entries were already refused
+                # correctly (the latch is checked first), but this flag is what the
+                # controller publishes and the API now surfaces, so leaving it True
+                # would report "trading allowed" during a kill switch.
+                if not self._emergency_stop_active:
+                    self._is_trading_allowed = True
+                    self._global_gate_disable_reason = None
 
-            logger.info(
-                f"Daily stats reset for new day {current_trading_day_str_utc_actual}. Start of day balance: ${self.stats.start_of_day_balance:.2f}."
-            )
+                logger.info(
+                    f"Daily stats reset for new day {current_trading_day_str_utc_actual}. Start of day balance: ${self.stats.start_of_day_balance:.2f}."
+                )
         else:
             logger.error(
                 f"Failed to initialize balance (FetchSuccess={success_fetch}, BalanceFromExecutor={self.stats.current_balance}). Trading may be disabled."
@@ -846,6 +944,13 @@ class RiskManager:
             f"Global PnL Updated: PnL={pnl:.2f}, GlobalTodayPnL={self.stats.today_pnl:.2f}, GlobalConsecLosses={self.stats.consecutive_losses}"
         )
         self._check_risk_limits()
+
+        # Persist the guard state NOW, not on the controller's next periodic
+        # tick: the streak is what closes the gate, so a process that dies
+        # between this loss and that tick would restart with a SMALLER
+        # streak than the one that closed the gate -- the same hole this
+        # whole change exists to close, just smaller.
+        await self.save_state()
 
         # AUTO-BLACKLIST: Tracking consecutive stops by symbols
         # Excluding BE (Break-Even) from stop count for blacklist
@@ -1109,6 +1214,25 @@ class RiskManager:
         self._emergency_stop_operator_initiated = False
         self._is_trading_allowed = True
         self._trading_disabled_reason = None
+        # The operator's clear releases the LATCH. It must not open a gate
+        # that the TRADING GUARD is holding closed.
+        #
+        # The guard state is not an operator decision: a loss streak restored
+        # from Redis is the account's real history, and an UNVERIFIED state is
+        # an infrastructure fault. Before the guard state was persisted this
+        # could not matter -- the streak was always zero in RAM after a
+        # restart -- so the unconditional re-enable was harmless. With the
+        # streak restored it is not: clearing a kill switch would resume an
+        # account that is still over its loss limit, which is exactly the
+        # hole this change exists to close, reached by another route.
+        #
+        # The sibling release_unverified_emergency_stop() has always behaved
+        # this way ("it never re-opens the global gate while a risk limit is
+        # still in force"). This keeps the operator path consistent for the
+        # state this change introduced, and leaves its documented behaviour
+        # for everything else untouched.
+        if self._guard_state_restored or self._guard_state_unverified:
+            self._check_risk_limits()
         logger.warning("EMERGENCY STOP cleared. New entries re-enabled.")
 
     def release_unverified_emergency_stop(self) -> bool:
@@ -1550,6 +1674,18 @@ class RiskManager:
             )
 
     def _check_risk_limits(self):  # Global limits
+        # A risk limit may only be treated as "within range" when the numbers
+        # it is computed from are KNOWN. If the guard state could not be read
+        # at start-up then the loss streak and the day's PnL are unknown, so
+        # no limit can be shown to be satisfied -- and a limit that is
+        # silently assumed to be satisfied is exactly how a blocked account
+        # gets un-blocked. Fail CLOSED until the state can be read again.
+        if getattr(self, "_guard_state_unverified", False):
+            self._is_trading_allowed = False
+            self._global_gate_disable_reason = RISK_GUARD_UNVERIFIED_REASON
+            if not getattr(self, "_emergency_stop_active", False):
+                self._trading_disabled_reason = RISK_GUARD_UNVERIFIED_REASON
+            return
         should_be_allowed = True
         disable_reason = ""
         if self.stats.current_balance < self.min_balance_threshold:
@@ -2320,8 +2456,298 @@ class RiskManager:
             return perf_stats.total_pnl_usd
         return 0.0
 
+    # ------------------------------------------------------------------
+    # Trading-guard state persistence
+    # ------------------------------------------------------------------
+    #
+    # `TradeStats.consecutive_losses` and `TradeStats.today_pnl` used to live
+    # in RAM only: `save_state()` was a no-op (`pass`), so the numbers that
+    # decide whether the account may trade were born again at zero on every
+    # process start.
+    #
+    # Measured in production on 2026-10-21: a routine deploy restart moved a
+    # blocked account's `consecutive_losses` from 10 to 0 and the trading gate
+    # from blocked to allowed. The account was correctly blocked by the loss
+    # streak, and a deploy silently un-blocked it.
+    #
+    # The state is mirrored into a DEDICATED Redis key
+    # (`REDIS_STATE_KEY_RISK`). It is NOT written into
+    # `REDIS_STATE_KEY_PORTFOLIO`: that key is the published view of the
+    # account and PR #25 fixed the API's reading of it, so its shape must not
+    # change.
+    #
+    # WHAT IS PERSISTED
+    #   * consecutive_losses -- the loss streak. This is the counter that
+    #     closes the gate, so it is the whole point of the change.
+    #   * today_pnl -- the day's realised PnL, which the daily-loss and
+    #     drawdown limits are computed from.
+    #   * start_of_day_balance -- the day's baseline. It travels with
+    #     today_pnl because those limits are a RATIO against it: a PnL
+    #     without its baseline would be measured against the wrong
+    #     denominator and could close (or open) the gate on a fiction.
+    #   * day_str -- the UTC date the numbers belong to, so the daily
+    #     rollover cannot resurrect a previous day's PnL.
+    #
+    # WHAT IS DELIBERATELY NOT PERSISTED
+    #   * The emergency-stop latch. It is ALREADY durable: the API writes
+    #     `emergency_stop:{user_id}` and the controller restores it, with a
+    #     deliberate distinction between an operator's kill switch and an
+    #     infrastructure failure. A second copy here would be a second source
+    #     of truth that could resurrect a stop the operator had cleared.
+    #   * The trading-disabled latch itself. It is DERIVED: the gate is
+    #     recomputed by _check_risk_limits() from the restored numbers, so a
+    #     persisted latch could only ever be a stale one.
+    #   * The balance. It is live-fetched from the exchange and is not a
+    #     persisted quantity.
+    #   * current_trading_day_start_ts. It is written and never read
+    #     anywhere in the codebase, so persisting it would be noise.
+
+    def _risk_state_redis_key(self) -> str:
+        """The dedicated Redis key holding THIS controller's guard state.
+
+        Scoped per user AND per api key, exactly like the portfolio key
+        (``depthsight:state:portfolio:{user_id}:{api_key_id}``), so two
+        controllers of the same user cannot overwrite each other's streak.
+        The streak is a PER-CONTROLLER quantity -- the API reports the MAX
+        across controllers -- so one shared key would make a controller
+        restore another controller's counter.
+        """
+        return f"{self.redis_state_key}:{self.user_id}:{self.api_key_id}"
+
+    def _current_utc_day_str(self) -> str:
+        """The UTC calendar date the current trading day belongs to."""
+        return self._get_current_day_start_info()[1]
+
     async def save_state(self):
-        pass
+        """Persist the trading-guard state so it survives a restart.
+
+        The controller AWAITS this on its periodic tick, and the Redis write
+        is awaited too (bounded by a hard timeout). It is deliberately NOT
+        fire-and-forget: the guarantee only holds if what is on disk is what
+        the controller believes in. A failed write is logged CRITICAL and
+        swallowed -- a Redis outage must not take the trading loop down -- but
+        it is never silent.
+        """
+        async with self._risk_state_write_lock:
+            if self._guard_state_unverified:
+                # The in-memory counters are NOT trustworthy: the process was
+                # born with a zero streak because the persisted state could
+                # not be read. Writing them now would DESTROY the persisted
+                # truth, so read it again first and write only what that
+                # read returns.
+                if not await self._reverify_guard_state():
+                    return
+
+            if not self.redis_client:
+                logger.critical(
+                    "[RiskGuard] No redis_client; the trading-guard state will "
+                    "NOT survive a restart. Fix the Redis connection."
+                )
+                return
+
+            payload = {
+                "version": RISK_STATE_VERSION,
+                "day_str": self.stats.last_known_day_str
+                or self._current_utc_day_str(),
+                "consecutive_losses": int(self.stats.consecutive_losses),
+                "today_pnl": float(self.stats.today_pnl),
+                "start_of_day_balance": float(self.stats.start_of_day_balance),
+                "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                await asyncio.wait_for(
+                    self.redis_client.set(
+                        self._risk_state_redis_key(),
+                        json.dumps(payload, default=str),
+                    ),
+                    timeout=RISK_STATE_PERSIST_TIMEOUT_SECONDS,
+                )
+                logger.debug(
+                    "[RiskGuard] Persisted the trading-guard state: "
+                    "consecutive_losses=%s today_pnl=%.2f (UTC day %s).",
+                    payload["consecutive_losses"],
+                    payload["today_pnl"],
+                    payload["day_str"],
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"[RiskGuard] FAILED to persist the trading-guard state to "
+                    f"{self._risk_state_redis_key()}: {exc}. The loss streak "
+                    "will NOT survive a restart.",
+                    exc_info=True,
+                )
+
+    async def restore_state(self) -> bool:
+        """Restore the trading-guard state a previous process persisted.
+
+        Called ONCE at start-up, before anything can trade. Returns True when
+        a state was restored.
+
+        FAIL-CLOSED. If the state cannot be read the gate stays closed until
+        it can be: a verification failure must never turn into permission to
+        trade. Unlike the operator's emergency stop, this latch is an
+        INFRASTRUCTURE fault and is released automatically as soon as the
+        state can be read again (see `_reverify_guard_state`), so a Redis
+        blip costs availability for as long as Redis is down and not a human
+        decision.
+        """
+        payload, error = await self._read_persisted_guard_state()
+        if error is not None:
+            self._guard_state_unverified = True
+            self._is_trading_allowed = False
+            self._global_gate_disable_reason = RISK_GUARD_UNVERIFIED_REASON
+            if not self._emergency_stop_active:
+                self._trading_disabled_reason = RISK_GUARD_UNVERIFIED_REASON
+            logger.critical(
+                f"[RiskGuard] FAILED to read the trading-guard state from "
+                f"{self._risk_state_redis_key()}: {error}. Trading stays "
+                "DISABLED until the state can be read (fail-closed)."
+            )
+            return False
+
+        self._guard_state_unverified = False
+        if payload is None:
+            logger.info(
+                "[RiskGuard] No persisted trading-guard state: starting with an "
+                "empty loss streak. This is a first boot, not a lost state."
+            )
+            return False
+        return self._apply_persisted_guard_state(payload)
+
+    async def _read_persisted_guard_state(
+        self,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Read the persisted trading-guard state.
+
+        Returns `(payload, error)`. `payload` is None when nothing is
+        persisted (a first boot, or a bot that never traded). `error` is a
+        human-readable string when the state could NOT be read -- the caller
+        must then fail closed.
+        """
+        if not self.redis_client:
+            return None, "there is no redis client"
+        key = self._risk_state_redis_key()
+        try:
+            raw = await asyncio.wait_for(
+                self.redis_client.get(key),
+                timeout=RISK_STATE_PERSIST_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            return None, (
+                f"the read timed out after {RISK_STATE_PERSIST_TIMEOUT_SECONDS}s"
+            )
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+
+        if not raw:
+            return None, None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            return None, f"the persisted payload is not valid JSON ({exc})"
+        if not isinstance(payload, dict):
+            return None, "the persisted payload is not a JSON object"
+        return payload, None
+
+    def _apply_persisted_guard_state(self, payload: Dict[str, Any]) -> bool:
+        """Apply a persisted guard state to this RiskManager.
+
+        Returns True when a state was applied, False when it was discarded
+        because it belongs to a previous UTC day.
+        """
+        current_day_str = self._current_utc_day_str()
+        persisted_day_str = str(payload.get("day_str") or "")
+        if persisted_day_str != current_day_str:
+            # The daily rollover resets the loss streak and the day's PnL at
+            # the UTC day boundary. A previous day's numbers must not be
+            # resurrected: doing so would re-block an account whose streak
+            # was legitimately cleared, and would carry a stale PnL into a
+            # new day.
+            logger.info(
+                "[RiskGuard] Discarding the persisted trading-guard state: it "
+                "belongs to UTC day %r and today is %r. The daily rollover "
+                "clears the loss streak and the day's PnL at the UTC day "
+                "boundary.",
+                persisted_day_str,
+                current_day_str,
+            )
+            return False
+
+        try:
+            consecutive_losses = int(payload.get("consecutive_losses") or 0)
+        except (TypeError, ValueError):
+            consecutive_losses = 0
+        try:
+            today_pnl = float(payload.get("today_pnl") or 0.0)
+        except (TypeError, ValueError):
+            today_pnl = 0.0
+        try:
+            start_of_day_balance = float(payload.get("start_of_day_balance") or 0.0)
+        except (TypeError, ValueError):
+            start_of_day_balance = 0.0
+
+        # The streak only ever grows within a UTC day (it is reset by a win
+        # or by the daily rollover), so the higher of the persisted and the
+        # in-memory value is the conservative -- and, after a failed restore,
+        # the more likely correct -- one.
+        self.stats.consecutive_losses = max(
+            0,
+            consecutive_losses,
+            int(self.stats.consecutive_losses or 0),
+        )
+        self.stats.today_pnl = today_pnl
+        if start_of_day_balance > 0:
+            self.stats.start_of_day_balance = start_of_day_balance
+        self.stats.last_known_day_str = current_day_str
+        self._guard_state_restored = True
+
+        # Re-evaluate the gate against the restored numbers. The start-up
+        # path re-opened the gate on the way in (initialize_balance resets
+        # the counters and the gate); this closes it again when the restored
+        # streak still breaches the limit.
+        self._check_risk_limits()
+        if not self._is_trading_allowed and not self._emergency_stop_active:
+            if self._global_gate_disable_reason:
+                self._trading_disabled_reason = self._global_gate_disable_reason
+
+        logger.critical(
+            "[RiskGuard] RESTORED the trading-guard state: consecutive_losses=%s "
+            "today_pnl=%.2f (UTC day %s). The trading gate is %s.",
+            self.stats.consecutive_losses,
+            self.stats.today_pnl,
+            current_day_str,
+            "CLOSED" if not self._is_trading_allowed else "open",
+        )
+        return True
+
+    async def _reverify_guard_state(self) -> bool:
+        """Try again to read the persisted guard state.
+
+        Releases the fail-closed start-up latch once the state can be read
+        again. Returns True when the state could be read, and therefore the
+        in-memory counters can be trusted again.
+        """
+        payload, error = await self._read_persisted_guard_state()
+        if error is not None:
+            logger.critical(
+                f"[RiskGuard] Still cannot read the trading-guard state from "
+                f"{self._risk_state_redis_key()}: {error}. Trading stays "
+                "DISABLED (fail-closed)."
+            )
+            return False
+        self._guard_state_unverified = False
+        if payload is not None:
+            self._apply_persisted_guard_state(payload)
+        else:
+            # Nothing is persisted, so the streak really is empty.
+            self._check_risk_limits()
+        logger.warning(
+            "[RiskGuard] The trading-guard state is verifiable again. The "
+            "fail-closed start-up latch is released."
+        )
+        return True
 
     def _adjust_and_round_quantity(
         self,
