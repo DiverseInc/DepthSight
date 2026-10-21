@@ -42,6 +42,14 @@
     "was only recorded, and wrong once the total became the thing subtracted",
     "from the PnL the risk manager is given.",
     "",
+    "K is the controller's OWN Trade row storing the NET PnL next to the",
+    "commission. `api/routes/portfolio.py` reports `sum(Trade.pnl -",
+    "Trade.commission)` in BOTH the PAPER branch and the LIVE branch, so the",
+    "row's pnl has to be the GROSS result: the commission is subtracted from",
+    "it THERE. A NET value in the row makes the API subtract the commission a",
+    "SECOND time, and under-reports the PnL of every LIVE fallback close by",
+    "exactly the total commission.",
+    "",
     "Run with:  python tools/mutation_harness.py tools/mutations/paper_pnl_reaches_risk_manager.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
     "read a file that is mid-mutation and report on code that does not exist."
@@ -108,6 +116,12 @@
       "file": "bot_module/controller.py",
       "needle": "                if (\n                    order_id is not None\n                    and str(ptp_order.order_id) == str(order_id)\n                ) or (\n                    client_order_id is not None\n                    and ptp_order.client_order_id is not None\n                    and str(ptp_order.client_order_id) == str(client_order_id)\n                ):\n                    continue\n",
       "replace": "                pass  # MUTATED: the triggering partial TP's commission is charged twice\n"
+    },
+    {
+      "label": "K: the controller's Trade row stores the NET pnl, so the API subtracts the commission twice",
+      "file": "bot_module/controller.py",
+      "needle": "                    \"exit_price\": exit_price,\n                    \"pnl\": gross_pnl_for_sinks,\n                    \"commission\": position_to_process_copy.total_commission,\n",
+      "replace": "                    \"exit_price\": exit_price,\n                    \"pnl\": position_to_process_copy.pnl,\n                    \"commission\": position_to_process_copy.total_commission,\n"
     }
   ]
 }

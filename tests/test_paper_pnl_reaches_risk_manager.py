@@ -1120,3 +1120,121 @@ async def test_the_final_exit_does_not_charge_the_triggering_tps_commission_twic
         f"the risk manager was told {rm.stats.today_pnl!r}; the NET result is "
         f"{expected_net!r} and the gross one is {gross!r}"
     )
+
+
+# --- 9. The Trade row the API reads must carry the GROSS ---------------------
+#
+# `api/routes/portfolio.py` reports `sum(Trade.pnl - Trade.commission)` to the
+# user -- in the PAPER branch (:237) and in the LIVE branch (:407). That is the
+# ONLY thing the API computes out of the Trade row, so the row's `pnl` has to
+# be the GROSS result and the row's `commission` the commission actually paid.
+#
+# The controller's own row is the one writer that did not follow that
+# convention: it stored the very same `position.pnl` the risk manager is
+# given. While that value was the GROSS (before c43ae18) the row was right by
+# accident. The moment it became the NET, the API subtracted the commission a
+# SECOND time and under-reported the PnL of every LIVE fallback close by
+# exactly the total commission.
+#
+# None of the tests above can kill that: they inspect `position.pnl` and the
+# risk manager's `today_pnl`, never the row the API reads. This one does.
+
+_EXIT_ROW_REASON = "STOP_LOSS"
+
+
+@pytest.mark.asyncio
+async def test_the_trade_row_the_api_reads_carries_the_GROSS_pnl(money):
+    """MUTATION KILLER: the row must hold the GROSS, beside the commission.
+
+    `controller.get_db_session` is stubbed here. The shared `_build_controller`
+    helper never sets it, so the controller's own Trade row raises an
+    AttributeError that is swallowed at controller.py:11249 -- the row is
+    never visible, and the double subtraction can never be observed. Without
+    this stub this test could not exist.
+    """
+    controller, paper_executor, rm = _build_controller(price=100.40)
+    position = _seed_long(
+        paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY, mode="live"
+    )
+    # The commission the exchange charged on the opening fill.
+    position.entry_commission = 0.06
+    rm.stats.last_known_day_str = _utc_day_str()
+    rm.stats.current_balance = 1000.0
+    rm.stats.start_of_day_balance = 1000.0
+
+    EXIT_PRICE = 100.40
+    EXIT_COMMISSION = 0.06024  # 100.40 * 1.0 * 0.0006
+
+    async def _fake_get_db_session():
+        yield _FakeDB()
+
+    controller.get_db_session = _fake_get_db_session
+
+    class _FakeTradeLoggerWithDiary(_FakeTradeLogger):
+        """The real TradeLogger has `log_closed_trade_to_diary`; the shared
+        fake does not. The controller's DB row write reuses `r_multiplier_val`,
+        which is computed inside that diary block, so without this method the
+        row write raises UnboundLocalError and the row is never written.
+        """
+
+        def log_closed_trade_to_diary(self, *args, **kwargs):
+            pass
+
+    controller.trade_logger = _FakeTradeLoggerWithDiary()
+
+    # No 'rp' from the exchange: the calculated fallback is taken.
+    await controller._handle_final_exit(
+        SYMBOL,
+        _EXIT_ROW_REASON,
+        exit_price=EXIT_PRICE,
+        commission=EXIT_COMMISSION,
+        commission_asset="USDT",
+        order_id=2200861599,
+        client_order_id="x-sl-live-00000001",
+        realized_pnl_from_exchange=0.0,
+        exchange_pnl_available=False,
+        market_type=MARKET_TYPE,
+    )
+
+    gross = (EXIT_PRICE - ENTRY_PRICE) * QTY
+    total_commission = 0.06 + EXIT_COMMISSION
+    expected_net = gross - total_commission
+
+    # The controller's own row is the row the API reads.
+    rows = [r for r in money["trades"] if r.get("exit_reason") == _EXIT_ROW_REASON]
+    assert len(rows) == 1, (
+        f"expected exactly one controller Trade row, got {money['trades']!r}"
+    )
+    row = rows[0]
+
+    # The row stores the GROSS result, because the API subtracts the
+    # commission itself. A NET value here would be charged the commission
+    # twice: the reported PnL would be `gross - 2 * commission`.
+    assert row["pnl"] == pytest.approx(gross, abs=1e-9), (
+        f"the Trade row holds a pnl of {row['pnl']!r}; it must hold the GROSS "
+        f"result {gross!r} and never the NET one {expected_net!r} -- the API "
+        f"computes `sum(pnl - commission)`, so a NET value in the row "
+        f"subtracts the commission a second time and under-reports the PnL "
+        f"by exactly the commission"
+    )
+
+    # The commission lives in its own column and is not touched.
+    assert row["commission"] == pytest.approx(total_commission, abs=1e-9), (
+        f"the Trade row holds a commission of {row['commission']!r}; the entry "
+        f"({0.06}) plus this close ({EXIT_COMMISSION}) is {total_commission!r}"
+    )
+
+    # And what the API reports is the NET result -- the same number the risk
+    # manager was given. The two conventions are split, not confused.
+    assert row["pnl"] - row["commission"] == pytest.approx(
+        expected_net, abs=1e-9
+    ), (
+        f"the API would report {row['pnl'] - row['commission']!r}; the NET "
+        f"result is {expected_net!r} (gross {gross!r} minus the commission "
+        f"{total_commission!r})"
+    )
+    assert rm.stats.today_pnl == pytest.approx(expected_net, abs=1e-9), (
+        f"the risk manager was told {rm.stats.today_pnl!r}; the NET result is "
+        f"{expected_net!r} -- the row holds the GROSS {gross!r} and the risk "
+        f"manager holds the NET, and both are correct"
+    )
