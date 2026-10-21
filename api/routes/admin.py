@@ -264,7 +264,9 @@ async def get_available_bonuses():
 
 @admin_router.get("/analytics/foundations", response_model=List[schemas.FoundationStat])
 async def get_foundation_stats(
-    source_type: str = Query(..., enum=["backtest", "live", "paper"]),
+    source_type: str = Query(
+        ..., json_schema_extra={"enum": ["backtest", "live", "paper"]}
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -279,7 +281,9 @@ async def get_foundation_stats(
     "/analytics/market-sentiment", response_model=List[schemas.MarketSentimentStat]
 )
 async def get_market_sentiment_stats(
-    source_type: str = Query(..., enum=["backtest", "live", "paper"]),
+    source_type: str = Query(
+        ..., json_schema_extra={"enum": ["backtest", "live", "paper"]}
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -337,7 +341,7 @@ async def trigger_system_update(
 @admin_router.get("/logs/errors")
 async def get_all_error_logs(
     limit: int = Query(100, ge=1, le=500),
-    level: str = Query("ERROR", enum=["ERROR", "WARNING"]),
+    level: str = Query("ERROR", json_schema_extra={"enum": ["ERROR", "WARNING"]}),
     db: AsyncSession = Depends(get_db),
     redis_client: redis.Redis = Depends(get_redis_client),
 ):
