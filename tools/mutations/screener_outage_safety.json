@@ -1,0 +1,72 @@
+{
+  "_comment": [
+    "Mutations that reintroduce the three screener-outage defects.",
+    "",
+    "C1: a feed DISABLED BY CONFIGURATION must still raise the",
+    "    RISK-CONTROL OUTAGE alarm. The escalation lives in the",
+    "    reconnect-failure handler, which a disabled feed never creates.",
+    "C2: a regime-change stop must not be ARMED on a deployment whose",
+    "    screener feed cannot deliver the regime data. C2-B is the",
+    "    FALSE-POSITIVE mutation: it makes the predicate refuse a",
+    "    protection that WOULD have worked, which must also be caught.",
+    "C3: one symbol's failure must not throw away the context for the",
+    "    others, one outage must not cost one timeout per symbol, and",
+    "    the degradation must be visible.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/screener_outage_safety.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_disabled_ws_feed_raises_risk_alarm.py tests/test_regime_change_arm_guard.py tests/test_ai_rag_partial_screener_failure.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "C1-A: the disabled-feed branch never detects a strategy whose regime-change stop depends on the feed",
+      "file": "bot_module/data_consumer.py",
+      "needle": "                dynamic_possible = bool(\n                    getattr(config, \"SYMBOL_SELECTION_ALLOW_DYNAMIC\", False)\n                )\n                regime_at_risk = self._regime_change_controls_at_risk()\n",
+      "replace": "                dynamic_possible = bool(\n                    getattr(config, \"SYMBOL_SELECTION_ALLOW_DYNAMIC\", False)\n                )\n                regime_at_risk = False  # MUTANT: a dependency is never seen\n"
+    },
+    {
+      "label": "C1-B: the disabled-feed branch never escalates at all (the original defect)",
+      "file": "bot_module/data_consumer.py",
+      "needle": "                regime_at_risk = self._regime_change_controls_at_risk()\n                if dynamic_possible or regime_at_risk:\n",
+      "replace": "                regime_at_risk = self._regime_change_controls_at_risk()\n                if False:  # MUTANT: never escalate\n"
+    },
+    {
+      "label": "C2-A: the 503 guard never refuses anything",
+      "file": "api/routes/strategies.py",
+      "needle": "    ) and not _screener_feed_can_deliver_regime_data():\n",
+      "replace": "    ) and False:  # MUTANT: never refuse\n"
+    },
+    {
+      "label": "C2-B: the feed predicate is wrong (a deployment that CAN deliver the regime data is treated as one that cannot)",
+      "file": "api/routes/strategies.py",
+      "needle": "    source_mode = str(\n        getattr(bot_config, \"SYMBOL_SOURCE_MODE\", \"MAIN_APP\")\n    ).strip().upper()\n",
+      "replace": "    source_mode = \"MUTANT_NEVER_DELIVERABLE\"\n"
+    },
+    {
+      "label": "C2-C: the arming check is dropped, so a stop is armed even on a deployment with no feed",
+      "file": "api/routes/strategies.py",
+      "needle": "    if _arms_breakeven_on_regime_change(\n        config_to_run.config_data, request.params\n    ) and not _screener_feed_can_deliver_regime_data():\n",
+      "replace": "    if False and _arms_breakeven_on_regime_change(\n        config_to_run.config_data, request.params\n    ) and not _screener_feed_can_deliver_regime_data():\n"
+    },
+    {
+      "label": "C3-A: one failing symbol aborts the whole context build again (the `break` that was replaced)",
+      "file": "api/ai_assistant.py",
+      "needle": "            skipped.append(f\"{target_pair} ({type(e).__name__}: {e})\")\n",
+      "replace": "            skipped.append(f\"{target_pair} ({type(e).__name__}: {e})\")\n            break  # MUTANT: one failure kills the rest\n"
+    },
+    {
+      "label": "C3-B: the per-call short-circuit is removed, so one outage costs one timeout PER symbol",
+      "file": "api/ai_assistant.py",
+      "needle": "                screener_unreachable = True\n",
+      "replace": "                screener_unreachable = False  # MUTANT: no short-circuit\n"
+    },
+    {
+      "label": "C3-C: the degraded-context report is never emitted",
+      "file": "api/ai_assistant.py",
+      "needle": "    if skipped:\n        logger.warning(\n            f\"RAG: DEGRADED CONTEXT - the screener could not be read for \"\n",
+      "replace": "    if False and skipped:\n        logger.warning(\n            f\"RAG: DEGRADED CONTEXT - the screener could not be read for \"\n"
+    }
+  ]
+}

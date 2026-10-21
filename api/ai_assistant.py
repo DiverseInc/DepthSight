@@ -548,13 +548,31 @@ async def enrich_market_context_for_ai(text_prompt: str) -> str:
     context_blocks = []
     screener_url = os.getenv("SCREENER_API_URL", "http://localhost:8050").rstrip("/")
 
+    # A degraded context must be VISIBLE, not one quiet warning line. Collect
+    # what could not be fetched so the summary at the end can say how many
+    # symbols were lost and why.
+    skipped: List[str] = []
+    screener_unreachable = False
+
     # To avoid spamming the API, take at most the first 2 found symbols
-    for symbol in possible_symbols[:2]:
+    candidates = possible_symbols[:2]
+    for symbol in candidates:
         target_pair = symbol
+        # Built OUTSIDE the try: the except handler reports this URL, and an
+        # exception raised before the assignment would leave it unbound.
+        api_url = f"{screener_url}/api/v1/metrics/{target_pair}"
+
+        if screener_unreachable:
+            # The previous symbol failed at the TRANSPORT level, so the
+            # screener host itself did not answer. Another request would cost
+            # another full timeout (2.0s) and cannot succeed, so one outage
+            # must not become N slow timeouts. This is a PER-CALL
+            # short-circuit, not a per-symbol one.
+            skipped.append(f"{target_pair} (screener unreachable)")
+            continue
 
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
-                api_url = f"{screener_url}/api/v1/metrics/{target_pair}"
                 response = await client.get(api_url)
                 if response.status_code == 200:
                     data = response.json().get("data", {})
@@ -583,7 +601,25 @@ async def enrich_market_context_for_ai(text_prompt: str) -> str:
             logger.warning(
                 f"RAG: Error requesting context from screener ({api_url}): {e}"
             )
-            break  # If the screener is down, don't waste time on the next symbol
+            skipped.append(f"{target_pair} ({type(e).__name__}: {e})")
+            # `continue`, not `break`: one symbol's failure must not throw
+            # away the context for every remaining symbol.
+            if isinstance(e, httpx.TransportError):
+                # Transport-level (connection refused, DNS failure, timeout)
+                # is a property of the SCREENER, not of this symbol, so stop
+                # issuing requests in this call. A symbol-level failure (a
+                # malformed body, say) is not host-level and the remaining
+                # symbols are still fetched.
+                screener_unreachable = True
+            continue
+
+    if skipped:
+        logger.warning(
+            f"RAG: DEGRADED CONTEXT - the screener could not be read for "
+            f"{len(skipped)} of {len(candidates)} symbol(s) "
+            f"({'; '.join(skipped)}). The assistant is answering WITHOUT the "
+            f"live screener metrics for those symbols."
+        )
 
     if context_blocks:
         return "\n\n".join(context_blocks) + "\n\n"
