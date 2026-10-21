@@ -461,11 +461,61 @@ class DataConsumer:
             # warning that masks real problems. Pinned-symbol and STATIC/FIXED
             # strategies do not use this feed at all.
             if not getattr(config, "MAIN_APP_WS_ENABLED", True):
-                logger.warning(
-                    "MAIN_APP_WS_ENABLED is false - the screener WebSocket loop "
-                    "is disabled. DYNAMIC symbol selection will not work. "
-                    "Pinned-symbol and STATIC/FIXED strategies are unaffected."
+                # The feed is off BY CONFIGURATION, not by outage -- and that
+                # makes the alarm WORSE, not better.
+                #
+                # The RISK-CONTROL OUTAGE escalation only fires from inside the
+                # reconnect-failure handler (data_consumer.py:3530-3540). This
+                # branch never creates the WS task, so that handler can never
+                # run and the alarm can never fire. A strategy that depends on
+                # the feed would sit UNPROTECTED behind a single WARNING line.
+                #
+                # "Pinned-symbol and STATIC/FIXED strategies are unaffected" was
+                # also false. `breakeven_on_regime_change` is implemented in
+                # `check_on_screener_update` (strategy.py:3070-3079), reached
+                # only from `_dynamic_symbol_selection_loop`
+                # (controller.py:5057), which is fed exclusively by this
+                # socket. A disabled feed disarms that stop, permanently and
+                # silently.
+                #
+                # The CRITICAL-vs-WARNING decision follows the SAME predicate
+                # as the failure path -- `dynamic_possible or regime_at_risk`
+                # -- so this branch is never louder than the established rule.
+                dynamic_possible = bool(
+                    getattr(config, "SYMBOL_SELECTION_ALLOW_DYNAMIC", False)
                 )
+                regime_at_risk = self._regime_change_controls_at_risk()
+                if dynamic_possible or regime_at_risk:
+                    if regime_at_risk:
+                        logger.critical(
+                            "MAIN_APP_WS_ENABLED is false - the screener "
+                            "WebSocket loop is DISABLED BY CONFIGURATION, so no "
+                            "screener data will ever reach this bot. THIS IS A "
+                            "RISK-CONTROL OUTAGE: at least one running strategy "
+                            "has breakeven_on_regime_change=true, and that "
+                            "regime-change stop (MOVE_SL / CLOSE_POSITION) is "
+                            "fed ONLY by this socket. Those positions are "
+                            "currently UNPROTECTED by it. Re-enable "
+                            "MAIN_APP_WS_ENABLED or disable the option on those "
+                            "strategies."
+                        )
+                    else:
+                        logger.critical(
+                            "MAIN_APP_WS_ENABLED is false - the screener "
+                            "WebSocket loop is DISABLED BY CONFIGURATION. The "
+                            "symbol source is DOWN: DYNAMIC-mode strategies "
+                            "cannot trade - they have no symbols to subscribe "
+                            "to or match against. Pinned-symbol strategies are "
+                            "unaffected. The static list is NOT used "
+                            "automatically; set SYMBOL_SOURCE_MODE='STATIC_LIST' "
+                            "to fall back deliberately."
+                        )
+                else:
+                    logger.warning(
+                        "MAIN_APP_WS_ENABLED is false - the screener WebSocket loop "
+                        "is disabled. DYNAMIC symbol selection will not work. "
+                        "Pinned-symbol and STATIC/FIXED strategies are unaffected."
+                    )
             elif (
                 websockets
                 and self._main_app_ws_url
@@ -3480,7 +3530,7 @@ class DataConsumer:
                 if should_escalate_ws_failure(consecutive_failures, threshold):
                     # The CRITICAL used to key off DYNAMIC alone. That was
                     # wrong: this feed is not symbol-discovery-only.
-                    # `_dynamic_symbol_selection_loop` (controller.py:1236)
+                    # `_dynamic_symbol_selection_loop` (controller.py:5057)
                     # runs for EVERY controller and calls
                     # `check_on_screener_update()` on open positions, which
                     # is what implements `breakeven_on_regime_change`
