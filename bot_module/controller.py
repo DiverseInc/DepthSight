@@ -4507,6 +4507,32 @@ class TradingController:
         equity = wallet_balance + total_unrealized_pnl  # Equity (including PnL)
 
         # The live emergency-stop latch, published so the API can report it.
+        # The RiskManager also records WHY it refuses a trade
+        # (get_trading_disabled_reason). Publishing it here is the only way the
+        # API can name the cause of a block: without it the dashboard can say
+        # "trading is switched off" but never why, which is the same blind spot
+        # the emergency-stop latch had.
+        #
+        # The reason means EXACTLY "why THIS ACCOUNT cannot trade", so it is
+        # published ONLY while the account-level gate is closed. The RiskManager
+        # overwrites `_trading_disabled_reason` on ANY refusal -- including a
+        # PER-SYMBOL blacklist hit -- and never clears it when the block lifts.
+        # A reason published next to an OPEN gate would therefore be stale or
+        # symbol-level: the account can trade, so the field must say nothing.
+        # When the global gate IS closed, `is_symbol_trading_allowed` returns
+        # at the global check BEFORE it reaches the blacklist branch, so the
+        # recorded reason is the account-level cause.
+        #
+        # Read defensively -- `self.rm` is a real RiskManager in production but
+        # a mock in some tests, and a Mock's attribute is truthy while its
+        # callable child returns a Mock, which json.dumps cannot serialize.
+        _gate_open = bool(getattr(self.rm, "_is_trading_allowed", True))
+        _reason_getter = getattr(self.rm, "get_trading_disabled_reason", None)
+        _disabled_reason = None
+        if not _gate_open and callable(_reason_getter):
+            _candidate = _reason_getter()
+            if isinstance(_candidate, str) and _candidate:
+                _disabled_reason = _candidate
         portfolio_status_data = {
             "user_id": self.user_id,
             "total_wallet_balance": round(wallet_balance, 2),
@@ -4514,7 +4540,8 @@ class TradingController:
             "total_equity": round(equity, 2),
             "today_pnl": round(self.rm.stats.today_pnl, 2),
             "consecutive_losses": self.rm.stats.consecutive_losses,
-            "is_trading_allowed": getattr(self.rm, "_is_trading_allowed", True),
+            "is_trading_allowed": _gate_open,
+            "trading_disabled_reason": _disabled_reason,
             **self._emergency_stop_state_for_publish(),
             "margin_usage_percent": 0.0,
             "active_positions_count": len(positions_to_publish),
