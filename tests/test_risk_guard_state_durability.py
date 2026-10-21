@@ -99,7 +99,7 @@ def redis_store():
 GUARD_STATE_NAMESPACE = "depthsight:state:risk"
 
 
-def _risk_manager(redis_client, user_id=1, api_key_name="paper"):
+def _risk_manager(redis_client, user_id=1, api_key_name="paper", api_key_id=None):
     """A real RiskManager with only the exchange handle faked.
 
     ``maxConsecutiveLosses`` is set explicitly to 5 so the test does not
@@ -123,6 +123,9 @@ def _risk_manager(redis_client, user_id=1, api_key_name="paper"):
     # The RiskManager builds its own Redis client in __init__; swap in the
     # fake so the test can observe exactly what was written.
     rm.redis_client = redis_client
+    # The controller hands the api key id over after the RiskManager is
+    # built (the RiskManager is constructed first).
+    rm.api_key_id = api_key_id
     return rm
 
 
@@ -135,7 +138,7 @@ def _yesterday_utc():
 
 
 def _guard_key(rm):
-    return f"{GUARD_STATE_NAMESPACE}:{rm.user_id}:{rm.api_key_name}"
+    return f"{GUARD_STATE_NAMESPACE}:{rm.user_id}:{rm.api_key_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -286,12 +289,12 @@ async def test_a_clean_restart_leaves_the_gate_open(redis_store):
 
 async def test_the_state_is_scoped_per_user_and_api_key(redis_store):
     """Two controllers must not overwrite each other's streak."""
-    rm_a = _risk_manager(FakeRedis(redis_store), user_id=7, api_key_name="key-a")
+    rm_a = _risk_manager(FakeRedis(redis_store), user_id=7, api_key_id=1)
     await rm_a.initialize_balance()
     rm_a.stats.consecutive_losses = 10
     await rm_a.save_state()
 
-    rm_b = _risk_manager(FakeRedis(redis_store), user_id=8, api_key_name="key-b")
+    rm_b = _risk_manager(FakeRedis(redis_store), user_id=8, api_key_id=1)
     await rm_b.initialize_balance()
     await rm_b.restore_state()
 
@@ -299,6 +302,47 @@ async def test_the_state_is_scoped_per_user_and_api_key(redis_store):
         "user 8 must not inherit user 7's loss streak"
     )
     assert rm_a.stats.consecutive_losses == 10
+
+
+async def test_two_api_keys_with_the_same_name_do_not_share_a_streak(redis_store):
+    """Api key NAMES are not unique per user -- the IDs are.
+
+    ``api_keys`` has no unique constraint on ``(user_id, name)``, so one user
+    can own two api keys called "default". If the guard state were scoped by
+    name, those two controllers would share one Redis key: the second
+    controller's write would erase the first controller's streak, and the
+    account would be un-blocked on the next restart -- the exact defect this
+    change exists to close.
+    """
+    rm_a = _risk_manager(
+        FakeRedis(redis_store), user_id=7, api_key_name="default", api_key_id=1
+    )
+    await rm_a.initialize_balance()
+    rm_a.stats.consecutive_losses = 10
+    await rm_a.save_state()
+
+    rm_b = _risk_manager(
+        FakeRedis(redis_store), user_id=7, api_key_name="default", api_key_id=2
+    )
+    await rm_b.initialize_balance()
+    rm_b.stats.consecutive_losses = 0
+    await rm_b.save_state()
+
+    assert _guard_key(rm_a) != _guard_key(rm_b), (
+        "two api keys of the same user must not share one guard key"
+    )
+
+    # And the first controller's streak must still be there for its own key.
+    rm_a2 = _risk_manager(
+        FakeRedis(redis_store), user_id=7, api_key_name="default", api_key_id=1
+    )
+    await rm_a2.initialize_balance()
+    await rm_a2.restore_state()
+
+    assert rm_a2.stats.consecutive_losses == 10, (
+        "the second controller's write erased the first controller's streak -- "
+        "they share a guard key"
+    )
 
 
 # ---------------------------------------------------------------------------

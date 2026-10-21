@@ -117,6 +117,18 @@ class RiskManager:
         self.user_id = user_id
         self.db_session = db_session
         self.api_key_name = api_key_name
+        # The api key this controller owns, used to scope the persisted
+        # trading-guard state. The controller fills it in (see
+        # TradingController.__init__), because the RiskManager is constructed
+        # before the controller exists.
+        #
+        # The api_key_NAME is deliberately NOT the scope: names are not
+        # unique per user (the api_keys table has no unique constraint on
+        # (user_id, name)), so two controllers of the same user could share a
+        # name -- and would then share one guard key, so one controller's
+        # write could erase the other controller's loss streak. The api key
+        # ID is unique and stable across a rename.
+        self.api_key_id: Optional[int] = None
         self.stats = TradeStats()
         self.trade_history: List[Dict[str, Any]] = []
 
@@ -2432,13 +2444,14 @@ class RiskManager:
     def _risk_state_redis_key(self) -> str:
         """The dedicated Redis key holding THIS controller's guard state.
 
-        Scoped per user AND per api key, exactly like the portfolio key, so
-        two controllers of the same user cannot overwrite each other's
-        streak. The streak is a PER-CONTROLLER quantity -- the API reports
-        the MAX across controllers -- so one shared key would make a
-        controller restore another controller's counter.
+        Scoped per user AND per api key, exactly like the portfolio key
+        (``depthsight:state:portfolio:{user_id}:{api_key_id}``), so two
+        controllers of the same user cannot overwrite each other's streak.
+        The streak is a PER-CONTROLLER quantity -- the API reports the MAX
+        across controllers -- so one shared key would make a controller
+        restore another controller's counter.
         """
-        return f"{self.redis_state_key}:{self.user_id}:{self.api_key_name}"
+        return f"{self.redis_state_key}:{self.user_id}:{self.api_key_id}"
 
     def _current_utc_day_str(self) -> str:
         """The UTC calendar date the current trading day belongs to."""

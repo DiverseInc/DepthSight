@@ -556,6 +556,10 @@ class TradingController:
             self.rm.user_telegram_chat_id = (
                 None  # Will be set when user config is loaded
             )
+            # The RiskManager scopes its persisted trading-guard state by
+            # api key id, and it is constructed BEFORE this controller
+            # exists -- so the id has to be handed over here.
+            self.rm.api_key_id = self.api_key_id
 
         self.trade_logger = TradeLogger(max_queue_size=config.SIGNAL_QUEUE_MAX_SIZE)
         self.realtime_ml_logger: Optional[RealtimeMLLogger] = None  # If used
