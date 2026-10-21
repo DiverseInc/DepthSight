@@ -1,0 +1,97 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the portfolio risk-reporting fix:",
+    "the endpoint must report the risk state the trading gate actually reads.",
+    "",
+    "A and B are the SAME guarantee in two branches (the paper branch and the",
+    "live-exchange branch each used to hardcode consecutive_losses=0). C is the",
+    "aggregation rule inside the helper: the counter must be the MAX across the",
+    "population, because the account is blocked when ANY controller is over the",
+    "limit. D is the controller no longer publishing the reason. E and F are the",
+    "reason not being surfaced in the paper branch and the live Redis fallback.",
+    "G is the mode filter being removed, so a PAPER controller's equity is",
+    "reported as the LIVE balance again -- the leak this fix exists to close.",
+    "H is the helper no longer ignoring a stale reason on an ALLOWED controller",
+    "(the RiskManager deliberately keeps the last refusal reason after the gate",
+    "re-opens, so an allowed controller must never contribute a reason).",
+    "I is the single-key fallback dropping the published unrealized PnL again.",
+    "J is the aggregate fallback no longer populating the counter and the reason",
+    "in the dict it maps to the schema.",
+    "K is the controller publishing a reason even while the ACCOUNT gate is open",
+    "-- which would put a stale or per-symbol reason next to an open account.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/portfolio_risk_reporting.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_portfolio_reports_risk_state.py tests/test_portfolio_reports_real_trading_gate.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the paper branch reports a hardcoded 0 again",
+      "file": "api/routes/portfolio.py",
+      "needle": "            # The REAL counter the controllers publish -- not a hardcoded 0.\n            consecutive_losses=paper_losses,\n",
+      "replace": "            consecutive_losses=0,\n"
+    },
+    {
+      "label": "B: the live-exchange branch reports a hardcoded 0 again",
+      "file": "api/routes/portfolio.py",
+      "needle": "            # The REAL counter the live controllers publish.\n            consecutive_losses=live_losses,\n",
+      "replace": "            consecutive_losses=0,\n"
+    },
+    {
+      "label": "C: the counter is no longer the MAX across the population",
+      "file": "api/routes/portfolio.py",
+      "needle": "        try:\n            max_losses = max(max_losses, int(raw_losses))\n        except (TypeError, ValueError):\n",
+      "replace": "        try:\n            max_losses = int(raw_losses)\n        except (TypeError, ValueError):\n"
+    },
+    {
+      "label": "D: the controller no longer publishes the reason",
+      "file": "bot_module/controller.py",
+      "needle": "            \"trading_disabled_reason\": _disabled_reason,\n",
+      "replace": ""
+    },
+    {
+      "label": "E: the paper branch no longer surfaces the reason",
+      "file": "api/routes/portfolio.py",
+      "needle": "            trading_disabled_reason=paper_reason,\n",
+      "replace": "            trading_disabled_reason=None,\n"
+    },
+    {
+      "label": "F: the live Redis fallback no longer surfaces the reason",
+      "file": "api/routes/portfolio.py",
+      "needle": "            trading_disabled_reason=aggregated_status.get(\"trading_disabled_reason\"),\n",
+      "replace": "            trading_disabled_reason=None,\n"
+    },
+    {
+      "label": "G: the mode filter is removed, so paper equity leaks into the live balance",
+      "file": "api/routes/portfolio.py",
+      "needle": "                    if not str(key).rsplit(\":\", 1)[-1].isdigit():\n                        continue\n",
+      "replace": "                    # MUTANT: the mode filter is gone.\n"
+    },
+    {
+      "label": "H: a stale reason on an ALLOWED controller is no longer ignored",
+      "file": "api/routes/portfolio.py",
+      "needle": "        if bool(state.get(\"is_trading_allowed\", True)):\n            continue\n",
+      "replace": "        # MUTANT: the stale-reason guard is gone.\n"
+    },
+    {
+      "label": "I: the single-key fallback drops the published unrealized PnL again",
+      "file": "api/routes/portfolio.py",
+      "needle": "            total_unrealized_pnl=aggregated_status.get(\"total_unrealized_pnl\", 0.0),\n",
+      "replace": ""
+    },
+    {
+      "label": "J: the aggregate fallback no longer populates the counter and the reason",
+      "file": "api/routes/portfolio.py",
+      "needle": "        aggregated_status[\"consecutive_losses\"] = risk_losses\n        aggregated_status[\"trading_disabled_reason\"] = risk_reason\n",
+      "replace": ""
+    },
+    {
+      "label": "K: the controller publishes a reason even while the ACCOUNT gate is open",
+      "file": "bot_module/controller.py",
+      "needle": "        if not _gate_open and callable(_reason_getter):\n",
+      "replace": "        if callable(_reason_getter):\n"
+    }
+  ]
+}

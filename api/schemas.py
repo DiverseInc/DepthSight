@@ -1020,6 +1020,12 @@ class PortfolioStatus(BaseModel):
     total_unrealized_pnl: float = 0.0
     total_margin_used: float = 0.0
     market_breakdown: List[MarketBalanceSummary] = Field(default_factory=list)
+    # WHY THIS IS HERE: the RiskManager records WHY it refused a trade
+    # (get_trading_disabled_reason). Without it the API could report that
+    # trading is blocked but never say why -- "anything that always reports
+    # OK is worse than nothing" (AGENTS.md). Optional with a default so
+    # payloads published before this change stay valid.
+    trading_disabled_reason: Optional[str] = None
 
 
 class StrategyStartRequest(BaseModel):
