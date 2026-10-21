@@ -103,7 +103,7 @@ def _split_symbols(s: str) -> List[str]:
 
 @router.get("/candle-health", response_model=schemas.CandleHealthResponse)
 async def get_candle_health(
-    mode: str = Query("paper", enum=["live", "paper"]),
+    mode: str = Query("paper", json_schema_extra={"enum": ["live", "paper"]}),
     app_redis: redis.Redis = Depends(get_redis_client),
     current_user: models.User = Depends(get_current_user),
 ):

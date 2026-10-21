@@ -24,8 +24,12 @@ gamification_router = APIRouter(
     response_model=schemas.ApiResponseData[List[schemas.LeaderboardEntry]],
 )
 async def get_leaderboard(
-    period: str = Query("all_time", enum=["weekly", "monthly", "all_time"]),
-    category: str = Query("sharpe_ratio", enum=["sharpe_ratio", "net_pnl_percent"]),
+    period: str = Query(
+        "all_time", json_schema_extra={"enum": ["weekly", "monthly", "all_time"]}
+    ),
+    category: str = Query(
+        "sharpe_ratio", json_schema_extra={"enum": ["sharpe_ratio", "net_pnl_percent"]}
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """
