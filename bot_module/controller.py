@@ -3166,9 +3166,23 @@ class TradingController:
             )
 
     async def _build_adopted_position(
-        self, symbol: str, exch_data: Dict[str, Any], market_type: str, executor: Any
+        self,
+        symbol: str,
+        exch_data: Dict[str, Any],
+        market_type: str,
+        executor: Any,
+        mode: str = "live",
     ) -> Optional[LivePosition]:
-        """Helper to build an adopted position object with DB and API lookups."""
+        """Helper to build an adopted position object with DB and API lookups.
+
+        `mode` is the venue the adopted position belongs to and is stamped
+        onto the returned `LivePosition`. It defaults to "live" so the live
+        call site is unchanged; the reconciler passes the mode it is actually
+        reconciling against ("paper" for a paper-only controller), which is
+        what makes `executors.get(position.mode, ...)` resolve to the paper
+        executor instead of falling through to None, and what lets
+        `_ensure_paper_exit_orders_present` arm the adopted position's exits.
+        """
         qty = float(exch_data["positionAmt"])
         entry_price = float(exch_data["entryPrice"])
         direction = SignalDirection.LONG if qty > 0 else SignalDirection.SHORT
@@ -3210,8 +3224,12 @@ class TradingController:
             entry_client_order_id=entry_client_id,
             user_id=self.user_id,
             config_id=assigned_config_id,
-            mode="live",
+            mode=mode,
             market_type=market_type,
+            # Left as self.api_key_id, which is None for a paper-only
+            # controller. `_ensure_paper_exit_orders_present` keys its
+            # paper handling off that, so an adopted paper position can be
+            # armed rather than skipped.
             api_key_id=self.api_key_id,
             current_sl_price=0.0,
         )
@@ -3244,7 +3262,9 @@ class TradingController:
 
         return adopted_pos
 
-    async def _reconcile_positions_with_exchange(self):
+    async def _reconcile_positions_with_exchange(
+        self, executor=None, reconcile_mode: Optional[str] = None
+    ):
         """
         Synchronizes the internal state of positions with the actual state on the exchange.
         Optimized using fine-grained locks and snapshotting to avoid blocking the event loop.
@@ -3252,27 +3272,66 @@ class TradingController:
         log_prefix = f"[ReconcilePositions:{self._log_scope}]"
         logger.info(f"{log_prefix} Starting reconciliation with exchange...")
 
-        executor = self.executors.get("live")
+        # WHICH book are we reconciling against?
+
+        # This used to hardcode `executors.get("live")` and give up when that
+        # was absent. For a paper-only controller (`api_key_id is None`, the
+        # discriminator used throughout this class) there is no live executor
+        # BY DESIGN, so the reconciler never ran at all -- and nothing else
+        # repairs that gap either: `_notify_controller_about_fill` declines to
+        # adopt, and `_ensure_paper_exit_orders_present` walks the CONTROLLER's
+        # map so it cannot discover a book entry the controller never learned.
+        # A paper book position the controller does not know about therefore
+        # stayed invisible forever, and because the pre-flight duplicate-entry
+        # guard reads that same book (`supports_positions` is True, so it runs
+        # for paper too) every later entry for that symbol aborted -- the symbol
+        # could not trade again until a restart emptied the book.
+
+        # Selection order is deliberate and leaves the live path untouched:
+        #   1. an explicitly passed executor wins (tests, and any caller that
+        #      already knows which book it means);
+        #   2. otherwise the live executor, as before -- so a controller that
+        #      holds both reconciles only its live book;
+        #   3. otherwise the paper executor, but ONLY when `api_key_id is None`.
+        #      A live controller whose live executor merely failed to build
+        #      must NOT reconcile against the paper book: the "close what is
+        #      not in this book" half of this method would mark its REAL
+        #      positions CLOSED.
+        if executor is None:
+            executor = self.executors.get("live")
+            if executor is None and self.api_key_id is None:
+                executor = self.executors.get("paper")
         if not executor:
-            # FIX 2026-09-23: downgrade to debug for paper-only controllers
-            # (no API keys → self.api_key_id is None → no live executor by design).
-            # The dashboard "Critical Events" panel surfaces every WARNING, so this
-            # benign message was spamming the user's dashboard. Reconcile does
-            # nothing for paper-only controllers anyway (no positions on an
-            # exchange to reconcile against). Live controllers with a live
-            # executor still go through the same early-return path without a
-            # warning if their executor isn't ready — we keep info-level only on
-            # actual reconciliation attempts.
             if self.api_key_id is None:
                 logger.debug(
-                    f"{log_prefix} Skipping reconciliation: paper-only controller "
-                    f"(no live executor)."
+                    f"{log_prefix} Skipping reconciliation: paper-only "
+                    f"controller with no paper executor available."
                 )
             else:
                 logger.warning(
                     f"{log_prefix} Live executor not available. Skipping reconciliation."
                 )
             return
+
+        # The mode is DERIVED from the executor and an explicitly passed mode
+        # is only honoured when it AGREES. A disagreement RAISES rather than
+        # being resolved in favour of one of them: silently reconciling a
+        # book the caller did not name is exactly how the to_close half ends
+        # up closing real live positions against a simulator's book. Identity
+        # against the registered paper executor is the only reliable signal
+        # available here: `PaperTradingExecutor` has NO `is_paper_book`
+        # attribute to test.
+        derived_mode = (
+            "paper" if executor is self.executors.get("paper") else "live"
+        )
+        if reconcile_mode is None:
+            reconcile_mode = derived_mode
+        elif reconcile_mode != derived_mode:
+            raise ValueError(
+                f"reconcile_mode={reconcile_mode!r} contradicts the "
+                f"executor selected (derived {derived_mode!r}); refusing "
+                f"to reconcile a book the caller did not name."
+            )
         reconcile_market_type = self._normalize_market_type(
             getattr(executor, "market_type", None)
         )
@@ -3289,12 +3348,44 @@ class TradingController:
                 f"{log_prefix} Exchange reports {len(exchange_positions_map)} open positions."
             )
 
-            # 2. Fast snapshot of internal positions
+            # 2. Fast snapshot of internal positions.
+            #
+            # The mode filter is NOT cosmetic, it is what stops this branch
+            # from destroying live positions. `_load_runtime_state` restores
+            # EVERY persisted position when there is no live executor to verify
+            # against (controller.py:4017-4019, 
+            # `validated_positions = restored_positions_objects`), so a
+            # controller can hold a `mode="live"` position while
+            # `api_key_id is None` -- the user removed their API key. Filtering
+            # on market_type alone put that live position in `to_close` (it is
+            # absent from the paper book) and stamped it CLOSED with
+            # exit_reason="CLOSED_WHILE_OFFLINE". Since `api_key_id is None` IS
+            # this repo's paper-only marker, a PAPER reconcile may only ever
+            # consider positions that have `api_key_id is None`.
+            #
+            # `mode` is checked as well, and the two checks are NOT
+            # redundant: `LivePosition.api_key_id` DEFAULTS TO None
+            # (controller.py:362) and `_load_runtime_state` backfills a missing
+            # one with `self.api_key_id` (controller.py:3978-3979), which is
+            # itself None on a paper-only controller. So a `mode="live"`
+            # position persisted before that field existed comes back with
+            # `api_key_id is None` and an api_key_id-only filter lets it
+            # straight into `to_close`.
+            #
+            # For a LIVE reconcile the added clause is vacuously true, so the
+            # live snapshot stays byte-identical to what it always was.
             async with self._positions_dict_lock:
                 internal_snapshot = {
                     k: v
                     for k, v in self._active_positions.items()
                     if self._market_type_for_position(v) == reconcile_market_type
+                    and (
+                        reconcile_mode != "paper"
+                        or (
+                            getattr(v, "api_key_id", None) is None
+                            and getattr(v, "mode", None) != "live"
+                        )
+                    )
                 }
 
             # 3. Calculate diff
@@ -3362,7 +3453,11 @@ class TradingController:
             for symbol, exch_data in to_adopt:
                 logger.warning(f"{log_prefix} Adopting orphan: {symbol}")
                 adopted_pos = await self._build_adopted_position(
-                    symbol, exch_data, reconcile_market_type, executor
+                    symbol,
+                    exch_data,
+                    reconcile_market_type,
+                    executor,
+                    mode=reconcile_mode,
                 )
                 if adopted_pos:
                     async with self._positions_dict_lock:
@@ -9109,13 +9204,33 @@ class TradingController:
                         f"{log_prefix} STOP! Exchange already has position for {signal.symbol}: {existing_on_exchange}. Aborting duplicate entry."
                     )
 
-                    # Urgently synchronizing local state
-                    async with self._positions_dict_lock:
-                        # If we don't have this position, create an "orphan" so the controller knows about it
-                        if not self._active_position_get(signal.symbol, market_type):
-                            logger.info(
-                                f"{log_prefix} Adopting found position immediately to prevent further spam."
-                            )
+                    # NOT an adoption. There is deliberately no write here,
+                    # in either mode.
+                    #
+                    # `_build_adopted_position` does a DB query and a
+                    # `get_open_orders` call, and this is the only place in
+                    # this method that holds the GLOBAL
+                    # `_positions_dict_lock` -- so adopting inline would stall
+                    # every other symbol behind one symbol's DB round trip.
+                    # The reconciler performs exactly this work OUTSIDE
+                    # that lock, on the 60s timer and at start-up, and it
+                    # now picks its executor by mode, so it also covers a
+                    # paper-only controller -- whose book is precisely what
+                    # this guard just read.
+                    #
+                    # Until that run happens the entry keeps aborting here.
+                    # That is the SAFE outcome: refusing is correct while the
+                    # existing position's size and leverage are unknown, and
+                    # the reconciler repairs the map within a minute.
+                    # The read needs no lock -- see the NOTE on
+                    # `_active_position_get`.
+                    if not self._active_position_get(signal.symbol, market_type):
+                        logger.info(
+                            f"{log_prefix} No controller position for this "
+                            f"{market_type} symbol. Adoption is left to "
+                            f"_reconcile_positions_with_exchange, which runs on "
+                            f"its next pass; entries stay aborted until it has."
+                        )
 
                     # Aborting execution, do not send the order!
                     return
