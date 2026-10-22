@@ -14,6 +14,9 @@ class BinanceExchangeExecutor(BinanceExecutor):
     """
 
     exchange_id = "binance"
+    # A real venue: its positions are real and its money is exposed. Declared so
+    # a call site can never mistake a Binance position for a simulation.
+    is_paper_book = False
 
     def __init__(
         self,

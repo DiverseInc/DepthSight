@@ -9089,13 +9089,28 @@ class TradingController:
             # Making a direct request to the exchange: "Do I ALREADY have a position for this symbol?"
             # ==============================================================================
             try:
+                # `supports_positions` says the book HAS positions. Whether it
+                # holds REAL ones is a different question, and it is the
+                # question this guard asks -- its own comment above says so
+                # ("making a direct request to the exchange"). The guard exists
+                # to catch a position the EXCHANGE holds that this controller
+                # does not know about: opened by hand, by another bot, or
+                # before a restart.
+                #
+                # PR #26 declared `PaperTradingExecutor.supports_positions = True`
+                # -- correctly, because the paper book IS a futures book. But it
+                # also flipped THIS call site, so `get_open_positions()` began
+                # returning the strategy's own SIMULATED position and the guard
+                # reported it as an exchange one. The distinction is
+                # `is_paper_book`; `supports_positions` keeps its PR #26 meaning
+                # and is deliberately still what gates the read.
                 real_positions = (
                     await executor.get_open_positions()
                     if getattr(executor, "supports_positions", False)
                     else []
                 )
                 # Search for a position by symbol where the size is not 0
-                existing_on_exchange = next(
+                existing_position = next(
                     (
                         p
                         for p in real_positions
@@ -9104,10 +9119,38 @@ class TradingController:
                     None,
                 )
 
-                if existing_on_exchange:
-                    logger.critical(
-                        f"{log_prefix} STOP! Exchange already has position for {signal.symbol}: {existing_on_exchange}. Aborting duplicate entry."
-                    )
+                if existing_position:
+                    if getattr(executor, "is_paper_book", False):
+                        # The entry is STILL refused. This really is a position
+                        # in the symbol and stacking a second one on top of it
+                        # would silently corrupt the simulated book and its PnL.
+                        # What changes here is the TRUTH of the message: the
+                        # abort is about this bot's own paper book -- no
+                        # exchange holds it and no real money is exposed -- and
+                        # it now says so, names the position, and says where it
+                        # is NOT visible so the operator is not sent to the
+                        # positions panel hunting for something that will not be
+                        # there.
+                        logger.critical(
+                            f"{log_prefix} STOP! The PAPER book already holds a "
+                            f"{signal.direction.name} {signal.symbol} position of "
+                            f"{existing_position['positionAmt']} at entry "
+                            f"{existing_position['entryPrice']} that this "
+                            f"controller is not tracking: {existing_position}. "
+                            f"Strategy={signal.strategy_name}, "
+                            f"config_id={instance_config_id}. This is a SIMULATED "
+                            f"position held by this bot: no exchange has it, no "
+                            f"leverage is applied to it and no real money is "
+                            f"exposed. The positions panel will NOT show it, "
+                            f"because that panel lists only positions this "
+                            f"controller tracks. Aborting the duplicate entry. "
+                            f"The paper book is held in memory, so restarting the "
+                            f"bot clears it."
+                        )
+                    else:
+                        logger.critical(
+                            f"{log_prefix} STOP! Exchange already has position for {signal.symbol}: {existing_position}. Aborting duplicate entry."
+                        )
 
                     # Urgently synchronizing local state
                     async with self._positions_dict_lock:

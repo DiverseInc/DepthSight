@@ -15,6 +15,12 @@ class ExchangeExecutor(Protocol):
     market_type: str
     supports_positions: bool
     supports_shorting: bool
+    # WHOSE book it is. `supports_positions` says the book holds positions;
+    # this says whether those positions are REAL (held by a venue, exposed to
+    # money) or SIMULATED (this process's own paper book). Anything reporting a
+    # position to an operator -- e.g. "the exchange already has this symbol" --
+    # must ask this, not the one above.
+    is_paper_book: bool
 
     async def close(self) -> None: ...
 
