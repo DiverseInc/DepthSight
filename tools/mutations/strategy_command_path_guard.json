@@ -24,6 +24,12 @@
     "    predates the approval record is treated as never-approved and an",
     "    already-approved armed strategy is REFUSED on the first restart after",
     "    the deploy. The backward-compatibility test must fail.",
+    "M7 is THE DEFECT THIS PR WAS ASKED TO CLOSE, reintroduced exactly: the",
+    "    refresh OVERWRITES the approval record with the CURRENT arming before",
+    "    the handler ever reads it, so a never-approved arming reads back as",
+    "    approved. Dropping the CHECK does not catch this -- the check's INPUT",
+    "    is what was corrupted. Both two-pass survival tests must fail: the",
+    "    per-controller publisher's and the global publisher's.",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/strategy_command_path_guard.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -67,6 +73,12 @@
       "file": "bot_module/controller.py",
       "needle": "        if approved_armed is None:\n",
       "replace": "        if False:  # MUTANT: the backward-compatibility fallback is gone\n"
+    },
+    {
+      "label": "M7: THE ORIGINAL DEFECT. The refresh OVERWRITES the approval record with the current arming",
+      "file": "bot_module/rehydrate.py",
+      "needle": "        updated = dict(payload)\n        updated[\"config_data\"] = fresh\n",
+      "replace": "        updated = dict(payload)\n        updated[\"config_data\"] = fresh\n        updated[\"approved_breakeven_on_regime_change\"] = bool((fresh or {}).get(\"breakeven_on_regime_change\"))  # MUTANT: the approval record is overwritten by the current arming\n"
     }
   ]
 }

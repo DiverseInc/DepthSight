@@ -57,6 +57,7 @@ is the current state, not the approved one. See
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 
@@ -107,7 +108,14 @@ class _FakeRedis:
         self.controller = None
 
     async def scan_iter(self, match=None, count=None):
-        for key in list(self.sets):
+        # Both publishers scan, for different patterns:
+        #   controller._rehydrate_running_strategies_from_redis -> "running_strategies:*"
+        #   bot_runner._rehydrate_all_strategies_globally       -> "running_strategy_payload:*"
+        # Real SCAN matches on the keyspace, so the fake honours the glob over
+        # the SET keys and the string keys rather than only over one of them.
+        for key in list(self.sets) + list(self.store):
+            if match and not fnmatch.fnmatch(key, match):
+                continue
             yield key
 
     async def smembers(self, key):
@@ -605,4 +613,125 @@ async def test_the_approval_record_survives_the_refresh_and_the_write_back(
     assert created_strategies == [], (
         "a never-approved arming must be REFUSED, not replayed with an inert "
         "stop -- the approval record says it was never approved"
+    )
+
+
+async def test_the_global_rehydrate_publisher_also_preserves_the_approval_record(
+    monkeypatch, created_strategies
+):
+    """THE SECOND PUBLISHER. There are two, and only one was covered.
+
+    `bot_runner._rehydrate_all_strategies_globally` is a SECOND, independent
+    implementation of the same publish path: it scans
+    `running_strategy_payload:*` (not `running_strategies:*`), parses the user
+    id as a STRING rather than an int, and calls `refresh_payload_config_from_db`
+    with a different db factory. It exists because the per-controller rehydrate
+    is gated on the controller existing, so a controller that fails to init
+    silently drops the user's strategies on every restart.
+
+    A defect fix that covers only the controller publisher leaves this door
+    open, and a bot restart that takes the global path would still replay a
+    never-approved arming as though it had been approved. So this runs the real
+    global publisher twice against a real refresh, the same two passes that
+    expose an overwrite, and asserts the record survives both.
+    """
+    import bot_runner
+
+    monkeypatch.setattr(bot_config, "SYMBOL_SOURCE_MODE", "STATIC_LIST")
+
+    redis_client = _FakeRedis()
+    redis_client.store[f"running_strategy_payload:{1}:{CONFIG_ID}"] = json.dumps(
+        {
+            "user_id": 1,
+            "id": CONFIG_ID,
+            "config_id": CONFIG_ID,
+            "mode": "paper",
+            "config_data": {"strategy_name": "VisualBuilderStrategy"},
+            # Approved WITHOUT the stop armed.
+            "approved_breakeven_on_regime_change": False,
+        }
+    )
+
+    # The user later PUTs the option on through the unguarded
+    # PUT /config/{config_id} route, so the row now carries an arming that was
+    # never approved on this deployment.
+    async def _fake_get_db():
+        yield object()
+
+    async def _fake_get_strategy_config(db, user_id, config_id):
+        return _FakeStrategyRow(
+            {
+                "strategy_name": "VisualBuilderStrategy",
+                "breakeven_on_regime_change": True,
+            }
+        )
+
+    monkeypatch.setattr(
+        "bot_module.rehydrate.crud.get_strategy_config", _fake_get_strategy_config
+    )
+
+    # Pass 1 refreshes config_data and writes the result back over the cached
+    # key; pass 2 reads what pass 1 left behind.
+    await bot_runner._rehydrate_all_strategies_globally(redis_client)
+    await bot_runner._rehydrate_all_strategies_globally(redis_client)
+
+    assert len(redis_client.published) == 2, (
+        "the global publisher must publish once per pass"
+    )
+    command = json.loads(redis_client.published[-1][1])
+    published_payload = command["payload"]
+
+    assert published_payload["config_data"].get("breakeven_on_regime_change") is True, (
+        "the refresh must have happened, or this test proves nothing"
+    )
+    assert published_payload.get("approved_breakeven_on_regime_change") is False, (
+        "the GLOBAL rehydrate publisher must preserve the approval record "
+        "through its refresh and its write-back, exactly as the per-controller "
+        "one does. It is a separate implementation of the same path and it is "
+        "the one that runs when a controller failed to init."
+    )
+
+    listener = _controller(redis_client=redis_client)
+    redis_client.controller = listener
+    listener._running = True
+    await listener._redis_command_listener()
+
+    assert created_strategies == [], (
+        "a never-approved arming replayed by the global publisher must be "
+        "REFUSED, not started with an inert stop"
+    )
+
+
+async def test_a_rehydrate_replay_without_an_approval_record_says_so_loudly(
+    created_strategies, monkeypatch, caplog
+):
+    """The fallback must be VISIBLE, or it is a silent hole.
+
+    An ABSENT record means the strategy was approved before the record shipped,
+    so the handler falls back to the payload's own arming rather than refusing
+    a running strategy. That fallback is the right call -- refusing would make
+    a user's strategy vanish on the first restart after the deploy -- but it
+    re-opens the hole this PR closes for exactly that payload, and silently.
+
+    So the fallback has to say so, at WARNING, naming the option. An operator
+    who sees it knows the strategy will keep running until it is re-approved.
+    """
+    monkeypatch.setattr(bot_config, "SYMBOL_SOURCE_MODE", "STATIC_LIST")
+    controller = _controller()
+
+    with caplog.at_level(logging.WARNING, logger="bot_module.controller"):
+        await _deliver(
+            controller,
+            _start_command(arms_the_stop=True, rehydrate=True, approved_armed=None),
+        )
+
+    assert created_strategies == ["VisualBuilderStrategy"]
+    assert "breakeven_on_regime_change" in caplog.text, (
+        "falling back to the payload's own arming must be logged at WARNING, "
+        "naming the option -- otherwise the hole this PR closes is re-opened "
+        "silently for every pre-record strategy"
+    )
+    assert "predates" in caplog.text or "no approval record" in caplog.text, (
+        "the warning must say WHY it fell back, so an operator can tell a "
+        "deliberate fallback from a guard that misfired"
     )
