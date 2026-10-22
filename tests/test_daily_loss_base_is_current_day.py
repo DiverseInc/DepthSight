@@ -459,6 +459,40 @@ async def test_a_zero_base_known_to_be_todays_still_fails_closed(redis_store):
     assert BASE_UNKNOWN_REASON_FRAGMENT in rm.get_trading_disabled_reason()
 
 
+async def test_a_positive_but_stale_day_base_still_fails_closed(redis_store):
+    """A POSITIVE base can still be unusable, and this is the measured case.
+
+    Mutation found this: a guard that only asks "is the base positive?" passes
+    every zero-base test, because a zero base is rejected by both that guard
+    and this one. The two differ on exactly one input -- a base that is
+    positive but belongs to a day that has ended -- which is the production
+    defect itself. So that input is pinned here explicitly: a stale-day base
+    must NOT be used as a denominator, however large it is.
+    """
+    rm = _risk_manager(FakeRedis(redis_store), DAY_THREE, balance=TRUE_BASE)
+    await rm.initialize_balance()
+    # The restore refused to vouch for this base, and the base it left behind
+    # is the one from an earlier day.
+    rm._daily_base_known = False
+    rm.stats.start_of_day_balance = STALE_BASE
+    rm.stats.start_of_day_day_str = DAY_ONE
+    rm.stats.today_pnl = -73.03
+
+    rm._check_risk_limits()
+
+    assert rm._is_trading_allowed is False, (
+        "a base of $1270.59 captured on 2026-10-20 is positive, so a "
+        "'is it positive?' guard would accept it -- and the daily loss would "
+        "then read 5.75% instead of the true 8.07%. The gate must fail closed "
+        "on a base that does not belong to the current UTC day, whatever its "
+        "size"
+    )
+    assert BASE_UNKNOWN_REASON_FRAGMENT in rm.get_trading_disabled_reason(), (
+        f"the gate must name the unknown base as the cause, got "
+        f"{rm.get_trading_disabled_reason()!r}"
+    )
+
+
 async def test_a_first_boot_can_still_trade(redis_store):
     """The positive control for the two rules above.
 
