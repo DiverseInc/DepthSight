@@ -474,7 +474,7 @@ class DataConsumer:
                 # also false. `breakeven_on_regime_change` is implemented in
                 # `check_on_screener_update` (strategy.py:3070-3079), reached
                 # only from `_dynamic_symbol_selection_loop`
-                # (controller.py:5213), which is fed exclusively by this
+                # (controller.py:5211), which is fed exclusively by this
                 # socket. A disabled feed disarms that stop, permanently and
                 # silently.
                 #
@@ -3530,7 +3530,7 @@ class DataConsumer:
                 if should_escalate_ws_failure(consecutive_failures, threshold):
                     # The CRITICAL used to key off DYNAMIC alone. That was
                     # wrong: this feed is not symbol-discovery-only.
-                    # `_dynamic_symbol_selection_loop` (controller.py:5213)
+                    # `_dynamic_symbol_selection_loop` (controller.py:5211)
                     # runs for EVERY controller and calls
                     # `check_on_screener_update()` on open positions, which
                     # is what implements `breakeven_on_regime_change`
@@ -3567,7 +3567,7 @@ class DataConsumer:
                             f"and symbol discovery is unaffected. "
                             f"⚠ ONE EXCEPTION, added 2026-10-18: this feed is NOT "
                             f"symbol-discovery-only. _dynamic_symbol_selection_loop "
-                            f"(controller.py:5213) runs for EVERY controller, STATIC "
+                            f"(controller.py:5211) runs for EVERY controller, STATIC "
                             f"and FIXED included, and calls "
                             f"strategy_instance.check_on_screener_update() on open "
                             f"positions. That is what implements "

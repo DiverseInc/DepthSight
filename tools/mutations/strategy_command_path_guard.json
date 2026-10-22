@@ -17,10 +17,13 @@
     "    restart. The rehydrate test must fail.",
     "M4 drops the REPLAY ALARM: the replay is still exempt from the refusal,",
     "    but nothing says its stop is inert. The replay-alarm test must fail.",
-    "M5 drops the APPROVAL-TIME check: an arming that appeared after the",
-    "    approval (the API's PUT /config route does not apply the guard, and",
-    "    the replay refreshes config_data from Postgres) inherits the",
-    "    exemption. The armed-after-approval test must fail.",
+    "M5 ignores the APPROVAL RECORD and always falls back to the payload's",
+    "    own arming -- the defect this PR was asked to close: a never-approved",
+    "    arming is then read back as approved. The two-pass test must fail.",
+    "M6 removes the BACKWARD-COMPATIBILITY FALLBACK, so a payload that",
+    "    predates the approval record is treated as never-approved and an",
+    "    already-approved armed strategy is REFUSED on the first restart after",
+    "    the deploy. The backward-compatibility test must fail.",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/strategy_command_path_guard.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -54,10 +57,16 @@
       "replace": "            logger.info(\n                f\"{log_prefix} REPLAYED a strategy that arms \"\n"
     },
     {
-      "label": "M5: the approval-time check is dropped, so an arming made AFTER the approval inherits the exemption",
+      "label": "M5: the approval record is ignored, so a never-approved arming is read back as approved",
       "file": "bot_module/controller.py",
-      "needle": "            not regime_stop_armed or armed_at_approval\n",
-      "replace": "            not regime_stop_armed or True  # MUTANT: the approval-time check is dropped\n"
+      "needle": "        approved_armed = payload.get(\"approved_breakeven_on_regime_change\")\n",
+      "replace": "        approved_armed = None  # MUTANT: the approval record is ignored\n"
+    },
+    {
+      "label": "M6: the backward-compatibility fallback is removed, so an already-approved armed strategy is refused",
+      "file": "bot_module/controller.py",
+      "needle": "        if approved_armed is None:\n",
+      "replace": "        if False:  # MUTANT: the backward-compatibility fallback is gone\n"
     }
   ]
 }

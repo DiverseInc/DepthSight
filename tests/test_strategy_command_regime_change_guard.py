@@ -44,8 +44,14 @@ A rehydrate replay is a strategy that was ALREADY approved by the API's 503
 guard and was running before the bot restarted. Refusing to replay it would
 make the user's running strategy vanish after a restart -- a different and
 worse regression than an inert stop. The rehydrate publisher therefore marks
-its command, and the guard honours that mark. See
-`_rehydrate_running_strategies_from_redis` in bot_module/controller.py.
+its command, and the guard honours that mark.
+
+The APPROVAL-TIME state of the option is read from the payload's
+`approved_breakeven_on_regime_change` sibling -- NOT from `config_data`. The
+rehydrate replaces `config_data` with the CURRENT Postgres copy and writes
+that back over the cached payload, so anything read out of `config_data` there
+is the current state, not the approved one. See
+`test_the_approval_record_survives_the_refresh_and_the_write_back`.
 """
 
 from __future__ import annotations
@@ -59,6 +65,9 @@ import pytest
 from bot_module import controller as controller_module
 from bot_module import config as bot_config
 from bot_module.controller import TradingController
+
+
+CONFIG_ID = "0123456789abcdef0123456789abcdef"
 
 
 # ---------------------------------------------------------------------------
@@ -81,47 +90,77 @@ def feed_configured(monkeypatch):
     )
 
 
-class _FakePubSub:
-    """Delivers exactly one message, then stops the listener loop."""
+class _FakeRedis:
+    """A Redis stand-in shared by the rehydrate publisher and the listener.
 
-    def __init__(self, controller, message):
-        self._controller = controller
-        self._message = message
+    It stores what the publisher writes back (so the write-back can be
+    observed) and records what the publisher publishes (so the real command
+    listener can consume the real command).
+    """
+
+    def __init__(self):
+        self.store: dict = {}
+        self.sets: dict = {}
+        self.published: list = []
+        # The controller whose listener is consuming this Redis. The fake
+        # pubsub stops that listener's `while self._running:` loop.
+        self.controller = None
+
+    async def scan_iter(self, match=None, count=None):
+        for key in list(self.sets):
+            yield key
+
+    async def smembers(self, key):
+        return set(self.sets.get(key, set()))
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value):
+        self.store[key] = value
+
+    async def sadd(self, key, member):
+        self.sets.setdefault(key, set()).add(member)
+
+    async def publish(self, channel, message):
+        self.published.append((channel, message))
+
+    def pubsub(self):
+        return _FakePubSub(self)
+
+
+class _FakePubSub:
+    """Delivers the last published command, then stops the listener loop."""
+
+    def __init__(self, redis):
+        self._redis = redis
         self._delivered = False
-        self.subscribed_channel = None
-        self.unsubscribed_channel = None
 
     async def subscribe(self, channel):
-        self.subscribed_channel = channel
+        return None
 
     async def unsubscribe(self, channel):
-        self.unsubscribed_channel = channel
+        return None
 
     async def get_message(self, ignore_subscribe_messages=False, timeout=1.0):
-        if self._delivered:
+        if self._delivered or not self._redis.published:
             return None
         self._delivered = True
         # Stop the `while self._running:` loop AFTER this message is handled.
-        self._controller._running = False
-        return self._message
+        controller = self._redis.controller
+        if controller is not None:
+            controller._running = False
+        _channel, message = self._redis.published[-1]
+        return {"type": "message", "data": message}
 
 
-class _FakeRedis:
-    """The only part of the redis client the command listener touches."""
-
-    def __init__(self, controller, message):
-        self._pubsub = _FakePubSub(controller, message)
-
-    def pubsub(self):
-        return self._pubsub
-
-
-def _controller():
+def _controller(redis_client=None, get_db_session=None):
     """A minimal TradingController.
 
     Uses `__new__` + set-state-by-hand, the pattern already established in
     tests/test_safety_guard_regressions.py. Only the attributes the Redis
-    command listener and `_handle_start_strategy_command` touch are set.
+    command listener, the rehydrate publisher and
+    `_handle_start_strategy_command` touch are set.
     """
     controller = TradingController.__new__(TradingController)
     controller.user_id = 1
@@ -130,6 +169,8 @@ def _controller():
     controller.instances_lock = asyncio.Lock()
     controller.running_strategy_instances = {}
     controller._running = True
+    controller.redis_client = redis_client
+    controller.get_db_session = get_db_session
     return controller
 
 
@@ -137,26 +178,31 @@ def _start_command(
     *,
     arms_the_stop: bool,
     rehydrate: bool = False,
-    armed_at_approval: bool = False,
+    approved_armed=None,
 ):
-    """A `START_STRATEGY` command in the exact envelope the API publishes."""
+    """A `START_STRATEGY` command in the exact envelope the API publishes.
+
+    `approved_armed` is the approval record: `True`/`False` when the API
+    recorded it, `None` when the payload predates the record (the
+    backward-compatible case).
+    """
     config_data = {"strategy_name": "VisualBuilderStrategy"}
     if arms_the_stop:
         config_data["breakeven_on_regime_change"] = True
     payload = {
         "user_id": 1,
-        "id": "0123456789abcdef0123456789abcdef",
-        "config_id": "0123456789abcdef0123456789abcdef",
+        "id": CONFIG_ID,
+        "config_id": CONFIG_ID,
         "mode": "paper",
         "config_data": config_data,
     }
+    if approved_armed is not None:
+        payload["approved_breakeven_on_regime_change"] = approved_armed
     command = {"command": "START_STRATEGY", "payload": payload}
     if rehydrate:
         # Set by `_rehydrate_running_strategies_from_redis` for a replay of
         # an already-approved strategy.
         command["rehydrate"] = True
-        # Whether the option was armed in the APPROVAL-TIME payload.
-        command["rehydrate_armed_at_approval"] = armed_at_approval
     return command
 
 
@@ -181,10 +227,12 @@ def created_strategies(monkeypatch):
 
 async def _deliver(controller, command):
     """Run the real Redis command listener until it has handled `command`."""
-    controller.redis_client = _FakeRedis(
-        controller,
-        {"type": "message", "data": json.dumps(command, default=str)},
+    redis_client = _FakeRedis()
+    redis_client.controller = controller
+    redis_client.published.append(
+        ("depthsight:commands", json.dumps(command))
     )
+    controller.redis_client = redis_client
     controller._running = True
     await controller._redis_command_listener()
 
@@ -327,7 +375,10 @@ async def test_a_rehydrate_replay_of_an_approved_strategy_still_starts(
     monkeypatch.setattr(bot_config, "SYMBOL_SOURCE_MODE", "STATIC_LIST")
     controller = _controller()
 
-    await _deliver(controller, _start_command(arms_the_stop=True, rehydrate=True, armed_at_approval=True))
+    await _deliver(
+        controller,
+        _start_command(arms_the_stop=True, rehydrate=True, approved_armed=True),
+    )
 
     assert created_strategies == ["VisualBuilderStrategy"], (
         "a rehydrate replay of an already-approved strategy must still start"
@@ -351,7 +402,7 @@ async def test_a_rehydrate_replay_armed_after_approval_is_refused(
 
     await _deliver(
         controller,
-        _start_command(arms_the_stop=True, rehydrate=True, armed_at_approval=False),
+        _start_command(arms_the_stop=True, rehydrate=True, approved_armed=False),
     )
 
     assert created_strategies == [], (
@@ -369,10 +420,35 @@ async def test_a_rehydrate_replay_of_a_strategy_that_was_never_armed_still_start
 
     await _deliver(
         controller,
-        _start_command(arms_the_stop=False, rehydrate=True, armed_at_approval=False),
+        _start_command(arms_the_stop=False, rehydrate=True, approved_armed=False),
     )
 
     assert created_strategies == ["VisualBuilderStrategy"]
+
+
+async def test_a_rehydrate_replay_without_an_approval_record_is_not_refused(
+    created_strategies, monkeypatch
+):
+    """BACKWARD COMPATIBILITY: a payload with no approval record still starts.
+
+    A strategy that was approved BEFORE the record shipped carries no
+    `approved_breakeven_on_regime_change`. Refusing it would make a running
+    strategy vanish on the first restart after the deploy -- a worse
+    regression than the hole the record closes. The handler falls back to the
+    payload's own arming and says so in the log.
+    """
+    monkeypatch.setattr(bot_config, "SYMBOL_SOURCE_MODE", "STATIC_LIST")
+    controller = _controller()
+
+    await _deliver(
+        controller,
+        _start_command(arms_the_stop=True, rehydrate=True, approved_armed=None),
+    )
+
+    assert created_strategies == ["VisualBuilderStrategy"], (
+        "an already-approved armed strategy with no approval record must NOT "
+        "be refused on the first restart after the deploy"
+    )
 
 
 async def test_a_rehydrate_replay_on_a_dead_feed_raises_the_alarm(
@@ -395,7 +471,7 @@ async def test_a_rehydrate_replay_on_a_dead_feed_raises_the_alarm(
         await _deliver(
             controller,
             _start_command(
-                arms_the_stop=True, rehydrate=True, armed_at_approval=True
+                arms_the_stop=True, rehydrate=True, approved_armed=True
             ),
         )
 
@@ -420,9 +496,113 @@ async def test_a_rehydrate_replay_with_a_working_feed_raises_no_alarm(
         await _deliver(
             controller,
             _start_command(
-                arms_the_stop=True, rehydrate=True, armed_at_approval=True
+                arms_the_stop=True, rehydrate=True, approved_armed=True
             ),
         )
 
     assert created_strategies == ["VisualBuilderStrategy"]
     assert "breakeven_on_regime_change" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# the approval record must survive the refresh and the write-back
+# ---------------------------------------------------------------------------
+
+
+class _FakeStrategyRow:
+    """Just enough of a StrategyConfig row for the refresh to read."""
+
+    def __init__(self, config_data):
+        self.config_data = config_data
+
+
+async def test_the_approval_record_survives_the_refresh_and_the_write_back(
+    monkeypatch, created_strategies
+):
+    """THE DEFECT, REPRODUCED THE WAY IT ACTUALLY HAPPENS.
+
+    The rehydrate publisher does three things in order: it READS the cached
+    payload, it REFRESHES `config_data` from Postgres, and it WRITES the
+    refreshed payload back over the cached key. Anything the approval signal
+    was read out of `config_data` is therefore destroyed by the write-back:
+    the next read sees the CURRENT config, not the approved one.
+
+    The approval record is a SIBLING of `config_data` in the payload, so the
+    refresh (which replaces `config_data` and nothing else) and the write-back
+    (which writes that same dict back) both leave it alone.
+
+    This test runs the REAL publisher twice against a real-ish Redis and a
+    real Postgres row, then feeds the command it produced to the REAL command
+    listener.
+    """
+    monkeypatch.setattr(bot_config, "SYMBOL_SOURCE_MODE", "STATIC_LIST")
+
+    redis_client = _FakeRedis()
+    redis_client.sets[f"running_strategies:{1}"] = {CONFIG_ID}
+    # The APPROVAL-TIME payload: the option was NOT armed when the API
+    # approved this strategy, and the API recorded that.
+    redis_client.store[f"running_strategy_payload:{1}:{CONFIG_ID}"] = json.dumps(
+        {
+            "user_id": 1,
+            "id": CONFIG_ID,
+            "config_id": CONFIG_ID,
+            "mode": "paper",
+            "config_data": {"strategy_name": "VisualBuilderStrategy"},
+            "approved_breakeven_on_regime_change": False,
+        }
+    )
+
+    # The user later PUTs the option on. The API's PUT /config route does not
+    # apply the regime-change guard, so the row now carries an arming that
+    # was never approved.
+    async def _fake_get_db_session():
+        yield object()
+
+    async def _fake_get_strategy_config(db, user_id, config_id):
+        return _FakeStrategyRow(
+            {
+                "strategy_name": "VisualBuilderStrategy",
+                "breakeven_on_regime_change": True,
+            }
+        )
+
+    monkeypatch.setattr(
+        "bot_module.rehydrate.crud.get_strategy_config", _fake_get_strategy_config
+    )
+
+    publisher = _controller(
+        redis_client=redis_client, get_db_session=_fake_get_db_session
+    )
+
+    # Pass 1: reads the approval-time payload, refreshes config_data, and
+    # writes the refreshed payload back over the cached one.
+    await publisher._rehydrate_running_strategies_from_redis()
+    # Pass 2: reads what pass 1 left behind.
+    await publisher._rehydrate_running_strategies_from_redis()
+
+    assert len(redis_client.published) == 2, "the publisher must publish twice"
+    _channel, raw = redis_client.published[-1]
+    command = json.loads(raw)
+    published_payload = command["payload"]
+
+    # The refresh DID happen: config_data is now the armed Postgres copy.
+    assert published_payload["config_data"].get("breakeven_on_regime_change") is True
+    # But the APPROVAL RECORD survived it, and it still says the arming was
+    # never approved.
+    assert published_payload.get("approved_breakeven_on_regime_change") is False, (
+        "the approval record must survive the refresh AND the write-back -- "
+        "otherwise a never-approved arming is read back as approved on the "
+        "next restart"
+    )
+
+    # And the command the publisher produced must not start an armed
+    # strategy on a deployment that cannot deliver the regime data.
+    listener = _controller(redis_client=redis_client)
+    redis_client.controller = listener
+    listener._running = True
+    await listener._redis_command_listener()
+
+    assert created_strategies == [], (
+        "a never-approved arming must be REFUSED, not replayed with an inert "
+        "stop -- the approval record says it was never approved"
+    )

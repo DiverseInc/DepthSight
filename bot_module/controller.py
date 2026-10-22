@@ -1527,9 +1527,6 @@ class TradingController:
                             await self._handle_start_strategy_command(
                                 payload,
                                 is_rehydrate=bool(command_data.get("rehydrate")),
-                                armed_at_approval=bool(
-                                    command_data.get("rehydrate_armed_at_approval")
-                                ),
                             )
                         elif command_type == "STOP_STRATEGY":
                             await self._handle_stop_strategy_command(payload)
@@ -2097,7 +2094,6 @@ class TradingController:
         self,
         payload: dict,
         is_rehydrate: bool = False,
-        armed_at_approval: bool = False,
     ):
         """Processes the command to start a strategy instance.
 
@@ -2106,15 +2102,13 @@ class TradingController:
         `_rehydrate_running_strategies_from_redis` and is the ONLY thing that
         distinguishes a replay from a new start on this path.
 
-        `armed_at_approval` says whether `breakeven_on_regime_change` was
-        armed in the APPROVAL-TIME payload -- the one the API stored when it
-        approved the launch. It matters because the replayed payload's
-        config_data is refreshed from Postgres before the replay
-        (`refresh_payload_config_from_db`), and the API's
-        `PUT /config/{config_id}` route does not apply the regime-change
-        guard, so the CURRENT config can carry an arming that was never
-        approved. An arming that was never approved does not inherit the
-        rehydrate exemption.
+        The APPROVAL-TIME state of the regime-change stop is read from the
+        payload itself (`approved_breakeven_on_regime_change`), NOT from the
+        command envelope and NOT from `config_data`. `config_data` is replaced
+        with the CURRENT Postgres copy during the rehydrate
+        (`bot_module/rehydrate.py:185`) and the refreshed payload is written
+        back over the cached one, so anything read out of `config_data` there
+        is the current state, not the approved one.
         """
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -2285,8 +2279,30 @@ class TradingController:
         # arming and is refused like any other.
         regime_stop_armed = arms_breakeven_on_regime_change(config_data, None)
         feed_can_deliver = screener_feed_can_deliver_regime_data()
+        # The APPROVAL-TIME arming state, recorded by the API when it approved
+        # the launch. It rides in the payload as a SIBLING of config_data
+        # because the rehydrate replaces config_data with the CURRENT Postgres
+        # copy and writes that back over the cached payload -- a key INSIDE
+        # config_data would be overwritten with it, and the approval signal
+        # would survive exactly one restart.
+        approved_armed = payload.get("approved_breakeven_on_regime_change")
+        if approved_armed is None:
+            # The payload predates the approval record: this strategy was
+            # approved before the record shipped. Fall back to the payload's
+            # own arming -- the previous behaviour -- so an ALREADY-APPROVED
+            # armed strategy is NOT refused on the first restart after the
+            # deploy. Refusing it would make a running strategy vanish, which
+            # is a worse regression than the hole this closes.
+            approved_armed = regime_stop_armed
+            logger.warning(
+                f"{log_prefix} Payload carries no approval record for "
+                "'breakeven_on_regime_change' (it predates the record). "
+                "Treating the payload's own arming as approved, so an "
+                "already-approved strategy is not refused. Re-approve it "
+                "through the API to make the state exact."
+            )
         replay_of_approved_arming = is_rehydrate and (
-            not regime_stop_armed or armed_at_approval
+            not regime_stop_armed or bool(approved_armed)
         )
         if regime_stop_armed and not feed_can_deliver:
             if not replay_of_approved_arming:
@@ -3836,19 +3852,6 @@ class TradingController:
                     if isinstance(payload_raw, bytes):
                         payload_raw = payload_raw.decode("utf-8")
                     payload = json.loads(payload_raw)
-                    # The APPROVAL-TIME arming state, captured BEFORE the DB
-                    # refresh below swaps in the CURRENT config_data. The
-                    # rehydrate exemption means "this arming was already
-                    # approved", so the approval-time state is what decides
-                    # it -- not the current one. The API's
-                    # `PUT /config/{config_id}` route writes config_data
-                    # without applying the regime-change guard, so the current
-                    # config can carry an arming that was never approved.
-                    approved_armed = bool(
-                        (payload.get("config_data") or {}).get(
-                            "breakeven_on_regime_change"
-                        )
-                    )
                     payload, refreshed = await refresh_payload_config_from_db(
                         payload, int(user_id_str), self.get_db_session
                     )
@@ -3880,11 +3883,6 @@ class TradingController:
                         # running strategy vanish after a restart, which is a
                         # worse regression than an inert stop.
                         "rehydrate": True,
-                        # Whether the option was armed in the APPROVAL-TIME
-                        # payload. An arming that appeared AFTER the approval
-                        # was never approved on this deployment, so it does not
-                        # inherit the exemption.
-                        "rehydrate_armed_at_approval": approved_armed,
                     }
                     await self.redis_client.publish(
                         redis_command_channel,

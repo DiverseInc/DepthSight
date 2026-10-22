@@ -600,7 +600,7 @@ async def start_strategy_instance(
     # `breakeven_on_regime_change` is implemented in
     # `check_on_screener_update` (strategy.py:3070-3079), which has exactly one
     # production caller: `_dynamic_symbol_selection_loop`
-    # (controller.py:5213). That loop reads the controller's screener-update
+    # (controller.py:5211). That loop reads the controller's screener-update
     # queue, and the ONLY producer of that queue is the `active_pairs_update`
     # message on the main_app WebSocket (data_consumer.py:3428). No screener
     # message, no regime change, no MOVE_SL / CLOSE_POSITION stop -- the
@@ -658,6 +658,22 @@ async def start_strategy_instance(
         "symbol_selection_mode": symbol_selection_mode,
         "symbols": symbols,
         "config_data": config_data_dict,
+        # The APPROVAL-TIME state of the regime-change stop, recorded here
+        # because this is the only place that knows what was approved.
+        #
+        # It is a SIBLING of config_data, not a key inside it, ON PURPOSE: the
+        # rehydrate replaces config_data with the CURRENT Postgres copy
+        # (bot_module/rehydrate.py:185) and writes that back over this very
+        # payload. A key inside config_data would be overwritten along with
+        # it, so the approval signal would survive exactly one restart. As a
+        # sibling it survives every refresh and every write-back.
+        #
+        # It matters because the API's `PUT /config/{config_id}` route writes
+        # config_data WITHOUT applying the regime-change guard, so the current
+        # config can carry an arming that was never approved.
+        "approved_breakeven_on_regime_change": bool(
+            config_data_dict.get("breakeven_on_regime_change")
+        ),
         # Pass the rest of the config attributes
         "name": config_to_run.name,
         "description": config_to_run.description,

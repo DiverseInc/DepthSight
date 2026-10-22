@@ -5,7 +5,7 @@ WHY THIS MODULE EXISTS
 `breakeven_on_regime_change` is implemented in `check_on_screener_update`
 (bot_module/strategy.py:3070-3079). Its only production caller is
 `_dynamic_symbol_selection_loop` in bot_module/controller.py -- the
-`check_on_screener_update` call site is controller.py:5213 -- and that loop is
+`check_on_screener_update` call site is controller.py:5211 -- and that loop is
 fed by the controller's screener-update queue. The only producer of that queue
 is the `active_pairs_update` message on the main_app WebSocket
 (bot_module/data_consumer.py:3428).
@@ -64,7 +64,7 @@ def arms_breakeven_on_regime_change(
     where the schema puts it (api/schemas.py:1666), where the frontend writes
     it (frontend/src/pages/Strategies.tsx:650) and where the bot reads it:
     the controller copies config_data into the strategy instance's params
-    (controller.py:2332-2333) and `_get_param` finds it at the top level
+    (controller.py:2348-2349) and `_get_param` finds it at the top level
     (strategy.py:2387-2393).
 
     A launch can also override it through `params`, which the API merges into
