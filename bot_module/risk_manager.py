@@ -1010,7 +1010,7 @@ class RiskManager:
             # it must not require an operator: a new UTC day starts the day's
             # PnL and the loss streak at zero by definition, so whatever was
             # lost belonged to the day that just ended.
-            if self._guard_state_lost:
+            if getattr(self, "_guard_state_lost", False):
                 # Only a STRICTLY LATER day releases this latch. A fresh
                 # process sees its first day-key change on its very first
                 # `_check_and_reset_daily_stats()` (its in-memory
@@ -1018,7 +1018,7 @@ class RiskManager:
                 # change would clear the latch on the same start that set it.
                 # Day strings are `YYYY-MM-DD`, so lexicographic order is
                 # chronological order.
-                if self._guard_state_lost_day_str and (
+                if getattr(self, "_guard_state_lost_day_str", "") and (
                     current_day_str_utc > self._guard_state_lost_day_str
                 ):
                     logger.critical(
@@ -1807,6 +1807,35 @@ class RiskManager:
                 exc_info=True,
             )
 
+    def _daily_loss_base_is_usable(self) -> bool:
+        """Can today's daily-loss / drawdown ratios actually be computed?
+
+        Three cases, and the distinction is between KNOWN and UNKNOWN:
+
+        * a positive base stamped with TODAY -> usable, by definition.
+        * a positive base stamped with an EARLIER day -> NOT usable. This is the
+          measured defect: the denominator is from a day that has ended, so the
+          ratio reads low and the gate under-trips.
+        * a positive base with NO stamp at all -> usable. Nothing in the product
+          produces this shape: every site that assigns the base also stamps the
+          day. It only appears when `TradeStats` is populated directly, which is
+          what the pre-v2 callers and the existing tests do. Treating it as
+          unknown would fail closed on correct existing behaviour, so it keeps
+          the pre-v2 meaning.
+        * a base of zero or less, or one stamped with no known day while the
+          process has not derived one -> NOT usable, whatever the stamp says.
+
+        `_daily_base_known` is what distinguishes "the restore refused to vouch
+        for this base" from "this base was derived here for today". It is not
+        sufficient on its own, because a caller that has not yet reached
+        `initialize_balance` has never had a chance to set it.
+        """
+        if self.stats.start_of_day_balance <= 1e-9:
+            return False
+        if getattr(self, "_daily_base_known", False):
+            return True
+        return not self.stats.start_of_day_day_str
+
     def _check_risk_limits(self):  # Global limits
         # A risk limit may only be treated as "within range" when the numbers
         # it is computed from are KNOWN. If the guard state could not be read
@@ -1837,7 +1866,7 @@ class RiskManager:
             should_be_allowed = False
             disable_reason = f"Balance (${self.stats.current_balance:.2f}) < min (${self.min_balance_threshold:.2f})"
         else:
-            if not getattr(self, "_daily_base_known", False):
+            if not self._daily_loss_base_is_usable():
                 # Both the drawdown and the daily-loss limits are a RATIO
                 # against the day's opening balance. Without a base that
                 # belongs to the CURRENT UTC day the ratio cannot be computed,
@@ -1848,17 +1877,9 @@ class RiskManager:
                 # silently, with no log at all.
                 #
                 # A brand-new account is not blocked by this: the first
-                # `initialize_balance` derives the base from the live balance
-                # and sets `_daily_base_known`, so the very next limit check
-                # can decide. What is blocked is the window where the base is
-                # genuinely unknown.
-                should_be_allowed = False
-                disable_reason = RISK_GUARD_BASE_UNKNOWN_REASON
-            elif self.stats.start_of_day_balance <= 1e-9:
-                # `_daily_base_known` says the base belongs to today, so a
-                # non-positive value here means the balance fetch produced a
-                # base that cannot divide anything. Still UNKNOWN, still fail
-                # closed.
+                # `initialize_balance` derives the base from the live balance,
+                # so the very next limit check can decide. What is blocked is
+                # the window where the base is genuinely unknown.
                 should_be_allowed = False
                 disable_reason = RISK_GUARD_BASE_UNKNOWN_REASON
             else:
