@@ -671,8 +671,16 @@ async def start_strategy_instance(
         # It matters because the API's `PUT /config/{config_id}` route writes
         # config_data WITHOUT applying the regime-change guard, so the current
         # config can carry an arming that was never approved.
-        "approved_breakeven_on_regime_change": bool(
-            config_data_dict.get("breakeven_on_regime_change")
+        #
+        # Read through the SAME predicate the 503 guard just used, not a
+        # re-implementation of it. The guard evaluates
+        # arms_breakeven_on_regime_change(config_to_run.config_data,
+        # request.params); a second, inline copy of that read here could drift
+        # from it -- decode a JSON-string config_data differently, or miss the
+        # dynamic-override merge -- and then the record would disagree with the
+        # very decision it is supposed to be evidence of.
+        "approved_breakeven_on_regime_change": _arms_breakeven_on_regime_change(
+            config_to_run.config_data, request.params
         ),
         # Pass the rest of the config attributes
         "name": config_to_run.name,
