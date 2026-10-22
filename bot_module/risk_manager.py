@@ -343,14 +343,6 @@ class RiskManager:
         # guarantee hold regardless of the order in which the controller
         # calls the two, instead of relying on one particular order.
         self._guard_state_restored: bool = False
-        # True once `start_of_day_balance` is known to belong to the CURRENT
-        # UTC day. The daily-loss and max-drawdown gates are ratios against that
-        # number, so "the base is from some earlier day" and "there is no base"
-        # are both UNKNOWN -- and an unknown ratio must not read as "not
-        # breached". `initialize_balance` sets this by deriving the base from
-        # the live balance; the restore sets it only when the persisted base
-        # carries today's day with it.
-        self._daily_base_known: bool = False
         # True when the persisted guard state has VANISHED for a controller that
         # has traded before (see `_guard_seen_redis_key`). This is deliberately
         # NOT `_guard_state_unverified`: that latch means "Redis could not be
@@ -731,7 +723,6 @@ class RiskManager:
                 )
                 self.stats.start_of_day_balance = self.stats.current_balance
                 self.stats.start_of_day_day_str = current_trading_day_str_utc_actual
-                self._daily_base_known = True
                 logger.info(
                     f"Daily-loss base re-derived for {current_trading_day_str_utc_actual}: "
                     f"${self.stats.start_of_day_balance:.2f}"
@@ -1004,7 +995,6 @@ class RiskManager:
             )
             self.stats.start_of_day_balance = self.stats.current_balance
             self.stats.start_of_day_day_str = current_day_str_utc
-            self._daily_base_known = True
             # A lost guard state heals at the UTC rollover and nowhere else.
             # It cannot heal on a re-read (there is nothing left to read), and
             # it must not require an operator: a new UTC day starts the day's
@@ -1810,31 +1800,34 @@ class RiskManager:
     def _daily_loss_base_is_usable(self) -> bool:
         """Can today's daily-loss / drawdown ratios actually be computed?
 
-        Three cases, and the distinction is between KNOWN and UNKNOWN:
+        The distinction is between KNOWN and UNKNOWN, not between large and
+        small:
 
-        * a positive base stamped with TODAY -> usable, by definition.
-        * a positive base stamped with an EARLIER day -> NOT usable. This is the
+        * a base of zero or less -> NOT usable. Nothing can divide by it.
+        * a base stamped with a day that is not TODAY -> NOT usable. This is the
           measured defect: the denominator is from a day that has ended, so the
-          ratio reads low and the gate under-trips.
-        * a positive base with NO stamp at all -> usable. Nothing in the product
+          ratio reads LOW and the gate under-trips. A large stale base is still
+          a stale base.
+        * a base stamped with TODAY -> usable.
+        * a base with NO stamp at all -> usable. Nothing in the product
           produces this shape: every site that assigns the base also stamps the
           day. It only appears when `TradeStats` is populated directly, which is
           what the pre-v2 callers and the existing tests do. Treating it as
           unknown would fail closed on correct existing behaviour, so it keeps
           the pre-v2 meaning.
-        * a base of zero or less, or one stamped with no known day while the
-          process has not derived one -> NOT usable, whatever the stamp says.
 
-        `_daily_base_known` is what distinguishes "the restore refused to vouch
-        for this base" from "this base was derived here for today". It is not
-        sufficient on its own, because a caller that has not yet reached
-        `initialize_balance` has never had a chance to set it.
+        The day comparison happens HERE, on the read side, rather than being
+        left to the discipline of every writer that stamps the base. That is
+        deliberate: the defect being fixed IS two fields drifting apart, so
+        trusting write-side discipline to keep them in step would assume away
+        the exact failure mode under repair. Raised by the hermes reviewer.
         """
         if self.stats.start_of_day_balance <= 1e-9:
             return False
-        if getattr(self, "_daily_base_known", False):
-            return True
-        return not self.stats.start_of_day_day_str
+        stamp = self.stats.start_of_day_day_str
+        if stamp:
+            return stamp == self._current_utc_day_str()
+        return True
 
     def _check_risk_limits(self):  # Global limits
         # A risk limit may only be treated as "within range" when the numbers
@@ -3021,9 +3014,7 @@ class RiskManager:
         if base_is_from_today:
             self.stats.start_of_day_balance = start_of_day_balance
             self.stats.start_of_day_day_str = current_day_str
-            self._daily_base_known = True
         else:
-            self._daily_base_known = False
             logger.critical(
                 "[RiskGuard] NOT restoring the persisted start-of-day balance "
                 f"(${start_of_day_balance:.2f}): it belongs to UTC day "

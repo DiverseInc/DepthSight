@@ -419,9 +419,8 @@ async def test_an_unknown_base_fails_closed_instead_of_skipping_the_checks(
     """
     rm = _risk_manager(FakeRedis(redis_store), DAY_THREE, balance=10000.0)
     await rm.initialize_balance()
-    # Simulate the base becoming unknown: the value is still there but it is
-    # not known to belong to today.
-    rm._daily_base_known = False
+    # The base is gone. A zero base cannot produce a ratio at all, so the
+    # limit is unknown.
     rm.stats.start_of_day_balance = 0.0
     rm.stats.today_pnl = -500.0
 
@@ -437,16 +436,15 @@ async def test_an_unknown_base_fails_closed_instead_of_skipping_the_checks(
     )
 
 
-async def test_a_zero_base_known_to_be_todays_still_fails_closed(redis_store):
-    """A base that is known-but-unusable is still UNKNOWN.
+async def test_a_zero_base_stamped_today_still_fails_closed(redis_store):
+    """A base stamped TODAY can still be unusable.
 
-    `_daily_base_known` can be true while the value cannot divide anything, so
-    the near-zero case needs its own fail-closed branch rather than falling
-    through to the division.
+    The stamp says which day the base belongs to; it says nothing about whether
+    the number can divide anything. A zero base stamped with today must still
+    fail closed rather than fall through to the division.
     """
     rm = _risk_manager(FakeRedis(redis_store), DAY_THREE, balance=10000.0)
     await rm.initialize_balance()
-    rm._daily_base_known = True
     rm.stats.start_of_day_balance = 0.0
     rm.stats.today_pnl = -500.0
 
@@ -471,9 +469,7 @@ async def test_a_positive_but_stale_day_base_still_fails_closed(redis_store):
     """
     rm = _risk_manager(FakeRedis(redis_store), DAY_THREE, balance=TRUE_BASE)
     await rm.initialize_balance()
-    # The restore refused to vouch for this base, and the base it left behind
-    # is the one from an earlier day.
-    rm._daily_base_known = False
+    # The base left behind is the one from an earlier day, and its stamp says so.
     rm.stats.start_of_day_balance = STALE_BASE
     rm.stats.start_of_day_day_str = DAY_ONE
     rm.stats.today_pnl = -73.03
@@ -509,7 +505,6 @@ async def test_a_first_boot_can_still_trade(redis_store):
     assert restored is False, "nothing was persisted, so nothing was restored"
     assert rm.stats.start_of_day_balance == pytest.approx(10000.0)
     assert rm.stats.start_of_day_day_str == DAY_THREE
-    assert rm._daily_base_known is True
     assert rm._is_trading_allowed is True, (
         "a first boot must be able to trade -- the fail-closed rule is about "
         "an UNKNOWN base, not about a missing one"
