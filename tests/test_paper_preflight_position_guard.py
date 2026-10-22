@@ -342,13 +342,25 @@ def _spy_on_place_order(executor):
     return calls
 
 
-def _critical_records(caplog):
-    """The CRITICAL records the guard emitted, joined for substring assertions."""
+def _abort_records(caplog, min_level=logging.WARNING):
+    """The records the guard emitted when it refused an entry.
+
+    `min_level` defaults to WARNING because the two books report at DIFFERENT
+    severities on purpose, and every assertion below states which one it expects
+    instead of inheriting it from this filter. Collecting at WARNING+ and then
+    pinning `levelno` per test is what stops a regression that quietly re-raises
+    the paper abort -- or lowers the live one -- from passing unnoticed.
+    """
     return [
         rec
         for rec in caplog.records
-        if rec.levelno >= logging.CRITICAL and "Aborting" in rec.getMessage()
+        if rec.levelno >= min_level and "Aborting" in rec.getMessage()
     ]
+
+
+def _critical_records(caplog):
+    """Kept as the name the paper tests used; now delegates to `_abort_records`."""
+    return _abort_records(caplog, logging.WARNING)
 
 
 # --- 1. THE DEFECT: a PAPER position is not an EXCHANGE position --------------
@@ -370,7 +382,7 @@ async def test_paper_preflight_abort_does_not_claim_the_exchange_holds_it(caplog
     )
     orders = _spy_on_place_order(paper_executor)
 
-    caplog.set_level(logging.CRITICAL, logger="bot_module.controller")
+    caplog.set_level(logging.WARNING, logger="bot_module.controller")
     await controller._process_signal(_signal(), {})
 
     records = _critical_records(caplog)
@@ -386,6 +398,12 @@ async def test_paper_preflight_abort_does_not_claim_the_exchange_holds_it(caplog
     )
     assert "paper" in message.lower(), (
         f"the guard must name the book it is actually reading. Message was: {message}"
+    )
+    assert records[0].levelno == logging.WARNING, (
+        "a simulated position with no money behind it is not a CRITICAL incident; "
+        f"CRITICAL is the level this guard raises for a real venue holding real "
+        f"money, and reusing it here buries that one. Got level "
+        f"{logging.getLevelName(records[0].levelno)}: {message}"
     )
 
 
@@ -406,7 +424,7 @@ async def test_paper_preflight_abort_names_the_position_so_it_can_be_found(caplo
     )
     _spy_on_place_order(paper_executor)
 
-    caplog.set_level(logging.CRITICAL, logger="bot_module.controller")
+    caplog.set_level(logging.WARNING, logger="bot_module.controller")
     await controller._process_signal(_signal(), {})
 
     message = _critical_records(caplog)[0].getMessage()
@@ -468,7 +486,7 @@ async def test_live_preflight_still_blames_the_exchange_and_refuses(caplog):
     ]
     orders = _spy_on_place_order(live_executor)
 
-    caplog.set_level(logging.CRITICAL, logger="bot_module.controller")
+    caplog.set_level(logging.WARNING, logger="bot_module.controller")
     await controller._process_signal(_signal(), {})
 
     records = _critical_records(caplog)
@@ -477,6 +495,13 @@ async def test_live_preflight_still_blames_the_exchange_and_refuses(caplog):
 
     assert "Exchange already has position" in message, (
         f"a real duplicate on a real exchange must still say so: {message}"
+    )
+    assert records[0].levelno == logging.CRITICAL, (
+        "the live abort is the one that IS critical -- a real venue holds a real "
+        "position this controller does not know about and the next entry would "
+        "double down on it. Dropping it to a warning silences the only case that "
+        f"costs money. Got level {logging.getLevelName(records[0].levelno)}: "
+        f"{message}"
     )
     assert orders == [], f"a duplicate live entry was placed: {orders}"
 
@@ -502,7 +527,7 @@ async def test_price_feed_failure_does_not_abort_a_paper_entry(caplog):
     )
     orders = _spy_on_place_order(paper_executor)
 
-    caplog.set_level(logging.CRITICAL, logger="bot_module.controller")
+    caplog.set_level(logging.WARNING, logger="bot_module.controller")
     await controller._process_signal(_signal(), {})
 
     errors = [
@@ -525,6 +550,10 @@ async def test_price_feed_failure_does_not_abort_a_paper_entry(caplog):
         "silently skipped"
     )
     assert "Exchange already has position" not in records[0].getMessage()
+    assert records[0].levelno == logging.WARNING, (
+        "the severity drop must survive a price-feed failure too -- the guard "
+        "must still reach its own branch to report the position it can see"
+    )
 
 
 @pytest.mark.asyncio
@@ -585,9 +614,22 @@ def test_paper_and_live_executors_declare_which_book_they_are():
             f"{exchange_class.__name__} must declare is_paper_book=False so a "
             "live book is never reported as a simulation"
         )
-        assert getattr(exchange_class, "supports_positions", None) is not None, (
-            f"{exchange_class.__name__} must keep declaring supports_positions"
+        # `is_paper_book` must be a CLASS attribute on the live executors, not
+        # an instance one: the guard's `getattr` runs against whatever the
+        # controller was handed, and a value that only exists after a
+        # successful connection is a value that reads as "live" by accident on a
+        # half-built executor -- which is the safe direction, but only by luck.
+        assert "is_paper_book" in vars(exchange_class), (
+            f"{exchange_class.__name__} must declare is_paper_book at CLASS "
+            "level, not in __init__"
         )
+
+    # The live executors set `supports_positions` per INSTANCE, in __init__ from
+    # the market type -- it is deliberately not a class attribute, so asserting
+    # it here would read None. That flag is what the exchange factory builds
+    # with, and `tests/test_exchange_factory.py` already pins it on real
+    # instances for every market type. What matters HERE is the paper side,
+    # asserted above: PR #26's declaration must not be reverted by this fix.
 
 
 def test_the_executor_protocol_declares_the_flag():

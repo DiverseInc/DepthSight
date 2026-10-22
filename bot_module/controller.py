@@ -9131,7 +9131,19 @@ class TradingController:
                         # is NOT visible so the operator is not sent to the
                         # positions panel hunting for something that will not be
                         # there.
-                        logger.critical(
+                        #
+                        # The SEVERITY drops with the truth. CRITICAL is the
+                        # level this guard exists to raise: a position on a real
+                        # venue that this controller does not know about, holding
+                        # real money, that the next entry would double down on.
+                        # None of that is true here. No venue holds it, no
+                        # leverage is applied, no real money is exposed, and a
+                        # restart clears it. Raising CRITICAL for it trains the
+                        # operator to ignore CRITICAL -- and buries the live
+                        # duplicate that genuinely is one. The refusal itself is
+                        # unchanged and still says STOP; what it is worth has
+                        # dropped to a warning.
+                        logger.warning(
                             f"{log_prefix} STOP! The PAPER book already holds a "
                             f"{signal.direction.name} {signal.symbol} position of "
                             f"{existing_position['positionAmt']} at entry "
