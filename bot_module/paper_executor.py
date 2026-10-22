@@ -55,6 +55,21 @@ class PaperTradingExecutor:
     supports_positions = True
     supports_shorting = True
 
+    # `supports_positions` answers "does this book hold POSITIONS?". It says
+    # nothing about WHOSE book it is, and those are two different questions.
+    # This executor's book is this process's own simulation: a position here was
+    # invented by a fill `place_order` simulated, it exists only in RAM, no
+    # venue anywhere holds it, and no real money is exposed by it.
+    #
+    # Call sites that must tell a real venue apart from a simulation ask THIS
+    # attribute. Asking `supports_positions` there was the 2026-10-21
+    # regression: PR #26 was right to declare the paper book a futures book,
+    # and the pre-flight duplicate-entry guard inherited that declaration as if
+    # the simulation were a live exchange position -- it logged "Exchange
+    # already has position" with a leverage and a liquidation price for money
+    # that was never at risk, and refused the entry.
+    is_paper_book = True
+
     def __init__(
         self,
         user_id: int,
@@ -634,7 +649,31 @@ class PaperTradingExecutor:
             avg_entry_price = pos_data.get("avg_entry_price", 0.0)
 
             if abs(quantity) > 1e-9:
-                current_price = await self.data_consumer.get_latest_price(symbol)
+                # The price lookup must never take the caller down with it.
+                # `get_open_positions` is awaited INSIDE the entry path (the
+                # pre-flight duplicate-entry guard), and that call site aborts
+                # the signal on ANY exception, so a price-feed error raised from
+                # here became a refused trade. A position does not stop existing
+                # because we cannot price it at this instant.
+                try:
+                    current_price = await self.data_consumer.get_latest_price(symbol)
+                except Exception as e_price:
+                    logger.warning(
+                        f"[PaperOpenPositions] Could not read a price for {symbol} "
+                        f"({e_price}); marking it at its entry price so the "
+                        f"position is still reported honestly."
+                    )
+                    current_price = None
+
+                # A missing or zero price is NOT a price of zero. Reporting
+                # `markPrice: "0"` next to a real BTCUSDT position reads like a
+                # real quote and makes the PnL below a fabricated 0.0. Falling
+                # back to the entry price keeps the mark visibly true, so the
+                # 0.0 that follows is the arithmetic of THAT mark rather than a
+                # claim about the market.
+                if not current_price or current_price <= 0:
+                    if avg_entry_price > 0:
+                        current_price = avg_entry_price
 
                 pnl = 0.0
                 if avg_entry_price > 0 and current_price:

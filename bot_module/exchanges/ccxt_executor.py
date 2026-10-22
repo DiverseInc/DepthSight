@@ -21,6 +21,10 @@ class CcxtExecutor:
     Implements the ExchangeExecutor protocol for cross-exchange trading.
     """
 
+    # A real venue. `sandbox` is a venue's TESTNET, still a venue and not this
+    # process's own simulation, so it is False in both cases.
+    is_paper_book = False
+
     def __init__(
         self,
         exchange_id: str,
