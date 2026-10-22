@@ -40,7 +40,7 @@
     },
     {
       "label": "C2-B: the feed predicate is wrong (a deployment that CAN deliver the regime data is treated as one that cannot)",
-      "file": "api/routes/strategies.py",
+      "file": "bot_module/regime_feed.py",
       "needle": "    source_mode = str(\n        getattr(bot_config, \"SYMBOL_SOURCE_MODE\", \"MAIN_APP\")\n    ).strip().upper()\n",
       "replace": "    source_mode = \"MUTANT_NEVER_DELIVERABLE\"\n"
     },

@@ -4,9 +4,9 @@ WHY
 ---
 `breakeven_on_regime_change` is implemented in
 `check_on_screener_update` (strategy.py:3070-3079), which is only ever reached
-from `_dynamic_symbol_selection_loop` (controller.py:1236) -- fed exclusively by
+from `_dynamic_symbol_selection_loop` (controller.py:5213) -- fed exclusively by
 the `Main_app_ws` socket. `_dynamic_symbol_selection_loop` runs for EVERY
-controller, STATIC and FIXED included; the DYNAMIC guard at strategies.py:566
+controller, STATIC and FIXED included; the DYNAMIC guard at strategies.py:583
 only refuses DYNAMIC strategies at START and says nothing about this.
 
 So while the feed is down, every running strategy with that option set has its

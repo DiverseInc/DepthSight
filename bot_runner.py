@@ -268,7 +268,17 @@ async def _rehydrate_all_strategies_globally(redis_client) -> None:
                         f"at {payload_key}: {exc}; continuing with the in-memory copy."
                     )
 
-            command = {"command": "START_STRATEGY", "payload": payload}
+            command = {
+                "command": "START_STRATEGY",
+                "payload": payload,
+                # Marks this as a REPLAY of a strategy that the API already
+                # approved and that was running before this bot restarted --
+                # NOT a new start. The command handler honours this mark:
+                # refusing to replay an already-approved strategy would make
+                # the user's running strategy vanish after a restart, which is
+                # a worse regression than an inert stop.
+                "rehydrate": True,
+            }
             await redis_client.publish(
                 config.REDIS_COMMAND_CHANNEL,
                 json.dumps(command, default=str),

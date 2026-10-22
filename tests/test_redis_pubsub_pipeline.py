@@ -36,12 +36,12 @@ def publisher(shared_server):
 
 
 @pytest.mark.asyncio
-async def test_pubsub_delivery(shared_server, publisher):
+async def test_pubsub_delivery(shared_server, publisher, monkeypatch):
     """
     Core test: DataConsumer subscribes, publishes, receives.
     """
     # Patch config + redis BEFORE importing DataConsumer
-    _patch_config_and_redis(shared_server)
+    _patch_config_and_redis(shared_server, monkeypatch)
 
     from bot_module.data_consumer import DataConsumer
 
@@ -110,12 +110,14 @@ async def test_pubsub_delivery(shared_server, publisher):
 
 
 @pytest.mark.asyncio
-async def test_multiple_rapid_subscriptions(shared_server, publisher):
+async def test_multiple_rapid_subscriptions(
+    shared_server, publisher, monkeypatch
+):
     """
     Subscribe to multiple channels while listener is polling get_message.
     This stress-tests the lock between get_message and subscribe.
     """
-    _patch_config_and_redis(shared_server)
+    _patch_config_and_redis(shared_server, monkeypatch)
 
     from bot_module.data_consumer import DataConsumer
 
@@ -177,24 +179,54 @@ async def test_multiple_rapid_subscriptions(shared_server, publisher):
         await consumer.stop()
 
 
-def _patch_config_and_redis(server):
-    """Patch config and redis.asyncio.Redis *before* DataConsumer import."""
+def _patch_config_and_redis(server, monkeypatch):
+    """Patch config and redis.asyncio.Redis *before* DataConsumer import.
+
+    Every global below is applied through `monkeypatch`, so it is UNDONE when
+    the test finishes. Assigning them directly leaked them into the rest of the
+    session, and `redis.asyncio.Redis` is the one that actually broke tests.
+
+    It stayed a plain factory function, so the `mock_redis_client` fixture in
+    tests/conftest.py built `MagicMock(spec=<function>)` instead of
+    `MagicMock(spec=Redis)`. That fixture promotes every callable it finds via
+    `dir(redis.Redis)` into an AsyncMock, and `dir()` of a function yields
+    nothing -- so every redis method outside conftest's hand-written list
+    (`sadd` included) raised AttributeError for the rest of the run.
+
+    Measured on tests/test_redis_pubsub_pipeline.py + the guard file:
+    test_the_api_records_the_approval_state_at_launch failed ONLY when this
+    file ran first, with `KeyError: running_strategy_payload:...`, because
+    strategies.py's `await redis_client.sadd(...)` had raised and the route's
+    `except Exception` swallowed it before the payload was cached. This file
+    is collected immediately before the guard file, which is why the failure
+    looked unrelated to it.
+    """
     import numpy as np
 
     if not hasattr(np, "NaN"):
-        np.NaN = np.nan
+        monkeypatch.setattr(np, "NaN", np.nan, raising=False)
 
     import bot_module.config as cfg
 
-    cfg.MARKET_DATA_FANOUT_MODE = "redis"
-    cfg.MARKET_DATA_REDIS_EVENT_CHANNEL_PREFIX = "depthsight:market_data:events"
-    cfg.MARKET_REDIS_HOST = "fake"
-    cfg.MARKET_REDIS_PORT = 6379
-    cfg.MARKET_REDIS_DB = 0
-    cfg.REDIS_USERNAME = "bot"
-    cfg.REDIS_PASSWORD = "x"
-    cfg.MARKET_DATA_REDIS_COMMAND_CHANNEL = "depthsight:market_data:commands"
-    cfg.BINANCE_DEPTH_STREAM_NAME = "@depth"
+    monkeypatch.setattr(cfg, "MARKET_DATA_FANOUT_MODE", "redis", raising=False)
+    monkeypatch.setattr(
+        cfg,
+        "MARKET_DATA_REDIS_EVENT_CHANNEL_PREFIX",
+        "depthsight:market_data:events",
+        raising=False,
+    )
+    monkeypatch.setattr(cfg, "MARKET_REDIS_HOST", "fake", raising=False)
+    monkeypatch.setattr(cfg, "MARKET_REDIS_PORT", 6379, raising=False)
+    monkeypatch.setattr(cfg, "MARKET_REDIS_DB", 0, raising=False)
+    monkeypatch.setattr(cfg, "REDIS_USERNAME", "bot", raising=False)
+    monkeypatch.setattr(cfg, "REDIS_PASSWORD", "x", raising=False)
+    monkeypatch.setattr(
+        cfg,
+        "MARKET_DATA_REDIS_COMMAND_CHANNEL",
+        "depthsight:market_data:commands",
+        raising=False,
+    )
+    monkeypatch.setattr(cfg, "BINANCE_DEPTH_STREAM_NAME", "@depth", raising=False)
 
     import bot_module.data_consumer as dc_mod
 
@@ -203,4 +235,6 @@ def _patch_config_and_redis(server):
         kw.setdefault("decode_responses", True)
         return fakeredis.aioredis.FakeRedis(server=server, **kw)
 
-    dc_mod.redis_asyncio.Redis = fake_factory
+    # Same target as before -- `dc_mod.redis_asyncio` IS the redis.asyncio
+    # module -- but now restorable. This is the leak that broke other files.
+    monkeypatch.setattr(dc_mod.redis_asyncio, "Redis", fake_factory)

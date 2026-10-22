@@ -1,0 +1,84 @@
+{
+  "_comment": [
+    "Mutations that reintroduce the START_STRATEGY command-path hole.",
+    "",
+    "The bot starts a strategy through a SECOND door than the HTTP route:",
+    "the Redis command channel. `_handle_start_strategy_command` is the only",
+    "consumer of the START_STRATEGY command, and it must refuse to start a",
+    "strategy that arms 'breakeven_on_regime_change' on a deployment whose",
+    "screener feed cannot deliver the regime data.",
+    "",
+    "M1 is the HOLE re-opened: the refusal never fires. The refusal tests",
+    "    must fail.",
+    "M2 is the FALSE POSITIVE: the feed check is dropped, so the guard refuses",
+    "    a protection that WOULD have worked. The positive control must fail.",
+    "M3 drops the REHYDRATE EXEMPTION: a replay of an already-approved",
+    "    strategy is refused, and the user's running strategy vanishes after a",
+    "    restart. The rehydrate test must fail.",
+    "M4 drops the REPLAY ALARM: the replay is still exempt from the refusal,",
+    "    but nothing says its stop is inert. The replay-alarm test must fail.",
+    "M5 ignores the APPROVAL RECORD and always falls back to the payload's",
+    "    own arming -- the defect this PR was asked to close: a never-approved",
+    "    arming is then read back as approved. The two-pass test must fail.",
+    "M6 removes the BACKWARD-COMPATIBILITY FALLBACK, so a payload that",
+    "    predates the approval record is treated as never-approved and an",
+    "    already-approved armed strategy is REFUSED on the first restart after",
+    "    the deploy. The backward-compatibility test must fail.",
+    "M7 is THE DEFECT THIS PR WAS ASKED TO CLOSE, reintroduced exactly: the",
+    "    refresh OVERWRITES the approval record with the CURRENT arming before",
+    "    the handler ever reads it, so a never-approved arming reads back as",
+    "    approved. Dropping the CHECK does not catch this -- the check's INPUT",
+    "    is what was corrupted. Both two-pass survival tests must fail: the",
+    "    per-controller publisher's and the global publisher's.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/strategy_command_path_guard.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_strategy_command_regime_change_guard.py tests/test_regime_change_arm_guard.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: the command-path guard never refuses anything (the hole, re-opened)",
+      "file": "bot_module/controller.py",
+      "needle": "            if not replay_of_approved_arming:\n",
+      "replace": "            if False:  # MUTANT: the command path never refuses\n"
+    },
+    {
+      "label": "M2: the feed check is dropped, so the guard refuses a protection that WOULD have worked",
+      "file": "bot_module/controller.py",
+      "needle": "        if regime_stop_armed and not feed_can_deliver:\n",
+      "replace": "        if regime_stop_armed:  # MUTANT: the feed check is dropped\n"
+    },
+    {
+      "label": "M3: the rehydrate exemption is dropped, so a replay of an already-approved strategy is refused",
+      "file": "bot_module/controller.py",
+      "needle": "        replay_of_approved_arming = is_rehydrate and (\n",
+      "replace": "        replay_of_approved_arming = False and (\n"
+    },
+    {
+      "label": "M4: the replay alarm is never raised, so an inert replayed stop is silent",
+      "file": "bot_module/controller.py",
+      "needle": "            logger.critical(\n                f\"{log_prefix} REPLAYED a strategy that arms \"\n",
+      "replace": "            logger.info(\n                f\"{log_prefix} REPLAYED a strategy that arms \"\n"
+    },
+    {
+      "label": "M5: the approval record is ignored, so a never-approved arming is read back as approved",
+      "file": "bot_module/controller.py",
+      "needle": "        approved_armed = payload.get(\"approved_breakeven_on_regime_change\")\n",
+      "replace": "        approved_armed = None  # MUTANT: the approval record is ignored\n"
+    },
+    {
+      "label": "M6: the backward-compatibility fallback is removed, so an already-approved armed strategy is refused",
+      "file": "bot_module/controller.py",
+      "needle": "        if approved_armed is None:\n",
+      "replace": "        if False:  # MUTANT: the backward-compatibility fallback is gone\n"
+    },
+    {
+      "label": "M7: THE ORIGINAL DEFECT. The refresh OVERWRITES the approval record with the current arming",
+      "file": "bot_module/rehydrate.py",
+      "needle": "        updated = dict(payload)\n        updated[\"config_data\"] = fresh\n",
+      "replace": "        updated = dict(payload)\n        updated[\"config_data\"] = fresh\n        updated[\"approved_breakeven_on_regime_change\"] = bool((fresh or {}).get(\"breakeven_on_regime_change\"))  # MUTANT: the approval record is overwritten by the current arming\n"
+    }
+  ]
+}

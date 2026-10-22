@@ -35,6 +35,10 @@ from bot_module.runtime_dependencies import (
     send_push_notification,
 )
 from bot_module.rehydrate import refresh_payload_config_from_db
+from bot_module.regime_feed import (
+    arms_breakeven_on_regime_change,
+    screener_feed_can_deliver_regime_data,
+)
 from bot_module.symbol_selection import SymbolSelectionConfig
 from bot_module.strategy import (
     StrategySignal,
@@ -1516,7 +1520,14 @@ class TradingController:
                         logger.info(f"Received command '{command_type}' via Redis.")
 
                         if command_type == "START_STRATEGY":
-                            await self._handle_start_strategy_command(payload)
+                            # `rehydrate` marks a REPLAY of a strategy that was
+                            # already approved and running before this bot
+                            # restarted -- not a new start. It is the only
+                            # thing that distinguishes the two on this path.
+                            await self._handle_start_strategy_command(
+                                payload,
+                                is_rehydrate=bool(command_data.get("rehydrate")),
+                            )
                         elif command_type == "STOP_STRATEGY":
                             await self._handle_stop_strategy_command(payload)
                         elif command_type == "TV_WEBHOOK_SIGNAL":
@@ -2079,8 +2090,26 @@ class TradingController:
         await pubsub.unsubscribe(hft_events_channel)
         logger.info("HFT event listener stopped.")
 
-    async def _handle_start_strategy_command(self, payload: dict):
-        """Processes the command to start a strategy instance."""
+    async def _handle_start_strategy_command(
+        self,
+        payload: dict,
+        is_rehydrate: bool = False,
+    ):
+        """Processes the command to start a strategy instance.
+
+        `is_rehydrate` marks a REPLAY of a strategy that the API already
+        approved and that was running before this bot restarted. It is set by
+        `_rehydrate_running_strategies_from_redis` and is the ONLY thing that
+        distinguishes a replay from a new start on this path.
+
+        The APPROVAL-TIME state of the regime-change stop is read from the
+        payload itself (`approved_breakeven_on_regime_change`), NOT from the
+        command envelope and NOT from `config_data`. `config_data` is replaced
+        with the CURRENT Postgres copy during the rehydrate
+        (`bot_module/rehydrate.py:185`) and the refreshed payload is written
+        back over the cached one, so anything read out of `config_data` there
+        is the current state, not the approved one.
+        """
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "[_handle_start_strategy_command] Received payload: %s",
@@ -2215,6 +2244,101 @@ class TradingController:
         log_prefix = (
             f"[StartCmd:{self._log_scope}:{strategy_name}:{config_id[:8]}]"
         )
+
+        # A strategy that arms `breakeven_on_regime_change` must not be STARTED
+        # on a deployment that cannot deliver the regime data.
+        #
+        # `breakeven_on_regime_change` is implemented in
+        # `check_on_screener_update` (strategy.py:3070-3079), whose only
+        # production caller is `_dynamic_symbol_selection_loop` -- fed
+        # exclusively by the controller's screener-update queue, and the only
+        # producer of that queue is the `active_pairs_update` message on the
+        # main_app WebSocket (data_consumer.py:3428). On a deployment with no
+        # such feed the stop is inert from the first second: the strategy
+        # starts, reports "running", and the user believes they are protected.
+        #
+        # The API already refuses this with a 503 (api/routes/strategies.py,
+        # `POST /api/v1/strategies`), but that protects the HTTP route ONLY.
+        # This Redis command channel is a second way in. Both paths ask the
+        # SAME predicate (`bot_module.regime_feed.
+        # screener_feed_can_deliver_regime_data`), so the two guards cannot
+        # drift apart: this one is exactly as narrow as the HTTP one, and a
+        # deployment whose feed IS configured still starts.
+        #
+        # A REHYDRATE REPLAY of an ALREADY-APPROVED arming is exempt from the
+        # refusal below, and deliberately so: the replayed strategy was already
+        # approved by the API's 503 guard and was running before the restart,
+        # so refusing it would make the user's running strategy VANISH after a
+        # restart -- a worse regression than an inert stop.
+        #
+        # An arming that appeared AFTER the approval does NOT inherit the
+        # exemption: the API's `PUT /config/{config_id}` route writes
+        # config_data without applying the regime-change guard, and the replay
+        # refreshes config_data from Postgres, so an arming can reach the
+        # replay that was never approved on this deployment. That one is a NEW
+        # arming and is refused like any other.
+        regime_stop_armed = arms_breakeven_on_regime_change(config_data, None)
+        feed_can_deliver = screener_feed_can_deliver_regime_data()
+        # The APPROVAL-TIME arming state, recorded by the API when it approved
+        # the launch. It rides in the payload as a SIBLING of config_data
+        # because the rehydrate replaces config_data with the CURRENT Postgres
+        # copy and writes that back over the cached payload -- a key INSIDE
+        # config_data would be overwritten with it, and the approval signal
+        # would survive exactly one restart.
+        approved_armed = payload.get("approved_breakeven_on_regime_change")
+        if approved_armed is None:
+            # The payload predates the approval record: this strategy was
+            # approved before the record shipped. Fall back to the payload's
+            # own arming -- the previous behaviour -- so an ALREADY-APPROVED
+            # armed strategy is NOT refused on the first restart after the
+            # deploy. Refusing it would make a running strategy vanish, which
+            # is a worse regression than the hole this closes.
+            approved_armed = regime_stop_armed
+            logger.warning(
+                f"{log_prefix} Payload carries no approval record for "
+                "'breakeven_on_regime_change' (it predates the record). "
+                "Treating the payload's own arming as approved, so an "
+                "already-approved strategy is not refused. Re-approve it "
+                "through the API to make the state exact."
+            )
+        replay_of_approved_arming = is_rehydrate and (
+            not regime_stop_armed or bool(approved_armed)
+        )
+        if regime_stop_armed and not feed_can_deliver:
+            if not replay_of_approved_arming:
+                logger.error(
+                    f"{log_prefix} REFUSED to start: this strategy arms "
+                    "'breakeven_on_regime_change', but THIS DEPLOYMENT CANNOT "
+                    "DELIVER THE REGIME DATA (SYMBOL_SOURCE_MODE is not "
+                    "'MAIN_APP', or MAIN_APP_WS_ENABLED is false, or "
+                    "MAIN_APP_WS_URL is not a ws:// / wss:// URL). The "
+                    "regime-change stop is fed ONLY by the screener WebSocket "
+                    "feed, so it would never fire. Turn the option off, or "
+                    "point the deployment at a working screener feed."
+                )
+                return
+
+            # The stop really IS inert in this case, so it must not be silent.
+            #
+            # PR #28's CRITICAL alarm in `DataConsumer.start()` covers this
+            # case only on a BEST-EFFORT basis: the rehydrate PUBLISHES the
+            # command to Redis and returns (the command-listener path is
+            # user-agnostic and routes by payload.user_id), so the listener
+            # starts the strategy asynchronously and the alarm may be
+            # evaluated before the replayed strategy is registered. The alarm
+            # is therefore emitted HERE, at the exact moment the replayed
+            # strategy starts -- no cross-component ordering involved.
+            logger.critical(
+                f"{log_prefix} REPLAYED a strategy that arms "
+                "'breakeven_on_regime_change' on a deployment that CANNOT "
+                "DELIVER THE REGIME DATA (SYMBOL_SOURCE_MODE is not 'MAIN_APP', "
+                "or MAIN_APP_WS_ENABLED is false, or MAIN_APP_WS_URL is not a "
+                "ws:// / wss:// URL). The regime-change stop is fed ONLY by the "
+                "screener WebSocket feed, so it is INERT from the first second. "
+                "It was NOT refused: it was already approved and running before "
+                "this restart, and refusing it would make the strategy vanish. "
+                "Fix the feed, or turn the option off."
+            )
 
         async with self.instances_lock:
             if config_id in self.running_strategy_instances:
@@ -3843,7 +3967,18 @@ class TradingController:
                                 f"payload for config_id={cid}: {exc}; continuing with "
                                 f"the in-memory copy."
                             )
-                    command = {"command": "START_STRATEGY", "payload": payload}
+                    command = {
+                        "command": "START_STRATEGY",
+                        "payload": payload,
+                        # Marks this as a REPLAY of a strategy that the API
+                        # already approved and that was running before this
+                        # bot restarted -- NOT a new start. The command handler
+                        # honours this mark: refusing to replay an
+                        # already-approved strategy would make the user's
+                        # running strategy vanish after a restart, which is a
+                        # worse regression than an inert stop.
+                        "rehydrate": True,
+                    }
                     await self.redis_client.publish(
                         redis_command_channel,
                         json.dumps(command, default=str),
