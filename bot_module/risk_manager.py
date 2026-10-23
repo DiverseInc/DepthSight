@@ -700,6 +700,10 @@ class RiskManager:
                 getattr(self, "_guard_state_restored", False)
                 and self.stats.last_known_day_str == current_trading_day_str_utc_actual
             )
+            # A LOST state is unknown in exactly the same way an unreadable
+            # one is: the counters are not zero, they are UNKNOWN. They must
+            # not be re-baselined, and the gate must not be re-opened.
+            guard_state_lost = bool(getattr(self, "_guard_state_lost", False))
 
             # The opening balance is re-derived on its OWN condition: it must
             # belong to the day we are initializing FOR. It is deliberately NOT
@@ -734,7 +738,11 @@ class RiskManager:
                     )
                 )
 
-            if guard_state_unverifiable or guard_state_restored_today:
+            if (
+                guard_state_unverifiable
+                or guard_state_restored_today
+                or guard_state_lost
+            ):
                 # The trading-guard state was restored from Redis on this very
                 # start, OR it could not be read at all. Re-baselining the
                 # trading day here would WIPE the restored loss streak and the
@@ -778,7 +786,10 @@ class RiskManager:
                 # correctly (the latch is checked first), but this flag is what the
                 # controller publishes and the API now surfaces, so leaving it True
                 # would report "trading allowed" during a kill switch.
-                if not self._emergency_stop_active:
+                if (
+                    not self._emergency_stop_active
+                    and not self._guard_state_is_unknown()
+                ):
                     self._is_trading_allowed = True
                     self._global_gate_disable_reason = None
 
@@ -1043,7 +1054,13 @@ class RiskManager:
             # and surfaced by the API, so flipping it here would report
             # "trading allowed" from midnight onward. Found by two reviewers:
             # the _check_risk_limits() re-enable was guarded, this one was not.
-            if not self._emergency_stop_active:
+            # A new UTC day does not re-open a gate that is held closed
+            # because the state is UNKNOWN. The day's counters legitimately
+            # restart at zero, but "unknown" is not "within limits", and the
+            # lost-state branch above promises exactly that:
+            # "Trading stays DISABLED until the day rolls over". Only a real
+            # limit evaluation may re-open the gate.
+            if not self._emergency_stop_active and not self._guard_state_is_unknown():
                 self._is_trading_allowed = True
                 self._global_gate_disable_reason = None
             logger.info(
@@ -1355,7 +1372,11 @@ class RiskManager:
         # still in force"). This keeps the operator path consistent for the
         # state this change introduced, and leaves its documented behaviour
         # for everything else untouched.
-        if self._guard_state_restored or self._guard_state_unverified:
+        if (
+            self._guard_state_restored
+            or self._guard_state_unverified
+            or getattr(self, "_guard_state_lost", False)
+        ):
             self._check_risk_limits()
         logger.warning("EMERGENCY STOP cleared. New entries re-enabled.")
 
@@ -2916,6 +2937,25 @@ class RiskManager:
             return False
         return self._apply_persisted_guard_state(payload)
 
+    def _guard_state_is_unknown(self) -> bool:
+        """Is the persisted trading-guard state UNKNOWN?
+
+        True when the state could not be read at start-up, or when it has
+        VANISHED for an account that has traded before. In both cases today's
+        PnL and the loss streak cannot be shown to be within limits, so the
+        gate must stay closed until the state can be established -- a
+        restore, a successful re-read, or a new UTC day.
+
+        This is the single predicate for "may the gate be re-opened?". It
+        exists because three separate call sites had each grown their own
+        version of that question, and each of them had got it wrong in a
+        different way.
+        """
+        return bool(
+            getattr(self, "_guard_state_unverified", False)
+            or getattr(self, "_guard_state_lost", False)
+        )
+
     def _mark_guard_state_lost(self) -> None:
         """Latch the fail-closed state for a guard key that has VANISHED.
 
@@ -3130,7 +3170,21 @@ class RiskManager:
             return False
         self._guard_state_unverified = False
         if payload is not None:
-            self._apply_persisted_guard_state(payload)
+            applied = self._apply_persisted_guard_state(payload)
+            if not applied:
+                # The payload belonged to a PREVIOUS UTC day and was
+                # DISCARDED: nothing was applied, and
+                # `_apply_persisted_guard_state` deliberately skipped its own
+                # limit re-evaluation on that path. The unreadable-state
+                # latch has just been cleared, so the gate is otherwise left
+                # holding a verdict that was computed against a state nobody
+                # could read.
+                #
+                # The in-memory counters are this process's view of TODAY,
+                # which the daily rollover legitimately reset to zero, so the
+                # gate is re-evaluated against them -- the same treatment the
+                # first-boot branch below gets.
+                self._check_risk_limits()
         else:
             # Nothing is persisted. That is a LOST state for an account that
             # has traded before and a first boot otherwise -- the SAME
@@ -3155,10 +3209,18 @@ class RiskManager:
             else:
                 # Nothing is persisted, so the streak really is empty.
                 self._check_risk_limits()
-        logger.warning(
-            "[RiskGuard] The trading-guard state is verifiable again. The "
-            "fail-closed start-up latch is released."
-        )
+        if getattr(self, "_guard_state_lost", False):
+            logger.critical(
+                "[RiskGuard] The trading-guard state is READABLE again, but it "
+                "is MISSING for an account that has traded before: this is a "
+                "LOST state, not a first boot. The trading-guard state stays "
+                "DISABLED (fail-closed) until the UTC day rolls over."
+            )
+        else:
+            logger.warning(
+                "[RiskGuard] The trading-guard state is verifiable again. The "
+                "fail-closed start-up latch is released."
+            )
         return True
 
     def _adjust_and_round_quantity(
