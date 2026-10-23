@@ -84,6 +84,20 @@ class FailingWriteRedis(FakeRedis):
         raise ConnectionError("redis is down")
 
 
+class MarkerExplodingRedis(FakeRedis):
+    """Redis that can read the guard key but NOT the 'has traded before' marker.
+
+    This is the partial failure: the guard key read succeeds and reports
+    "nothing persisted", while the discriminator that distinguishes a first
+    boot from a LOST state cannot be read at all.
+    """
+
+    async def get(self, key):
+        if key.endswith(":seen"):
+            raise ConnectionError("redis is down")
+        return await super().get(key)
+
+
 @pytest.fixture
 def redis_store():
     """The shared Redis store -- the thing that outlives a process."""
@@ -546,6 +560,101 @@ async def test_a_lost_state_is_never_overwritten_with_a_zero(redis_store):
     assert await rm_c.restore_state() is False
     assert rm_c._guard_state_lost is True
     assert rm_c._is_trading_allowed is False
+
+
+async def test_the_reverify_path_does_not_treat_a_lost_state_as_an_empty_streak(
+    redis_store,
+):
+    """The re-read path must make the SAME lost-vs-first-boot call.
+
+    A start-up where Redis cannot be read at all latches fail-closed. When
+    Redis comes back, the guard key is genuinely GONE -- it vanished during
+    the outage -- while the 'has traded before' marker survives.
+
+    The re-read path used to assume "nothing is persisted, so the streak
+    really is empty", which skipped the discriminator entirely: the gate
+    re-opened on the process-born zero streak, and because the lost-state
+    latch had never been set, the zeroed counters were then persisted too.
+    That is the laundering the lost-state latch exists to prevent, reached
+    through a second door.
+
+    Found by the DSH reviewer during the free-tier review fan-out and
+    verified against the committed tree at 36f3372.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    rm_a.stats.consecutive_losses = 10
+    await rm_a.save_state()
+
+    # The guard key vanishes; the 'has traded before' marker survives.
+    redis_store.pop(_guard_key(rm_a))
+
+    # A start-up where Redis cannot be read at all -> the unverified latch.
+    rm_b = _risk_manager(ExplodingRedis(redis_store))
+    assert await rm_b.restore_state() is False
+    assert rm_b._guard_state_unverified is True
+    assert rm_b._is_trading_allowed is False
+    await rm_b.initialize_balance()
+
+    # Redis comes back, but the guard key is still gone.
+    rm_b.redis_client = FakeRedis(redis_store)
+    await rm_b.save_state()
+
+    assert rm_b._guard_state_lost is True, (
+        "the re-read path treated a LOST guard state as an empty streak"
+    )
+    assert rm_b._is_trading_allowed is False, (
+        "the gate re-opened on the process-born zero streak after the "
+        "persisted state was found to be missing"
+    )
+    assert _guard_key(rm_a) not in redis_store, (
+        "the zeroed counters were laundered into the guard key through the "
+        "re-read path"
+    )
+
+
+async def test_an_unreadable_seen_marker_does_not_read_as_a_first_boot(
+    redis_store,
+):
+    """An unreadable discriminator is an unknown, not a "never traded".
+
+    The guard key read succeeds and reports "nothing persisted", while the
+    'has traded before' marker cannot be read. The old code swallowed that
+    error and returned False, so the account was treated as a first boot:
+    the streak was zeroed and the gate opened on a loss that the lost state
+    had hidden.
+
+    A genuinely new account is NOT affected: its marker is simply absent,
+    which is a readable `False`, not an unreadable `None`.
+
+    Found by the DSH reviewer during the free-tier review fan-out and
+    verified against the committed tree at 36f3372.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    rm_a.stats.consecutive_losses = 10
+    await rm_a.save_state()
+
+    # The guard key vanishes; the marker cannot be read.
+    redis_store.pop(_guard_key(rm_a))
+
+    rm_b = _risk_manager(MarkerExplodingRedis(redis_store))
+    assert await rm_b.restore_state() is False
+    await rm_b.initialize_balance()
+
+    assert rm_b._guard_state_lost is True, (
+        "an unreadable 'has traded before' marker was read as a first boot"
+    )
+    assert rm_b._is_trading_allowed is False, (
+        "the gate opened on a zero streak because the discriminator could "
+        "not be read"
+    )
+
+    # And the zeros must not have been laundered into the guard key.
+    await rm_b.save_state()
+    assert _guard_key(rm_a) not in redis_store
 
 
 async def test_clearing_the_emergency_stop_does_not_resume_a_blocked_account(

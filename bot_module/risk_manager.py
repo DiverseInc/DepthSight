@@ -2883,22 +2883,30 @@ class RiskManager:
             # A first boot must still be able to trade, so this is deliberately
             # NOT "always fail closed on a missing key".
             traded_before = await self._has_traded_before()
-            if traded_before:
-                self._guard_state_lost = True
-                self._guard_state_lost_day_str = self._current_utc_day_str()
-                self._is_trading_allowed = False
-                self._global_gate_disable_reason = RISK_GUARD_STATE_LOST_REASON
-                if not self._emergency_stop_active:
-                    self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
-                logger.critical(
-                    "[RiskGuard] The persisted trading-guard state is MISSING for "
-                    f"{self._risk_state_redis_key()}, but "
-                    f"{self._guard_seen_redis_key()} says this controller has "
-                    "traded before. This is a LOST state, not a first boot: the "
-                    "loss streak and the day's PnL cannot be shown to be zero. "
-                    "Trading stays DISABLED (fail-closed) until the state is "
-                    "persisted again."
-                )
+            if traded_before is not False:
+                # `None` means the marker could not be READ. That is not a
+                # first boot -- it is an unknown -- and an unknown fails
+                # closed exactly like a known loss.
+                self._mark_guard_state_lost()
+                if traded_before:
+                    logger.critical(
+                        "[RiskGuard] The persisted trading-guard state is MISSING for "
+                        f"{self._risk_state_redis_key()}, but "
+                        f"{self._guard_seen_redis_key()} says this controller has "
+                        "traded before. This is a LOST state, not a first boot: the "
+                        "loss streak and the day's PnL cannot be shown to be zero. "
+                        "Trading stays DISABLED (fail-closed) until the state is "
+                        "persisted again."
+                    )
+                else:
+                    logger.critical(
+                        "[RiskGuard] The persisted trading-guard state is MISSING for "
+                        f"{self._risk_state_redis_key()} and the 'has traded before' "
+                        f"marker {self._guard_seen_redis_key()} could NOT be read. "
+                        "Whether this is a first boot or a LOST state cannot be "
+                        "established, so the loss streak and the day's PnL cannot be "
+                        "shown to be zero. Trading stays DISABLED (fail-closed)."
+                    )
                 return False
             logger.info(
                 "[RiskGuard] No persisted trading-guard state and no "
@@ -2908,25 +2916,53 @@ class RiskManager:
             return False
         return self._apply_persisted_guard_state(payload)
 
-    async def _has_traded_before(self) -> bool:
+    def _mark_guard_state_lost(self) -> None:
+        """Latch the fail-closed state for a guard key that has VANISHED.
+
+        Today's PnL and the loss streak cannot be shown to be zero, so the
+        gate closes and stays closed. The latch is released at the UTC day
+        rollover (see `_check_and_reset_daily_stats`), which is the one moment
+        the day's counters restart at zero by definition.
+
+        Both places that can observe a missing guard key call this, so they
+        cannot drift apart.
+        """
+        self._guard_state_lost = True
+        self._guard_state_lost_day_str = self._current_utc_day_str()
+        self._is_trading_allowed = False
+        self._global_gate_disable_reason = RISK_GUARD_STATE_LOST_REASON
+        if not self._emergency_stop_active:
+            self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
+
+    async def _has_traded_before(self) -> Optional[bool]:
         """Has THIS controller ever successfully persisted a guard state?
 
-        Returns False when the marker cannot be read, because an unreadable
-        discriminator must not be turned into "fail closed" on a genuine first
-        boot -- that would brick every new account the first time Redis hiccups.
-        The asymmetry is deliberate: this marker only ever TIGHTENS the gate for
-        an account that is already known to have traded, and the Redis-outage
-        case is already covered fail-closed by the `error` branch above.
+        Returns:
+            True  -- the marker is PRESENT, so a missing guard key means the
+                     state was LOST.
+            False -- the marker is ABSENT, so a missing guard key really does
+                     mean this account has never traded: a first boot.
+            None  -- the marker could NOT be read. The answer is UNKNOWN.
+
+        The third state is the one that matters. An unreadable discriminator
+        must not be read as "first boot": that is precisely the path on which
+        the gate re-opens on a zero streak.
+
+        Failing closed on `None` does NOT brick a new account. A brand-new
+        account's marker is simply ABSENT, which is `False`, not `None`. Only
+        a genuinely unreadable marker yields `None`, and by then the guard-key
+        read has already proven that Redis is at least partly working, so
+        this is a partial failure -- not a first boot.
         """
         if not self.redis_client:
-            return False
+            return None
         try:
             raw = await asyncio.wait_for(
                 self.redis_client.get(self._guard_seen_redis_key()),
                 timeout=RISK_STATE_PERSIST_TIMEOUT_SECONDS,
             )
         except Exception:
-            return False
+            return None
         return bool(raw)
 
     async def _read_persisted_guard_state(
@@ -3096,8 +3132,29 @@ class RiskManager:
         if payload is not None:
             self._apply_persisted_guard_state(payload)
         else:
-            # Nothing is persisted, so the streak really is empty.
-            self._check_risk_limits()
+            # Nothing is persisted. That is a LOST state for an account that
+            # has traded before and a first boot otherwise -- the SAME
+            # distinction `restore_state()` makes.
+            #
+            # Assuming "the streak really is empty" here skipped the
+            # discriminator entirely, so a guard key that vanished during a
+            # Redis outage re-opened the gate on the process-born zero
+            # streak -- and the zeroed counters were then persisted, which is
+            # the laundering the lost-state latch exists to prevent.
+            traded_before = await self._has_traded_before()
+            if traded_before is not False:
+                self._mark_guard_state_lost()
+                logger.critical(
+                    "[RiskGuard] The persisted trading-guard state is MISSING for "
+                    f"{self._risk_state_redis_key()}, but this controller has traded "
+                    "before (the 'has traded before' marker is present, or could "
+                    "not be read). This is a LOST state, not a first boot: the loss "
+                    "streak and the day's PnL cannot be shown to be zero. Trading "
+                    "stays DISABLED (fail-closed) until the state is persisted again."
+                )
+            else:
+                # Nothing is persisted, so the streak really is empty.
+                self._check_risk_limits()
         logger.warning(
             "[RiskGuard] The trading-guard state is verifiable again. The "
             "fail-closed start-up latch is released."
