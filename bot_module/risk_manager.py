@@ -2944,7 +2944,8 @@ class RiskManager:
         VANISHED for an account that has traded before. In both cases today's
         PnL and the loss streak cannot be shown to be within limits, so the
         gate must stay closed until the state can be established -- a
-        restore, a successful re-read, or a new UTC day.
+        restore, a successful re-read, or a UTC day strictly later than the
+        day the state was lost.
 
         This is the single predicate for "may the gate be re-opened?". It
         exists because three separate call sites had each grown their own
@@ -2962,7 +2963,12 @@ class RiskManager:
         Today's PnL and the loss streak cannot be shown to be zero, so the
         gate closes and stays closed. The latch is released at the UTC day
         rollover (see `_check_and_reset_daily_stats`), which is the one moment
-        the day's counters restart at zero by definition.
+        the day's counters restart at zero by definition -- but ONLY on a
+        rollover to a STRICTLY LATER day than the day the state was lost. A
+        fresh process sees its first day-key change on the same start that
+        set the latch, so 'release on any day change' would clear it while
+        today's loss is still unknown. The rollover's own comment repeats
+        this, because the two rules are easy to conflate.
 
         Both places that can observe a missing guard key call this, so they
         cannot drift apart.
