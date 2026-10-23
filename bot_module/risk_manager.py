@@ -30,7 +30,13 @@ RISK_STATE_PERSIST_TIMEOUT_SECONDS = 5.0
 
 # The version of the persisted payload. Bump it when the shape changes in a
 # way that an older reader would misread.
-RISK_STATE_VERSION = 1
+#
+# v2 adds `start_of_day_day_str`: the UTC day the `start_of_day_balance`
+# belongs to. v1 recorded only `day_str` -- the day the STREAK and the day's
+# PnL belong to -- so the reader validated one day's worth of facts and then
+# applied a quantity scoped to a DIFFERENT day. See
+# `_apply_persisted_guard_state`.
+RISK_STATE_VERSION = 2
 
 # Why the gate is closed while the guard state is UNVERIFIABLE.
 #
@@ -43,10 +49,37 @@ RISK_GUARD_UNVERIFIED_REASON = (
     "- trading disabled until the state can be read"
 )
 
+# Why the gate is closed while the day's opening balance is UNKNOWN.
+#
+# The daily-loss and max-drawdown limits are a RATIO against the day's opening
+# balance. With no opening balance the ratio cannot be computed at all, and the
+# previous code treated "cannot be computed" as "not breached" -- a fail-OPEN
+# inside a function whose own comment demands failing closed on unknown state.
+RISK_GUARD_BASE_UNKNOWN_REASON = (
+    "the opening balance for the current UTC day is unknown "
+    "- trading disabled until it can be established"
+)
+
+# Why the gate is closed when the persisted guard state has VANISHED for an
+# account that has traded before.
+#
+# A missing key is NOT a first boot: a first boot has never had a guard state to
+# lose. See `_read_persisted_guard_state` for the discriminator that separates
+# the two cases.
+RISK_GUARD_STATE_LOST_REASON = (
+    "the persisted trading-guard state is missing for an account that has "
+    "traded before - treated as an unknown state, trading disabled"
+)
+
 
 @dataclass
 class TradeStats:
     start_of_day_balance: float = 0.0
+    # The UTC day `start_of_day_balance` was captured on, and "" when it is not
+    # known. This is a SEPARATE field from `last_known_day_str` on purpose: the
+    # two describe different quantities (the opening balance and the loss
+    # streak / day's PnL) and only one of them used to travel with the payload.
+    start_of_day_day_str: str = ""
     current_balance: float = 0.0
     today_pnl: float = 0.0
     consecutive_losses: int = 0
@@ -310,6 +343,25 @@ class RiskManager:
         # guarantee hold regardless of the order in which the controller
         # calls the two, instead of relying on one particular order.
         self._guard_state_restored: bool = False
+        # True when the persisted guard state has VANISHED for a controller that
+        # has traded before (see `_guard_seen_redis_key`). This is deliberately
+        # NOT `_guard_state_unverified`: that latch means "Redis could not be
+        # read" and releases itself on the next successful read, whereas a lost
+        # state can never be read back -- it is gone. Re-reading would keep
+        # finding nothing and the auto-release would quietly re-open the gate
+        # on an account whose loss streak is still unknown.
+        #
+        # So this latch heals at the UTC day rollover instead, which is the one
+        # moment the day's PnL and streak legitimately become unknowable without
+        # mattering: the next day starts them at zero by definition. No human
+        # decision is required, so this does not need to be an operator's.
+        self._guard_state_lost: bool = False
+        # The UTC day the state was lost on. The latch may only be released on
+        # a STRICTLY LATER day, and a fresh process always sees its first day
+        # key change (its in-memory `last_known_day_str` starts empty), so
+        # without this the latch would release on the very same start that set
+        # it and never mean anything.
+        self._guard_state_lost_day_str: str = ""
         # Serialises the read-snapshot + write of the guard state, so a
         # periodic tick and a trade handler cannot interleave and leave the
         # OLDER snapshot on disk last.
@@ -648,7 +700,49 @@ class RiskManager:
                 getattr(self, "_guard_state_restored", False)
                 and self.stats.last_known_day_str == current_trading_day_str_utc_actual
             )
-            if guard_state_unverifiable or guard_state_restored_today:
+            # A LOST state is unknown in exactly the same way an unreadable
+            # one is: the counters are not zero, they are UNKNOWN. They must
+            # not be re-baselined, and the gate must not be re-opened.
+            guard_state_lost = bool(getattr(self, "_guard_state_lost", False))
+
+            # The opening balance is re-derived on its OWN condition: it must
+            # belong to the day we are initializing FOR. It is deliberately NOT
+            # gated on the restore having happened, because the two are
+            # different questions and coupling them is what let a base captured
+            # on one day stay in force for the life of the account.
+            #
+            # `_apply_persisted_guard_state` restores the base only when the
+            # payload says which day the base belongs to and that day is today,
+            # so this block is normally a no-op after a same-day restore -- and
+            # it is what CORRECTS the base when the restored one was stale.
+            base_is_current_day = (
+                self.stats.start_of_day_day_str == current_trading_day_str_utc_actual
+                and self.stats.start_of_day_balance > 0
+            )
+            if not base_is_current_day:
+                stale_base = (
+                    self.stats.start_of_day_balance
+                    if self.stats.start_of_day_day_str
+                    else None
+                )
+                self.stats.start_of_day_balance = self.stats.current_balance
+                self.stats.start_of_day_day_str = current_trading_day_str_utc_actual
+                logger.info(
+                    f"Daily-loss base re-derived for {current_trading_day_str_utc_actual}: "
+                    f"${self.stats.start_of_day_balance:.2f}"
+                    + (
+                        f" (was ${stale_base:.2f} from UTC day "
+                        f"{self.stats.last_known_day_str or 'unknown'})"
+                        if stale_base is not None
+                        else " (no base was known)"
+                    )
+                )
+
+            if (
+                guard_state_unverifiable
+                or guard_state_restored_today
+                or guard_state_lost
+            ):
                 # The trading-guard state was restored from Redis on this very
                 # start, OR it could not be read at all. Re-baselining the
                 # trading day here would WIPE the restored loss streak and the
@@ -667,6 +761,10 @@ class RiskManager:
                 # The gate is NOT re-opened either: it must reflect the
                 # restored streak. update_balance() above already
                 # re-evaluated the limits against the fresh balance.
+                #
+                # Note that this protects the COUNTERS, not the base: the base
+                # is settled above, on its own day condition, so a stale base
+                # cannot survive here by riding on a restored streak.
                 logger.info(
                     f"Trading day NOT re-baselined: the trading-guard state "
                     f"(unverifiable={guard_state_unverifiable}, "
@@ -676,7 +774,6 @@ class RiskManager:
                     f"${self.stats.start_of_day_balance:.2f}."
                 )
             else:
-                self.stats.start_of_day_balance = self.stats.current_balance
                 self.stats.today_pnl = 0.0
                 self.stats.consecutive_losses = 0
                 self.stats.current_trading_day_start_ts = (
@@ -689,7 +786,10 @@ class RiskManager:
                 # correctly (the latch is checked first), but this flag is what the
                 # controller publishes and the API now surfaces, so leaving it True
                 # would report "trading allowed" during a kill switch.
-                if not self._emergency_stop_active:
+                if (
+                    not self._emergency_stop_active
+                    and not self._guard_state_is_unknown()
+                ):
                     self._is_trading_allowed = True
                     self._global_gate_disable_reason = None
 
@@ -905,6 +1005,41 @@ class RiskManager:
                 f"New trading day detected (UTC): {current_day_str_utc}. Previous day: {self.stats.last_known_day_str}"
             )
             self.stats.start_of_day_balance = self.stats.current_balance
+            self.stats.start_of_day_day_str = current_day_str_utc
+            # A lost guard state heals at the UTC rollover and nowhere else.
+            # It cannot heal on a re-read (there is nothing left to read), and
+            # it must not require an operator: a new UTC day starts the day's
+            # PnL and the loss streak at zero by definition, so whatever was
+            # lost belonged to the day that just ended.
+            if getattr(self, "_guard_state_lost", False):
+                # Only a STRICTLY LATER day releases this latch. A fresh
+                # process sees its first day-key change on its very first
+                # `_check_and_reset_daily_stats()` (its in-memory
+                # `last_known_day_str` starts empty), so releasing on any day
+                # change would clear the latch on the same start that set it.
+                # Day strings are `YYYY-MM-DD`, so lexicographic order is
+                # chronological order.
+                if getattr(self, "_guard_state_lost_day_str", "") and (
+                    current_day_str_utc > self._guard_state_lost_day_str
+                ):
+                    logger.critical(
+                        "[RiskGuard] The trading-guard state was lost on UTC day "
+                        f"{self._guard_state_lost_day_str}; the rollover to "
+                        f"{current_day_str_utc} resets the day's PnL and the "
+                        "loss streak to zero, so the account is no longer "
+                        "trading on unknown numbers. Trading is released for "
+                        "the new day."
+                    )
+                    self._guard_state_lost = False
+                    self._guard_state_lost_day_str = ""
+                else:
+                    logger.critical(
+                        "[RiskGuard] The trading-guard state is lost and UTC day "
+                        f"{current_day_str_utc} is not past "
+                        f"{self._guard_state_lost_day_str or 'unknown'}, so "
+                        "today's PnL and loss streak are still unknown. "
+                        "Trading stays DISABLED until the day rolls over."
+                    )
             self.stats.today_pnl = 0.0
             self.stats.consecutive_losses = 0
             self.stats.current_trading_day_start_ts = current_start_ts_float
@@ -919,7 +1054,13 @@ class RiskManager:
             # and surfaced by the API, so flipping it here would report
             # "trading allowed" from midnight onward. Found by two reviewers:
             # the _check_risk_limits() re-enable was guarded, this one was not.
-            if not self._emergency_stop_active:
+            # A new UTC day does not re-open a gate that is held closed
+            # because the state is UNKNOWN. The day's counters legitimately
+            # restart at zero, but "unknown" is not "within limits", and the
+            # lost-state branch above promises exactly that:
+            # "Trading stays DISABLED until the day rolls over". Only a real
+            # limit evaluation may re-open the gate.
+            if not self._emergency_stop_active and not self._guard_state_is_unknown():
                 self._is_trading_allowed = True
                 self._global_gate_disable_reason = None
             logger.info(
@@ -1231,7 +1372,11 @@ class RiskManager:
         # still in force"). This keeps the operator path consistent for the
         # state this change introduced, and leaves its documented behaviour
         # for everything else untouched.
-        if self._guard_state_restored or self._guard_state_unverified:
+        if (
+            self._guard_state_restored
+            or self._guard_state_unverified
+            or getattr(self, "_guard_state_lost", False)
+        ):
             self._check_risk_limits()
         logger.warning("EMERGENCY STOP cleared. New entries re-enabled.")
 
@@ -1673,6 +1818,38 @@ class RiskManager:
                 exc_info=True,
             )
 
+    def _daily_loss_base_is_usable(self) -> bool:
+        """Can today's daily-loss / drawdown ratios actually be computed?
+
+        The distinction is between KNOWN and UNKNOWN, not between large and
+        small:
+
+        * a base of zero or less -> NOT usable. Nothing can divide by it.
+        * a base stamped with a day that is not TODAY -> NOT usable. This is the
+          measured defect: the denominator is from a day that has ended, so the
+          ratio reads LOW and the gate under-trips. A large stale base is still
+          a stale base.
+        * a base stamped with TODAY -> usable.
+        * a base with NO stamp at all -> usable. Nothing in the product
+          produces this shape: every site that assigns the base also stamps the
+          day. It only appears when `TradeStats` is populated directly, which is
+          what the pre-v2 callers and the existing tests do. Treating it as
+          unknown would fail closed on correct existing behaviour, so it keeps
+          the pre-v2 meaning.
+
+        The day comparison happens HERE, on the read side, rather than being
+        left to the discipline of every writer that stamps the base. That is
+        deliberate: the defect being fixed IS two fields drifting apart, so
+        trusting write-side discipline to keep them in step would assume away
+        the exact failure mode under repair. Raised by the hermes reviewer.
+        """
+        if self.stats.start_of_day_balance <= 1e-9:
+            return False
+        stamp = self.stats.start_of_day_day_str
+        if stamp:
+            return stamp == self._current_utc_day_str()
+        return True
+
     def _check_risk_limits(self):  # Global limits
         # A risk limit may only be treated as "within range" when the numbers
         # it is computed from are KNOWN. If the guard state could not be read
@@ -1686,13 +1863,40 @@ class RiskManager:
             if not getattr(self, "_emergency_stop_active", False):
                 self._trading_disabled_reason = RISK_GUARD_UNVERIFIED_REASON
             return
+        if getattr(self, "_guard_state_lost", False):
+            # The guard state is GONE, not merely unreadable. Today's PnL and
+            # the loss streak cannot be shown to be within limits, so the gate
+            # stays closed. This heals itself at the UTC day rollover (see
+            # `_check_and_reset_daily_stats`), which is the one moment the day's
+            # counters restart at zero by definition.
+            self._is_trading_allowed = False
+            self._global_gate_disable_reason = RISK_GUARD_STATE_LOST_REASON
+            if not getattr(self, "_emergency_stop_active", False):
+                self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
+            return
         should_be_allowed = True
         disable_reason = ""
         if self.stats.current_balance < self.min_balance_threshold:
             should_be_allowed = False
             disable_reason = f"Balance (${self.stats.current_balance:.2f}) < min (${self.min_balance_threshold:.2f})"
         else:
-            if self.stats.start_of_day_balance > 1e-9:
+            if not self._daily_loss_base_is_usable():
+                # Both the drawdown and the daily-loss limits are a RATIO
+                # against the day's opening balance. Without a base that
+                # belongs to the CURRENT UTC day the ratio cannot be computed,
+                # and "cannot be computed" is NOT "within limits" -- it used to
+                # be treated as within limits, which is a fail-OPEN inside a
+                # function whose own comment above demands failing closed on
+                # unknown state. A base near zero used to skip BOTH checks
+                # silently, with no log at all.
+                #
+                # A brand-new account is not blocked by this: the first
+                # `initialize_balance` derives the base from the live balance,
+                # so the very next limit check can decide. What is blocked is
+                # the window where the base is genuinely unknown.
+                should_be_allowed = False
+                disable_reason = RISK_GUARD_BASE_UNKNOWN_REASON
+            else:
                 drawdown_pct = (
                     abs(self.stats.today_pnl / self.stats.start_of_day_balance)
                     if self.stats.today_pnl < 0
@@ -2514,6 +2718,31 @@ class RiskManager:
         """
         return f"{self.redis_state_key}:{self.user_id}:{self.api_key_id}"
 
+    def _guard_seen_redis_key(self) -> str:
+        """A SEPARATE key recording that this controller HAS traded before.
+
+        WHY THIS EXISTS. A missing guard key was treated as a first boot
+        (`restore_state` returned False with `_guard_state_unverified = False`),
+        so `initialize_balance` zeroed `today_pnl` and `consecutive_losses` and
+        the gate re-opened. But "no key" and "never had a key" are different
+        facts: the first is a LOST state, the second is a fresh account. The
+        guard key alone cannot tell them apart -- it is the thing that went
+        missing.
+
+        So the "has this controller ever persisted guard state?" answer is
+        stored under its own key, written the first time `save_state`
+        succeeds and never overwritten. A missing guard key next to a PRESENT
+        marker is a lost state and fails closed; missing next to missing is a
+        first boot and still trades. A brand-new account is therefore not
+        bricked.
+
+        LIMITATION, stated rather than hidden: under a memory-based eviction
+        policy this marker and the guard key are evicted together, so this does
+        not cover a Redis-wide flush -- it covers a lost or deleted guard key.
+        It is a strict improvement over "always open", not a proof.
+        """
+        return f"{self._risk_state_redis_key()}:seen"
+
     def _current_utc_day_str(self) -> str:
         """The UTC calendar date the current trading day belongs to."""
         return self._get_current_day_start_info()[1]
@@ -2538,6 +2767,36 @@ class RiskManager:
                 if not await self._reverify_guard_state():
                     return
 
+            if getattr(self, "_guard_state_lost", False):
+                # The persisted state is GONE, not merely unreadable: today's
+                # PnL and the loss streak are UNKNOWN, not zero. The
+                # in-memory counters are the zeros this process was born
+                # with, so writing them now would LAUNDER an unknown state
+                # into a payload -- and the next start-up would read that
+                # payload as "the streak really is empty" and OPEN the gate.
+                #
+                # This is the same hazard the `_guard_state_unverified` branch
+                # above guards against, in its permanent form: that latch
+                # heals on the next successful read, this one cannot, because
+                # there is nothing left to read. So while it is set, nothing
+                # is persisted, the state stays lost, and the next start-up
+                # detects the loss again and fails closed. The latch is
+                # released at the UTC day rollover, where the day's counters
+                # legitimately restart at zero.
+                #
+                # Found by the DSH reviewer and verified against the tree at
+                # 035b0d2: without this guard the controller's unconditional
+                # periodic save defeated the latch one tick later.
+                logger.critical(
+                    "[RiskGuard] NOT persisting the trading-guard state: it was "
+                    f"lost on UTC day {self._guard_state_lost_day_str or 'unknown'} "
+                    "and the in-memory counters are UNKNOWN, not zero. Writing "
+                    "them would make the next start-up read the loss as an "
+                    "empty streak and open the gate. The lost-state latch "
+                    "holds until the UTC day rolls over."
+                )
+                return
+
             if not self.redis_client:
                 logger.critical(
                     "[RiskGuard] No redis_client; the trading-guard state will "
@@ -2552,6 +2811,15 @@ class RiskManager:
                 "consecutive_losses": int(self.stats.consecutive_losses),
                 "today_pnl": float(self.stats.today_pnl),
                 "start_of_day_balance": float(self.stats.start_of_day_balance),
+                # WHICH DAY THE BASE BELONGS TO. Without this the reader can
+                # only check `day_str`, which describes the streak and the
+                # day's PnL -- not this number. A payload whose base was
+                # captured on an earlier day but whose `day_str` says today
+                # used to be accepted, and then re-blessed on every subsequent
+                # restore, so the base stayed in force for the life of the
+                # account while the daily-loss gate measured a real loss
+                # against a denominator from days ago.
+                "start_of_day_day_str": self.stats.start_of_day_day_str or "",
                 "saved_at_utc": datetime.now(timezone.utc).isoformat(),
             }
             try:
@@ -2569,6 +2837,25 @@ class RiskManager:
                     payload["today_pnl"],
                     payload["day_str"],
                 )
+                # Record that this controller has persisted guard state at
+                # least once. Written only on a SUCCESSFUL guard write, and
+                # never overwritten, so it answers "has this account traded
+                # before?" even after the guard key itself is lost.
+                try:
+                    await asyncio.wait_for(
+                        self.redis_client.set(self._guard_seen_redis_key(), "1"),
+                        timeout=RISK_STATE_PERSIST_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    # Not fatal to this save -- the guard state IS on disk.
+                    # But the lost-state discriminator just got weaker, so it
+                    # is logged rather than swallowed.
+                    logger.warning(
+                        "[RiskGuard] FAILED to write the 'has traded before' "
+                        f"marker {self._guard_seen_redis_key()}: {exc}. A "
+                        "subsequent loss of the guard state will be "
+                        "indistinguishable from a first boot.",
+                    )
             except Exception as exc:
                 logger.critical(
                     f"[RiskGuard] FAILED to persist the trading-guard state to "
@@ -2607,12 +2894,122 @@ class RiskManager:
 
         self._guard_state_unverified = False
         if payload is None:
+            # Nothing persisted. Is that a FIRST BOOT or a LOST state? Those
+            # are different facts with opposite consequences, and the guard
+            # key alone cannot tell them apart -- it is the thing that is
+            # missing. The "has traded before" marker can: it is written under
+            # its own key and is never part of the payload, so it survives the
+            # loss of the guard key it describes.
+            #
+            # A first boot must still be able to trade, so this is deliberately
+            # NOT "always fail closed on a missing key".
+            traded_before = await self._has_traded_before()
+            if traded_before is not False:
+                # `None` means the marker could not be READ. That is not a
+                # first boot -- it is an unknown -- and an unknown fails
+                # closed exactly like a known loss.
+                self._mark_guard_state_lost()
+                if traded_before:
+                    logger.critical(
+                        "[RiskGuard] The persisted trading-guard state is MISSING for "
+                        f"{self._risk_state_redis_key()}, but "
+                        f"{self._guard_seen_redis_key()} says this controller has "
+                        "traded before. This is a LOST state, not a first boot: the "
+                        "loss streak and the day's PnL cannot be shown to be zero. "
+                        "Trading stays DISABLED (fail-closed) until the state is "
+                        "persisted again."
+                    )
+                else:
+                    logger.critical(
+                        "[RiskGuard] The persisted trading-guard state is MISSING for "
+                        f"{self._risk_state_redis_key()} and the 'has traded before' "
+                        f"marker {self._guard_seen_redis_key()} could NOT be read. "
+                        "Whether this is a first boot or a LOST state cannot be "
+                        "established, so the loss streak and the day's PnL cannot be "
+                        "shown to be zero. Trading stays DISABLED (fail-closed)."
+                    )
+                return False
             logger.info(
-                "[RiskGuard] No persisted trading-guard state: starting with an "
-                "empty loss streak. This is a first boot, not a lost state."
+                "[RiskGuard] No persisted trading-guard state and no "
+                "'has traded before' marker: starting with an empty loss "
+                "streak. This is a first boot, not a lost state."
             )
             return False
         return self._apply_persisted_guard_state(payload)
+
+    def _guard_state_is_unknown(self) -> bool:
+        """Is the persisted trading-guard state UNKNOWN?
+
+        True when the state could not be read at start-up, or when it has
+        VANISHED for an account that has traded before. In both cases today's
+        PnL and the loss streak cannot be shown to be within limits, so the
+        gate must stay closed until the state can be established -- a
+        restore, a successful re-read, or a UTC day strictly later than the
+        day the state was lost.
+
+        This is the single predicate for "may the gate be re-opened?". It
+        exists because three separate call sites had each grown their own
+        version of that question, and each of them had got it wrong in a
+        different way.
+        """
+        return bool(
+            getattr(self, "_guard_state_unverified", False)
+            or getattr(self, "_guard_state_lost", False)
+        )
+
+    def _mark_guard_state_lost(self) -> None:
+        """Latch the fail-closed state for a guard key that has VANISHED.
+
+        Today's PnL and the loss streak cannot be shown to be zero, so the
+        gate closes and stays closed. The latch is released at the UTC day
+        rollover (see `_check_and_reset_daily_stats`), which is the one moment
+        the day's counters restart at zero by definition -- but ONLY on a
+        rollover to a STRICTLY LATER day than the day the state was lost. A
+        fresh process sees its first day-key change on the same start that
+        set the latch, so 'release on any day change' would clear it while
+        today's loss is still unknown. The rollover's own comment repeats
+        this, because the two rules are easy to conflate.
+
+        Both places that can observe a missing guard key call this, so they
+        cannot drift apart.
+        """
+        self._guard_state_lost = True
+        self._guard_state_lost_day_str = self._current_utc_day_str()
+        self._is_trading_allowed = False
+        self._global_gate_disable_reason = RISK_GUARD_STATE_LOST_REASON
+        if not self._emergency_stop_active:
+            self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
+
+    async def _has_traded_before(self) -> Optional[bool]:
+        """Has THIS controller ever successfully persisted a guard state?
+
+        Returns:
+            True  -- the marker is PRESENT, so a missing guard key means the
+                     state was LOST.
+            False -- the marker is ABSENT, so a missing guard key really does
+                     mean this account has never traded: a first boot.
+            None  -- the marker could NOT be read. The answer is UNKNOWN.
+
+        The third state is the one that matters. An unreadable discriminator
+        must not be read as "first boot": that is precisely the path on which
+        the gate re-opens on a zero streak.
+
+        Failing closed on `None` does NOT brick a new account. A brand-new
+        account's marker is simply ABSENT, which is `False`, not `None`. Only
+        a genuinely unreadable marker yields `None`, and by then the guard-key
+        read has already proven that Redis is at least partly working, so
+        this is a partial failure -- not a first boot.
+        """
+        if not self.redis_client:
+            return None
+        try:
+            raw = await asyncio.wait_for(
+                self.redis_client.get(self._guard_seen_redis_key()),
+                timeout=RISK_STATE_PERSIST_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return None
+        return bool(raw)
 
     async def _read_persisted_guard_state(
         self,
@@ -2698,8 +3095,48 @@ class RiskManager:
             int(self.stats.consecutive_losses or 0),
         )
         self.stats.today_pnl = today_pnl
-        if start_of_day_balance > 0:
+
+        # THE BASE MUST CARRY ITS OWN DAY. `day_str` above describes the STREAK
+        # and the day's PnL. It says nothing about which day
+        # `start_of_day_balance` was captured on, and the two were independent:
+        # a base captured on one day could ride along under a later day's stamp
+        # and be accepted forever. Each restore then stamped `last_known_day_str
+        # = current_day_str` onto it, which both re-blessed the stale number as
+        # current AND suppressed the daily re-baseline in `initialize_balance`
+        # (whose `guard_state_restored_today` branch skips it). The base
+        # therefore survived indefinitely while the daily-loss gate measured a
+        # real loss against a denominator from days earlier -- which
+        # UNDER-TRIPS: the same loss read 5.75% on the stale base and 8.07% on
+        # the true one.
+        #
+        # So the base is restored ONLY when the payload says it belongs to
+        # today. A payload without the field (any v1 payload) is UNKNOWN, not
+        # known-good, and is treated the same way -- `initialize_balance` then
+        # re-derives the base from the live balance, which can only make the
+        # gate stricter and more accurate.
+        #
+        # `today_pnl` IS still restored: it is day-scoped by `day_str`, which
+        # was checked above, and discarding it would measure nothing at all and
+        # open the gate wider. Restoring it against a correctly re-derived base
+        # is exactly the measurement the control is supposed to make.
+        persisted_base_day_str = str(payload.get("start_of_day_day_str") or "")
+        base_is_from_today = (
+            persisted_base_day_str == current_day_str and start_of_day_balance > 0
+        )
+        if base_is_from_today:
             self.stats.start_of_day_balance = start_of_day_balance
+            self.stats.start_of_day_day_str = current_day_str
+        else:
+            logger.critical(
+                "[RiskGuard] NOT restoring the persisted start-of-day balance "
+                f"(${start_of_day_balance:.2f}): it belongs to UTC day "
+                f"{persisted_base_day_str or 'UNKNOWN (pre-v2 payload)'} and today "
+                f"is {current_day_str}. A base from an earlier day makes the "
+                "daily-loss and drawdown gates measure against the wrong "
+                "denominator, which reads LOW and under-trips. The base will be "
+                "re-derived from the live balance by initialize_balance().",
+            )
+
         self.stats.last_known_day_str = current_day_str
         self._guard_state_restored = True
 
@@ -2739,14 +3176,57 @@ class RiskManager:
             return False
         self._guard_state_unverified = False
         if payload is not None:
-            self._apply_persisted_guard_state(payload)
+            applied = self._apply_persisted_guard_state(payload)
+            if not applied:
+                # The payload belonged to a PREVIOUS UTC day and was
+                # DISCARDED: nothing was applied, and
+                # `_apply_persisted_guard_state` deliberately skipped its own
+                # limit re-evaluation on that path. The unreadable-state
+                # latch has just been cleared, so the gate is otherwise left
+                # holding a verdict that was computed against a state nobody
+                # could read.
+                #
+                # The in-memory counters are this process's view of TODAY,
+                # which the daily rollover legitimately reset to zero, so the
+                # gate is re-evaluated against them -- the same treatment the
+                # first-boot branch below gets.
+                self._check_risk_limits()
         else:
-            # Nothing is persisted, so the streak really is empty.
-            self._check_risk_limits()
-        logger.warning(
-            "[RiskGuard] The trading-guard state is verifiable again. The "
-            "fail-closed start-up latch is released."
-        )
+            # Nothing is persisted. That is a LOST state for an account that
+            # has traded before and a first boot otherwise -- the SAME
+            # distinction `restore_state()` makes.
+            #
+            # Assuming "the streak really is empty" here skipped the
+            # discriminator entirely, so a guard key that vanished during a
+            # Redis outage re-opened the gate on the process-born zero
+            # streak -- and the zeroed counters were then persisted, which is
+            # the laundering the lost-state latch exists to prevent.
+            traded_before = await self._has_traded_before()
+            if traded_before is not False:
+                self._mark_guard_state_lost()
+                logger.critical(
+                    "[RiskGuard] The persisted trading-guard state is MISSING for "
+                    f"{self._risk_state_redis_key()}, but this controller has traded "
+                    "before (the 'has traded before' marker is present, or could "
+                    "not be read). This is a LOST state, not a first boot: the loss "
+                    "streak and the day's PnL cannot be shown to be zero. Trading "
+                    "stays DISABLED (fail-closed) until the state is persisted again."
+                )
+            else:
+                # Nothing is persisted, so the streak really is empty.
+                self._check_risk_limits()
+        if getattr(self, "_guard_state_lost", False):
+            logger.critical(
+                "[RiskGuard] The trading-guard state is READABLE again, but it "
+                "is MISSING for an account that has traded before: this is a "
+                "LOST state, not a first boot. The trading-guard state stays "
+                "DISABLED (fail-closed) until the UTC day rolls over."
+            )
+        else:
+            logger.warning(
+                "[RiskGuard] The trading-guard state is verifiable again. The "
+                "fail-closed start-up latch is released."
+            )
         return True
 
     def _adjust_and_round_quantity(

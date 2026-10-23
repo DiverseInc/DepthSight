@@ -84,6 +84,20 @@ class FailingWriteRedis(FakeRedis):
         raise ConnectionError("redis is down")
 
 
+class MarkerExplodingRedis(FakeRedis):
+    """Redis that can read the guard key but NOT the 'has traded before' marker.
+
+    This is the partial failure: the guard key read succeeds and reports
+    "nothing persisted", while the discriminator that distinguishes a first
+    boot from a LOST state cannot be read at all.
+    """
+
+    async def get(self, key):
+        if key.endswith(":seen"):
+            raise ConnectionError("redis is down")
+        return await super().get(key)
+
+
 @pytest.fixture
 def redis_store():
     """The shared Redis store -- the thing that outlives a process."""
@@ -495,6 +509,307 @@ async def test_an_unverifiable_state_is_never_overwritten_with_a_zero(redis_stor
     # Redis is still down for the write, so nothing is written.
     await rm_b.save_state()
     assert json.loads(redis_store[_guard_key(rm_a)])["consecutive_losses"] == 10
+
+
+async def test_a_lost_state_is_never_overwritten_with_a_zero(redis_store):
+    """A LOST guard state must not be laundered into an empty streak.
+
+    The permanent form of the fail-closed latch: the persisted guard state
+    has VANISHED for an account that has traded before, so today's PnL and
+    the loss streak are UNKNOWN, not zero. The gate is closed and the
+    `_guard_state_lost` latch is set.
+
+    The in-memory counters are still the zeros this process was born with.
+    If they are persisted, the next start-up finds a payload, takes the
+    normal restore path, restores streak=0 / pnl=0, and OPENS the gate --
+    the product's own periodic save would launder an unknown state into
+    "the streak really is empty", which is precisely the fail-open the
+    lost-state latch exists to prevent.
+
+    Found by the DSH reviewer during the free-tier review fan-out and
+    verified against the committed tree at 035b0d2. This mirrors the
+    analogous `_guard_state_unverified` guard directly above.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    rm_a.stats.consecutive_losses = 10
+    await rm_a.save_state()
+
+    # The guard key vanishes but the "has traded before" marker survives:
+    # this is a LOST state, not a first boot.
+    redis_store.pop(_guard_key(rm_a))
+
+    rm_b = _risk_manager(redis)
+    # The controller restores BEFORE it initializes the balance.
+    assert await rm_b.restore_state() is False
+    assert rm_b._guard_state_lost is True
+    assert rm_b._is_trading_allowed is False
+
+    # `initialize_balance()` zeroes the in-memory counters -- the state is
+    # unknown, not zero, so those zeros must never reach Redis.
+    await rm_b.initialize_balance()
+    await rm_b.save_state()
+    assert _guard_key(rm_a) not in redis_store, (
+        "the lost guard state was overwritten with the in-memory zeros; the "
+        "next start-up would read the loss as an empty streak and open the gate"
+    )
+
+    # And the next start-up must still see a LOST state, not a clean one.
+    rm_c = _risk_manager(redis)
+    assert await rm_c.restore_state() is False
+    assert rm_c._guard_state_lost is True
+    assert rm_c._is_trading_allowed is False
+
+
+async def test_the_reverify_path_does_not_treat_a_lost_state_as_an_empty_streak(
+    redis_store,
+):
+    """The re-read path must make the SAME lost-vs-first-boot call.
+
+    A start-up where Redis cannot be read at all latches fail-closed. When
+    Redis comes back, the guard key is genuinely GONE -- it vanished during
+    the outage -- while the 'has traded before' marker survives.
+
+    The re-read path used to assume "nothing is persisted, so the streak
+    really is empty", which skipped the discriminator entirely: the gate
+    re-opened on the process-born zero streak, and because the lost-state
+    latch had never been set, the zeroed counters were then persisted too.
+    That is the laundering the lost-state latch exists to prevent, reached
+    through a second door.
+
+    Found by the DSH reviewer during the free-tier review fan-out and
+    verified against the committed tree at 36f3372.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    rm_a.stats.consecutive_losses = 10
+    await rm_a.save_state()
+
+    # The guard key vanishes; the 'has traded before' marker survives.
+    redis_store.pop(_guard_key(rm_a))
+
+    # A start-up where Redis cannot be read at all -> the unverified latch.
+    rm_b = _risk_manager(ExplodingRedis(redis_store))
+    assert await rm_b.restore_state() is False
+    assert rm_b._guard_state_unverified is True
+    assert rm_b._is_trading_allowed is False
+    await rm_b.initialize_balance()
+
+    # Redis comes back, but the guard key is still gone.
+    rm_b.redis_client = FakeRedis(redis_store)
+    await rm_b.save_state()
+
+    assert rm_b._guard_state_lost is True, (
+        "the re-read path treated a LOST guard state as an empty streak"
+    )
+    assert rm_b._is_trading_allowed is False, (
+        "the gate re-opened on the process-born zero streak after the "
+        "persisted state was found to be missing"
+    )
+    assert _guard_key(rm_a) not in redis_store, (
+        "the zeroed counters were laundered into the guard key through the "
+        "re-read path"
+    )
+
+
+async def test_an_unreadable_seen_marker_does_not_read_as_a_first_boot(
+    redis_store,
+):
+    """An unreadable discriminator is an unknown, not a "never traded".
+
+    The guard key read succeeds and reports "nothing persisted", while the
+    'has traded before' marker cannot be read. The old code swallowed that
+    error and returned False, so the account was treated as a first boot:
+    the streak was zeroed and the gate opened on a loss that the lost state
+    had hidden.
+
+    A genuinely new account is NOT affected: its marker is simply absent,
+    which is a readable `False`, not an unreadable `None`.
+
+    Found by the DSH reviewer during the free-tier review fan-out and
+    verified against the committed tree at 36f3372.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    rm_a.stats.consecutive_losses = 10
+    await rm_a.save_state()
+
+    # The guard key vanishes; the marker cannot be read.
+    redis_store.pop(_guard_key(rm_a))
+
+    rm_b = _risk_manager(MarkerExplodingRedis(redis_store))
+    assert await rm_b.restore_state() is False
+    await rm_b.initialize_balance()
+
+    assert rm_b._guard_state_lost is True, (
+        "an unreadable 'has traded before' marker was read as a first boot"
+    )
+    assert rm_b._is_trading_allowed is False, (
+        "the gate opened on a zero streak because the discriminator could "
+        "not be read"
+    )
+
+    # And the zeros must not have been laundered into the guard key.
+    await rm_b.save_state()
+    assert _guard_key(rm_a) not in redis_store
+
+
+async def test_the_day_rollover_does_not_reopen_a_lost_gate(redis_store):
+    """A day change must not re-open a gate held closed for an UNKNOWN state.
+
+    The UTC rollover re-opens the global gate on a new day -- the day's
+    counters legitimately restart at zero. But the lost-state latch says
+    today's PnL and the loss streak are UNKNOWN, and "unknown" is not
+    "within limits". The rollover's own log line promises "Trading stays
+    DISABLED until the day rolls over"; the unconditional re-open further
+    down contradicted that promise.
+
+    Found by the Hermes reviewer during the free-tier review fan-out and
+    verified against the committed tree at 696f82c.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    await rm_a.save_state()
+
+    # The guard key vanishes; the 'has traded before' marker survives.
+    redis_store.pop(_guard_key(rm_a))
+
+    rm_b = _risk_manager(redis)
+    assert await rm_b.restore_state() is False
+    assert rm_b._guard_state_lost is True
+    assert rm_b._is_trading_allowed is False
+
+    # Force a UTC day change.
+    rm_b.stats.last_known_day_str = "2000-01-01"
+    rm_b._check_and_reset_daily_stats()
+
+    assert rm_b._is_trading_allowed is False, (
+        "the day rollover re-opened a gate that the LOST guard state is "
+        "holding closed"
+    )
+    assert rm_b._guard_state_lost is True
+    assert rm_b._global_gate_disable_reason is not None, (
+        "the day rollover cleared the reason the gate was held closed"
+    )
+
+
+async def test_initialize_balance_does_not_reopen_a_lost_gate(redis_store):
+    """The gate must not be open at ANY limit evaluation while unknown.
+
+    `initialize_balance()` re-opened the gate in its counter-reset branch,
+    and the UTC rollover it calls re-opened it too. Both were corrected a
+    line later by the re-check, but the flag was briefly True -- and in the
+    one path where no re-check follows it, it stayed True.
+
+    The spy records the gate flag as every limit evaluation sees it, so the
+    momentary opening is observable rather than invisible.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    await rm_a.save_state()
+    redis_store.pop(_guard_key(rm_a))
+
+    rm_b = _risk_manager(redis)
+    assert await rm_b.restore_state() is False
+    assert rm_b._guard_state_lost is True
+
+    seen = []
+    original = rm_b._check_risk_limits
+
+    def spy():
+        seen.append(rm_b._is_trading_allowed)
+        original()
+
+    rm_b._check_risk_limits = spy
+    await rm_b.initialize_balance()
+
+    assert seen, "the limit check never ran"
+    assert all(flag is False for flag in seen), (
+        f"the gate was open at a limit evaluation while the guard state was "
+        f"unknown: {seen}"
+    )
+    assert rm_b._is_trading_allowed is False
+
+
+async def test_clearing_the_emergency_stop_does_not_reopen_a_lost_gate(
+    redis_store,
+):
+    """The operator's kill switch must not open a lost-state gate.
+
+    `clear_emergency_stop()` sets the gate open and only re-evaluates the
+    limits when the guard state was RESTORED or UNVERIFIABLE. The lost-state
+    latch was in neither list, so clearing the kill switch opened the gate on
+    an account whose loss streak and day's PnL are unknown -- and, unlike the
+    other paths, nothing corrected it afterwards.
+
+    Found by the free-tier review fan-out and verified against the committed
+    tree at 696f82c.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    await rm_a.save_state()
+    redis_store.pop(_guard_key(rm_a))
+
+    rm_b = _risk_manager(redis)
+    assert await rm_b.restore_state() is False
+    assert rm_b._guard_state_lost is True
+    assert rm_b._is_trading_allowed is False
+
+    rm_b.trigger_emergency_stop("operator test")
+    rm_b.clear_emergency_stop()
+
+    assert rm_b._is_trading_allowed is False, (
+        "clearing the emergency stop re-opened a gate that the LOST guard "
+        "state is holding closed"
+    )
+    assert rm_b._guard_state_lost is True
+
+
+async def test_a_discarded_previous_day_payload_re_evaluates_the_gate(redis_store):
+    """A DISCARDED payload must not leave the gate holding a stale verdict.
+
+    `_reverify_guard_state()` ignored the `False` that
+    `_apply_persisted_guard_state()` returns for a previous-day payload. That
+    function applies nothing on that path and deliberately skips its own limit
+    re-evaluation, so the gate was left holding whatever the
+    unreadable-state latch had last set -- even though the state had become
+    readable and the in-memory counters are today's truth.
+
+    Found by the verifier during the free-tier review fan-out and verified
+    against the committed tree at 696f82c.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    # Persist a payload that belongs to YESTERDAY.
+    rm_a.stats.last_known_day_str = _yesterday_utc()
+    await rm_a.save_state()
+
+    # A start-up where Redis cannot be read -> the unreadable-state latch.
+    rm_b = _risk_manager(ExplodingRedis(redis_store))
+    assert await rm_b.restore_state() is False
+    assert rm_b._guard_state_unverified is True
+    assert rm_b._is_trading_allowed is False
+    await rm_b.initialize_balance()
+
+    # Redis comes back. The payload is still yesterday's, so it is discarded.
+    rm_b.redis_client = FakeRedis(redis_store)
+    await rm_b.save_state()
+
+    assert rm_b._guard_state_unverified is False, (
+        "the unreadable-state latch was not cleared once the state could be "
+        "read again"
+    )
+    assert rm_b._is_trading_allowed is True, (
+        "the gate was left holding the unreadable-state verdict after the "
+        "previous-day payload was discarded and the state became readable"
+    )
 
 
 async def test_clearing_the_emergency_stop_does_not_resume_a_blocked_account(
