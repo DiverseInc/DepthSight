@@ -2746,6 +2746,36 @@ class RiskManager:
                 if not await self._reverify_guard_state():
                     return
 
+            if getattr(self, "_guard_state_lost", False):
+                # The persisted state is GONE, not merely unreadable: today's
+                # PnL and the loss streak are UNKNOWN, not zero. The
+                # in-memory counters are the zeros this process was born
+                # with, so writing them now would LAUNDER an unknown state
+                # into a payload -- and the next start-up would read that
+                # payload as "the streak really is empty" and OPEN the gate.
+                #
+                # This is the same hazard the `_guard_state_unverified` branch
+                # above guards against, in its permanent form: that latch
+                # heals on the next successful read, this one cannot, because
+                # there is nothing left to read. So while it is set, nothing
+                # is persisted, the state stays lost, and the next start-up
+                # detects the loss again and fails closed. The latch is
+                # released at the UTC day rollover, where the day's counters
+                # legitimately restart at zero.
+                #
+                # Found by the DSH reviewer and verified against the tree at
+                # 035b0d2: without this guard the controller's unconditional
+                # periodic save defeated the latch one tick later.
+                logger.critical(
+                    "[RiskGuard] NOT persisting the trading-guard state: it was "
+                    f"lost on UTC day {self._guard_state_lost_day_str or 'unknown'} "
+                    "and the in-memory counters are UNKNOWN, not zero. Writing "
+                    "them would make the next start-up read the loss as an "
+                    "empty streak and open the gate. The lost-state latch "
+                    "holds until the UTC day rolls over."
+                )
+                return
+
             if not self.redis_client:
                 logger.critical(
                     "[RiskGuard] No redis_client; the trading-guard state will "

@@ -497,6 +497,57 @@ async def test_an_unverifiable_state_is_never_overwritten_with_a_zero(redis_stor
     assert json.loads(redis_store[_guard_key(rm_a)])["consecutive_losses"] == 10
 
 
+async def test_a_lost_state_is_never_overwritten_with_a_zero(redis_store):
+    """A LOST guard state must not be laundered into an empty streak.
+
+    The permanent form of the fail-closed latch: the persisted guard state
+    has VANISHED for an account that has traded before, so today's PnL and
+    the loss streak are UNKNOWN, not zero. The gate is closed and the
+    `_guard_state_lost` latch is set.
+
+    The in-memory counters are still the zeros this process was born with.
+    If they are persisted, the next start-up finds a payload, takes the
+    normal restore path, restores streak=0 / pnl=0, and OPENS the gate --
+    the product's own periodic save would launder an unknown state into
+    "the streak really is empty", which is precisely the fail-open the
+    lost-state latch exists to prevent.
+
+    Found by the DSH reviewer during the free-tier review fan-out and
+    verified against the committed tree at 035b0d2. This mirrors the
+    analogous `_guard_state_unverified` guard directly above.
+    """
+    redis = FakeRedis(redis_store)
+    rm_a = _risk_manager(redis)
+    await rm_a.initialize_balance()
+    rm_a.stats.consecutive_losses = 10
+    await rm_a.save_state()
+
+    # The guard key vanishes but the "has traded before" marker survives:
+    # this is a LOST state, not a first boot.
+    redis_store.pop(_guard_key(rm_a))
+
+    rm_b = _risk_manager(redis)
+    # The controller restores BEFORE it initializes the balance.
+    assert await rm_b.restore_state() is False
+    assert rm_b._guard_state_lost is True
+    assert rm_b._is_trading_allowed is False
+
+    # `initialize_balance()` zeroes the in-memory counters -- the state is
+    # unknown, not zero, so those zeros must never reach Redis.
+    await rm_b.initialize_balance()
+    await rm_b.save_state()
+    assert _guard_key(rm_a) not in redis_store, (
+        "the lost guard state was overwritten with the in-memory zeros; the "
+        "next start-up would read the loss as an empty streak and open the gate"
+    )
+
+    # And the next start-up must still see a LOST state, not a clean one.
+    rm_c = _risk_manager(redis)
+    assert await rm_c.restore_state() is False
+    assert rm_c._guard_state_lost is True
+    assert rm_c._is_trading_allowed is False
+
+
 async def test_clearing_the_emergency_stop_does_not_resume_a_blocked_account(
     redis_store,
 ):
