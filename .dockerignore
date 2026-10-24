@@ -9,6 +9,54 @@ Dockerfile
 Dockerfile.*
 docker-compose.yml
 
+# Secrets — these must NEVER be baked into an image layer.
+# docker-compose.yml supplies .env to the containers via env_file (read by
+# Compose on the HOST) and gcp_key.json via a read-only bind mount, so the
+# image never needs them at build time.
+.env
+.env.*
+*.env
+**/*.env
+**/.env
+**/.env.*
+!.env.example
+gcp_key.json
+**/gcp_key.json
+*.key
+**/*.key
+*.pem
+**/*.pem
+*.p12
+**/*.p12
+*.pfx
+**/*.pfx
+*.crt
+**/*.crt
+*.cer
+**/*.cer
+*.secret
+**/*.secret
+*.token
+**/*.token
+id_rsa*
+**/id_rsa*
+credentials*.json
+**/credentials*.json
+service_account*.json
+**/service_account*.json
+*keys*.json
+**/*keys*.json
+application_default_credentials.json
+**/application_default_credentials.json
+.npmrc
+**/.npmrc
+.netrc
+**/.netrc
+.envrc
+**/.envrc
+secrets/
+**/secrets/
+
 # Python
 __pycache__/
 *.pyc
@@ -17,6 +65,10 @@ __pycache__/
 venv/
 venv_bot/
 .venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
 
 # Node.js (для бэкенд-контейнера они не нужны, фронтенд их обработает сам)
 # Если папка frontend в корне, то так:
@@ -32,6 +84,12 @@ Makefile
 # IDE
 .idea/
 .vscode/
+.opencode/
+
+# Tests and docs are not needed at runtime: nothing in the image imports them
+# (alembic needs alembic/ + alembic.ini, not tests/ or docs/).
+tests/
+docs/
 
 # Другое
 *.log
