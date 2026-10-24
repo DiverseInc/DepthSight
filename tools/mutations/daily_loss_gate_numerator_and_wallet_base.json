@@ -48,6 +48,12 @@
     "fires while `last_known_day_str` is still empty and writes the mid-day",
     "balance as today's opening balance. Both call orders must agree.",
     "",
+    "N11 is the EXIT leg being booked TWICE. Twice would make the daily-loss",
+    "gate over-trip on a loss the account did not make. It is here because a",
+    "test that never exercises the exit leg cannot catch it: the SL/TP exit",
+    "only happens when the market price falls through the stop, so a test",
+    "that rests a stop and leaves the market still never triggers it.",
+    "",
     "Run with:  python tools/mutation_harness.py tools/mutations/daily_loss_gate_numerator_and_wallet_base.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
     "read a file that is mid-mutation and report on code that does not exist."
@@ -108,6 +114,12 @@
       "file": "bot_module/risk_manager.py",
       "needle": "        if (\n            getattr(self.stats, \"start_of_day_day_str\", None) == day_str\n            and self.stats.start_of_day_balance > 1e-9\n        ):\n            return False\n",
       "replace": "        if False:\n            return False\n"
+    },
+    {
+      "label": "N11: the SL/TP exit leg is DOUBLE-booked",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n",
+      "replace": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n                        if is_reducing_trade:\n                            await self._book_fill_pnl_to_position(\n                                symbol, net_pnl, is_entry_leg=False\n                            )\n"
     },
     {
       "label": "N10: the restore does not invalidate a base written before it",

@@ -344,6 +344,19 @@ def _rest_exit_order(paper_executor, *, qty, price, order_type):
     return client_order_id
 
 
+def _move_market_to(paper_executor, price: float) -> None:
+    """Moves the fake market price.
+
+    A SELL stop -- a stop-loss on a long -- is hit when the price FALLS to
+    it: `check_open_orders` fires it only when `current_price <=
+    order_price`. Resting a stop below a market that never moves leaves the
+    stop untouched, so the exit NEVER happens and any assertion about the
+    exit leg is vacuous. This is what makes the market move through the stop,
+    which is what happens in production.
+    """
+    paper_executor.data_consumer.price = float(price)
+
+
 async def _finalize(controller, reason: str):
     """Runs the REAL controller finalization of a paper close.
 
@@ -402,10 +415,30 @@ async def test_the_risk_manager_today_pnl_is_the_wallet_and_the_db_after_an_entr
     )
 
     # A real SL/TP exit fill: the wallet is credited the net of the close.
+    # The market has to FALL to the stop for the stop to fire.
     _rest_exit_order(
         paper_executor, qty=QTY, price=ENTRY_PRICE * 0.99, order_type="STOP_MARKET"
     )
+    _move_market_to(paper_executor, ENTRY_PRICE * 0.98)
     await paper_executor.check_open_orders()
+
+    # The exit must ACTUALLY have happened. A test that asserts something
+    # about an exit that never fired asserts nothing.
+    assert len(money["wallet"]) == 2, (
+        "the SL/TP exit never fired: a SELL stop is only triggered when the "
+        "price falls to it, so the market has to move. Without this the "
+        "assertions below would be about the entry leg alone."
+    )
+    assert len(money["trades"]) == 2, (
+        f"expected an entry row and an exit row, got {len(money['trades'])}"
+    )
+    exit_row = money["trades"][1]
+    assert float(exit_row.get("commission") or 0.0) > 0, (
+        "the exit fill was not charged a commission, so it did not happen"
+    )
+    assert float(exit_row.get("pnl") or 0.0) < 0, (
+        "the exit was supposed to be a LOSS (the price fell through the stop)"
+    )
 
     # The real finalization hands `position.pnl` to the real risk manager.
     await _finalize(controller, "STOP_LOSS")
@@ -475,9 +508,32 @@ async def test_the_sl_tp_exit_leg_is_booked_exactly_once(money):
     _rest_exit_order(
         paper_executor, qty=QTY, price=ENTRY_PRICE * 0.99, order_type="STOP_MARKET"
     )
+    # A SELL stop fires only when the price has fallen to it. Without this
+    # move the stop never triggers, the exit never happens, and this test
+    # would assert nothing about the exit leg at all.
+    _move_market_to(paper_executor, ENTRY_PRICE * 0.98)
     await paper_executor.check_open_orders()
 
+    # The exit MUST have happened. A green assertion about an exit that never
+    # fired proves nothing.
+    assert len(money["wallet"]) == 2, (
+        "the SL/TP exit never fired: a SELL stop is only triggered when the "
+        "price falls to it, so the market has to move"
+    )
+    assert len(money["trades"]) == 2, (
+        f"expected an entry row and an exit row, got {len(money['trades'])}"
+    )
+    exit_row = money["trades"][1]
+    assert float(exit_row.get("commission") or 0.0) > 0, (
+        "the exit fill was not charged a commission, so it did not happen"
+    )
+
     exit_net = _wallet_total(money) - (-entry_commission)
+
+    assert exit_net < 0, (
+        f"the exit leg was {exit_net}, which is not a losing close -- the "
+        "market did not fall through the stop"
+    )
 
     assert float(position.pnl or 0.0) == pytest.approx(exit_net - entry_commission), (
         f"the exit leg was booked {position.pnl} but the wallet moved "
