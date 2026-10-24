@@ -1,0 +1,119 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the daily-loss gate fix",
+    "(2026-10-24): the gate's NUMERATOR must be the wallet's day PnL, and",
+    "its DENOMINATOR must never be invented by a read.",
+    "",
+    "N1 is the ENTRY leg not being booked -- the exact origin/main defect.",
+    "The entry fill is charged a commission and the wallet is debited, but",
+    "nothing books it to the risk manager, so the gate's numerator is short",
+    "by every entry commission ever paid:",
+    "    RM loss = DB loss - entry commissions.",
+    "The daily-loss gate then reads LOW and under-trips (a true 8.2767% was",
+    "published as 6.17% against a 5% threshold).",
+    "",
+    "N2 is a fill booking the GROSS instead of the NET, so the wallet and the",
+    "risk manager are told different numbers for the same fill.",
+    "",
+    "N3 is the forced close not booking its leg at all. The forced close does",
+    "not go through `place_order`, so it has to book its own leg where its",
+    "money moved -- and it must do so BEFORE the notifier, which flips the",
+    "position to CLOSING (an exit leg is only booked while the position is",
+    "still OPEN).",
+    "",
+    "N4 is the paper balance READ creating a $10,000 wallet for an account",
+    "that has none. The risk manager then stamps that $10,000 as the day's",
+    "opening balance: 5% of $10,000 is $500 of tolerated loss against 5% of a",
+    "real ~$756.28 base = $37.81 -- a 13.2x disarm of the gate.",
+    "",
+    "N5 and N6 are the two GET routes creating a wallet. A read must never",
+    "create money.",
+    "",
+    "N7 is the destructive wallet reset no longer requiring an explicit",
+    "`reset=True`, so any caller could wipe a live balance.",
+    "",
+    "N8 is the startup re-derive writing the MID-DAY balance as today's",
+    "opening balance. The live balance already contains today's PnL, so",
+    "restating the day's loss against it measures the loss against a",
+    "denominator that contains it -- it reads LOW, which is the same shape of",
+    "defect as a base captured on another day. The base must stay UNKNOWN and",
+    "the gate must fail CLOSED instead.",
+    "",
+    "N9 is the ONE opening-balance writer overwriting a base that already",
+    "belongs to today. Today's opening balance is a fact about the start of",
+    "the day.",
+    "",
+    "N10 is the restore not invalidating a base that was written BEFORE it.",
+    "That is what happens in the 'init-first' call order: the UTC rollover",
+    "fires while `last_known_day_str` is still empty and writes the mid-day",
+    "balance as today's opening balance. Both call orders must agree.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/daily_loss_gate_numerator_and_wallet_base.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_paper_daily_loss_gate_numerator.py tests/test_daily_loss_base_is_current_day.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "N1: the ENTRY leg is not booked to the risk manager",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n",
+      "replace": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=False\n                        )\n"
+    },
+    {
+      "label": "N2: a fill books the GROSS instead of the NET",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n",
+      "replace": "                        await self._book_fill_pnl_to_position(\n                            symbol, realized_pnl, is_entry_leg=not is_reducing_trade\n                        )\n"
+    },
+    {
+      "label": "N3: the forced close does not book its leg",
+      "file": "bot_module/paper_executor.py",
+      "needle": "        await self._book_fill_pnl_to_position(\n            symbol,\n            net_realized_pnl(realized_pnl, commission),\n            is_entry_leg=False,\n        )\n",
+      "replace": "        pass  # MUTATED: the forced close never books its leg\n"
+    },
+    {
+      "label": "N4: a balance READ creates a $10,000 wallet",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                logger.error(\n                    f\"[PaperExecutor] No paper wallet exists for user \"\n                    f\"{self.user_id}. The balance is UNKNOWN and no wallet is \"\n                    \"created by a read. The risk manager will fail closed \"\n                    \"until a wallet exists (POST /api/v1/account/paper/reset \"\n                    \"creates one).\"\n                )\n                return None\n",
+      "replace": "                wallet_assets = await crud.init_or_reset_paper_wallet(\n                    self.db, user_id=self.user_id\n                )\n"
+    },
+    {
+      "label": "N5: the portfolio GET creates a wallet",
+      "file": "api/routes/portfolio.py",
+      "needle": "        wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)\n        # A READ NEVER CREATES MONEY. A wallet-less account is reported with\n",
+      "replace": "        wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)\n        if not wallet_assets:\n            wallet_assets = await crud.init_or_reset_paper_wallet(\n                db, user_id=current_user.id\n            )\n            await db.commit()\n        # A READ NEVER CREATES MONEY. A wallet-less account is reported with\n"
+    },
+    {
+      "label": "N6: the paper account GET creates a wallet",
+      "file": "api/routes/account.py",
+      "needle": "    wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)\n\n    return {\"data\": wallet_assets}\n",
+      "replace": "    wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)\n\n    if not wallet_assets:\n        wallet_assets = await crud.init_or_reset_paper_wallet(\n            db, user_id=current_user.id\n        )\n        await db.commit()\n\n    return {\"data\": wallet_assets}\n"
+    },
+    {
+      "label": "N7: the destructive wallet reset no longer needs an explicit opt-in",
+      "file": "api/crud.py",
+      "needle": "    if reset:\n        # Delete existing wallet entries for the user\n",
+      "replace": "    if True:\n        # Delete existing wallet entries for the user\n"
+    },
+    {
+      "label": "N8: the startup re-derive writes a mid-day balance as today's opening balance",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                # Leave the base unusable: a base captured on another day must\n                # not linger where something could read it, and an absent\n                # base must not be filled with a guess. `_daily_loss_base_is_usable()`\n                # therefore returns False and `_check_risk_limits()` closes the\n                # gate with `RISK_GUARD_BASE_UNKNOWN_REASON`.\n                self.stats.start_of_day_balance = 0.0\n                self.stats.start_of_day_day_str = \"\"\n",
+      "replace": "                self.stats.start_of_day_balance = self.stats.current_balance\n                self.stats.start_of_day_day_str = current_trading_day_str_utc_actual\n"
+    },
+    {
+      "label": "N9: the opening-balance writer overwrites a base that already belongs to today",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        if (\n            getattr(self.stats, \"start_of_day_day_str\", None) == day_str\n            and self.stats.start_of_day_balance > 1e-9\n        ):\n            return False\n",
+      "replace": "        if False:\n            return False\n"
+    },
+    {
+      "label": "N10: the restore does not invalidate a base written before it",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                    self.stats.start_of_day_balance,\n                )\n                self.stats.start_of_day_balance = 0.0\n                self.stats.start_of_day_day_str = \"\"\n",
+      "replace": "                    self.stats.start_of_day_balance,\n                )\n                pass  # MUTATED: the mid-day base written before the restore survives\n"
+    }
+  ]
+}
