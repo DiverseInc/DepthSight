@@ -8,8 +8,10 @@
     "is profitable before commission and a LOSS after it would be counted as a",
     "win -- the exact blindness that made the daily-loss guard unable to fire.",
     "",
-    "B is the fill notification not ACCUMULATING onto the position. A position",
-    "closed in several partial fills would keep only the last fill's PnL.",
+    "B is the fill not ACCUMULATING onto the position. A position closed in",
+    "several partial fills would keep only the last fill's PnL. The booking",
+    "now lives in `_book_fill_pnl_to_position`, which is called from the two",
+    "places where the WALLET moved -- `place_order` and the forced close.",
     "",
     "C is the MARKET branch computing a GROSS net_pnl, so the wallet and the",
     "risk manager are told different numbers for the same fill.",
@@ -18,7 +20,8 @@
     "",
     "E is the liquidation path handing the risk manager the GROSS PnL.",
     "",
-    "F is the check_open_orders call site passing 0.0 instead of the net PnL.",
+    "F is the fill booking 0.0 instead of the fill's net PnL, so the exit leg",
+    "never reaches the risk manager.",
     "",
     "G is the rollover running AFTER the limit check. The reverse order judges",
     "the new day against the old day's counters and can leave the gate open",
@@ -75,8 +78,8 @@
     {
       "label": "B: the fill no longer accumulates onto the position's PnL",
       "file": "bot_module/paper_executor.py",
-      "needle": "            position.pnl = previous_pnl + float(net_pnl or 0.0)\n",
-      "replace": "            position.pnl = previous_pnl\n"
+      "needle": "                position.pnl = previous_pnl + float(net_pnl or 0.0)\n",
+      "replace": "                position.pnl = previous_pnl\n"
     },
     {
       "label": "C: the MARKET branch computes a GROSS net_pnl",
@@ -93,14 +96,14 @@
     {
       "label": "E: the liquidation path hands the risk manager the GROSS PnL",
       "file": "bot_module/paper_executor.py",
-      "needle": "                net_pnl=net_realized_pnl(realized_pnl, commission),\n",
-      "replace": "                net_pnl=realized_pnl,\n"
+      "needle": "            net_realized_pnl(realized_pnl, commission),\n",
+      "replace": "            realized_pnl,\n"
     },
     {
-      "label": "F: the check_open_orders call site passes 0.0 instead of the net PnL",
+      "label": "F: the fill books 0.0 instead of the fill's net PnL",
       "file": "bot_module/paper_executor.py",
-      "needle": "                            net_pnl=float(fill_result.get(\"net_realized_pnl\") or 0.0),\n",
-      "replace": "                            net_pnl=0.0,\n"
+      "needle": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n",
+      "replace": "                        await self._book_fill_pnl_to_position(\n                            symbol, 0.0, is_entry_leg=not is_reducing_trade\n                        )\n"
     },
     {
       "label": "G: the rollover runs AFTER the limit check",
