@@ -720,23 +720,47 @@ class RiskManager:
                 and self.stats.start_of_day_balance > 0
             )
             if not base_is_current_day:
-                stale_base = (
-                    self.stats.start_of_day_balance
-                    if self.stats.start_of_day_day_str
-                    else None
+                # TODAY'S OPENING BALANCE IS UNKNOWN -- AND IT MUST NOT BE
+                # GUESSED.
+                #
+                # `update_balance()` runs BEFORE this block, so the UTC
+                # rollover has already had its chance: if it fired, it wrote
+                # and stamped today's base and `base_is_current_day` is
+                # True. Reaching this branch therefore means the rollover did
+                # NOT fire -- we are mid-day, and today's opening balance is
+                # genuinely unknown (a base captured on another day was
+                # refused by `_apply_persisted_guard_state`, or there was no
+                # base at all).
+                #
+                # The live balance is a MID-DAY balance: it already contains
+                # whatever the account won or lost today. Writing it as
+                # today's OPENING balance restates the day's loss against a
+                # denominator that already contains it, which reads LOW and
+                # under-trips the daily-loss gate -- the same shape of defect
+                # as a base captured on another day, wearing a different hat.
+                #
+                # So the base is left UNUSABLE and the gate fails closed with
+                # `RISK_GUARD_BASE_UNKNOWN_REASON`. Today's opening balance
+                # becomes knowable at the true UTC rollover, where the
+                # balance genuinely IS the opening balance.
+                logger.error(
+                    "[RiskGuard] Today's opening balance is UNKNOWN for %s and is "
+                    "NOT guessed: the live balance ($%.2f) is a MID-DAY balance "
+                    "that already contains today's PnL, so using it as the "
+                    "opening balance would measure the day's loss against a "
+                    "denominator that contains it and read LOW. The daily-loss "
+                    "and drawdown gates fail CLOSED until the UTC rollover "
+                    "captures the real opening balance.",
+                    current_trading_day_str_utc_actual,
+                    self.stats.current_balance,
                 )
-                self.stats.start_of_day_balance = self.stats.current_balance
-                self.stats.start_of_day_day_str = current_trading_day_str_utc_actual
-                logger.info(
-                    f"Daily-loss base re-derived for {current_trading_day_str_utc_actual}: "
-                    f"${self.stats.start_of_day_balance:.2f}"
-                    + (
-                        f" (was ${stale_base:.2f} from UTC day "
-                        f"{self.stats.last_known_day_str or 'unknown'})"
-                        if stale_base is not None
-                        else " (no base was known)"
-                    )
-                )
+                # Leave the base unusable: a base captured on another day must
+                # not linger where something could read it, and an absent
+                # base must not be filled with a guess. `_daily_loss_base_is_usable()`
+                # therefore returns False and `_check_risk_limits()` closes the
+                # gate with `RISK_GUARD_BASE_UNKNOWN_REASON`.
+                self.stats.start_of_day_balance = 0.0
+                self.stats.start_of_day_day_str = ""
 
             if (
                 guard_state_unverifiable
@@ -998,14 +1022,57 @@ class RiskManager:
             start_of_trading_day_dt = reset_time_today_utc
         return start_of_trading_day_dt.timestamp(), current_day_str
 
+    def _write_start_of_day_base(self, balance: float, day_str: str) -> bool:
+        """The ONE writer of the day's opening balance.
+
+        The balance and the UTC day it belongs to are written TOGETHER, so
+        the two can never drift apart: a base whose stamp says one day and
+        whose amount was captured on another is a base measured against the
+        wrong denominator, which reads LOW and under-trips the daily-loss
+        gate.
+
+        A base that already belongs to `day_str` is NEVER overwritten.
+        Today's opening balance is a fact about the start of the day, and
+        restating it from a mid-session balance would silently bake the
+        losses already taken today into the denominator -- the exact shape
+        of the defect this writer exists to prevent.
+
+        Its ONLY caller is the UTC rollover, which is the one moment the
+        number is known to BE the opening balance. Nothing else may write it:
+        a balance that is merely CURRENT is a mid-day balance, and it is not
+        the day's opening balance.
+
+        A base of exactly 0 is "unknown", not "a real opening balance of
+        zero": `_daily_loss_base_is_usable()` treats it as unusable and the
+        gate fails closed. That is the safe direction (it never re-opens the
+        gate), and it is consistent with the min-balance check, which blocks
+        a zero-balance account anyway.
+
+        Returns True when the base was written.
+        """
+        # A stats object with NO day stamp means the base is not known to
+        # belong to today -- that is "unknown", not "already today's", so the
+        # guard must not block the write. The attribute is read defensively:
+        # the guard-state test doubles model a stats object without it.
+        if (
+            getattr(self.stats, "start_of_day_day_str", None) == day_str
+            and self.stats.start_of_day_balance > 1e-9
+        ):
+            return False
+
+        self.stats.start_of_day_balance = float(balance)
+        self.stats.start_of_day_day_str = day_str
+        return True
+
     def _check_and_reset_daily_stats(self):
         current_start_ts_float, current_day_str_utc = self._get_current_day_start_info()
         if self.stats.last_known_day_str != current_day_str_utc:
             logger.info(
                 f"New trading day detected (UTC): {current_day_str_utc}. Previous day: {self.stats.last_known_day_str}"
             )
-            self.stats.start_of_day_balance = self.stats.current_balance
-            self.stats.start_of_day_day_str = current_day_str_utc
+            self._write_start_of_day_base(
+                self.stats.current_balance, current_day_str_utc
+            )
             # A lost guard state heals at the UTC rollover and nowhere else.
             # It cannot heal on a re-read (there is nothing left to read), and
             # it must not require an operator: a new UTC day starts the day's
@@ -1891,9 +1958,11 @@ class RiskManager:
                 # silently, with no log at all.
                 #
                 # A brand-new account is not blocked by this: the first
-                # `initialize_balance` derives the base from the live balance,
-                # so the very next limit check can decide. What is blocked is
-                # the window where the base is genuinely unknown.
+                # `initialize_balance` captures the base at the UTC rollover
+                # (inside `update_balance`), where the balance genuinely IS the
+                # opening balance, so the very next limit check can decide.
+                # What is blocked is the window where the base is genuinely
+                # unknown.
                 should_be_allowed = False
                 disable_reason = RISK_GUARD_BASE_UNKNOWN_REASON
             else:
@@ -3112,8 +3181,12 @@ class RiskManager:
         # So the base is restored ONLY when the payload says it belongs to
         # today. A payload without the field (any v1 payload) is UNKNOWN, not
         # known-good, and is treated the same way -- `initialize_balance` then
-        # re-derives the base from the live balance, which can only make the
-        # gate stricter and more accurate.
+        # leaves the base unusable and the daily-loss gate fails CLOSED
+        # (`RISK_GUARD_BASE_UNKNOWN_REASON`) until the UTC rollover captures
+        # the real opening balance. It is NOT re-derived from the live
+        # balance: that balance is a mid-day balance which already contains
+        # today's PnL, and restating the day's loss against a denominator
+        # that contains it reads LOW.
         #
         # `today_pnl` IS still restored: it is day-scoped by `day_str`, which
         # was checked above, and discarding it would measure nothing at all and
@@ -3133,9 +3206,32 @@ class RiskManager:
                 f"{persisted_base_day_str or 'UNKNOWN (pre-v2 payload)'} and today "
                 f"is {current_day_str}. A base from an earlier day makes the "
                 "daily-loss and drawdown gates measure against the wrong "
-                "denominator, which reads LOW and under-trips. The base will be "
-                "re-derived from the live balance by initialize_balance().",
+                "denominator, which reads LOW and under-trips. Today's opening "
+                "balance stays UNKNOWN and the gate fails CLOSED until the UTC "
+                "rollover captures the real one.",
             )
+            # If a base was written BEFORE this restore, it is a GUESS and must
+            # be invalidated. That is what happens in the "init-first" call
+            # order: `initialize_balance()` runs before the state is read, so
+            # `last_known_day_str` is still empty, the UTC rollover fires
+            # (empty != today), and it writes the live MID-DAY balance as
+            # today's opening balance. This payload says the account already
+            # HAS today's state, so that base cannot be today's opening
+            # balance -- and the "restore-first" order ends up with no base at
+            # all. Invalidating here makes both call orders end in the same
+            # state: today's opening balance is UNKNOWN, and the gate fails
+            # closed.
+            if getattr(self.stats, "start_of_day_day_str", None) == current_day_str:
+                logger.critical(
+                    "[RiskGuard] Invalidating an opening balance that was "
+                    "written before this restore ($%.2f): it was captured from "
+                    "a mid-day balance, and this account's state proves it has "
+                    "already traded today, so it is not the day's opening "
+                    "balance.",
+                    self.stats.start_of_day_balance,
+                )
+                self.stats.start_of_day_balance = 0.0
+                self.stats.start_of_day_day_str = ""
 
         self.stats.last_known_day_str = current_day_str
         self._guard_state_restored = True
