@@ -16,6 +16,7 @@ from pathlib import Path
 import pandas_ta as ta
 import redis.asyncio as redis
 import copy
+from contextlib import asynccontextmanager
 
 # Importing module components
 from bot_module import config
@@ -988,6 +989,48 @@ class TradingController:
             return sl_price is None or target_price < sl_price
         return False
 
+    @asynccontextmanager
+    async def _owned_session(self):
+        """Yield one DB session that is always rolled back and closed.
+
+        Replaces `async for db in self.get_db_session()`, which abandons the
+        generator (and its checked-out pool connection) whenever the body
+        returns or raises: with hundreds of controllers doing that every few
+        seconds the pool drains to QueuePool timeout even though the pool is
+        sized correctly. The abandoned generator keeps its transaction OPEN,
+        so the connection stays pinned until the garbage collector happens to
+        finalise it - measured at ~120 pinned server connections at 660
+        controllers, which starved the pooler and made every other query
+        queue. Works with the real get_db and with the async-generator mocks
+        used in tests.
+
+        The session is rolled back when the body raises (the read never
+        committed) and closed either way, so the connection goes back to the
+        pool on the happy path AND on the error path.
+        """
+        gen = self.get_db_session()
+        try:
+            db = await gen.__anext__()
+        except StopAsyncIteration:
+            raise RuntimeError("DB session factory yielded nothing")
+        try:
+            yield db
+        except Exception:
+            try:
+                await db.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                await gen.aclose()
+            except Exception:
+                pass
+            try:
+                await db.close()
+            except Exception:
+                pass
+
     async def load_symbol_selection_config(self) -> bool:
         """
         Loads the user's symbol selection configuration from the API.
@@ -995,7 +1038,7 @@ class TradingController:
         """
         log_prefix = "[LoadSymbolSelectionConfig]"
         try:
-            async for db in self.get_db_session():
+            async with self._owned_session() as db:
                 user_config_data = await crud.get_user_symbol_selection_config(
                     db, self.user_id
                 )
@@ -1097,7 +1140,7 @@ class TradingController:
             f"Controller for user_id={self.user_id} starting. Loading user-specific configuration..."
         )
         try:
-            async for db in self.get_db_session():
+            async with self._owned_session() as db:
                 app_config = await crud.get_config(db, user_id=self.user_id)
                 if app_config and self.rm:
                     logger.info("Applying user-specific runtime settings.")
@@ -3317,7 +3360,7 @@ class TradingController:
 
         # DB lookup
         try:
-            async for db in self.get_db_session():
+            async with self._owned_session() as db:
                 last_trade = await crud.get_last_open_trade_for_symbol(
                     db, self.user_id, symbol
                 )
@@ -3332,7 +3375,6 @@ class TradingController:
                         "x-entry-"
                     ):
                         entry_client_id = last_trade.trade_uuid
-                    break
         except Exception as e:
             logger.error(f"Adopt:{symbol}: DB error: {e}")
 
@@ -4847,7 +4889,7 @@ class TradingController:
         """
         log_prefix = "[ReloadUserAppConfig]"
         try:
-            async for db in self.get_db_session():
+            async with self._owned_session() as db:
                 app_config = await crud.get_config(db, user_id=self.user_id)
                 if app_config:
                     # 1. Update Notifications (Telegram Chat ID)
@@ -4886,8 +4928,6 @@ class TradingController:
                     logger.warning(
                         f"{log_prefix} Could not load AppConfig for user {self.user_id}."
                     )
-
-                break  # Break after one successful load
 
         except Exception as e:
             logger.error(
@@ -9736,9 +9776,11 @@ class TradingController:
                 "PENDING_ENTRY",
                 "OPEN",
             ]:
-                async for db_session in (
-                    self.get_db_session()
-                ):  # Use async for to iterate over the generator
+                # An owned session, not `async for db in self.get_db_session()`:
+                # the latter abandons the generator when the body raises, and a
+                # user lookup that fails under DB pressure then leaves an OPEN
+                # TRANSACTION holding a pooled connection forever.
+                async with self._owned_session() as db_session:
                     user = await crud.admin_get_user_details(
                         db_session, new_position.user_id
                     )
@@ -11326,7 +11368,9 @@ class TradingController:
 
             # Send Push Notification for Position Closed
             if position_to_process_copy.user_id:
-                async for db_session in self.get_db_session():  # Using async for
+                # Owned session: see the position-opened path above - an
+                # abandoned session here would pin a connection the same way.
+                async with self._owned_session() as db_session:
                     try:
                         user = await crud.admin_get_user_details(
                             db_session, position_to_process_copy.user_id
@@ -11622,7 +11666,7 @@ class TradingController:
                 }
 
                 # Get the DB session and call the save function
-                async for db in self.get_db_session():
+                async with self._owned_session() as db:
                     try:
                         await crud.create_trade(
                             db=db,
@@ -11637,8 +11681,6 @@ class TradingController:
                     except Exception as e_inner:
                         await db.rollback()
                         raise e_inner
-                    finally:
-                        break  # Exiting the loop after one iteration
             except Exception as e_db_save:
                 logger.error(
                     f"{log_prefix} CRITICAL: Failed to save trade to database for user_id={self.user_id}, symbol={symbol}. Error: {e_db_save}",
