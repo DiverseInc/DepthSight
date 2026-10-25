@@ -954,3 +954,78 @@ async def test_the_funding_charge_reaches_the_risk_manager_exactly_once(money):
         f"moved {_wallet_total(money):.8f} in total. The funding was already "
         "reported when it was charged, so the close must not report it again."
     )
+
+
+@pytest.mark.asyncio
+async def test_a_funding_charge_the_risk_manager_refused_is_reported_by_the_close(
+    money, monkeypatch
+):
+    """A funding charge the risk manager REFUSED must still be counted once.
+
+    The wallet moved BEFORE the risk manager was told, so the funding is part
+    of the position's booked PnL whatever the risk manager did with it. If
+    the risk manager never took it, the close has to report it -- otherwise
+    the money the wallet lost is invisible to the daily-loss gate for the
+    rest of the position's life.
+
+    The mirror image of the double-count: the close subtracts the funding
+    that was ALREADY REPORTED. A funding that was never reported must not be
+    subtracted, because subtracting it would take it out of the risk
+    manager's PnL entirely.
+    """
+    controller, paper_executor, rm = _build_controller(ENTRY_PRICE)
+    _pin_day(rm)
+    position, entry_result = await _run_real_entry(controller, paper_executor)
+    entry_commission = sum(
+        float(f.get("commission") or 0.0) for f in entry_result.get("fills", [])
+    )
+
+    async def _refuse(symbol, funding_pnl):
+        raise RuntimeError("the risk manager is unavailable")
+
+    monkeypatch.setattr(rm, "apply_funding_pnl", _refuse)
+
+    # Exactly ONE settlement boundary crossed since the position was opened.
+    now = datetime.now(timezone.utc)
+    paper_executor._positions[SYMBOL]["last_funding_timestamp"] = (
+        paper_executor._last_funding_boundary_before(
+            now, PAPER_FUNDING_INTERVAL_HOURS
+        )
+        - timedelta(hours=PAPER_FUNDING_INTERVAL_HOURS)
+    )
+
+    wallet_before = _wallet_total(money)
+    await paper_executor.check_funding()
+    charged = _wallet_total(money) - wallet_before
+
+    assert charged < 0, (
+        "the funding must have been charged to the wallet, or this test would "
+        "be asserting nothing"
+    )
+    assert float(getattr(position, "funding_pnl_reported", 0.0) or 0.0) == (
+        pytest.approx(0.0)
+    ), (
+        "the funding was NOT reported to the risk manager, so it must not be "
+        "counted as reported: the close has to report it, and subtracting it "
+        "there would take it out of the risk manager's PnL entirely"
+    )
+    assert rm.stats.today_pnl == pytest.approx(0.0), (
+        "the risk manager refused the funding, so its day PnL must not "
+        f"contain it, got {rm.stats.today_pnl:.8f}"
+    )
+    assert float(position.pnl or 0.0) == pytest.approx(
+        -entry_commission + charged
+    ), (
+        "the funding is part of the position's booked PnL whatever the risk "
+        "manager did with it: the WALLET moved it"
+    )
+
+    # The close reports the position's net result, which includes the
+    # funding: the wallet moved it, so the risk manager hears about it once.
+    await _finalize(controller, "STOP_LOSS")
+
+    assert rm.stats.today_pnl == pytest.approx(_wallet_total(money)), (
+        f"the risk manager was told {rm.stats.today_pnl:.8f} but the wallet "
+        f"moved {_wallet_total(money):.8f} in total. The funding the risk "
+        "manager refused must be reported by the close, exactly once."
+    )

@@ -35,7 +35,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from bot_module import config
-from bot_module.risk_manager import RiskManager
+from bot_module.risk_manager import (
+    RISK_GUARD_BASE_UNKNOWN_REASON,
+    RISK_GUARD_UNVERIFIED_REASON,
+    RiskManager,
+)
 from bot_module.exchanges import ExchangeExecutor
 
 
@@ -806,9 +810,51 @@ async def test_a_discarded_previous_day_payload_re_evaluates_the_gate(redis_stor
         "the unreadable-state latch was not cleared once the state could be "
         "read again"
     )
-    assert rm_b._is_trading_allowed is True, (
-        "the gate was left holding the unreadable-state verdict after the "
+    # The gate must be RE-EVALUATED, not left holding the verdict the
+    # unreadable-state latch set. The verdict it now carries is a DIFFERENT
+    # one, and for a reason that is not a defect:
+    #
+    # the discarded payload belongs to a PREVIOUS UTC day, so it PROVES this
+    # account has traded. That makes the live balance a MID-DAY balance, so
+    # the opening balance captured from it (a guess, made while the persisted
+    # state could not be read) is not today's opening balance and is
+    # dropped. Today's opening balance is therefore UNKNOWN, the daily-loss
+    # ratio cannot be computed, and the gate fails CLOSED on that -- which
+    # is exactly what "the opening balance must be captured only on a real
+    # UTC day transition" requires.
+    #
+    # The original defect -- a gate left holding the unreadable-state
+    # verdict -- is pinned below: that verdict must be gone from BOTH the
+    # internal flag and the reason the operator (and the API) is shown. A
+    # Redis that has recovered must not be blamed for a gate that is held
+    # for a different reason.
+    assert RISK_GUARD_UNVERIFIED_REASON not in (
+        rm_b._global_gate_disable_reason or ""
+    ), (
+        "the gate is still holding the unreadable-state verdict after the "
         "previous-day payload was discarded and the state became readable"
+    )
+    assert RISK_GUARD_BASE_UNKNOWN_REASON in (
+        rm_b._global_gate_disable_reason or ""
+    ), (
+        "the gate should now be closed because today's opening balance is "
+        f"unknown, got {rm_b._global_gate_disable_reason!r}"
+    )
+    assert RISK_GUARD_UNVERIFIED_REASON not in (
+        rm_b.get_trading_disabled_reason() or ""
+    ), (
+        "the reason shown to the operator is still the stale unreadable-state "
+        "verdict: the state WAS read again, so blaming Redis is wrong"
+    )
+    assert RISK_GUARD_BASE_UNKNOWN_REASON in (
+        rm_b.get_trading_disabled_reason() or ""
+    ), (
+        "the reason shown to the operator must be the real one, got "
+        f"{rm_b.get_trading_disabled_reason()!r}"
+    )
+    assert rm_b._is_trading_allowed is False, (
+        "an account whose opening balance for today is unknown must not trade: "
+        "the daily-loss ratio cannot be computed against it"
     )
 
 

@@ -1350,7 +1350,7 @@ class RiskManager:
         # base that already belongs to today.
         self._capture_first_boot_base(current_day_str_utc)
 
-    async def apply_funding_pnl(self, symbol: str, funding_pnl: float) -> None:
+    async def apply_funding_pnl(self, symbol: str, funding_pnl: float) -> bool:
         """Record a FUNDING charge against the day's PnL.
 
         Funding is a CARRY COST, not a trade: the paper wallet is debited (or
@@ -1364,18 +1364,43 @@ class RiskManager:
         consecutive-loss streak (which counts losing CLOSES -- a funding
         payment is not a losing trade, and counting it could falsely trip the
         max-consecutive-losses guard) and it is not a trade timestamp.
+
+        Returns True when the funding IS in today's PnL. The caller needs
+        that distinction: the close subtracts the funding that was ALREADY
+        reported, so a funding that never reached this counter must NOT be
+        subtracted -- otherwise the close would report it a second time, or
+        the gate would never hear about it at all.
         """
         self._check_and_reset_daily_stats()
-        self.stats.today_pnl += funding_pnl
+        amount = float(funding_pnl or 0.0)
+        self.stats.today_pnl += amount
         logger.info(
             f"[RiskManager:Funding] Funding for {symbol}: "
-            f"{float(funding_pnl or 0.0):+.8f} USDT. "
+            f"{amount:+.8f} USDT. "
             f"GlobalTodayPnL={self.stats.today_pnl:.8f} "
             f"(the consecutive-loss streak is unchanged: a funding payment is "
             f"a carry cost, not a losing trade)."
         )
-        self._check_risk_limits()
-        await self.save_state()
+        # FROM HERE THE FUNDING IS IN TODAY'S PnL. Nothing below may raise:
+        # a failure would reach the caller as "not applied", and the close
+        # would then report the same funding a second time.
+        try:
+            self._check_risk_limits()
+        except Exception as exc:
+            logger.error(
+                f"[RiskManager:Funding] The limit check failed after the "
+                f"funding for {symbol} was applied: {exc}",
+                exc_info=True,
+            )
+        try:
+            await self.save_state()
+        except Exception as exc:
+            logger.error(
+                f"[RiskManager:Funding] The trading-guard state could not be "
+                f"persisted after the funding for {symbol} was applied: {exc}",
+                exc_info=True,
+            )
+        return True
 
     async def update_trade_result(
         self, symbol: str, pnl: float, exit_reason: Optional[str] = None
@@ -3509,7 +3534,10 @@ class RiskManager:
             # belongs to another day and is refused, but the one in force is
             # measured against the right denominator, and throwing it away
             # would block a healthy account for no gain.
-            if False:
+            if (
+                getattr(self.stats, "start_of_day_day_str", None) == current_day_str
+                and self._opening_base_is_unbacked()
+            ):
                 logger.critical(
                     "[RiskGuard] Invalidating an opening balance that was "
                     "written before this restore ($%.2f): it is UNBACKED -- it "
@@ -3600,6 +3628,20 @@ class RiskManager:
             else:
                 # Nothing is persisted, so the streak really is empty.
                 self._check_risk_limits()
+        # THE OPERATOR-FACING REASON MUST BE THE CURRENT ONE. The gate was
+        # re-evaluated above, but `_check_risk_limits()` only rewrites
+        # `_trading_disabled_reason` when it CLOSES the gate, and here the
+        # gate was ALREADY closed -- by the unreadable-state latch, whose
+        # reason is now stale. Without this, a Redis that has recovered is
+        # blamed forever, and the real reason the gate is held (for example
+        # "today's opening balance is unknown") is never shown.
+        #
+        # `restore_state()` already does exactly this after its own limit
+        # re-evaluation; this is the same fix-up for the same reason on the
+        # re-verification path.
+        if not self._is_trading_allowed and not self._emergency_stop_active:
+            if self._global_gate_disable_reason:
+                self._trading_disabled_reason = self._global_gate_disable_reason
         if getattr(self, "_guard_state_lost", False):
             logger.critical(
                 "[RiskGuard] The trading-guard state is READABLE again, but it "

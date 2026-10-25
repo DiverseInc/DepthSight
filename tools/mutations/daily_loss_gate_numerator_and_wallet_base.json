@@ -85,7 +85,16 @@
     "",
     "N15 is the funding never being reported to the risk manager at all: the",
     "wallet is debited and the gate never hears about it, so the daily-loss",
-    "guard cannot see a loss that has already happened."
+    "guard cannot see a loss that has already happened.",
+    "",
+    "N17 REVERTS the funding booking: the funding is charged to the wallet",
+    "but never booked onto the position's PnL, so the close reports a net",
+    "result that does not include the money the wallet actually moved.",
+    "",
+    "N18 is the close subtracting the already-reported funding even when it",
+    "was NEVER reported (the risk manager refused it). The funding would",
+    "then be taken out of the risk manager's PnL entirely -- the loss",
+    "disappears instead of being counted once."
   ],
   "pytest_target": "tests/test_paper_daily_loss_gate_numerator.py tests/test_daily_loss_base_is_current_day.py tests/test_daily_loss_base_previous_day_payload.py",
   "timeout_s": 1800,
@@ -184,8 +193,20 @@
     {
       "label": "N15: the funding is never reported to the risk manager",
       "file": "bot_module/paper_executor.py",
-      "needle": "                await rm.apply_funding_pnl(symbol, funding_pnl)\n",
-      "replace": "                pass  # MUTATED: the funding is never reported\n"
+      "needle": "                funding_reported = bool(await rm.apply_funding_pnl(symbol, amount))\n",
+      "replace": "                funding_reported = False  # MUTATED: the funding is never reported\n"
+    },
+    {
+      "label": "N17: the funding is never booked onto the position's PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                position.pnl = previous_pnl + amount\n",
+      "replace": "                position.pnl = previous_pnl  # MUTATED: the funding is never booked\n"
+    },
+    {
+      "label": "N18: the close subtracts a funding that was never reported",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                if funding_reported:",
+      "replace": "                if True:  # MUTATED: subtracted even when it was never reported"
     }
   ]
 }

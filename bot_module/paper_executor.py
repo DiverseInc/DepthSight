@@ -1053,24 +1053,30 @@ class PaperTradingExecutor:
 
         The amount already reported to the risk manager is carried on the
         position (`funding_pnl_reported`), so the finalization can subtract
-        it and the same funding is never counted twice.
+        it and the same funding is never counted twice. That counter is
+        advanced ONLY when the risk manager actually took the funding: a
+        funding the risk manager never heard about is still part of the
+        position's booked PnL, so the close reports it and the gate is not
+        left blind to money the wallet already moved.
         """
+        amount = float(funding_pnl or 0.0)
         if not self.controller:
             logger.warning(
                 f"[PaperFunding:{symbol}] No controller reference, so the risk "
                 f"manager was NOT told about the funding charge "
-                f"({float(funding_pnl or 0.0):.8f} USDT)."
+                f"({amount:.8f} USDT)."
             )
             return
         controller = self.controller
         rm = getattr(controller, "rm", None)
+        funding_reported = False
         if rm is not None:
             try:
-                await rm.apply_funding_pnl(symbol, funding_pnl)
+                funding_reported = bool(await rm.apply_funding_pnl(symbol, amount))
             except Exception as e:
                 logger.error(
                     f"[PaperFunding:{symbol}] Failed to report the funding "
-                    f"charge ({float(funding_pnl or 0.0):.8f} USDT) to the "
+                    f"charge ({amount:.8f} USDT) to the "
                     "risk manager: the WALLET was already moved, but the risk "
                     "manager was NOT told, so today's PnL and the daily-loss "
                     f"guard are now wrong. {e}",
@@ -1092,14 +1098,28 @@ class PaperTradingExecutor:
                     )
                     return
                 previous_pnl = float(position.pnl or 0.0)
-                position.pnl = previous_pnl + float(funding_pnl or 0.0)
-                position.funding_pnl_reported = float(
-                    getattr(position, "funding_pnl_reported", 0.0) or 0.0
-                ) + float(funding_pnl or 0.0)
+                position.pnl = previous_pnl + amount
+                if funding_reported:
+                    position.funding_pnl_reported = float(
+                        getattr(position, "funding_pnl_reported", 0.0) or 0.0
+                    ) + amount
+                else:
+                    # NOT reported. The funding is in the position's PnL and
+                    # the close will report it, so `funding_pnl_reported` must
+                    # NOT count it: subtracting it at the close would take it
+                    # out of the risk manager's PnL entirely.
+                    logger.warning(
+                        f"[PaperFunding:{symbol}] The funding charge "
+                        f"({amount:.8f} USDT) was NOT reported to the risk "
+                        "manager, so it is not subtracted at the close: the "
+                        "close reports it instead. The daily-loss gate stays "
+                        "blind to it until the position is closed."
+                    )
                 logger.info(
                     f"[PaperFunding:{symbol}] Booked the funding charge "
-                    f"{float(funding_pnl or 0.0):+.8f} (position.pnl "
-                    f"{previous_pnl:.8f} -> {float(position.pnl):.8f})."
+                    f"{amount:+.8f} (position.pnl "
+                    f"{previous_pnl:.8f} -> {float(position.pnl):.8f}, "
+                    f"reported to the risk manager: {funding_reported})."
                 )
         except Exception as e:
             logger.error(

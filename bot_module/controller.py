@@ -11139,6 +11139,23 @@ class TradingController:
                     position.pnl = net_realized_pnl(
                         total_pnl_calculated, total_commission_calculated
                     )
+                    # The FUNDING this position has already paid is part of
+                    # its net result, but the recomputation above cannot know
+                    # about it: it rebuilds the result from the fill prices
+                    # and the commissions, and a funding charge is neither.
+                    # It is added back so `position.pnl` keeps meaning "this
+                    # position's net result", which is what the finalization
+                    # subtracts the already-reported funding from. Without
+                    # this, the subtraction would take the funding out of a
+                    # number that never contained it, and the risk manager
+                    # would be short by exactly the funding -- the same
+                    # under-trip this whole change exists to close.
+                    #
+                    # A LIVE position never has funding (`check_funding` is
+                    # the paper executor's), so this is a no-op there.
+                    position.pnl += float(
+                        getattr(position, "funding_pnl_reported", 0.0) or 0.0
+                    )
                     # The GROSS result travels separately. The Trade row, the
                     # trader diary and the trade log store the gross result
                     # next to a SEPARATE commission field, and
