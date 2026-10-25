@@ -30,8 +30,8 @@ deep in the signal/final-exit paths to unit test in isolation.
 """
 
 import ast
-import inspect
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("POSTGRES_USER", "testuser")
@@ -46,8 +46,15 @@ import pytest
 
 from bot_module import controller as controller_mod
 from bot_module.controller import TradingController
+from bot_module.rehydrate import refresh_payload_config_from_db
 from bot_module.runtime_dependencies import crud
 from bot_module.symbol_selection import SymbolSelectionConfig
+
+# The names a session factory is called by. `get_db_session` is the
+# controller's own (`self.get_db_session()`); `db_session_factory` is the
+# rehydrate path's, and it is called as a BARE NAME (it is a parameter), so
+# the guard has to match a plain name as well as an attribute.
+_SESSION_FACTORY_NAMES = {"get_db_session", "db_session_factory"}
 
 
 # ---------------------------------------------------------------------------
@@ -265,12 +272,38 @@ async def test_many_operations_leave_no_connection_pinned(monkeypatch):
     )
 
 
+async def test_the_rehydrate_lookup_releases_the_connection(monkeypatch):
+    """The rehydrate path pins a connection the same way the controller did.
+
+    `refresh_payload_config_from_db` is called once per strategy on every
+    bot restart, with the controller's own session factory
+    (`controller.py:3993`). It used to walk that factory with
+    `async for ... : break`, abandoning the generator - so every restart
+    rehydrating every strategy left a connection pinned until the GC.
+    """
+
+    async def _fake_get_strategy_config(db, user_id, config_id):
+        return None
+
+    monkeypatch.setattr(crud, "get_strategy_config", _fake_get_strategy_config)
+
+    factory = _DbFactory()
+    payload = {"id": "cfg-1", "config_data": {"symbol": "BTCUSDT"}}
+
+    returned, refreshed = await refresh_payload_config_from_db(payload, 1, factory)
+
+    assert refreshed is False
+    assert factory.pool.opened == 1, "the rehydrate path did not open a session"
+    assert factory.pool.checked_out == 0, (
+        "the rehydrate lookup left a pooled connection checked out"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The structural net (upstream's own regression test)
 # ---------------------------------------------------------------------------
 
-
-def test_no_raw_async_for_over_get_db_session():
+def test_no_raw_async_for_over_a_session_factory():
     """Guard: long-lived session reads must go through an owned session.
 
     `async for db in self.get_db_session()` abandons the generator when the
@@ -278,19 +311,34 @@ def test_no_raw_async_for_over_get_db_session():
     pins a pooled server connection. On the 2026-10-19 night run that was
     ~120 pinned connections at 660 controllers: the pooler ran out of server
     connections and every query past them timed out.
+
+    The whole `bot_module` package is scanned, not just `controller.py`:
+    `rehydrate.py` had the same defect (it is reached once per strategy on
+    every bot restart, with the controller's own session factory), and a
+    guard that only covers the file it was written for would not have caught
+    it.
     """
-    tree = ast.parse(inspect.getsource(controller_mod))
+    package_dir = Path(controller_mod.__file__).resolve().parent
     offenders = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFor):
+    for path in sorted(package_dir.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.AsyncFor):
+                continue
             it = node.iter
-            if (
-                isinstance(it, ast.Call)
-                and isinstance(it.func, ast.Attribute)
-                and it.func.attr == "get_db_session"
-            ):
-                offenders.append(node.lineno)
+            if not isinstance(it, ast.Call):
+                continue
+            func = it.func
+            if isinstance(func, ast.Attribute):
+                called = func.attr
+            elif isinstance(func, ast.Name):
+                called = func.id
+            else:
+                called = None
+            if called in _SESSION_FACTORY_NAMES:
+                rel = path.relative_to(package_dir.parent).as_posix()
+                offenders.append(f"{rel}:{node.lineno}")
     assert offenders == [], (
-        "raw `async for ... self.get_db_session()` pins a connection on error: "
-        f"lines {offenders}"
+        "raw `async for ... <session factory>()` pins a connection on error: "
+        f"{offenders}"
     )

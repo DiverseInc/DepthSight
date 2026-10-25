@@ -1030,13 +1030,17 @@ async def _run_command_listener(
             logger.error(f"Error in bot runner command listener: {e}", exc_info=True)
             await asyncio.sleep(5)
 
-    await pubsub.unsubscribe(config.REDIS_COMMAND_CHANNEL)
-    # Close the listener's own session: the generator's exit path releases the
-    # connection it holds.
     try:
-        await listener_db_gen.aclose()
-    except Exception as e_close:
-        logger.debug(f"Command listener session close failed: {e_close}")
+        await pubsub.unsubscribe(config.REDIS_COMMAND_CHANNEL)
+    finally:
+        # Close the listener's own session: the generator's exit path releases
+        # the connection it holds. A rollback does NOT release the connection
+        # - only the generator's close does - so this must run even when the
+        # unsubscribe fails, or the connection stays pinned until the GC.
+        try:
+            await listener_db_gen.aclose()
+        except Exception as e_close:
+            logger.debug(f"Command listener session close failed: {e_close}")
     logger.info("Bot runner command listener stopped.")
 
 

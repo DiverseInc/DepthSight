@@ -24,6 +24,7 @@ from bot_module.feature_extractor import FeatureExtractor
 from bot_module.model_pipeline import ModelPipeline
 from bot_module.realtime_ml_logger import RealtimeMLLogger
 from bot_module.data_consumer import DataConsumer
+from bot_module.db_session import owned_session
 from bot_module.executor import BinanceExecutor
 from bot_module.paper_executor import PaperTradingExecutor, net_realized_pnl
 from bot_module.risk_manager import RiskManager
@@ -993,43 +994,21 @@ class TradingController:
     async def _owned_session(self):
         """Yield one DB session that is always rolled back and closed.
 
-        Replaces `async for db in self.get_db_session()`, which abandons the
-        generator (and its checked-out pool connection) whenever the body
-        returns or raises: with hundreds of controllers doing that every few
-        seconds the pool drains to QueuePool timeout even though the pool is
-        sized correctly. The abandoned generator keeps its transaction OPEN,
-        so the connection stays pinned until the garbage collector happens to
-        finalise it - measured at ~120 pinned server connections at 660
-        controllers, which starved the pooler and made every other query
-        queue. Works with the real get_db and with the async-generator mocks
-        used in tests.
+        `async for db in self.get_db_session():` abandons the generator (and
+        its checked-out pool connection) whenever the body returns or raises:
+        with hundreds of controllers doing that every few seconds the pool
+        drains to QueuePool timeout even though the pool is sized correctly.
+        The abandoned generator keeps its transaction OPEN, so the connection
+        stays pinned until the garbage collector happens to finalise it -
+        measured at ~120 pinned server connections at 660 controllers, which
+        starved the pooler and made every other query queue.
 
-        The session is rolled back when the body raises (the read never
-        committed) and closed either way, so the connection goes back to the
-        pool on the happy path AND on the error path.
+        The implementation lives in `bot_module.db_session` because the
+        rehydrate path (`bot_module/rehydrate.py`) has the same defect and
+        needs the same guarantee.
         """
-        gen = self.get_db_session()
-        try:
-            db = await gen.__anext__()
-        except StopAsyncIteration:
-            raise RuntimeError("DB session factory yielded nothing")
-        try:
+        async with owned_session(self.get_db_session) as db:
             yield db
-        except Exception:
-            try:
-                await db.rollback()
-            except Exception:
-                pass
-            raise
-        finally:
-            try:
-                await gen.aclose()
-            except Exception:
-                pass
-            try:
-                await db.close()
-            except Exception:
-                pass
 
     async def load_symbol_selection_config(self) -> bool:
         """

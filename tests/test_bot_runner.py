@@ -153,6 +153,55 @@ async def test_command_listener_releases_its_own_session_after_each_command(mock
 
 
 @pytest.mark.asyncio
+async def test_the_listener_closes_its_session_even_when_the_unsubscribe_fails(
+    mocker,
+):
+    """Closing the generator is what returns the connection - a rollback does
+    not. So the close must run even when the unsubscribe raises, or the
+    listener's connection stays pinned until the garbage collector.
+    """
+    listener_session = AsyncMock()
+    shared_db = AsyncMock()
+    closed = {"n": 0}
+
+    async def _fake_get_db():
+        try:
+            yield listener_session
+        finally:
+            closed["n"] += 1
+
+    mocker.patch.object(bot_runner, "get_db", _fake_get_db)
+
+    calls = {"n": 0}
+
+    async def _get_message(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "type": "message",
+                "data": json.dumps({"command": "NOOP", "payload": {}}),
+            }
+        raise asyncio.CancelledError()
+
+    pubsub = SimpleNamespace(
+        subscribe=AsyncMock(),
+        unsubscribe=AsyncMock(side_effect=RuntimeError("redis went away")),
+        get_message=_get_message,
+    )
+    redis_client = SimpleNamespace(pubsub=lambda: pubsub)
+
+    with pytest.raises(RuntimeError):
+        await bot_runner._run_command_listener(
+            shared_db, object(), redis_client, None, 0, 1
+        )
+
+    assert closed["n"] == 1, (
+        "the listener's session was not closed: the connection it holds stays "
+        "pinned until the garbage collector finalises the generator"
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_failed_init_does_not_roll_back_the_shared_session(mocker):
     """A failed init must not discard the shared session's pending writes.
 
