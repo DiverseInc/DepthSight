@@ -94,9 +94,19 @@
     "N18 is the close subtracting the already-reported funding even when it",
     "was NEVER reported (the risk manager refused it). The funding would",
     "then be taken out of the risk manager's PnL entirely -- the loss",
-    "disappears instead of being counted once."
+    "disappears instead of being counted once.",
+    "",
+    "N19 is the GENUINE UTC rollover capture being disabled: the day transition",
+    "this process observed no longer installs the new day's opening balance,",
+    "so the base stays UNKNOWN and the gate never recovers a denominator. This",
+    "is the positive half of the base's identity: refusing to guess on a fresh",
+    "start is only safe if the real transition DOES install the right base.",
+    "",
+    "N20 is the FIRST-BOOT capture being disabled: an account that has never",
+    "traded no longer gets an opening balance either, so nothing can ever",
+    "measure a day against a denominator it can vouch for."
   ],
-  "pytest_target": "tests/test_paper_daily_loss_gate_numerator.py tests/test_daily_loss_base_is_current_day.py tests/test_daily_loss_base_previous_day_payload.py",
+  "pytest_target": "tests/test_paper_daily_loss_gate_numerator.py tests/test_daily_loss_base_is_current_day.py tests/test_daily_loss_base_previous_day_payload.py tests/test_daily_loss_gate_reconciles_with_the_wallet.py",
   "timeout_s": 1800,
   "mutations": [
     {
@@ -207,6 +217,18 @@
       "file": "bot_module/paper_executor.py",
       "needle": "                if funding_reported:",
       "replace": "                if True:  # MUTATED: subtracted even when it was never reported"
+    },
+    {
+      "label": "N19: the genuine UTC rollover capture is disabled",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            if self.stats.last_known_day_str:\n                if self._write_start_of_day_base(\n",
+      "replace": "            if False:  # MUTATED: the rollover capture is disabled\n                if self._write_start_of_day_base(\n"
+    },
+    {
+      "label": "N20: the first-boot capture is disabled",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        self._capture_first_boot_base(current_day_str_utc)\n",
+      "replace": "        pass  # MUTATED: the first-boot capture is disabled\n"
     }
   ]
 }
