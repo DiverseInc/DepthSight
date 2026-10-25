@@ -25,8 +25,11 @@ tests - anything that is an async generator yielding one session.
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["owned_session"]
 
@@ -51,14 +54,29 @@ async def owned_session(db_session_factory: Callable[[], Any]):
         try:
             await db.rollback()
         except Exception:
-            pass
+            # Not swallowed silently: a rollback that fails leaves the
+            # transaction in an unknown state, and this repo's rule is that
+            # anything that always reports OK is worse than nothing.
+            logger.exception(
+                "[DbSession] rollback failed while handling an exception; "
+                "the session's transaction state is unknown"
+            )
         raise
     finally:
+        # The generator's close is what returns the pooled connection. If it
+        # fails, the connection stays checked out and the leak is silent -
+        # so this is logged at ERROR, never swallowed.
         try:
             await gen.aclose()
         except Exception:
-            pass
+            logger.exception(
+                "[DbSession] closing the session generator failed; the pooled "
+                "connection may still be checked out"
+            )
         try:
             await db.close()
         except Exception:
-            pass
+            logger.exception(
+                "[DbSession] closing the session failed; the pooled connection "
+                "may still be checked out"
+            )
