@@ -508,12 +508,22 @@ const PlanCard: React.FC<{
 			<CardContent className="flex-1 space-y-3">
 				<p className="text-sm text-muted-foreground h-16">{plan.description}</p>
 				<ul className="space-y-2">
-					{plan.features.map((feature, index) => {
+					{/*
+					 * Prefer the entitlements derived from the real
+					 * quotas/permissions/limits. `plan.features` is hand-written
+					 * copy and has drifted from the backend before (the $100
+					 * tier used to promise "Unlimited AI Assistant" while its
+					 * quota is 50 queries a day).
+					 */}
+					{(plan.entitlements?.length
+						? plan.entitlements
+								.filter((entitlement) => entitlement.included)
+								.map((entitlement) => entitlement.label)
+						: plan.features
+					).map((feature, index) => {
 						const lowerFeature = feature.toLowerCase();
 						const isLimitation =
 							lowerFeature.includes("limited") ||
-							lowerFeature.includes("limited") ||
-							lowerFeature.includes("(30 days)") ||
 							lowerFeature.includes("(30 days)");
 						const Icon = isLimitation ? Clock : CheckCircle2;
 						const iconColor = isLimitation

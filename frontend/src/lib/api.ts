@@ -6,6 +6,7 @@ import {
 	useQuery,
 	useQueryClient,
 } from "@tanstack/react-query";
+import type { PlanEntitlement, PublicPlanCatalog } from "@/lib/pricing";
 import type {
 	AccountStatusData,
 	Achievement,
@@ -104,6 +105,19 @@ export interface Plan {
 	} | null;
 	description: string;
 	features: string[];
+	/**
+	 * Entitlements derived from the real quotas/permissions/limits.
+	 * Preferred over `features`, which is hand-written copy and can drift.
+	 */
+	entitlements?: PlanEntitlement[];
+	billing?: {
+		monthly?: { price_usd?: number; period_days?: number };
+		lifetime?: {
+			enabled?: boolean;
+			price_usd?: number;
+			slot_limit?: number;
+		};
+	};
 }
 
 export interface AIChatRequest {
@@ -603,6 +617,21 @@ export const usePlans = (options?: { refetchInterval?: number | false }) => {
 		refetchInterval: options?.refetchInterval,
 	});
 };
+
+/**
+ * The PUBLIC plan catalog.
+ *
+ * The marketing pricing page is a public route, so it cannot use
+ * `usePlans` (that endpoint requires authentication). This endpoint serves
+ * the SAME catalog built from api/plans_config.yml, so the public page and
+ * the billing page can never disagree about what a tier contains.
+ */
+export const usePublicPlans = () =>
+	useQuery<PublicPlanCatalog, Error>({
+		queryKey: ["publicPlans"],
+		queryFn: () => apiClient<PublicPlanCatalog>("/public/plans"),
+		staleTime: 60 * 60 * 1000, // 1 hour
+	});
 
 export const useCreatePayment = () => {
 	const { toast } = useToast();
@@ -1906,35 +1935,6 @@ export const useListTrainingRuns = () => {
 			)
 				? 10000
 				: false,
-	});
-};
-
-// Placeholder for future implementation
-export const useDeployModel = () => {
-	const { toast } = useToast();
-	const { t } = useTranslation(["modelLab", "common"]);
-	return useMutation<{ success: boolean; message: string }, Error, string>({
-		mutationFn: async (modelId: string) => {
-			// This would call a backend endpoint like POST /api/v1/models/{model_id}/deploy
-			console.log(`Deploying model ${modelId}...`);
-			await new Promise((res) => setTimeout(res, 1000)); // Simulate API call
-			return { success: true, message: `Model ${modelId} deployed.` };
-		},
-		onSuccess: (data) => {
-			toast({
-				title: t("modelLab:deploymentSuccessTitle"),
-				description: t("modelLab:deploymentSuccessDescription", {
-					modelId: data.message.split(" ")[1],
-				}),
-			});
-		},
-		onError: (error) => {
-			toast({
-				variant: "destructive",
-				title: t("modelLab:deploymentFailedTitle"),
-				description: error.message,
-			});
-		},
 	});
 };
 

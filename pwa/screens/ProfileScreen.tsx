@@ -236,7 +236,20 @@ const PricingModal: React.FC<PricingModalProps> = ({
 											{plan.description}
 										</p>
 										<ul className="mt-4 space-y-1 text-xs text-[hsl(var(--muted-foreground))]">
-											{plan.features.map((feature, index) => (
+											{/*
+											 * Prefer the entitlements derived from the real
+											 * quotas/permissions/limits. `plan.features` is
+											 * hand-written copy and has drifted from the
+											 * backend before (the $100 tier used to promise
+											 * "Unlimited AI Assistant" against a quota of 50
+											 * queries a day).
+											 */}
+											{(plan.entitlements?.length
+												? plan.entitlements
+														.filter((entitlement) => entitlement.included)
+														.map((entitlement) => entitlement.label)
+												: plan.features
+											).map((feature, index) => (
 												<li key={index} className="flex items-start gap-2">
 													<span className="mt-1 inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full bg-[hsl(var(--primary))]" />
 													<span>{feature}</span>

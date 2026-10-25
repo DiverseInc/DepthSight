@@ -47,7 +47,7 @@
 		"q2": "Is Paper Trading available?",
 		"a2": "Yes, you can run any strategy in Paper Trading mode without risk of real funds.",
 		"q3": "How do backtest limits work?",
-		"a3": "Limits depend on your subscription plan. On the free plan, 10 backtests per day are available."
+		"a3": "Limits depend on your subscription plan. On the free plan, 20 backtests per day are available."
 	},
 	"ai_helper": {
 		"title": "Need a quick answer?",

@@ -8,12 +8,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import crud, schemas
 from ..database import get_db
 from ..og_image_generator import generate_og_image
+from ..plans import build_plan_catalog
 from ..redis_client import get_redis_client
 
 
 logger = logging.getLogger(__name__)
 
 public_router = APIRouter(tags=["Public"])
+
+
+@public_router.get("/api/v1/public/plans")
+async def get_public_plans():
+    """Public plan catalog for the marketing pricing page.
+
+    Deliberately unauthenticated: the landing page is a public route and has
+    to be able to render prices before anyone logs in.
+
+    It returns the SAME catalog the authenticated billing page uses
+    (`build_plan_catalog`), so the marketing page cannot advertise a tier
+    that differs from the tier the backend actually grants.
+    """
+    return build_plan_catalog()
+
 
 
 @public_router.get(

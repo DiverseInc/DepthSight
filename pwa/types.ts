@@ -635,6 +635,16 @@ export interface Plan {
 	active: boolean;
 	description: string;
 	features: string[];
+	/**
+	 * Entitlements derived from the real quotas/permissions/limits on the
+	 * server. Preferred over `features`, which is hand-written copy and has
+	 * drifted from the backend before.
+	 */
+	entitlements?: {
+		code: string;
+		label: string;
+		included: boolean;
+	}[];
 }
 
 export interface CreatePaymentResponse {

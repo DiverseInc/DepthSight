@@ -1052,18 +1052,41 @@ async def create_user(
         initial_plan_expires_at = None
 
         trial_config = plans_config.get_registration_trial_config()
-        if trial_config.get("enabled") and trial_config.get("days", 0) > 0:
-            trial_plan = trial_config.get("plan", "standard")
-            if trial_plan in plans_config.get_all_plans():
-                initial_plan = trial_plan
-                initial_plan_expires_at = datetime.now(timezone.utc) + timedelta(
-                    days=trial_config["days"]
-                )
-            else:
-                logger.warning(
-                    "Registration trial plan '%s' is not defined in plans_config.yml. New user will stay on free plan.",
-                    trial_plan,
-                )
+        # A trial only exists when it is enabled AND lasts more than zero
+        # days. `days: 0` means "no trial", and the account starts on `free`.
+        trial_is_active = bool(trial_config.get("enabled")) and trial_config.get(
+            "days", 0
+        ) > 0
+        trial_plan = trial_config.get("plan", "standard")
+        if trial_is_active and trial_plan in plans_config.get_all_plans():
+            initial_plan = trial_plan
+            initial_plan_expires_at = datetime.now(timezone.utc) + timedelta(
+                days=trial_config["days"]
+            )
+        elif not trial_is_active:
+            logger.info(
+                "No active registration trial (enabled=%s, days=%s). New user starts on the free plan.",
+                trial_config.get("enabled"),
+                trial_config.get("days"),
+            )
+        else:
+            logger.warning(
+                "Registration trial plan '%s' is not defined in plans_config.yml. New user will stay on free plan.",
+                trial_plan,
+            )
+
+        # A plan requested at signup (e.g. `?plan=standard` from the pricing
+        # page) is a REQUEST, never a grant. The tier the account actually
+        # starts on was decided above: the trial tier when a trial is really
+        # running, otherwise `free`. A paid tier is NEVER granted at signup.
+        requested_plan = (getattr(user, "plan", None) or "").strip().lower()
+        if requested_plan and requested_plan != initial_plan:
+            logger.warning(
+                "Registration requested plan '%s' is not granted on signup. "
+                "New user starts on '%s'.",
+                requested_plan,
+                initial_plan,
+            )
 
     db_user = models.User(
         username=user.username,

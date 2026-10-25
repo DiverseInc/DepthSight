@@ -10,7 +10,7 @@ from .. import crud, models, schemas
 from ..auth import get_current_user
 from ..database import get_db
 from ..redis_client import get_redis_client
-from ..plans import plans_config
+from ..plans import build_plan_catalog, plans_config
 
 logger = logging.getLogger(__name__)
 
@@ -26,16 +26,22 @@ payments_router = APIRouter(
 async def get_plans(db: AsyncSession = Depends(get_db)):
     """
     Get a list of all available plans from the config file.
+
+    Built from the SAME `build_plan_catalog()` the public marketing pricing
+    page uses, so the in-app billing page and the public page can never show
+    different entitlements for the same tier.
     """
     try:
         from ..depthsight_api import _get_lifetime_slots_for_plan
 
+        catalog = build_plan_catalog()
+        billing_mode = catalog["billing_mode"]
         all_plans = plans_config.get_all_plans()
-        billing_mode = plans_config.get_billing_mode()
         # Convert to required format
         response_plans = []
-        for key, config in all_plans.items():
-            effective_price = plans_config.get_effective_plan_price(key)
+        for plan in catalog["plans"]:
+            key = plan["key"]
+            config = all_plans.get(key, {})
             plan_billing = plans_config.get_plan_billing(key, billing_mode)
             is_lifetime_offer = billing_mode == "lifetime" and plan_billing.get(
                 "enabled", False
@@ -48,14 +54,18 @@ async def get_plans(db: AsyncSession = Depends(get_db)):
             response_plans.append(
                 {
                     "key": key,
-                    "name": config.get("name", "Unnamed Plan"),
-                    "price_usd": effective_price,
-                    "active": config.get("active", False),
+                    "name": plan["name"],
+                    "price_usd": plan["price_usd"],
+                    "active": plan["active"],
                     "billing_mode": billing_mode,
                     "period_label": "lifetime" if is_lifetime_offer else "month",
                     "slots": slots,
-                    "description": config.get("description", ""),
-                    "features": config.get("features", []),
+                    "description": plan["description"],
+                    "features": plan["features"],
+                    # Derived from the real quotas/permissions/limits. The
+                    # marketing page renders these, not the hand-written copy.
+                    "entitlements": plan["entitlements"],
+                    "billing": plan["billing"],
                 }
             )
         return response_plans

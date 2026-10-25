@@ -55,6 +55,11 @@
 		"available": "Available",
 		"accountBreakdown": "Account Breakdown"
 	},
+	"tradingDisabled": {
+		"title": "Trading is blocked — no new positions are being opened",
+		"badge": "cannot_trade",
+		"fallbackReason": "The bot is not opening new positions right now. Open positions are still managed by your risk rules."
+	},
 	"topStrategies": {
 		"title": "Top Performing Strategies",
 		"description": "Highlighting strategies with the highest Profit and Loss.",
