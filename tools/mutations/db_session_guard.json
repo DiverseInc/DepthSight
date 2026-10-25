@@ -1,0 +1,80 @@
+{
+  "_comment": [
+    "Mutations that reopen the FOUR gaps the review panel raised in the",
+    "session-leak guard. Each one takes the guard (or the session release)",
+    "back to the broken shape; every one of them must be KILLED by",
+    "tests/test_db_session_guard.py.",
+    "",
+    "GAP 1 (SCOPE)  - A1 stops the guard scanning `api/`; A2 stops it scanning",
+    "                  the repo root.",
+    "GAP 2 (SHAPE)  - A3 removes the `await anext(...)` acquisition rule; A4",
+    "                  removes the assign-then-iterate form; A5 removes the",
+    "                  inline `await anext(factory())` form.",
+    "GAP 3 (NAMES)  - A6 puts the factory NAME list back; A7 lets a close in",
+    "                  one function hide a leak in another; A9 writes the leak",
+    "                  again with a RENAMED factory - the rename mutant.",
+    "GAP 4 (SWALLOW) - A8 swallows the close failure again.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/db_session_guard.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_db_session_guard.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "GAP1: the guard stops scanning the api package",
+      "file": "tools/db_session_guard.py",
+      "needle": "        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)\n",
+      "replace": "        dirnames[:] = sorted(\n            d for d in dirnames if d not in SKIP_DIR_NAMES and d != \"api\"\n        )\n"
+    },
+    {
+      "label": "GAP1: the guard stops scanning the repo root",
+      "file": "tools/db_session_guard.py",
+      "needle": "        for name in sorted(filenames):\n            if name.endswith(\".py\"):\n",
+      "replace": "        for name in sorted(filenames):\n            if name.endswith(\".py\") and Path(dirpath) != repo:\n"
+    },
+    {
+      "label": "GAP2: the anext acquisition rule is gone",
+      "file": "tools/db_session_guard.py",
+      "needle": "    \"\"\"`await anext(gen)` where the generator is never closed.\"\"\"\n    findings: List[str] = []\n",
+      "replace": "    \"\"\"`await anext(gen)` where the generator is never closed.\"\"\"\n    findings: List[str] = []\n    return findings  # MUTANT: the anext acquisition rule is gone\n"
+    },
+    {
+      "label": "GAP2: the assign-then-iterate form is no longer matched",
+      "file": "tools/db_session_guard.py",
+      "needle": "            if isinstance(it, ast.Name):\n                bound = _resolved_bound_value(it.id, scope, before=node.lineno)\n                if bound is not None and _is_zero_arg_call(bound):\n                    findings.append(f\"{path}:{node.lineno}\")\n",
+      "replace": "            if isinstance(it, ast.Name):\n                # MUTANT: the assign-then-iterate form is no longer matched.\n                pass\n"
+    },
+    {
+      "label": "GAP2: the inline anext acquisition is no longer matched",
+      "file": "tools/db_session_guard.py",
+      "needle": "            if isinstance(gen_expr, ast.Call):\n                # `await anext(factory())` - an inline generator. There is no\n                # name to close it by, so it is abandoned by construction.\n                findings.append(f\"{path}:{node.lineno}\")\n                continue\n",
+      "replace": "            if isinstance(gen_expr, ast.Call):\n                # MUTANT: the inline acquisition is no longer matched.\n                continue\n"
+    },
+    {
+      "label": "GAP3: the guard matches the factory by NAME again",
+      "file": "tools/db_session_guard.py",
+      "needle": "def _is_zero_arg_call(node: ast.AST) -> bool:\n    return isinstance(node, ast.Call) and not node.args and not node.keywords\n",
+      "replace": "def _is_zero_arg_call(node: ast.AST) -> bool:\n    # MUTANT: the factory is matched by NAME again, so a rename defeats the rule.\n    if not (isinstance(node, ast.Call) and not node.args and not node.keywords):\n        return False\n    callee = node.func\n    called = getattr(callee, \"attr\", getattr(callee, \"id\", \"\"))\n    return called in (\"get_db_session\", \"db_session_factory\")\n"
+    },
+    {
+      "label": "GAP3: a close in one function hides a leak in another",
+      "file": "tools/db_session_guard.py",
+      "needle": "    stack: List[ast.AST] = list(body)\n    while stack:\n        node = stack.pop()\n        yield node\n        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):\n            continue\n        stack.extend(ast.iter_child_nodes(node))\n",
+      "replace": "    # MUTANT: the whole scope is walked, nested functions included, so a\n    # close in one function hides an unclosed generator in another.\n    for node in ast.walk(scope):\n        yield node\n"
+    },
+    {
+      "label": "GAP4: the close failure is swallowed again",
+      "file": "bot_module/db_session.py",
+      "needle": "        try:\n            await gen.aclose()\n        except Exception:\n            logger.exception(\n                \"[DbSession] closing the session generator failed; the pooled \"\n                \"connection may still be checked out\"\n            )\n",
+      "replace": "        try:\n            await gen.aclose()\n        except Exception:\n            pass  # MUTANT: the close failure is swallowed\n"
+    },
+    {
+      "label": "GAP3 (RENAME MUTANT): the leak is written again with a RENAMED factory",
+      "file": "bot_module/controller.py",
+      "needle": "    async def load_symbol_selection_config(self) -> bool:\n",
+      "replace": "    async def _gap3_renamed_factory_leak(self):\n        \"\"\"MUTANT: the leak, written with a factory name the old guard did not\n        know. A shape-based guard must still see it.\"\"\"\n        async for db in self._db_session():\n            await crud.get_config(db, user_id=self.user_id)\n\n    async def load_symbol_selection_config(self) -> bool:\n"
+    }
+  ]
+}

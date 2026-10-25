@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Mutations that put the ORIGINAL abandoned-session defect back into the",
+    "production code, one at a time. Every one of them must be KILLED by",
+    "tests/test_controller_db_session_leak.py or tests/test_bot_runner.py.",
+    "",
+    "M1 a controller site is back to `async for db in self.get_db_session():`",
+    "M2 `owned_session` no longer closes the generator or the session",
+    "M3 the rehydrate path is back to `async for db in db_session_factory():`",
+    "M4 the Telegram path no longer closes its session generator",
+    "M5 the command listener no longer closes its session generator",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/db_session_leak_product.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_controller_db_session_leak.py tests/test_bot_runner.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: a controller site is back to the abandoned generator",
+      "file": "bot_module/controller.py",
+      "needle": "            async with self._owned_session() as db:\n                user_config_data = await crud.get_user_symbol_selection_config(\n",
+      "replace": "            async for db in self.get_db_session():\n                user_config_data = await crud.get_user_symbol_selection_config(\n"
+    },
+    {
+      "label": "M2: owned_session no longer closes the generator or the session",
+      "file": "bot_module/db_session.py",
+      "needle": "        try:\n            await gen.aclose()\n        except Exception:\n            logger.exception(\n                \"[DbSession] closing the session generator failed; the pooled \"\n                \"connection may still be checked out\"\n            )\n        try:\n            await db.close()\n        except Exception:\n            logger.exception(\n                \"[DbSession] closing the session failed; the pooled connection \"\n                \"may still be checked out\"\n            )\n",
+      "replace": "        # MUTANT: the release block is gone - the connection stays pinned.\n        pass\n"
+    },
+    {
+      "label": "M3: the rehydrate path is back to the abandoned generator",
+      "file": "bot_module/rehydrate.py",
+      "needle": "        async with owned_session(db_session_factory) as db:\n            row = await crud.get_strategy_config(\n                db, user_id=user_id_int, config_id=config_id\n            )\n",
+      "replace": "        async for db in db_session_factory():\n            row = await crud.get_strategy_config(\n                db, user_id=user_id_int, config_id=config_id\n            )\n            break\n"
+    },
+    {
+      "label": "M4: the Telegram path no longer closes its session generator",
+      "file": "bot_module/telegram_notifier.py",
+      "needle": "                finally:\n                    # Close the generator, not just the session: `get_db` holds\n                    # an `async with AsyncSessionLocal()` that owns the pooled\n                    # connection, and leaving it suspended keeps the\n                    # transaction OPEN until the garbage collector finalises\n                    # it. This is the same defect class as the controller's\n                    # abandoned sessions.\n                    try:\n                        await db_gen.aclose()\n                    except Exception as e_close:\n                        logger.warning(\n                            f\"Telegram DB session close failed: {e_close}\",\n                            exc_info=True,\n                        )\n",
+      "replace": "                finally:\n                    # MUTANT: the generator is never closed.\n                    pass\n"
+    },
+    {
+      "label": "M5: the command listener no longer closes its session generator",
+      "file": "bot_runner.py",
+      "needle": "        try:\n            await listener_db_gen.aclose()\n        except Exception as e_close:\n            logger.debug(f\"Command listener session close failed: {e_close}\")\n",
+      "replace": "        # MUTANT: the listener's session generator is never closed.\n        pass\n"
+    }
+  ]
+}

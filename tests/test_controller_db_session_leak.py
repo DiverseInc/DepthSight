@@ -49,6 +49,7 @@ from bot_module.controller import TradingController
 from bot_module.rehydrate import refresh_payload_config_from_db
 from bot_module.runtime_dependencies import crud
 from bot_module.symbol_selection import SymbolSelectionConfig
+from bot_module.telegram_notifier import TelegramNotifier
 
 # The names a session factory is called by. `get_db_session` is the
 # controller's own (`self.get_db_session()`); `db_session_factory` is the
@@ -97,6 +98,16 @@ class _Session:
         if not self.closed:
             self.closed = True
             self._pool.release()
+
+    async def __aenter__(self):
+        # The real `AsyncSession` is an async context manager, and the
+        # Telegram path takes the session out of the generator and then uses
+        # `async with` on it.
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+        return False
 
 
 class _DbFactory:
@@ -299,10 +310,70 @@ async def test_the_rehydrate_lookup_releases_the_connection(monkeypatch):
     )
 
 
+async def test_the_telegram_link_closes_its_session_generator(monkeypatch):
+    """The Telegram link handler took a session out of the generator.
+
+    `async with await anext(db_gen) as db:` closes the SESSION. It does NOT
+    close the GENERATOR: the generator is left suspended at its `yield`,
+    inside the `async with AsyncSessionLocal()` that owns the pooled
+    connection. Only `db_gen.aclose()` ends that `async with` for good.
+
+    The fake session's `close()` returns the connection either way, so the
+    assertion is about the GENERATOR itself: an abandoned async generator
+    still has a live frame, a closed one does not.
+    """
+
+    async def _fake_update_user_telegram_chat_id(db, user_id, chat_id, username):
+        return None
+
+    monkeypatch.setattr(
+        crud, "update_user_telegram_chat_id", _fake_update_user_telegram_chat_id
+    )
+
+    factory = _DbFactory()
+    handlers = {}
+
+    class _FakeBot:
+        def message_handler(self, commands=None):
+            def _decorator(fn):
+                handlers[commands[0]] = fn
+                return fn
+
+            return _decorator
+
+        async def reply_to(self, message, text, **kwargs):
+            return None
+
+    redis_client = SimpleNamespace(
+        get=AsyncMock(return_value=b"42"),
+        delete=AsyncMock(return_value=None),
+    )
+
+    notifier = TelegramNotifier.__new__(TelegramNotifier)
+    notifier.bot = _FakeBot()
+    notifier.loop = None
+    notifier.setup_handlers(factory, redis_client)
+
+    message = SimpleNamespace(
+        text="/start bind-token",
+        chat=SimpleNamespace(id=99),
+        from_user=SimpleNamespace(username="someone"),
+    )
+
+    await handlers["start"](message)
+
+    assert factory.pool.opened == 1, "the Telegram path did not open a session"
+    generator = factory.generators[0]
+    assert generator.ag_frame is None, (
+        "the Telegram path abandoned the session generator: it is still "
+        "suspended at its `yield`, inside the `async with AsyncSessionLocal()` "
+        "that owns the pooled connection"
+    )
+
+
 # ---------------------------------------------------------------------------
 # The structural net (upstream's own regression test)
 # ---------------------------------------------------------------------------
-
 def test_no_raw_async_for_over_a_session_factory():
     """Guard: long-lived session reads must go through an owned session.
 

@@ -11,13 +11,28 @@ connections at 660 controllers.
 
 The rule lives in `tools/db_session_guard.py`. It matches the SHAPE of the
 acquisition, not the NAME of the factory, so renaming `get_db_session` to
-`_db_session` cannot hide a leak, and it covers both acquisition forms
-(`async for` over the generator, and `await anext(gen)`).
+`_db_session` - or binding it to another name first - cannot hide a leak,
+and it covers both acquisition forms (`async for` over the generator, and
+`await anext(gen)`).
 
 These tests check the rule itself against synthetic sources, so a rule that
 silently stops matching is caught here rather than at the next incident.
+
+The four gaps the review panel raised are covered by:
+
+* GAP 1 (SCOPE)  - `test_the_guard_scans_every_python_file_in_the_repo` and
+  `test_the_guard_scans_the_repo_root_the_api_package_and_the_tools`.
+* GAP 2 (SHAPE)  - the `anext` and assign-then-iterate tests, plus
+  `test_the_rule_flags_an_inline_anext_acquisition` and
+  `test_the_rule_does_not_let_a_close_in_another_function_hide_a_leak`.
+* GAP 3 (NAMES)  - `test_the_rule_flags_a_renamed_factory`,
+  `test_the_rule_flags_an_aliased_factory`,
+  `test_the_rule_flags_an_aliased_generator` and
+  `test_the_rule_flags_a_leak_whose_body_calls_no_session_method`.
+* GAP 4 (SWALLOW) - `test_the_session_release_never_swallows_a_failure`.
 """
 
+import ast
 import os
 from pathlib import Path
 
@@ -30,6 +45,7 @@ os.environ.setdefault("POSTGRES_PORT", "5432")
 from tools.db_session_guard import (  # noqa: E402
     ALLOWED,
     REPO,
+    SKIP_DIR_NAMES,
     find_offenders,
     find_offenders_in_source,
     scanned_files,
@@ -52,6 +68,23 @@ async def handler(self):
         await db.commit()
 """
 
+# The factory ALIASED to another name first.
+LEAK_ALIASED_FACTORY = """
+async def handler(self):
+    factory = self._db_session
+    async for db in factory():
+        config = await crud.get_config(db, user_id=self.user_id)
+"""
+
+# The generator ALIASED to another name first.
+LEAK_ALIASED_GENERATOR = """
+async def handler(self):
+    gen = self.get_db_session()
+    alias = gen
+    async for db in alias:
+        config = await crud.get_config(db, user_id=self.user_id)
+"""
+
 # The assign-then-iterate form: the factory call is not in the `async for`.
 LEAK_ASSIGN_THEN_ITERATE = """
 async def handler(self):
@@ -60,11 +93,27 @@ async def handler(self):
         config = await crud.get_config(db, user_id=self.user_id)
 """
 
+# A leak whose body never calls a session method. The rule must not depend
+# on a list of session-method NAMES either.
+LEAK_NO_SESSION_METHOD = """
+async def handler(self):
+    async for db in self.get_db_session():
+        config = await crud.get_config(db, user_id=self.user_id)
+"""
+
 # The `anext` acquisition form, never closed.
 LEAK_UNCLOSED_ANEXT = """
 async def handler(self):
     db_gen = get_db()
     db = await anext(db_gen)
+    config = await crud.get_config(db, user_id=self.user_id)
+"""
+
+# The `anext` acquisition form with the factory called inline. There is no
+# name to close it by, so it is abandoned by construction.
+LEAK_INLINE_ANEXT = """
+async def handler(self):
+    db = await anext(self.get_db_session())
     config = await crud.get_config(db, user_id=self.user_id)
 """
 
@@ -77,6 +126,19 @@ async def handler(self):
         config = await crud.get_config(db, user_id=self.user_id)
     finally:
         await db_gen.aclose()
+"""
+
+# A close in ANOTHER function must not hide a leak in this one. The module
+# scope contains every function, so a whole-module search for `aclose()`
+# masked the leak everywhere else in the file.
+CLOSED_IN_ANOTHER_FUNCTION = """
+async def helper(gen):
+    await gen.aclose()
+
+async def handler(self):
+    db_gen = get_db()
+    db = await anext(db_gen)
+    config = await crud.get_config(db, user_id=self.user_id)
 """
 
 # The correct shape.
@@ -112,16 +174,48 @@ def test_the_guard_finds_no_unowned_db_sessions():
     )
 
 
-def test_the_guard_covers_the_repo_root_and_the_api_package():
-    """The command listener lives in the repo root; `api/` holds the factory.
+def test_the_guard_scans_every_python_file_in_the_repo():
+    """GAP 1: the scope is the whole repo, not one package.
 
-    A guard that only scanned `bot_module/` would be blind to
-    `bot_runner.py` - which is where the largest leak in this fix was.
+    A guard that only scanned `bot_module/` would have been blind to the
+    command listener in `bot_runner.py` - one of the largest leaks this fix
+    closed - and blind to `api/`, where the session factory is defined.
+
+    The expected set is built here, independently of the scanner, so
+    narrowing the scanner's scope fails this test.
     """
+    expected = set()
+    for dirpath, dirnames, filenames in os.walk(REPO):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES]
+        for name in filenames:
+            if name.endswith(".py"):
+                expected.add(Path(dirpath, name).resolve())
+
+    scanned = {p.resolve() for p in scanned_files()}
+
+    assert expected, "the repo has no Python files at all"
+    assert scanned == expected, (
+        "the guard's scope is not the whole repo: "
+        f"missing {sorted(str(p) for p in expected - scanned)[:10]}, "
+        f"extra {sorted(str(p) for p in scanned - expected)[:10]}"
+    )
+
+
+def test_the_guard_scans_the_repo_root_the_api_package_and_the_tools():
+    """GAP 1: the named places the guard must not be blind to."""
     files = {p.relative_to(REPO).as_posix() for p in scanned_files()}
-    assert "bot_runner.py" in files, "the repo root is not scanned"
-    assert any(f.startswith("api/") for f in files), "api/ is not scanned"
-    assert any(f.startswith("bot_module/") for f in files), "bot_module/ is not scanned"
+    for required in (
+        "bot_runner.py",  # the repo root: the command listener
+        "market_data_service.py",  # the repo root: another root module
+        "tasks.py",
+        "api/database.py",  # where the session factory is defined
+        "api/routes/admin.py",
+        "bot_module/controller.py",
+        "bot_module/rehydrate.py",
+        "bot_module/telegram_notifier.py",
+        "tools/db_session_guard.py",
+    ):
+        assert required in files, f"{required} is not scanned"
 
 
 def test_the_allowed_leftover_is_a_real_site():
@@ -145,6 +239,32 @@ def test_the_rule_flags_a_renamed_factory():
     )
 
 
+def test_the_rule_flags_an_aliased_factory():
+    """GAP 3: a factory bound to another name is still the same shape."""
+    assert find_offenders_in_source(LEAK_ALIASED_FACTORY), (
+        "the rule missed a leak after the factory was aliased"
+    )
+
+
+def test_the_rule_flags_an_aliased_generator():
+    """GAP 3: the generator bound to another name is still the same shape."""
+    assert find_offenders_in_source(LEAK_ALIASED_GENERATOR), (
+        "the rule missed a leak after the generator was aliased"
+    )
+
+
+def test_the_rule_flags_a_leak_whose_body_calls_no_session_method():
+    """GAP 3: the rule must not depend on a list of session-method names.
+
+    `await crud.get_config(db, ...)` alone is enough to make the loop
+    variable a session. A rule that only knew `commit`/`execute`/`flush`
+    would miss this leak.
+    """
+    assert find_offenders_in_source(LEAK_NO_SESSION_METHOD), (
+        "the rule missed a leak whose body calls no session method"
+    )
+
+
 def test_the_rule_flags_the_assign_then_iterate_form():
     """GAP 2: the factory call is not in the `async for`."""
     assert find_offenders_in_source(LEAK_ASSIGN_THEN_ITERATE), (
@@ -157,6 +277,25 @@ def test_the_rule_flags_an_unclosed_anext_acquisition():
     assert find_offenders_in_source(LEAK_UNCLOSED_ANEXT), (
         "the rule missed an unclosed anext acquisition"
     )
+
+
+def test_the_rule_flags_an_inline_anext_acquisition():
+    """GAP 2: `await anext(factory())` has no name to close it by."""
+    assert find_offenders_in_source(LEAK_INLINE_ANEXT), (
+        "the rule missed an inline anext acquisition"
+    )
+
+
+def test_the_rule_does_not_let_a_close_in_another_function_hide_a_leak():
+    """GAP 2: the close must be in the SAME function as the acquisition.
+
+    The module scope contains every function in the file, so a whole-file
+    search for `aclose()` used to mask an unclosed generator in a different
+    function of the same file.
+    """
+    offenders = find_offenders_in_source(CLOSED_IN_ANOTHER_FUNCTION)
+    assert len(offenders) == 1, offenders
+    assert offenders[0].endswith(":7"), offenders
 
 
 def test_the_rule_does_not_flag_a_closed_anext_acquisition():
@@ -174,6 +313,34 @@ def test_the_rule_does_not_flag_an_owned_session():
 def test_the_rule_does_not_flag_a_loop_that_is_not_a_session():
     assert not find_offenders_in_source(NOT_A_SESSION), (
         "the rule flagged a websocket loop"
+    )
+
+
+def test_the_session_release_never_swallows_a_failure():
+    """GAP 4: a swallowed close failure is worse than no close attempt.
+
+    `owned_session` closes the generator and the session in a `finally`.
+    If either close raises and the failure is swallowed, the pooled
+    connection stays checked out and NOTHING says so - which is the exact
+    failure this whole change exists to prevent. So every handler in
+    `bot_module/db_session.py` must log with `logger.exception`.
+    """
+    path = REPO / "bot_module" / "db_session.py"
+    source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
+    assert handlers, "db_session.py has no exception handler at all"
+
+    for handler in handlers:
+        assert not (
+            len(handler.body) == 1 and isinstance(handler.body[0], ast.Pass)
+        ), "a rollback/close failure is swallowed with `except ...: pass`"
+
+    assert "except Exception: pass" not in source
+    assert "logger.exception" in source, (
+        "the rollback/close failure must be logged with logger.exception, "
+        "not swallowed and not downgraded to a debug line"
     )
 
 

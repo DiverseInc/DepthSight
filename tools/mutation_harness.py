@@ -15,8 +15,9 @@ Three bugs this harness itself had, all of which made it report false comfort:
 3. A SKIP counted as neither pass nor fail, so a mutation that never applied
    looked like a mutation that was handled.
 
-So: CRLF-aware needles, SHA-256 revert verification against a pre-mutation
-snapshot, and SKIP exits non-zero.
+So: line-ending-aware needles (CRLF and LF are both tried, because this
+repo's worktree is mixed), SHA-256 revert verification against a
+pre-mutation snapshot, and SKIP exits non-zero.
 
 NEVER run this concurrently with a test run or a reviewer. Both will read a
 file that is mid-mutation and report on code that does not exist.
@@ -99,9 +100,19 @@ def run_pytest(target: str, timeout: int = 1800) -> tuple[int, str]:
     return proc.returncode, summary
 
 
-def crlf(text: str) -> bytes:
-    """Match the file's actual line ending instead of assuming LF."""
-    return text.replace("\n", "\r\n").encode("utf-8")
+def eol_variants(text: str) -> list[bytes]:
+    """The text in BOTH line-ending forms: CRLF first, then LF.
+
+    The repo's worktree is MIXED: `bot_module/controller.py` and
+    `bot_runner.py` are CRLF, while `tools/db_session_guard.py` and
+    `bot_module/db_session.py` are LF. Git stores LF for both (`*
+    text=auto` in .gitattributes), so the worktree's endings are whatever
+    the file physically is. A needle written with `\n` must therefore be
+    tried in BOTH forms, or the mutation silently SKIPs - and a skip is
+    not a pass.
+    """
+    lf = text.replace("\r\n", "\n").encode("utf-8")
+    return [lf.replace(b"\n", b"\r\n"), lf]
 
 
 def apply(spec_path: Path) -> int:
@@ -127,9 +138,15 @@ def apply(spec_path: Path) -> int:
     try:
         for m in spec["mutations"]:
             label, rel = m["label"], REPO / m["file"]
-            needle, repl = crlf(m["needle"]), crlf(m["replace"])
+            needle = repl = None
+            for cand, cand_repl in zip(
+                eol_variants(m["needle"]), eol_variants(m["replace"])
+            ):
+                if cand in originals[rel]:
+                    needle, repl = cand, cand_repl
+                    break
 
-            if needle not in originals[rel]:
+            if needle is None:
                 skipped.append(label)
                 print(f"SKIP     {label} -- needle NOT FOUND in {rel.name}")
                 print("          (a skip is NOT a pass; fix the spec or the code)")
