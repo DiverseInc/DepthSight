@@ -362,6 +362,42 @@ class RiskManager:
         # without this the latch would release on the very same start that set
         # it and never mean anything.
         self._guard_state_lost_day_str: str = ""
+        # Has this controller EVER traded? True / False / None (unknown).
+        #
+        # It decides whether the live balance may be installed as today's
+        # OPENING balance. A balance that has never moved cannot contain
+        # today's PnL, so for an account that has NEVER traded it IS the
+        # opening balance. A MID-DAY balance DOES contain today's PnL, so
+        # installing it measures the day's loss against a denominator that
+        # already contains it -- the gate reads LOW and under-trips.
+        #
+        # It is resolved from the persisted state (a guard payload, or the
+        # 'has traded before' marker) BEFORE the first balance read, because
+        # after the read the balance may already have been captured.
+        # `None` means UNKNOWN and must never be read as "never traded".
+        self._account_has_traded_before: Optional[bool] = None
+        # Whether the question above has been answered yet. A failed read
+        # leaves the answer unknown and is retried on the next attempt
+        # rather than cached as "never traded".
+        self._account_history_resolved: bool = False
+        # HOW the opening balance in force was obtained:
+        #   "rollover"   -- captured at a genuine UTC day transition, where the
+        #                    balance genuinely IS the opening balance;
+        #   "first_boot" -- captured for an account that has never traded, so
+        #                    its balance cannot contain today's PnL;
+        #   "restored"   -- restored from a persisted payload that says the
+        #                    base belongs to today;
+        #   None         -- NOT captured by this process (set directly, or
+        #                    unknown): the base is UNBACKED, so a payload from a
+        #                    previous day invalidates it.
+        #
+        # It matters because a previous-day payload proves the account has
+        # traded, which makes a live-balance base suspect -- but NOT a base
+        # that was captured at the rollover (the balance was the opening one
+        # by definition) or as a first boot (the balance cannot contain PnL
+        # that was never earned). Invalidating those would block a healthy
+        # account for a whole day.
+        self._start_of_day_base_provenance: Optional[str] = None
         # Serialises the read-snapshot + write of the guard state, so a
         # periodic tick and a trade handler cannot interleave and leave the
         # OLDER snapshot on disk last.
@@ -679,6 +715,11 @@ class RiskManager:
 
     async def initialize_balance(self):
         logger.info("Initializing balance for RiskManager...")
+        # BEFORE the first balance read: whether this account has EVER traded
+        # decides whether the balance we are about to read may be installed as
+        # today's OPENING balance. Resolving it after the read would be too
+        # late -- the balance may already have been captured.
+        await self._resolve_has_traded_before()
         success_fetch = await self.update_balance()
 
         if success_fetch and self.stats.current_balance > 0:
@@ -726,11 +767,15 @@ class RiskManager:
                 # `update_balance()` runs BEFORE this block, so the UTC
                 # rollover has already had its chance: if it fired, it wrote
                 # and stamped today's base and `base_is_current_day` is
-                # True. Reaching this branch therefore means the rollover did
-                # NOT fire -- we are mid-day, and today's opening balance is
-                # genuinely unknown (a base captured on another day was
-                # refused by `_apply_persisted_guard_state`, or there was no
-                # base at all).
+                # True. Reaching this branch therefore means EITHER the
+                # rollover did not fire -- we are mid-day, and today's opening
+                # balance is genuinely unknown (a base captured on another day
+                # was refused by `_apply_persisted_guard_state`, or there was
+                # no base at all) -- OR this process observed NO UTC day
+                # transition at all: its first observation of the day is not a
+                # transition, so it never had a moment at which the balance
+                # was known to be the opening one. Both are the same fact from
+                # the gate's point of view: today's opening balance is UNKNOWN.
                 #
                 # The live balance is a MID-DAY balance: it already contains
                 # whatever the account won or lost today. Writing it as
@@ -1064,15 +1109,148 @@ class RiskManager:
         self.stats.start_of_day_day_str = day_str
         return True
 
+    async def _resolve_has_traded_before(self) -> Optional[bool]:
+        """Has this controller EVER traded?  True / False / None (unknown).
+
+        Two independent pieces of evidence, either of which proves history:
+
+        * a persisted guard payload -- it only exists after the controller
+          saved state, which it does on every balance update and on every
+          trade result;
+        * the 'has traded before' marker -- written under its own key and
+          never overwritten.
+
+        `None` means the question could NOT be answered (no Redis client, or
+        the read failed). An unknown must never be read as "never traded":
+        that is exactly how a MID-DAY balance gets installed as the opening
+        balance.
+
+        Failing closed on `None` does NOT brick a new account: a brand-new
+        account has neither a payload nor a marker, which is `False`, not
+        `None`.
+        """
+        if getattr(self, "_account_history_resolved", False):
+            return getattr(self, "_account_has_traded_before", None)
+        if getattr(self, "redis_client", None) is None:
+            # No persistence layer at all: there is no persisted state that
+            # could prove the account has traded, and none that could
+            # contradict a capture either. The answer stays UNKNOWN.
+            self._account_has_traded_before = None
+            self._account_history_resolved = False
+            logger.info(
+                "[RiskGuard] History check for user_id=%s: no persistence "
+                "layer, so has_traded_before is UNKNOWN (None).",
+                self.user_id,
+            )
+            return None
+        payload, error = await self._read_persisted_guard_state()
+        if error is not None:
+            self._account_has_traded_before = None
+            # Not cached: the next attempt retries the read.
+            self._account_history_resolved = False
+        elif payload is not None:
+            self._account_has_traded_before = True
+            self._account_history_resolved = True
+        else:
+            self._account_has_traded_before = await self._has_traded_before()
+            self._account_history_resolved = (
+                self._account_has_traded_before is not None
+            )
+        logger.info(
+            "[RiskGuard] History check for user_id=%s: has_traded_before=%s "
+            "(None = unknown).",
+            self.user_id,
+            self._account_has_traded_before,
+        )
+        return self._account_has_traded_before
+
+    def _capture_first_boot_base(self, day_str: str) -> bool:
+        """Install the live balance as today's opening balance -- ONLY WHEN NOTHING CONTRADICTS IT.
+
+        The live balance may be today's OPENING balance only when it cannot
+        contain today's PnL, or when nothing can prove that it does:
+
+        * the account has NEVER traded -- there is no trade to have won or
+          lost anything, so the balance IS the opening balance. This is what
+          makes a brand-new account tradable ("fail closed on unknown" must
+          not become "brick every new account");
+        * the persisted state could not be READ -- the capture is then a
+          GUESS, so it is marked UNBACKED and a later previous-day payload
+          invalidates it. (The unreadable-state latch holds the gate closed
+          in production until the state can be read.)
+
+        The account HAS traded -- a persisted payload exists, or the 'has
+        traded before' marker does -- is the case the review panel measured:
+        its live balance is a MID-DAY balance that already contains today's
+        PnL, and installing it measures the day's loss against a denominator
+        that contains it. The panel measured a gate reading 0.0000% where the
+        truth was 4.4188%, with trading still ALLOWED. So the capture is
+        REFUSED there.
+        """
+        if getattr(self, "_account_has_traded_before", None) is True:
+            # The account has traded: the live balance is a mid-day balance.
+            return False
+        provenance = (
+            "first_boot"
+            if getattr(self, "_account_has_traded_before", None) is False
+            else "unknown_history"
+        )
+        if self.stats.current_balance <= 0:
+            return False
+        if (
+            getattr(self.stats, "start_of_day_day_str", None) == day_str
+            and self.stats.start_of_day_balance > 1e-9
+        ):
+            # A base for today is already in force. Today's opening balance is
+            # a fact about the start of the day; it is never restated.
+            return False
+        logger.info(
+            "[RiskGuard] Capturing the opening balance $%.8f for UTC day %s "
+            "(%s).",
+            self.stats.current_balance,
+            day_str,
+            "the account has never traded, so its balance cannot contain "
+            "today's PnL and IS the opening balance"
+            if provenance == "first_boot"
+            else "the persisted state could not be read, so this capture is a "
+            "GUESS and is marked unbacked",
+        )
+        if self._write_start_of_day_base(self.stats.current_balance, day_str):
+            self._start_of_day_base_provenance = provenance
+        return True
+
     def _check_and_reset_daily_stats(self):
         current_start_ts_float, current_day_str_utc = self._get_current_day_start_info()
         if self.stats.last_known_day_str != current_day_str_utc:
             logger.info(
                 f"New trading day detected (UTC): {current_day_str_utc}. Previous day: {self.stats.last_known_day_str}"
             )
-            self._write_start_of_day_base(
-                self.stats.current_balance, current_day_str_utc
-            )
+            # A base may be captured ONLY on a genuine UTC day transition --
+            # one this process OBSERVED, i.e. one where it already knew the
+            # previous day. An EMPTY `last_known_day_str` means "this process
+            # has no known day yet", NOT "the day changed": on a fresh process
+            # the live balance is a MID-DAY balance that already contains
+            # today's PnL, and installing it as the opening base measures the
+            # day's loss against a denominator that contains it -- the same
+            # defect as a base captured on another day, wearing a different
+            # hat. The base stays UNKNOWN here and the gate fails closed.
+            if self.stats.last_known_day_str:
+                if self._write_start_of_day_base(
+                    self.stats.current_balance, current_day_str_utc
+                ):
+                    # A genuine UTC transition: the balance WAS the opening
+                    # balance at that moment.
+                    self._start_of_day_base_provenance = "rollover"
+            else:
+                logger.error(
+                    "[RiskManager:DailyReset] No previous UTC day is known to "
+                    f"this process (it started on {current_day_str_utc}), so "
+                    "the live balance cannot be told apart from a MID-DAY "
+                    "balance. NO opening balance is captured: the base stays "
+                    "UNKNOWN and the daily-loss gate fails CLOSED until the "
+                    "persisted state proves this account has never traded (a "
+                    "first boot) or a real UTC day transition is observed."
+                )
             # A lost guard state heals at the UTC rollover and nowhere else.
             # It cannot heal on a re-read (there is nothing left to read), and
             # it must not require an operator: a new UTC day starts the day's
@@ -1137,6 +1315,14 @@ class RiskManager:
                 logger.info(
                     "Trading day change. Cooldowns for 'strategy-symbol' pairs may be revised."
                 )
+
+        # THE CAPTURE THAT MAY RUN WITHOUT A DAY CHANGE. The live balance may
+        # be today's OPENING balance only when nothing proves otherwise (see
+        # `_capture_first_boot_base`). It is attempted on every balance update,
+        # not only on a day change, because a balance fetch that RECOVERS must
+        # be able to re-open the gate -- and the writer refuses to restate a
+        # base that already belongs to today.
+        self._capture_first_boot_base(current_day_str_utc)
 
     async def update_trade_result(
         self, symbol: str, pnl: float, exit_reason: Optional[str] = None
@@ -3139,6 +3325,40 @@ class RiskManager:
                 persisted_day_str,
                 current_day_str,
             )
+            # A previous-day payload PROVES this account has traded, so its
+            # live balance is a MID-DAY balance and cannot be today's opening
+            # balance. Any base already stamped with TODAY's day key is
+            # therefore unbacked and must be invalidated here -- otherwise
+            # this early return leaves a mid-day base in force with the gate
+            # open on it. The review panel measured exactly that: base=865.23,
+            # usable=True, trading ALLOWED=True, the gate reading 0.0000%
+            # against a true 4.4188% loss.
+            if (
+                getattr(self.stats, "start_of_day_day_str", None) == current_day_str
+                and getattr(self, "_start_of_day_base_provenance", None) is None
+            ):
+                logger.critical(
+                    "[RiskGuard] Invalidating the opening balance: the "
+                    "persisted state belongs to UTC day %r, so it proves this "
+                    "account has traded and today's opening balance is "
+                    "UNKNOWN. The base stamped with today's day key ($%.8f) "
+                    "is unbacked -- it was not captured at a UTC rollover, not "
+                    "restored from a payload that says it belongs to today, "
+                    "and not captured for an account that has never traded -- "
+                    "so it is dropped and the daily-loss gate fails CLOSED.",
+                    persisted_day_str,
+                    float(self.stats.start_of_day_balance or 0.0),
+                )
+                self.stats.start_of_day_balance = 0.0
+                self.stats.start_of_day_day_str = ""
+                self._start_of_day_base_provenance = None
+                # Re-evaluate the gate: it must not stay OPEN on a base that
+                # has just been invalidated.
+                self._check_risk_limits()
+            # The account has traded, so its live balance is a mid-day balance
+            # and must never be installed as today's opening balance.
+            self._account_has_traded_before = True
+            self._account_history_resolved = True
             return False
 
         try:
@@ -3199,6 +3419,9 @@ class RiskManager:
         if base_is_from_today:
             self.stats.start_of_day_balance = start_of_day_balance
             self.stats.start_of_day_day_str = current_day_str
+            # The payload says this base belongs to today, so it is backed:
+            # a later previous-day payload must not invalidate it.
+            self._start_of_day_base_provenance = "restored"
         else:
             logger.critical(
                 "[RiskGuard] NOT restoring the persisted start-of-day balance "
@@ -3232,6 +3455,7 @@ class RiskManager:
                 )
                 self.stats.start_of_day_balance = 0.0
                 self.stats.start_of_day_day_str = ""
+                self._start_of_day_base_provenance = None
 
         self.stats.last_known_day_str = current_day_str
         self._guard_state_restored = True

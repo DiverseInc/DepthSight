@@ -267,11 +267,15 @@ async def test_a_base_captured_on_day_one_is_not_still_in_force_on_day_three(
     )
 
 
-async def test_the_stale_base_makes_the_daily_loss_gate_under_trip(redis_store):
+async def test_the_stale_base_cannot_make_the_daily_loss_gate_under_trip(redis_store):
     """The user-visible harm, in the production numbers.
 
     A correct base makes the gate STRICTER. This asserts the measured
     difference so a fix cannot make the gate pass by some other route.
+
+    The NAME used to say the stale base "makes the gate under-trip". It no
+    longer does: the base is refused, the opening balance stays UNKNOWN, and
+    the gate fails CLOSED instead of measuring against a wrong denominator.
     """
     redis = FakeRedis(redis_store)
     probe = _risk_manager(redis, DAY_THREE, balance=TRUE_BASE)
@@ -318,7 +322,16 @@ async def test_the_stale_base_makes_the_daily_loss_gate_under_trip(redis_store):
     # published reason is only refreshed on an allowed->blocked transition.
     # That latching is pre-existing behaviour and is not what this change is
     # about, so this pins the daily-loss computation on its own terms.
-    mid_session = _risk_manager(redis, DAY_THREE, balance=TRUE_BASE)
+    # A SEPARATE account, so this object is a FIRST BOOT: a process that has
+    # never traded captures its opening balance from the live balance (which
+    # cannot contain today's PnL), exactly as this object always did. A
+    # process for an account WITH history can no longer do that -- installing
+    # a live (mid-day) balance as the opening balance is the defect the review
+    # panel measured (a 0.0000% reading against a true 4.4188% loss, with
+    # trading still allowed). The ASSERTION below is unchanged: with today's
+    # opening balance and today's PnL, the limit that breaches is still the
+    # daily-loss one.
+    mid_session = _risk_manager(redis, DAY_THREE, balance=TRUE_BASE, user_id=2)
     await mid_session.initialize_balance()
     mid_session.stats.today_pnl = -73.03
     mid_session._check_risk_limits()
@@ -329,7 +342,7 @@ async def test_the_stale_base_makes_the_daily_loss_gate_under_trip(redis_store):
     )
 
 
-async def test_the_re_derived_base_is_the_one_persisted_for_the_next_start(
+async def test_the_unknown_base_is_the_one_persisted_for_the_next_start(
     redis_store,
 ):
     """The fix must be SELF-SUSTAINING, not a one-process patch.
@@ -669,9 +682,15 @@ async def test_a_lost_state_heals_at_the_utc_rollover_without_an_operator(
     restarted = await _start_on_day(redis, redis_store, DAY_THREE, TRUE_BASE)
     assert restarted._is_trading_allowed is False
 
-    # The next UTC day.
+    # The next UTC day. A rollover is only a rollover for a process that
+    # already knows the PREVIOUS day: a first observation of a day is not a
+    # transition, and treating it as one is exactly how a mid-day balance got
+    # installed as the opening balance (the review panel's measurement). So
+    # the previous day is stated here, which is what a long-running process
+    # that crosses midnight has.
     restarters = _risk_manager(redis, DAY_TWO, balance=TRUE_BASE)
     restarters._fake_day = "2026-10-23"
+    restarters.stats.last_known_day_str = "2026-10-22"
     await restarters.update_balance()
 
     assert restarters._guard_state_lost is False, (

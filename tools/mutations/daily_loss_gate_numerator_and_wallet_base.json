@@ -56,9 +56,22 @@
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/daily_loss_gate_numerator_and_wallet_base.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
-    "read a file that is mid-mutation and report on code that does not exist."
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "",
+    "N12 is the F3 hole: a process whose FIRST observation of the day is not",
+    "a UTC day transition capturing the live (MID-DAY) balance as today's",
+    "opening balance. An empty `last_known_day_str` means 'this process has",
+    "no known day yet', not 'the day changed': the live balance already",
+    "contains today's PnL, so installing it measures the day's loss against",
+    "a denominator that contains it. The review panel measured a gate",
+    "reading 0.0000% against a true 4.4188% loss, with trading ALLOWED.",
+    "",
+    "N13 is a previous-day payload NOT invalidating an unbacked base that is",
+    "already stamped with today's day key. A payload from a previous day",
+    "proves the account has traded, so today's opening balance is UNKNOWN",
+    "and an unbacked base stamped today must be dropped."
   ],
-  "pytest_target": "tests/test_paper_daily_loss_gate_numerator.py tests/test_daily_loss_base_is_current_day.py",
+  "pytest_target": "tests/test_paper_daily_loss_gate_numerator.py tests/test_daily_loss_base_is_current_day.py tests/test_daily_loss_base_previous_day_payload.py",
   "timeout_s": 1800,
   "mutations": [
     {
@@ -126,6 +139,18 @@
       "file": "bot_module/risk_manager.py",
       "needle": "                    self.stats.start_of_day_balance,\n                )\n                self.stats.start_of_day_balance = 0.0\n                self.stats.start_of_day_day_str = \"\"\n",
       "replace": "                    self.stats.start_of_day_balance,\n                )\n                pass  # MUTATED: the mid-day base written before the restore survives\n"
+    },
+    {
+      "label": "N12: a first observation (no known previous day) captures the mid-day balance as today's base",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            if self.stats.last_known_day_str:\n                if self._write_start_of_day_base(\n                    self.stats.current_balance, current_day_str_utc\n                ):\n",
+      "replace": "            if True:\n                if self._write_start_of_day_base(\n                    self.stats.current_balance, current_day_str_utc\n                ):\n"
+    },
+    {
+      "label": "N13: a previous-day payload does not invalidate an unbacked base stamped today",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                and self._start_of_day_base_provenance is None\n            ):\n",
+      "replace": "                and False\n            ):\n"
     }
   ]
 }
