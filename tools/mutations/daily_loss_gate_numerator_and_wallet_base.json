@@ -43,10 +43,10 @@
     "belongs to today. Today's opening balance is a fact about the start of",
     "the day.",
     "",
-    "N10 is the restore not invalidating a base that was written BEFORE it.",
-    "That is what happens in the 'init-first' call order: the UTC rollover",
-    "fires while `last_known_day_str` is still empty and writes the mid-day",
-    "balance as today's opening balance. Both call orders must agree.",
+    "N10 is the restore not invalidating an UNBACKED base that was written",
+    "BEFORE it. A base captured while the persisted state could not be READ",
+    "is a guess -- the balance may already contain today's PnL -- so a later",
+    "payload that refuses the persisted base must refuse the guess too.",
     "",
     "N11 is the EXIT leg being booked TWICE. Twice would make the daily-loss",
     "gate over-trip on a loss the account did not make. It is here because a",
@@ -69,7 +69,23 @@
     "N13 is a previous-day payload NOT invalidating an unbacked base that is",
     "already stamped with today's day key. A payload from a previous day",
     "proves the account has traded, so today's opening balance is UNKNOWN",
-    "and an unbacked base stamped today must be dropped."
+    "and an unbacked base stamped today must be dropped -- including the",
+    "guess captured while the persisted state could not be read.",
+    "",
+    "N16 is every opening balance counting as unbacked, so a base this",
+    "process VOUCHED for (captured at a genuine UTC rollover, captured for",
+    "an account that had never traded, restored from a payload that says it",
+    "belongs to today) is thrown away when a later payload arrives. That",
+    "blocks a healthy account for the rest of the day for no gain",
+    "",
+    "N14 is the finalization counting the FUNDING a second time. The funding",
+    "is reported to the risk manager the moment it is charged (the wallet",
+    "moved then), and it is part of the position's booked PnL, so the close",
+    "would count it twice without subtracting the already-reported part.",
+    "",
+    "N15 is the funding never being reported to the risk manager at all: the",
+    "wallet is debited and the gate never hears about it, so the daily-loss",
+    "guard cannot see a loss that has already happened."
   ],
   "pytest_target": "tests/test_paper_daily_loss_gate_numerator.py tests/test_daily_loss_base_is_current_day.py tests/test_daily_loss_base_previous_day_payload.py",
   "timeout_s": 1800,
@@ -135,10 +151,10 @@
       "replace": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n                        if is_reducing_trade:\n                            await self._book_fill_pnl_to_position(\n                                symbol, net_pnl, is_entry_leg=False\n                            )\n"
     },
     {
-      "label": "N10: the restore does not invalidate a base written before it",
+      "label": "N10: the restore does not invalidate an UNBACKED base written before it",
       "file": "bot_module/risk_manager.py",
-      "needle": "                    self.stats.start_of_day_balance,\n                )\n                self.stats.start_of_day_balance = 0.0\n                self.stats.start_of_day_day_str = \"\"\n",
-      "replace": "                    self.stats.start_of_day_balance,\n                )\n                pass  # MUTATED: the mid-day base written before the restore survives\n"
+      "needle": "            if (\n                getattr(self.stats, \"start_of_day_day_str\", None) == current_day_str\n                and self._opening_base_is_unbacked()\n            ):\n                logger.critical(\n                    \"[RiskGuard] Invalidating an opening balance that was \"\n",
+      "replace": "            if False:\n                logger.critical(\n                    \"[RiskGuard] Invalidating an opening balance that was \"\n"
     },
     {
       "label": "N12: a first observation (no known previous day) captures the mid-day balance as today's base",
@@ -147,10 +163,29 @@
       "replace": "            if True:\n                if self._write_start_of_day_base(\n                    self.stats.current_balance, current_day_str_utc\n                ):\n"
     },
     {
-      "label": "N13: a previous-day payload does not invalidate an unbacked base stamped today",
+      "label": "N13: a previous-day payload does not invalidate an UNBACKED base stamped today",
       "file": "bot_module/risk_manager.py",
-      "needle": "                and self._start_of_day_base_provenance is None\n            ):\n",
-      "replace": "                and False\n            ):\n"
+      "needle": "            if (\n                getattr(self.stats, \"start_of_day_day_str\", None) == current_day_str\n                and self._opening_base_is_unbacked()\n            ):\n                logger.critical(\n                    \"[RiskGuard] Invalidating the opening balance: the \"\n",
+      "replace": "            if False:\n                logger.critical(\n                    \"[RiskGuard] Invalidating the opening balance: the \"\n"
+    },
+    {
+      "label": "N16: every opening balance counts as unbacked, so a vouched-for base is dropped",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        provenance = getattr(self, \"_start_of_day_base_provenance\", None)\n        return provenance is None or provenance == \"unknown_history\"\n",
+      "replace": "        return True  # MUTATED: every base counts as unbacked\n"
+    },
+
+    {
+      "label": "N14: the finalization counts the funding a second time",
+      "file": "bot_module/controller.py",
+      "needle": "                position_to_process_copy.pnl - funding_already_reported,\n",
+      "replace": "                position_to_process_copy.pnl,\n"
+    },
+    {
+      "label": "N15: the funding is never reported to the risk manager",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                await rm.apply_funding_pnl(symbol, funding_pnl)\n",
+      "replace": "                pass  # MUTATED: the funding is never reported\n"
     }
   ]
 }

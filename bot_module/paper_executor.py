@@ -1042,6 +1042,73 @@ class PaperTradingExecutor:
                     exc_info=True,
                 )
 
+    async def _book_funding_pnl(self, symbol: str, funding_pnl: float) -> None:
+        """Book a funding charge: the WALLET moved, so the risk manager must be told.
+
+        Funding is a CARRY COST on an open position, not an exit leg: longs
+        pay it, shorts receive it. It is booked onto the position's PnL, so
+        the close reports the wallet's NET movement for that position, and it
+        is reported to the risk manager AT ONCE, so the daily-loss gate sees
+        it while the position is still open.
+
+        The amount already reported to the risk manager is carried on the
+        position (`funding_pnl_reported`), so the finalization can subtract
+        it and the same funding is never counted twice.
+        """
+        if not self.controller:
+            logger.warning(
+                f"[PaperFunding:{symbol}] No controller reference, so the risk "
+                f"manager was NOT told about the funding charge "
+                f"({float(funding_pnl or 0.0):.8f} USDT)."
+            )
+            return
+        controller = self.controller
+        rm = getattr(controller, "rm", None)
+        if rm is not None:
+            try:
+                await rm.apply_funding_pnl(symbol, funding_pnl)
+            except Exception as e:
+                logger.error(
+                    f"[PaperFunding:{symbol}] Failed to report the funding "
+                    f"charge ({float(funding_pnl or 0.0):.8f} USDT) to the "
+                    "risk manager: the WALLET was already moved, but the risk "
+                    "manager was NOT told, so today's PnL and the daily-loss "
+                    f"guard are now wrong. {e}",
+                    exc_info=True,
+                )
+        try:
+            async with controller._positions_dict_lock:
+                if hasattr(controller, "_active_position_get"):
+                    position = controller._active_position_get(
+                        symbol, getattr(self, "market_type", None)
+                    )
+                else:
+                    position = controller._active_positions.get(symbol)
+                if not position:
+                    logger.warning(
+                        f"[PaperFunding:{symbol}] Position not found in the "
+                        "controller, so the funding was not booked onto the "
+                        "position's PnL (the risk manager WAS told)."
+                    )
+                    return
+                previous_pnl = float(position.pnl or 0.0)
+                position.pnl = previous_pnl + float(funding_pnl or 0.0)
+                position.funding_pnl_reported = float(
+                    getattr(position, "funding_pnl_reported", 0.0) or 0.0
+                ) + float(funding_pnl or 0.0)
+                logger.info(
+                    f"[PaperFunding:{symbol}] Booked the funding charge "
+                    f"{float(funding_pnl or 0.0):+.8f} (position.pnl "
+                    f"{previous_pnl:.8f} -> {float(position.pnl):.8f})."
+                )
+        except Exception as e:
+            logger.error(
+                f"[PaperFunding:{symbol}] Failed to book the funding charge "
+                f"({float(funding_pnl or 0.0):.8f} USDT) onto the position's "
+                f"PnL: the WALLET was already moved. {e}",
+                exc_info=True,
+            )
+
     async def check_funding(self) -> None:
         """
         Charge funding on open paper positions for every settlement boundary
@@ -1059,6 +1126,7 @@ class PaperTradingExecutor:
         now = datetime.now(timezone.utc)
         total_delta = 0.0
         charged: List[str] = []
+        funding_by_symbol: Dict[str, float] = {}
 
         for symbol in list(self._positions.keys()):
             pos = self._positions.get(symbol)
@@ -1084,6 +1152,9 @@ class PaperTradingExecutor:
             multiplier = 1.0 if qty < 0 else -1.0
             funding_pnl = multiplier * periods * notional * rate
             total_delta += funding_pnl
+            funding_by_symbol[symbol] = (
+                funding_by_symbol.get(symbol, 0.0) + funding_pnl
+            )
             charged.append(f"{symbol} {periods}p {funding_pnl:+.4f}")
 
             # Advance the anchor so the next tick does not re-bill the same
@@ -1107,6 +1178,12 @@ class PaperTradingExecutor:
                     exc_info=True,
                 )
                 return
+
+        # THE WALLET HAS MOVED. The risk manager must be told, and the
+        # position's booked PnL must include it, so that the close
+        # reports the wallet's NET movement for that position.
+        for funded_symbol, symbol_funding in funding_by_symbol.items():
+            await self._book_funding_pnl(funded_symbol, symbol_funding)
 
         logger.info(
             f"[PaperFunding] user={self.user_id} applied {total_delta:+.4f} USDT "

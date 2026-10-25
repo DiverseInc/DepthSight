@@ -53,6 +53,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from bot_module.config import (
+    PAPER_FUNDING_INTERVAL_HOURS,
+    PAPER_FUNDING_RATE_8H,
+)
 from bot_module.controller import (
     ActivePositionMap,
     LivePosition,
@@ -858,4 +862,95 @@ async def test_the_destructive_paper_wallet_reset_requires_an_explicit_opt_in(
     await db_session.commit()
     assert await _balance() == pytest.approx(10000.0), (
         "the explicit reset must still reset the wallet to the initial balance"
+    )
+
+
+# --- 6. FUNDING: a carry charge must reach the gate too ---------------------
+
+
+@pytest.mark.asyncio
+async def test_the_funding_charge_reaches_the_risk_manager_exactly_once(money):
+    """Funding moves the wallet, so the gate must see it -- once.
+
+    A funding charge is an ACCOUNT-level carry cost: at every settlement
+    boundary it is debited from (or credited to) the paper wallet, and until
+    this branch it was booked NOWHERE -- no trade row, no PnL to the risk
+    manager. The gate's numerator is supposed to be the wallet's day PnL, and
+    a funding charge is part of it, so a charge that never reaches the gate
+    is the same defect shape as the entry commission that was missing.
+
+    Pinned here:
+
+    * the wallet moved by the funding;
+    * the position's booked PnL includes it, so the close reports the
+      wallet's NET movement for that position;
+    * the risk manager's today_pnl includes it IMMEDIATELY -- the gate must
+      not be blind to it while the position is still open;
+    * the consecutive-loss streak did NOT move: a funding payment is a carry
+      cost, not a losing trade, and counting it could falsely trip the
+      max-consecutive-losses guard;
+    * the finalization does not count it a SECOND time.
+    """
+    controller, paper_executor, rm = _build_controller(ENTRY_PRICE)
+    _pin_day(rm)
+    position, entry_result = await _run_real_entry(controller, paper_executor)
+    entry_commission = sum(
+        float(f.get("commission") or 0.0) for f in entry_result.get("fills", [])
+    )
+
+    # Exactly ONE settlement boundary crossed since the position was opened.
+    now = datetime.now(timezone.utc)
+    paper_executor._positions[SYMBOL]["last_funding_timestamp"] = (
+        paper_executor._last_funding_boundary_before(
+            now, PAPER_FUNDING_INTERVAL_HOURS
+        )
+        - timedelta(hours=PAPER_FUNDING_INTERVAL_HOURS)
+    )
+
+    pos_state = paper_executor._positions[SYMBOL]
+    notional = abs(pos_state["quantity"]) * float(pos_state["avg_entry_price"])
+    # The backtesters' sign convention: longs PAY (negative), shorts receive.
+    expected_funding = -1.0 * notional * PAPER_FUNDING_RATE_8H
+
+    wallet_before = _wallet_total(money)
+    await paper_executor.check_funding()
+
+    charged = _wallet_total(money) - wallet_before
+    assert charged == pytest.approx(expected_funding), (
+        f"the wallet moved {charged:.8f} but one funding period on a "
+        f"${notional:.2f} notional at {PAPER_FUNDING_RATE_8H:.6f} per "
+        f"{PAPER_FUNDING_INTERVAL_HOURS}h is {expected_funding:.8f}. If the "
+        "funding was not charged at all, this test would assert nothing."
+    )
+    assert charged < 0, (
+        "a LONG position pays funding: the wallet must be debited"
+    )
+    assert float(position.pnl or 0.0) == pytest.approx(
+        -entry_commission + charged
+    ), (
+        f"the position booked {position.pnl} but the wallet moved "
+        f"{-entry_commission:.8f} (the entry commission) + {charged:.8f} (the "
+        "funding). The position's net result must equal the wallet's net "
+        "movement for that position, or the close reports a number the "
+        "account never earned."
+    )
+    assert rm.stats.today_pnl == pytest.approx(charged), (
+        f"the risk manager was told {rm.stats.today_pnl:.8f} but the wallet "
+        f"moved {charged:.8f} of funding. The gate's numerator is the "
+        "wallet's day PnL, so a funding charge that never reaches it is "
+        "invisible to the daily-loss guard."
+    )
+    assert rm.stats.consecutive_losses == 0, (
+        "a funding payment is a CARRY COST, not a losing trade: the "
+        "consecutive-loss streak counts losing CLOSES, and counting funding "
+        "against it could falsely trip the max-consecutive-losses guard"
+    )
+
+    # The close must not count the funding a second time.
+    await _finalize(controller, "STOP_LOSS")
+
+    assert rm.stats.today_pnl == pytest.approx(_wallet_total(money)), (
+        f"the risk manager was told {rm.stats.today_pnl:.8f} but the wallet "
+        f"moved {_wallet_total(money):.8f} in total. The funding was already "
+        "reported when it was charged, so the close must not report it again."
     )

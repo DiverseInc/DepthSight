@@ -83,11 +83,14 @@ class FakeRedis:
     "the bot restarted" means here.
     """
 
-    def __init__(self, store=None):
+    def __init__(self, store=None, fail_reads=False):
         self.store = {} if store is None else store
+        self.fail_reads = fail_reads
         self.set_calls = []
 
     async def get(self, key):
+        if self.fail_reads:
+            raise ConnectionError("redis is down")
         return self.store.get(key)
 
     async def set(self, key, value):
@@ -296,4 +299,56 @@ async def test_a_previous_day_payload_invalidates_a_base_already_stamped_today(
     )
     assert rm.stats.start_of_day_day_str != TODAY, (
         "the invalidated base kept today's day key"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_previous_day_payload_invalidates_a_base_captured_while_the_state_was_unreadable(
+    redis_store,
+):
+    """A GUESS must not survive the state that proves it wrong.
+
+    When the persisted state cannot be READ, nothing can say whether the
+    account has traded, so the capture of the live balance as today's opening
+    balance is a GUESS: the balance may already contain today's PnL. The
+    capture is marked UNBACKED for exactly that reason.
+
+    The proof arrives later -- Redis comes back and the state it holds is
+    from YESTERDAY, which proves the account has traded. The guess must then
+    be dropped. Measured on the unfixed branch: the guess SURVIVED with
+    ``base=865.23``, ``usable=True`` and the gate OPEN, which is the review
+    panel's measurement (a gate reading 0.0000% against a true 4.4188% loss)
+    wearing a different hat.
+    """
+    redis = FakeRedis(redis_store, fail_reads=True)
+    rm = _risk_manager(redis, TODAY, balance=MID_DAY_BALANCE)
+    await rm.initialize_balance()
+
+    # The state could not be read, so the capture is a guess...
+    assert rm.stats.start_of_day_balance == pytest.approx(MID_DAY_BALANCE)
+    assert rm._start_of_day_base_provenance == "unknown_history", (
+        "a capture made while the persisted state was unreadable must be "
+        "marked as a guess, so a later payload can drop it"
+    )
+
+    # ...and now Redis comes back, holding yesterday's state.
+    working = FakeRedis(redis_store)
+    rm.redis_client = working
+    probe = _risk_manager(working, TODAY, balance=MID_DAY_BALANCE)
+    _seed_previous_day_payload(probe, redis_store)
+
+    await rm.restore_state()
+
+    assert rm.stats.start_of_day_balance != pytest.approx(MID_DAY_BALANCE), (
+        f"the mid-day balance {MID_DAY_BALANCE}, captured as a guess while the "
+        "state was unreadable, survived a payload that proves the account has "
+        "traded: the gate is measuring the day's loss against a denominator "
+        "that already contains it"
+    )
+    assert rm._daily_loss_base_is_usable() is False, (
+        "the guess must be dropped, so today's opening balance is UNKNOWN and "
+        "the gate fails CLOSED"
+    )
+    assert rm._is_trading_allowed is False, (
+        "the gate must be CLOSED while the opening balance is unknown"
     )

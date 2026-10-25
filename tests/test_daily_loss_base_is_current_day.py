@@ -728,3 +728,94 @@ async def test_an_unreadable_state_still_fails_closed(redis_store):
     assert rm._is_trading_allowed is False, (
         "an unreadable guard state must fail CLOSED, not open"
     )
+
+async def test_a_same_day_payload_with_a_stale_base_invalidates_an_unbacked_base(
+    redis_store,
+):
+    """A GUESS written before the restore must not survive it.
+
+    The payload says the account's state is TODAY's but carries a base that
+    belongs to another day, so the persisted base is refused. A base that was
+    written BEFORE the restore is a different thing: if it is UNBACKED -- a
+    capture made while the persisted state could not be read -- it is a guess
+    that may already contain today's PnL, and it has to be dropped with it.
+    """
+    rm = _risk_manager(ExplodingRedis(redis_store), DAY_THREE, balance=TRUE_BASE)
+    await rm.initialize_balance()
+    assert rm._start_of_day_base_provenance == "unknown_history", (
+        "the capture must be marked as a guess: the persisted state could not "
+        "be read, so the balance may already contain today's PnL"
+    )
+
+    working = FakeRedis(redis_store)
+    rm.redis_client = working
+    probe = _risk_manager(working, DAY_THREE, balance=TRUE_BASE)
+    _seed_payload(
+        probe,
+        redis_store,
+        day_str=DAY_THREE,
+        base=STALE_BASE,
+        base_day_str=DAY_ONE,
+    )
+
+    await rm.restore_state()
+
+    assert rm.stats.start_of_day_balance != pytest.approx(TRUE_BASE), (
+        f"the guessed opening balance ${TRUE_BASE:.2f} survived a restore that "
+        "refused the persisted base: it may already contain today's PnL, so "
+        "the gate would measure the day's loss against a denominator that "
+        "contains it"
+    )
+    assert rm._daily_loss_base_is_usable() is False, (
+        "today's opening balance is UNKNOWN once the guess is dropped, so the "
+        "gate must fail CLOSED"
+    )
+    assert rm._is_trading_allowed is False, (
+        "the gate must be CLOSED while the opening balance is unknown"
+    )
+
+
+async def test_a_rollover_base_survives_a_restore_that_carries_a_stale_base(
+    redis_store,
+):
+    """The counterweight: a base this process VOUCHED for must be kept.
+
+    A base captured at a genuine UTC rollover IS today's opening balance: at
+    that moment the balance was the opening balance. A payload whose own base
+    belongs to another day says nothing about it, so the base in force stays
+    and is measured against the right denominator. Dropping it would block a
+    healthy account for the rest of the day for no gain.
+    """
+    redis = FakeRedis(redis_store)
+    rm = _risk_manager(redis, DAY_THREE, balance=TRUE_BASE)
+    # The process already knows YESTERDAY, so the day change IS a transition
+    # and the balance at that moment IS the opening balance.
+    rm.stats.last_known_day_str = DAY_TWO
+    await rm.update_balance()
+    assert rm.stats.start_of_day_balance == pytest.approx(TRUE_BASE)
+    assert rm._start_of_day_base_provenance == "rollover"
+
+    probe = _risk_manager(redis, DAY_THREE, balance=TRUE_BASE)
+    _seed_payload(
+        probe,
+        redis_store,
+        day_str=DAY_THREE,
+        base=STALE_BASE,
+        base_day_str=DAY_ONE,
+        today_pnl=-1.00,
+    )
+
+    await rm.restore_state()
+
+    assert rm.stats.start_of_day_balance == pytest.approx(TRUE_BASE), (
+        "a base captured at a genuine UTC rollover IS today's opening balance: "
+        "a payload whose own base belongs to another day must not throw it "
+        "away and leave the account with no denominator at all"
+    )
+    assert rm._daily_loss_base_is_usable() is True, (
+        "the base in force is today's, so the ratio can be computed against it"
+    )
+    assert rm._is_trading_allowed is True, (
+        "a $1.00 loss against the day's own opening balance is well inside the "
+        "5% limit, so the account must still trade"
+    )

@@ -334,6 +334,12 @@ class LivePosition(BasePosition):
     #     `sum(Trade.pnl - Trade.commission)`. A NET value in the row would
     #     subtract the commission a second time.
     pnl_gross: Optional[float] = None
+    # The FUNDING already reported to the RiskManager for this
+    # position. A funding charge moves the wallet between the entry
+    # and the close, so it is reported the moment it is charged; the
+    # close reports the position's cumulative pnl, and would count
+    # the same funding a second time without this.
+    funding_pnl_reported: float = 0.0
     closed_time: Optional[float] = None
     exit_reason: Optional[str] = None
     total_commission: Optional[float] = None
@@ -11245,8 +11251,20 @@ class TradingController:
         )
 
         if position_to_process_copy:
+            # The paper executor may have already reported this
+            # position's FUNDING to the risk manager (a funding charge
+            # moves the wallet between the entry and the close), and
+            # `position.pnl` includes it. Reporting it again here would
+            # count the same money twice, so the already-reported part
+            # is subtracted. `getattr` keeps a position without the
+            # attribute working.
+            funding_already_reported = float(
+                getattr(position_to_process_copy, "funding_pnl_reported", 0.0) or 0.0
+            )
             await self.rm.update_trade_result(
-                symbol, position_to_process_copy.pnl, exit_reason=reason
+                symbol,
+                position_to_process_copy.pnl - funding_already_reported,
+                exit_reason=reason,
             )  # Global risk update
 
             # NEW: CREATE PHANTOM TRADE FOR BE ANALYSIS
