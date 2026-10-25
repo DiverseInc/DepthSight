@@ -2965,7 +2965,6 @@ class FastVectorBacktester:
                 self.main_df["ATR_14"]
                 .astype(float)
                 .reindex(self.main_df.index)
-                .bfill()
                 .ffill()
             )
         if "ATR_14" in self.signals.columns:
@@ -2973,7 +2972,6 @@ class FastVectorBacktester:
                 self.signals["ATR_14"]
                 .astype(float)
                 .reindex(self.main_df.index)
-                .bfill()
                 .ffill()
             )
         return (self.main_df["close"].astype(float) * 0.01).reindex(self.main_df.index)
@@ -4014,7 +4012,7 @@ class FastVectorBacktester:
                 )
                 if series is None:
                     return pd.Series(False, index=self.main_df.index)
-                series = series.bfill().ffill().fillna(0.0)
+                series = series.ffill().fillna(0.0)
 
             aligned = self._align_filter_series(series, timeframe)
             return self._compare_numeric_series(
@@ -4043,7 +4041,6 @@ class FastVectorBacktester:
             middle = bb_df[middle_col].replace(0.0, np.nan)
             series = (
                 ((bb_df[upper_col] - bb_df[lower_col]) / middle)
-                .bfill()
                 .ffill()
                 .fillna(0.0)
             )
@@ -4094,7 +4091,6 @@ class FastVectorBacktester:
                 ((high_low / close_adj) * 100.0)
                 .rolling(window=period)
                 .mean()
-                .bfill()
                 .ffill()
                 .fillna(0.0)
             )
@@ -4393,8 +4389,8 @@ class FastVectorBacktester:
         self._ensure_market_features()
         # Calculation of ATR if missing (always on 1m)
         if "ATR_14" in self.main_df.columns:
-            # Ensure no NaNs from external sources
-            self.main_df["ATR_14"] = self.main_df["ATR_14"].bfill().fillna(0)
+            # Ensure no NaNs from external sources without forward lookahead
+            self.main_df["ATR_14"] = self.main_df["ATR_14"].ffill().fillna(0)
 
         if (
             "ATR_14" not in self.main_df.columns
@@ -4409,7 +4405,7 @@ class FastVectorBacktester:
                 atr = ta.atr(high=high, low=low, close=close, length=14)
                 # Fallback for NaNs at the beginning
                 atr = atr.fillna(close * 0.01)
-                self.signals["ATR_14"] = atr.bfill().fillna(0)
+                self.signals["ATR_14"] = atr.ffill().fillna(0)
             except Exception as e:
                 logger.warning(f"Failed to calculate ATR_14: {e}")
                 self.signals["ATR_14"] = self.main_df["close"] * 0.01
@@ -4464,21 +4460,21 @@ class FastVectorBacktester:
                 if indicator_type == "ema":
                     result_series = ta.ema(
                         close=close_tf, length=params.get("period")
-                    ).bfill()
+                    ).ffill()
                 elif indicator_type == "sma":
                     result_series = ta.sma(
                         close=close_tf, length=params.get("period")
-                    ).bfill()
+                    ).ffill()
                 elif indicator_type == "rsi":
                     result_series = ta.rsi(
                         close=close_tf, length=params.get("period")
-                    ).bfill()
+                    ).ffill()
                 elif indicator_type == "natr":
                     period = params.get("period", 14)
                     high_low = df_tf["high"] - df_tf["low"]
                     close_adj = df_tf["close"].replace(0, 1)
                     val = (high_low / close_adj) * 100
-                    result_series = val.rolling(window=period).mean().bfill()
+                    result_series = val.rolling(window=period).mean().ffill()
 
                 elif indicator_type == "atr":
                     period = params.get("period", 14)
@@ -4489,7 +4485,7 @@ class FastVectorBacktester:
                         length=period,
                     )
                     if result_series is not None:
-                        result_series = result_series.bfill()
+                        result_series = result_series.ffill()
 
                 elif indicator_type == "adx":
                     period = params.get("period", 14)
@@ -4500,7 +4496,7 @@ class FastVectorBacktester:
                         length=period,
                     )
                     if adx_df is not None:
-                        result_series = adx_df[f"ADX_{period}"].bfill()
+                        result_series = adx_df[f"ADX_{period}"].ffill()
 
                 elif indicator_type == "macd":
                     p1, p2 = params.get("fast", 12), params.get("slow", 26)
@@ -4515,7 +4511,7 @@ class FastVectorBacktester:
                         # Copy all MACD columns (with broadcasting)
                         for col in macd_df.columns:
                             broadcasted_col = self._broadcast_to_1m(
-                                macd_df[col].bfill(), tf
+                                macd_df[col].ffill(), tf
                             )
                             col_cache_key = f"{col}_{tf}"
                             self.broadcasted_cache[col_cache_key] = broadcasted_col
@@ -4528,7 +4524,7 @@ class FastVectorBacktester:
                     if bb_df is not None:
                         for col in bb_df.columns:
                             broadcasted_col = self._broadcast_to_1m(
-                                bb_df[col].bfill(), tf
+                                bb_df[col].ffill(), tf
                             )
                             col_cache_key = f"{col}_{tf}"
                             self.broadcasted_cache[col_cache_key] = broadcasted_col
@@ -4549,7 +4545,7 @@ class FastVectorBacktester:
                     if stoch_df is not None:
                         for col in stoch_df.columns:
                             broadcasted_col = self._broadcast_to_1m(
-                                stoch_df[col].bfill(), tf
+                                stoch_df[col].ffill(), tf
                             )
                             col_cache_key = f"{col}_{tf}"
                             self.broadcasted_cache[col_cache_key] = broadcasted_col
