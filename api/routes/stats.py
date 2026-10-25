@@ -45,7 +45,11 @@ async def platform_stats(db: AsyncSession = Depends(get_db)):
             )
         ).scalar() or 0
         templates = (
-            await db.execute(select(func.count(models.StrategyTemplate.id)))
+            await db.execute(
+                select(func.count(models.StrategyTemplate.id)).where(
+                    models.StrategyTemplate.is_active.is_(True)
+                )
+            )
         ).scalar() or 0
         news = (
             await db.execute(select(func.count(models.HubNewsItem.id)))
