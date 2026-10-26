@@ -71,8 +71,8 @@
     {
       "label": "F: one query per strategy instead of one aggregate query",
       "file": "bot_module/controller.py",
-      "needle": "            async for db in session_gen:\n                return await crud.get_strategy_realized_pnl_aggregates(\n                    db,\n                    user_id=self.user_id,\n                    strategy_config_ids=[str(c) for c in config_ids],\n                )\n",
-      "replace": "            async for db in session_gen:\n                merged = {}\n                for _one in config_ids:\n                    merged.update(\n                        await crud.get_strategy_realized_pnl_aggregates(\n                            db,\n                            user_id=self.user_id,\n                            strategy_config_ids=[str(_one)],\n                        )\n                    )\n                return merged\n"
+      "needle": "            async with self._owned_session() as db:\n                return await crud.get_strategy_realized_pnl_aggregates(\n                    db,\n                    user_id=self.user_id,\n                    strategy_config_ids=[str(c) for c in config_ids],\n                )\n",
+      "replace": "            async with self._owned_session() as db:\n                merged = {}\n                for _one in config_ids:\n                    merged.update(\n                        await crud.get_strategy_realized_pnl_aggregates(\n                            db,\n                            user_id=self.user_id,\n                            strategy_config_ids=[str(_one)],\n                        )\n                    )\n                return merged\n"
     },
     {
       "label": "G: an unreachable database publishes a false 0.0",

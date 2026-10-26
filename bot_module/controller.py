@@ -4583,10 +4583,14 @@ class TradingController:
         if not config_ids:
             return {}
 
-        session_gen = None
         try:
-            session_gen = self.get_db_session()
-            async for db in session_gen:
+            # Owned session: the same idiom as every other session read in
+            # this controller. `async for db in session_gen:` abandons the
+            # generator when the body returns, so the transaction stays OPEN
+            # and the pooled connection stays checked out until the garbage
+            # collector happens to finalise it -- at fleet scale that is what
+            # drained the pool. This session is released either way.
+            async with self._owned_session() as db:
                 return await crud.get_strategy_realized_pnl_aggregates(
                     db,
                     user_id=self.user_id,
@@ -4600,16 +4604,6 @@ class TradingController:
                 exc_info=True,
             )
             return None
-        finally:
-            # The session factory is an async generator: closing it returns
-            # the connection to the pool instead of leaving it suspended.
-            aclose = getattr(session_gen, "aclose", None)
-            if callable(aclose):
-                try:
-                    await aclose()
-                except Exception:
-                    pass
-        return {}
 
     async def _publish_state_to_redis(self):
         """
