@@ -580,9 +580,13 @@ def _extract_verdict(text: str) -> tuple[str | None, str | None]:
     Returns (verdict, bad_value). `verdict` is "YES"/"NO" when a marker line
     carries one of those values. `bad_value` is the text of a marker line
     whose value was not YES/NO, so the caller can say so precisely.
+
+    The LAST marker wins: the contract asks the reviewer to END its reply with
+    the verdict, so a marker quoted earlier in the analysis does not override
+    the one the reviewer actually concluded with.
     """
     bad: str | None = None
-    for m in _VERDICT_LINE.finditer(text):
+    for m in reversed(list(_VERDICT_LINE.finditer(text))):
         rest = (m.group("rest") or "").strip().strip("*`'\" \t")
         word = re.match(r"[A-Za-z]+", rest)
         if not word:
@@ -605,9 +609,29 @@ def parse_verdict(text: str) -> tuple[str | None, str]:
     no verdict -- is None, and the reason says why.
 
     The rule this encodes: a NO VERDICT is never approval.
+
+    THE MARKER IS AUTHORITATIVE. The blocker phrases (permission rejection,
+    truncation complaint, request for the question) are only consulted when
+    there is NO marker. MEASURED 2026-10-26: opencode, reviewing a diff of
+    this very tool, explained itself by quoting this tool's own regexes --
+    its output contained the literal text "truncat...diff" and "please
+    provide the question" -- and then correctly ended with "VERDICT: NO".
+    With the blockers checked first, that real verdict was thrown away and
+    the reviewer was reported as NO VERDICT. A reviewer that is EXPLAINING
+    this tool must not be silenced by this tool's own vocabulary.
     """
     cleaned = _meaningful(text)
 
+    verdict, bad = _extract_verdict(cleaned)
+    if verdict is not None:
+        return verdict, f"VERDICT: {verdict}"
+    if bad is not None:
+        return None, (
+            f"a VERDICT: marker was present but its value ({bad!r}) is not "
+            f"YES or NO -- NO VERDICT"
+        )
+
+    # No marker: the reviewer never answered in the required form.
     # A reviewer that was BLOCKED never answered, whatever else it printed.
     if _PERMISSION_DENIED.search(cleaned):
         return None, (
@@ -626,15 +650,6 @@ def parse_verdict(text: str) -> tuple[str | None, str]:
         return None, (
             "the reviewer ASKED FOR THE QUESTION instead of answering it "
             "-- NO VERDICT"
-        )
-
-    verdict, bad = _extract_verdict(cleaned)
-    if verdict is not None:
-        return verdict, f"VERDICT: {verdict}"
-    if bad is not None:
-        return None, (
-            f"a VERDICT: marker was present but its value ({bad!r}) is not "
-            f"YES or NO -- NO VERDICT"
         )
 
     words = len(re.findall(r"[A-Za-z0-9]{2,}", cleaned))
@@ -691,7 +706,8 @@ def _run(name: str, cmd: list[str], timeout: int = DEFAULT_TIMEOUT) -> ReviewOut
     resolved = _resolve_argv(cmd)
     if resolved is None:
         return name, (
-            f"{name} is genuinely not installed / not on PATH -- NO VERDICT"
+            f"ENGINE FAILURE: {name} is genuinely not installed / not on "
+            f"PATH -- NO VERDICT"
         ), False
     argv, how = resolved
     env = dict(os.environ)
@@ -726,21 +742,24 @@ def _run(name: str, cmd: list[str], timeout: int = DEFAULT_TIMEOUT) -> ReviewOut
         )
         raw = (p.stdout or "") + (p.stderr or "")
         out = _meaningful(raw)
-        verdict, reason = parse_verdict(out)
-        if verdict is None:
-            return name, f"{reason}\n\n{out[:4000]}", False
-        return name, out, True
+        verdict, _reason = parse_verdict(out)
+        # The FULL output is returned, never a truncated slice: the saved
+        # file is the evidence, and a truncation that hides the tail of a
+        # review is how a blocked run gets mistaken for an answer.
+        return name, out, verdict is not None
     except FileNotFoundError:
         return name, (
-            f"launch failed (FileNotFoundError) via {how}; the binary exists at "
-            f"{argv[0] if argv else '?'} but could not be started -- NO VERDICT"
+            f"ENGINE FAILURE: launch failed (FileNotFoundError) via {how}; the "
+            f"binary exists at {argv[0] if argv else '?'} but could not be "
+            f"started -- NO VERDICT"
         ), False
     except subprocess.TimeoutExpired:
         # A reviewer that timed out has NOT approved anything.
-        return name, f"TIMED OUT after {timeout}s -- NO VERDICT", False
+        return name, f"ENGINE FAILURE: TIMED OUT after {timeout}s -- NO VERDICT", False
     except Exception as exc:
         return name, (
-            f"{name} runner crashed: {type(exc).__name__}: {exc} -- NO VERDICT"
+            f"ENGINE FAILURE: {name} runner crashed: {type(exc).__name__}: "
+            f"{exc} -- NO VERDICT"
         ), False
 
 
@@ -768,11 +787,11 @@ def _run_dsh(prompt: str, timeout: int = DEFAULT_TIMEOUT) -> ReviewOutcome:
     node = resolve_node()
     if entry is None:
         return "dsh", (
-            "dsh entry point not found (expected .../dsh/lib/bin.js) -- "
-            "NO VERDICT"
+            "ENGINE FAILURE: dsh entry point not found (expected "
+            ".../dsh/lib/bin.js) -- NO VERDICT"
         ), False
     if node is None:
-        return "dsh", "node is not on PATH -- NO VERDICT", False
+        return "dsh", "ENGINE FAILURE: node is not on PATH -- NO VERDICT", False
 
     argv = [node, str(entry), "headless"]
     try:
@@ -787,15 +806,14 @@ def _run_dsh(prompt: str, timeout: int = DEFAULT_TIMEOUT) -> ReviewOutcome:
         )
         raw = (p.stdout or "") + (p.stderr or "")
         out = _meaningful(raw)
-        verdict, reason = parse_verdict(out)
-        if verdict is None:
-            return "dsh", f"{reason}\n\n{out[:4000]}", False
-        return "dsh", out, True
+        verdict, _reason = parse_verdict(out)
+        return "dsh", out, verdict is not None
     except subprocess.TimeoutExpired:
-        return "dsh", f"TIMED OUT after {timeout}s -- NO VERDICT", False
+        return "dsh", f"ENGINE FAILURE: TIMED OUT after {timeout}s -- NO VERDICT", False
     except Exception as exc:
         return "dsh", (
-            f"dsh runner crashed: {type(exc).__name__}: {exc} -- NO VERDICT"
+            f"ENGINE FAILURE: dsh runner crashed: {type(exc).__name__}: {exc} "
+            f"-- NO VERDICT"
         ), False
 
 
@@ -823,8 +841,8 @@ def _run_opencode(
     exe = resolve_opencode_exe()
     if exe is None:
         return "opencode", (
-            "the standalone opencode.exe was not found (set OPENCODE_EXE) -- "
-            "NO VERDICT"
+            "ENGINE FAILURE: the standalone opencode.exe was not found (set "
+            "OPENCODE_EXE) -- NO VERDICT"
         ), False
 
     argv = [
@@ -848,15 +866,16 @@ def _run_opencode(
         )
         raw = (p.stdout or "") + (p.stderr or "")
         out = _meaningful(raw)
-        verdict, reason = parse_verdict(out)
-        if verdict is None:
-            return "opencode", f"{reason}\n\n{out[:4000]}", False
-        return "opencode", out, True
+        verdict, _reason = parse_verdict(out)
+        return "opencode", out, verdict is not None
     except subprocess.TimeoutExpired:
-        return "opencode", f"TIMED OUT after {timeout}s -- NO VERDICT", False
+        return "opencode", (
+            f"ENGINE FAILURE: TIMED OUT after {timeout}s -- NO VERDICT"
+        ), False
     except Exception as exc:
         return "opencode", (
-            f"opencode runner crashed: {type(exc).__name__}: {exc} -- NO VERDICT"
+            f"ENGINE FAILURE: opencode runner crashed: {type(exc).__name__}: "
+            f"{exc} -- NO VERDICT"
         ), False
 
 
@@ -1036,29 +1055,62 @@ def run_all(jobs: dict[str, Callable[[], ReviewOutcome]]) -> dict[str, ReviewOut
             except Exception as exc:
                 results[name] = (
                     name,
-                    f"{name} runner crashed: {type(exc).__name__}: {exc} "
-                    f"-- NO VERDICT",
+                    f"ENGINE FAILURE: {name} runner crashed: "
+                    f"{type(exc).__name__}: {exc} -- NO VERDICT",
                     False,
                 )
     return results
 
 
+def _no_verdict_reason(out: str) -> str:
+    """Why this reviewer has no verdict.
+
+    An engine-level failure diagnostic already explains itself; anything else
+    is scored by the parser.
+    """
+    if out.startswith("ENGINE FAILURE:"):
+        return out.splitlines()[0]
+    _, reason = parse_verdict(out)
+    return reason
+
+
 def format_summary(results: dict[str, ReviewOutcome]) -> str:
-    """The honest tally. Every reviewer appears, and NO VERDICT is named."""
+    """The honest tally. Every reviewer appears, and NO VERDICT is named.
+
+    A triage-only reviewer (see ADVISORY_REVIEWERS) is NEVER counted as a
+    verdict: it is listed separately so the headline number cannot read like
+    an approval from a model that cannot see the diff.
+    """
     total = len(results)
-    counted = [n for n, (_, _, ok) in results.items() if ok]
-    missing = sorted(n for n, (_, _, ok) in results.items() if not ok)
+    # Every advisory reviewer is excluded from BOTH the numerator and the
+    # denominator: it is triage, and a tally that counted it would read like
+    # an approval from a model that cannot see the diff.
+    advisory = sorted(n for n in results if n in ADVISORY_REVIEWERS)
+    counted = sorted(
+        n for n, (_e, _o, ok) in results.items()
+        if ok and n not in ADVISORY_REVIEWERS
+    )
+    triage = sorted(
+        n for n, (_e, _o, ok) in results.items()
+        if ok and n in ADVISORY_REVIEWERS
+    )
+    missing = sorted(n for n, (_e, _o, ok) in results.items() if not ok)
+    non_triage_total = total - len(advisory)
     verdicts: list[str] = []
     for name, (_engine, out, ok) in results.items():
-        if not ok:
+        if not ok or name in ADVISORY_REVIEWERS:
             continue
         verdict, _ = parse_verdict(out)
         if verdict:
             verdicts.append(f"{name}={verdict}")
     lines = [
-        f"reviewers that returned a VERDICT: {len(counted)}/{total}  "
-        f"{sorted(counted)}",
+        f"reviewers that returned a VERDICT: {len(counted)}/{non_triage_total}  "
+        f"{counted}",
     ]
+    if triage:
+        lines.append(
+            "triage only, NOT counted as a verdict: " + ", ".join(triage)
+        )
     if verdicts:
         lines.append("verdicts: " + ", ".join(sorted(verdicts)))
     if missing:
@@ -1124,17 +1176,25 @@ def main() -> int:
 
     print("=" * 70)
     for name, (_engine, out, ok) in results.items():
-        verdict, _ = parse_verdict(out) if ok else (None, "")
+        verdict, _ = parse_verdict(out)
         if ok:
             flag = f"VERDICT: {verdict}"
+            reason = ""
         else:
             flag = "NO VERDICT"
+            reason = _no_verdict_reason(out)
         if name in ADVISORY_REVIEWERS:
             flag += " / TRIAGE ONLY - NOT A VERDICT"
         print(f"\n--- {name}  [{flag}] ---")
-        print(redact(out.strip()[-1800:]) if out.strip() else "(empty response)")
+        if reason:
+            print(f"[{name}] {reason}")
+        body = out.strip()
+        print(redact(body[-1800:]) if body else "(empty response)")
         OUT_DIR.mkdir(exist_ok=True)
-        (OUT_DIR / f"{name}.txt").write_text(redact(out), encoding="utf-8")
+        # The saved file is the EVIDENCE: the full output, plus the reason
+        # when there is no verdict. Never a truncated slice.
+        saved = out if ok else f"{reason}\n\n{out}"
+        (OUT_DIR / f"{name}.txt").write_text(redact(saved), encoding="utf-8")
 
     print("\n" + "=" * 70)
     print(format_summary(results))

@@ -159,6 +159,35 @@ def test_echoed_instruction_is_not_a_verdict():
     assert "NO VERDICT" in reason
 
 
+def test_reviewer_that_quotes_this_tool_is_still_scored_on_its_marker():
+    """MEASURED 2026-10-26: opencode, reviewing a diff of this tool, quoted
+    this tool's own regexes -- its output contained "truncat...diff" and
+    "please provide the question" -- and then correctly ended with
+    "VERDICT: NO". The blockers must not silence a real verdict.
+    """
+    fanout = _load_tool()
+    output = (
+        "The parser checks `_TRUNCATED` and `_NO_ANSWER`, which match the "
+        "patterns \"diff truncated\" and \"please provide the question\".\n"
+        "So a reviewer whose output merely discusses the diff can be "
+        "mislabelled.\n"
+        "VERDICT: NO\n"
+    )
+    verdict, reason = fanout.parse_verdict(output)
+    assert verdict == "NO", reason
+
+
+def test_the_last_marker_wins():
+    """The contract asks the reviewer to END its reply with the verdict."""
+    fanout = _load_tool()
+    verdict, _ = fanout.parse_verdict(
+        "An earlier quoted example:\nVERDICT: YES\n"
+        "But the reviewer actually concluded the opposite.\n"
+        "VERDICT: NO\n"
+    )
+    assert verdict == "NO"
+
+
 # --------------------------------------------------------------------------
 # The engine runner: the old behaviour counted a blocked run as a "return"
 # --------------------------------------------------------------------------
@@ -225,9 +254,23 @@ def test_summary_names_every_no_verdict_reviewer():
         "ollama": ("ollama", "no usable output -- NO VERDICT", False),
     }
     summary = fanout.format_summary(results)
-    assert "2/3" in summary, summary
+    assert "2/2" in summary, summary
     assert "ollama" in summary, summary
     assert "never approval" in summary, summary
+
+
+def test_summary_does_not_count_a_triage_only_reviewer_as_a_verdict():
+    """MEASURED 2026-10-26: opencode itself flagged that the tally counted
+    ollama, which is labelled TRIAGE ONLY, as if it were a verdict."""
+    fanout = _load_tool()
+    results = {
+        "dsh": ("dsh", "VERDICT: NO\n", True),
+        "ollama": ("ollama", "VERDICT: NO\n", True),
+    }
+    summary = fanout.format_summary(results)
+    assert "1/1" in summary, summary
+    assert "triage" in summary.lower(), summary
+    assert "ollama" in summary, summary
 
 
 def test_summary_reports_the_verdict_values():
