@@ -3019,13 +3019,22 @@ async def create_or_update_shared_backtest(
 # --- PaperWallet CRUD ---
 
 
-async def get_paper_wallet(db: AsyncSession, user_id: int) -> List[models.PaperWallet]:
+async def get_paper_wallet(
+    db: AsyncSession, user_id: int, *, refresh: bool = False
+) -> List[models.PaperWallet]:
     """
     Gets all paper wallet balances for a user.
+
+    `refresh=True` makes the returned objects reflect the DATABASE rather than
+    whatever the session's identity map is holding. It is needed after a
+    delete-and-insert: the session can still hold the deleted row, and the
+    row inserted in its place can reuse its primary key, so the balance
+    returned would otherwise be the STALE pre-reset one.
     """
-    result = await db.execute(
-        select(models.PaperWallet).filter(models.PaperWallet.user_id == user_id)
-    )
+    stmt = select(models.PaperWallet).filter(models.PaperWallet.user_id == user_id)
+    if refresh:
+        stmt = stmt.execution_options(populate_existing=True)
+    result = await db.execute(stmt)
     return result.scalars().all()
 
 
@@ -3069,11 +3078,19 @@ async def update_paper_wallet_balance(
 
 
 async def init_or_reset_paper_wallet(
-    db: AsyncSession, user_id: int, initial_balance: Optional[float] = None
+    db: AsyncSession,
+    user_id: int,
+    initial_balance: Optional[float] = None,
+    reset: bool = False,
 ) -> List[models.PaperWallet]:
     """
-    Creates or resets the paper wallet for a user to the initial balance.
-    Deletes existing wallet entries for the user and creates a new one for USDT.
+    Creates the paper wallet for a user at the initial balance.
+
+    The DESTRUCTIVE half (deleting an existing wallet) requires an explicit
+    `reset=True`. The default is create-if-absent, which never touches a
+    wallet that already exists. Only the explicit
+    `POST /api/v1/account/paper/reset` may destroy a live balance: a read
+    must never be able to wipe or re-create money.
     """
     # Use provided initial_balance or fall back to config
     balance_to_set = (
@@ -3082,11 +3099,18 @@ async def init_or_reset_paper_wallet(
         else PAPER_TRADING_INITIAL_BALANCE
     )
 
-    # Delete existing wallet entries for the user
-    await db.execute(
-        delete(models.PaperWallet).where(models.PaperWallet.user_id == user_id)
-    )
-    await db.flush()  # Ensure deletes are processed before adds
+    if reset:
+        # Delete existing wallet entries for the user
+        await db.execute(
+            delete(models.PaperWallet).where(models.PaperWallet.user_id == user_id)
+        )
+        await db.flush()  # Ensure deletes are processed before adds
+    else:
+        # Create-if-absent: an existing wallet is returned UNTOUCHED. It is
+        # never deleted and never re-seeded with the initial balance.
+        existing = await get_paper_wallet(db, user_id)
+        if existing:
+            return existing
 
     # Create a new wallet with the initial USDT balance
     new_wallet = models.PaperWallet(
@@ -3095,8 +3119,12 @@ async def init_or_reset_paper_wallet(
     db.add(new_wallet)
     await db.flush()
 
-    # Return all wallet assets for the user (which will be just the one we created)
-    return await get_paper_wallet(db, user_id)
+    # Return all wallet assets for the user (which will be just the one we created).
+    # After a reset the read is REFRESHED: the session can still be holding
+    # the deleted row, and the row created above can reuse its primary key,
+    # so without this the balance handed back would be the STALE pre-reset
+    # one -- the opposite of what a reset is for.
+    return await get_paper_wallet(db, user_id, refresh=reset)
 
 
 async def get_leaderboard(

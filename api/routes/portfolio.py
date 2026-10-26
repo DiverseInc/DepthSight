@@ -267,11 +267,10 @@ async def get_portfolio_status(
             f"User '{current_user.username}' requesting paper portfolio status."
         )
         wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)
-        if not wallet_assets:
-            wallet_assets = await crud.init_or_reset_paper_wallet(
-                db, user_id=current_user.id
-            )
-            await db.commit()
+        # A READ NEVER CREATES MONEY. A wallet-less account is reported with
+        # no assets instead of being handed a $10,000 balance, which the risk
+        # manager would then adopt as the day's opening balance and use as
+        # the daily-loss gate's denominator.
 
         total_balance = 0.0
         for asset in wallet_assets:

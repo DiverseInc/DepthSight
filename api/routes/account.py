@@ -103,16 +103,15 @@ async def get_paper_wallet(
 ):
     """
     Retrieves the paper trading wallet balances for the current user.
-    If the wallet does not exist, it initializes it with the default balance.
+
+    A READ NEVER CREATES MONEY. If the wallet does not exist it is reported
+    as absent; the wallet is created by the explicit
+    `POST /api/v1/account/paper/reset`. Creating one here used to give every
+    wallet-less account a $10,000 balance, which the risk manager then
+    adopted as the day's opening balance -- a $10,000 denominator that made
+    the daily-loss gate untrippable.
     """
     wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)
-
-    # If wallet is empty (e.g. for new user), create it
-    if not wallet_assets:
-        wallet_assets = await crud.init_or_reset_paper_wallet(
-            db, user_id=current_user.id
-        )
-        await db.commit()
 
     return {"data": wallet_assets}
 
@@ -131,7 +130,9 @@ async def reset_paper_wallet(
     """
     logger.info(f"User '{current_user.username}' resetting paper trading account.")
 
-    updated_wallet = await crud.init_or_reset_paper_wallet(db, user_id=current_user.id)
+    updated_wallet = await crud.init_or_reset_paper_wallet(
+        db, user_id=current_user.id, reset=True
+    )
 
     # Grant 'reset_paper' achievement
     await grant_achievement(db, current_user.id, "reset_paper")

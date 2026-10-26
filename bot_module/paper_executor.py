@@ -105,12 +105,30 @@ class PaperTradingExecutor:
             wallet_assets = await crud.get_paper_wallet(self.db, user_id=self.user_id)
 
             if not wallet_assets:
-                logger.info(
-                    f"Paper wallet not found for user {self.user_id}. Initializing..."
+                # NO WALLET, NO BALANCE -- AND NO INVENTED ONE.
+                #
+                # This used to create a $10,000 wallet here, as a side effect
+                # of a READ. The risk manager then read that $10,000 as the
+                # account's balance and stamped it as the day's opening
+                # balance: a $10,000 denominator for an account whose real
+                # base was ~$756.28. 5% of $10,000 is $500 of tolerated loss
+                # against 5% of $756.28 = $37.81 -- a 13.2x disarm of the
+                # daily-loss gate.
+                #
+                # A balance that is not known must be reported as NOT known.
+                # `RiskManager.update_balance` fails closed on a missing
+                # balance ("balance could not be fetched at start-up --
+                # trading disabled"), which is the right outcome: an account
+                # with no wallet has no money to lose, and it must never be
+                # given a synthetic denominator by a balance READ.
+                logger.error(
+                    f"[PaperExecutor] No paper wallet exists for user "
+                    f"{self.user_id}. The balance is UNKNOWN and no wallet is "
+                    "created by a read. The risk manager will fail closed "
+                    "until a wallet exists (POST /api/v1/account/paper/reset "
+                    "creates one)."
                 )
-                wallet_assets = await crud.init_or_reset_paper_wallet(
-                    self.db, user_id=self.user_id
-                )
+                return None
 
             balances = {}
             for asset in wallet_assets:
@@ -123,6 +141,100 @@ class PaperTradingExecutor:
                 exc_info=True,
             )
             return None
+
+    async def _book_fill_pnl_to_position(
+        self, symbol: str, net_pnl: float, *, is_entry_leg: bool
+    ) -> None:
+        """Book a paper fill's NET PnL onto the controller's LivePosition.
+
+        THE wallet was moved at the moment this fill was simulated
+        (`total_balance_change = realized_pnl - actual_commission_paid`), so
+        the risk manager must be told the SAME number. If it is not, the
+        daily-loss gate measures a loss that never happened -- or misses one
+        that did.
+
+        This is the ONLY place a paper fill's PnL is booked for the risk
+        manager, and it is called from exactly the places where the wallet
+        moved, so a leg is booked exactly once by construction:
+
+        * An ENTRY leg -- the fill opened or increased the position -- is
+          booked even though the position may still be ``PENDING_ENTRY``.
+          That is the whole point: the entry fill was charged a commission
+          and NOTHING ever booked it to the risk manager. An ENTRY never
+          goes through `_notify_controller_about_fill`, which was the ONLY
+          place the paper executor touched `position.pnl`: a market entry
+          never notifies at all, and a resting LIMIT entry is filled later
+          through `check_open_orders` -> `place_order` and then reaches the
+          SL/TP exit notifier, whose `PENDING_ENTRY` guard skips it. The
+          controller does learn the entry commission -- it lands in
+          `position.entry_commission` via `_handle_entry_fill` -- but that
+          is not the number the risk manager is given: the risk manager is
+          given `position.pnl` at finalization, and the paper finalization
+          (`exit_price == 0.0`) never applies `total_commission_calculated`
+          to it. The result was a `today_pnl` short by every entry
+          commission ever paid, and a daily-loss gate that read LOW.
+        * An EXIT leg is booked only while the position is still ``OPEN``. A
+          position that is not OPEN has already been finalized (and already
+          reported to the risk manager), so booking it again would count the
+          same money twice.
+
+        This method never raises: the wallet has already moved by the time it
+        is called, so a failure here loses the REPORTING of the money, not the
+        money, and it must not abort the fill that already happened.
+        """
+        try:
+            if not self.controller:
+                logger.warning(
+                    f"[PaperBookFill:{symbol}] No controller reference, so the "
+                    f"risk manager was NOT told about this fill's net PnL "
+                    f"({float(net_pnl or 0.0):.8f} USDT)."
+                )
+                return
+
+            controller = self.controller
+            async with controller._positions_dict_lock:
+                if hasattr(controller, "_active_position_get"):
+                    position = controller._active_position_get(
+                        symbol, getattr(self, "market_type", None)
+                    )
+                else:
+                    position = controller._active_positions.get(symbol)
+                if not position:
+                    logger.warning(
+                        f"[PaperBookFill:{symbol}] Position not found in the "
+                        f"controller, so the risk manager was NOT told about "
+                        f"this fill's net PnL "
+                        f"({float(net_pnl or 0.0):.8f} USDT)."
+                    )
+                    return
+
+                if not is_entry_leg and position.status != "OPEN":
+                    logger.warning(
+                        f"[PaperBookFill:{symbol}] Position status is "
+                        f"{position.status}, not OPEN, so this close was "
+                        f"already finalized (and already reported to the risk "
+                        f"manager): NOT booking its net PnL "
+                        f"({float(net_pnl or 0.0):.8f} USDT) a second time."
+                    )
+                    return
+
+                previous_pnl = float(position.pnl or 0.0)
+                position.pnl = previous_pnl + float(net_pnl or 0.0)
+                logger.info(
+                    f"[PaperBookFill:{symbol}] Booked the net PnL of this "
+                    f"{'ENTRY' if is_entry_leg else 'EXIT'} leg: "
+                    f"{float(net_pnl or 0.0):.4f} (position.pnl "
+                    f"{previous_pnl:.4f} -> {position.pnl:.4f})"
+                )
+        except Exception as e:
+            logger.error(
+                f"[PaperBookFill:{symbol}] Failed to book this fill's net PnL "
+                f"({float(net_pnl or 0.0):.8f} USDT) onto the controller's "
+                f"position: the WALLET was already moved, but the risk manager "
+                f"was NOT told, so today's PnL and the consecutive-loss streak "
+                f"are now wrong and the daily-loss guard is blind. {e}",
+                exc_info=True,
+            )
 
     async def place_order(
         self, symbol: str, side: str, order_type: str, **kwargs
@@ -227,6 +339,7 @@ class PaperTradingExecutor:
                         asset_to_update = "USDT"
 
                         # Check if this trade is a closure or a reduction of an existing position
+                        is_reducing_trade = False
                         if symbol in self._positions:
                             old_pos = self._positions[symbol]
                             old_qty = old_pos["quantity"]
@@ -274,6 +387,33 @@ class PaperTradingExecutor:
 
                         await crud.update_paper_wallet_balance(
                             self.db, self.user_id, asset_to_update, total_balance_change
+                        )
+
+                        # The wallet has moved, so the risk manager must be told
+                        # about it -- HERE, where the money moved. EVERY fill
+                        # that goes through `place_order` is booked, once.
+                        #
+                        # The ENTRY leg is the one that was missing: it was
+                        # charged a commission (`realized_pnl` is 0 for an
+                        # entry, so the wallet was debited the commission
+                        # alone) and NOTHING ever booked it to the risk
+                        # manager. The result was
+                        #     RM loss = DB loss - entry commissions,
+                        # so the daily-loss gate read LOW and under-tripped.
+                        #
+                        # This covers BOTH entry kinds: a market entry fills
+                        # through here directly, and a LIMIT entry rests and
+                        # is filled through here too (as a market fill of the
+                        # resting order).
+                        #
+                        # The EXIT leg is booked here too, and only here: the
+                        # SL/TP close goes through `place_order`, and the
+                        # notifier that follows it no longer books anything,
+                        # so no leg is counted twice. The forced close does
+                        # NOT go through `place_order`, so it books its own
+                        # leg where its money moved.
+                        await self._book_fill_pnl_to_position(
+                            symbol, net_pnl, is_entry_leg=not is_reducing_trade
                         )
 
                         # Recording the equity history point in Redis
@@ -902,6 +1042,101 @@ class PaperTradingExecutor:
                     exc_info=True,
                 )
 
+    async def _book_funding_pnl(self, symbol: str, funding_pnl: float) -> None:
+        """Book a funding charge: the WALLET moved, so the risk manager must be told.
+
+        Funding is a CARRY COST on an open position, not an exit leg: longs
+        pay it, shorts receive it. It is booked onto the position's PnL, so
+        the close reports the wallet's NET movement for that position, and it
+        is reported to the risk manager AT ONCE, so the daily-loss gate sees
+        it while the position is still open.
+
+        The amount already reported to the risk manager is carried on the
+        position (`funding_pnl_reported`), so the finalization can subtract
+        it and the same funding is never counted twice. That counter is
+        advanced ONLY when the risk manager actually took the funding: a
+        funding the risk manager never heard about is still part of the
+        position's booked PnL, so the close reports it and the gate is not
+        left blind to money the wallet already moved.
+        """
+        amount = float(funding_pnl or 0.0)
+        if not self.controller:
+            logger.warning(
+                f"[PaperFunding:{symbol}] No controller reference, so the risk "
+                f"manager was NOT told about the funding charge "
+                f"({amount:.8f} USDT)."
+            )
+            return
+        controller = self.controller
+        rm = getattr(controller, "rm", None)
+        funding_reported = False
+        if rm is not None:
+            try:
+                funding_reported = bool(await rm.apply_funding_pnl(symbol, amount))
+            except Exception as e:
+                logger.error(
+                    f"[PaperFunding:{symbol}] Failed to report the funding "
+                    f"charge ({amount:.8f} USDT) to the "
+                    "risk manager: the WALLET was already moved, but the risk "
+                    "manager was NOT told, so today's PnL and the daily-loss "
+                    f"guard are now wrong. {e}",
+                    exc_info=True,
+                )
+        try:
+            async with controller._positions_dict_lock:
+                if hasattr(controller, "_active_position_get"):
+                    position = controller._active_position_get(
+                        symbol, getattr(self, "market_type", None)
+                    )
+                else:
+                    position = controller._active_positions.get(symbol)
+                if not position:
+                    logger.warning(
+                        f"[PaperFunding:{symbol}] Position not found in the "
+                        "controller, so the funding was not booked onto the "
+                        "position's PnL (the risk manager WAS told)."
+                    )
+                    return
+                previous_pnl = float(position.pnl or 0.0)
+                position.pnl = previous_pnl + amount
+                # The funding is in the position's net result WHATEVER the risk
+                # manager did with it: the WALLET moved. This is the number the
+                # close needs to put back if it rebuilds `position.pnl` from
+                # the fill prices, because that rebuild knows nothing about
+                # funding.
+                position.funding_pnl_booked = float(
+                    getattr(position, "funding_pnl_booked", 0.0) or 0.0
+                ) + amount
+                if funding_reported:
+                    position.funding_pnl_reported = float(
+                        getattr(position, "funding_pnl_reported", 0.0) or 0.0
+                    ) + amount
+                else:
+                    # NOT reported. The funding is in the position's PnL and
+                    # the close will report it, so `funding_pnl_reported` must
+                    # NOT count it: subtracting it at the close would take it
+                    # out of the risk manager's PnL entirely.
+                    logger.warning(
+                        f"[PaperFunding:{symbol}] The funding charge "
+                        f"({amount:.8f} USDT) was NOT reported to the risk "
+                        "manager, so it is not subtracted at the close: the "
+                        "close reports it instead. The daily-loss gate stays "
+                        "blind to it until the position is closed."
+                    )
+                logger.info(
+                    f"[PaperFunding:{symbol}] Booked the funding charge "
+                    f"{amount:+.8f} (position.pnl "
+                    f"{previous_pnl:.8f} -> {float(position.pnl):.8f}, "
+                    f"reported to the risk manager: {funding_reported})."
+                )
+        except Exception as e:
+            logger.error(
+                f"[PaperFunding:{symbol}] Failed to book the funding charge "
+                f"({float(funding_pnl or 0.0):.8f} USDT) onto the position's "
+                f"PnL: the WALLET was already moved. {e}",
+                exc_info=True,
+            )
+
     async def check_funding(self) -> None:
         """
         Charge funding on open paper positions for every settlement boundary
@@ -919,6 +1154,7 @@ class PaperTradingExecutor:
         now = datetime.now(timezone.utc)
         total_delta = 0.0
         charged: List[str] = []
+        funding_by_symbol: Dict[str, float] = {}
 
         for symbol in list(self._positions.keys()):
             pos = self._positions.get(symbol)
@@ -944,6 +1180,9 @@ class PaperTradingExecutor:
             multiplier = 1.0 if qty < 0 else -1.0
             funding_pnl = multiplier * periods * notional * rate
             total_delta += funding_pnl
+            funding_by_symbol[symbol] = (
+                funding_by_symbol.get(symbol, 0.0) + funding_pnl
+            )
             charged.append(f"{symbol} {periods}p {funding_pnl:+.4f}")
 
             # Advance the anchor so the next tick does not re-bill the same
@@ -967,6 +1206,12 @@ class PaperTradingExecutor:
                     exc_info=True,
                 )
                 return
+
+        # THE WALLET HAS MOVED. The risk manager must be told, and the
+        # position's booked PnL must include it, so that the close
+        # reports the wallet's NET movement for that position.
+        for funded_symbol, symbol_funding in funding_by_symbol.items():
+            await self._book_funding_pnl(funded_symbol, symbol_funding)
 
         logger.info(
             f"[PaperFunding] user={self.user_id} applied {total_delta:+.4f} USDT "
@@ -1071,6 +1316,18 @@ class PaperTradingExecutor:
 
         del self._positions[symbol]
 
+        # The wallet was credited/debited by this close, so the risk manager
+        # must be told the SAME number. This close does NOT go through
+        # `place_order`, so it books its own leg here, where its money moved.
+        # It is booked BEFORE the notify below, because the notify flips the
+        # position to `CLOSING` and an EXIT leg is only booked while the
+        # position is still `OPEN`.
+        await self._book_fill_pnl_to_position(
+            symbol,
+            net_realized_pnl(realized_pnl, commission),
+            is_entry_leg=False,
+        )
+
         try:
             await self._record_equity_point()
         except Exception:
@@ -1085,10 +1342,6 @@ class PaperTradingExecutor:
                 "SELL" if qty > 0 else "BUY",
                 abs(qty),
                 exit_price,
-                # The net result of this close: gross realized PnL minus the
-                # commission actually paid. This is what the risk manager must
-                # be told, and until it is told the daily-loss guard is blind.
-                net_pnl=net_realized_pnl(realized_pnl, commission),
             )
         except Exception as e:
             # The wallet was ALREADY credited above (`balance_change`), so a
@@ -1261,9 +1514,6 @@ class PaperTradingExecutor:
                             side=order_side,
                             quantity=float(order["origQty"]),
                             price=current_price,
-                            # The net PnL of this fill, carried out of the fill
-                            # itself so the risk manager is told the truth.
-                            net_pnl=float(fill_result.get("net_realized_pnl") or 0.0),
                         )
                     except Exception as e:
                         # The fill already moved the wallet: `place_order`
@@ -1343,21 +1593,20 @@ class PaperTradingExecutor:
         side: str,
         quantity: float,
         price: float,
-        net_pnl: float = 0.0,
     ):
         """
         Notifies the controller about a partial position closure when TP/SL is executed.
         This is necessary to synchronize remaining_quantity in LivePosition.
 
-        It also books the NET realized PnL of the fill (gross minus the
-        commission actually paid) onto the LivePosition, in the same place and
-        under the same guard as the quantity update. The controller's
-        finalization then reads `position.pnl` and hands THAT number to the
-        risk manager -- which is the only place the risk manager is told
-        about a close. Without this, a paper close reaches the risk manager
-        as 0.0, so the daily-loss and drawdown guards (which read
-        `today_pnl`) can never fire and a winning close can never reset the
-        consecutive-loss streak.
+        IT DOES NOT BOOK PnL. The PnL of a fill is booked by
+        `_book_fill_pnl_to_position`, from the code that MOVED THE WALLET
+        (`place_order` and the forced close). Booking it here as well would
+        count the same money twice, and booking it ONLY here is what left the
+        ENTRY leg invisible: a market entry is never notified at all, and a
+        LIMIT entry is notified while the position is still `PENDING_ENTRY`,
+        which the guard below skips. The controller's finalization reads
+        `position.pnl` and hands THAT number to the risk manager, so every
+        leg has to be in it -- including the entry.
         """
         if not self.controller:
             logger.warning(
@@ -1396,18 +1645,6 @@ class PaperTradingExecutor:
 
             logger.info(
                 f"{log_prefix} Updated remaining_quantity: {old_remaining:.8f} -> {position.remaining_quantity:.8f}"
-            )
-
-            # Book the realized PnL of this fill. It ACCUMULATES across the
-            # partial closes of one position and is read once, at
-            # finalization, by the controller. A position that is not OPEN has
-            # already been finalized (and already reported to the risk
-            # manager), so it is never booked twice.
-            previous_pnl = float(position.pnl or 0.0)
-            position.pnl = previous_pnl + float(net_pnl or 0.0)
-            logger.info(
-                f"{log_prefix} Booked realized PnL for this fill: {float(net_pnl or 0.0):.4f} "
-                f"(position.pnl {previous_pnl:.4f} -> {position.pnl:.4f})"
             )
 
             # If the position is fully closed, changing the status

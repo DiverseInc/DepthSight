@@ -336,6 +336,22 @@ class LivePosition(BasePosition):
     #     `sum(Trade.pnl - Trade.commission)`. A NET value in the row would
     #     subtract the commission a second time.
     pnl_gross: Optional[float] = None
+    # The FUNDING already reported to the RiskManager for this
+    # position. A funding charge moves the wallet between the entry
+    # and the close, so it is reported the moment it is charged; the
+    # close reports the position's cumulative pnl, and would count
+    # the same funding a second time without this.
+    funding_pnl_reported: float = 0.0
+    # The FUNDING booked INTO this position's `pnl`. A funding charge moves
+    # the wallet between the entry and the close, so it is added to the
+    # position's net result whether or not the RiskManager took it.
+    #
+    # This is NOT the same number as `funding_pnl_reported`: a funding the
+    # risk manager REFUSED is booked into the position but was never reported,
+    # so the close still has to carry it. A close that REBUILDS `pnl` from
+    # the fill prices (the `exit_price > 0` branch) has to put the whole of
+    # this back, and then subtract only the part already reported.
+    funding_pnl_booked: float = 0.0
     closed_time: Optional[float] = None
     exit_reason: Optional[str] = None
     total_commission: Optional[float] = None
@@ -11268,6 +11284,31 @@ class TradingController:
                     position.pnl = net_realized_pnl(
                         total_pnl_calculated, total_commission_calculated
                     )
+                    # The FUNDING this position has already paid is part of
+                    # its net result, but the recomputation above cannot know
+                    # about it: it rebuilds the result from the fill prices
+                    # and the commissions, and a funding charge is neither.
+                    # It is added back so `position.pnl` keeps meaning "this
+                    # position's net result", which is what the finalization
+                    # subtracts the already-reported funding from. Without
+                    # this, the subtraction would take the funding out of a
+                    # number that never contained it, and the risk manager
+                    # would be short by exactly the funding -- the same
+                    # under-trip this whole change exists to close.
+                    #
+                    # The WHOLE of the funding that was booked into the
+                    # position is put back, not only the part the risk
+                    # manager took: a funding the risk manager REFUSED is
+                    # still in the position's net result, and this is the last
+                    # chance to carry it. Adding back only the reported part
+                    # would ERASE a refused funding here, and the loss would
+                    # disappear from the risk manager's PnL for good.
+                    #
+                    # A LIVE position never has funding (`check_funding` is
+                    # the paper executor's), so this is a no-op there.
+                    position.pnl += float(
+                        getattr(position, "funding_pnl_booked", 0.0) or 0.0
+                    )
                     # The GROSS result travels separately. The Trade row, the
                     # trader diary and the trade log store the gross result
                     # next to a SEPARATE commission field, and
@@ -11380,8 +11421,20 @@ class TradingController:
         )
 
         if position_to_process_copy:
+            # The paper executor may have already reported this
+            # position's FUNDING to the risk manager (a funding charge
+            # moves the wallet between the entry and the close), and
+            # `position.pnl` includes it. Reporting it again here would
+            # count the same money twice, so the already-reported part
+            # is subtracted. `getattr` keeps a position without the
+            # attribute working.
+            funding_already_reported = float(
+                getattr(position_to_process_copy, "funding_pnl_reported", 0.0) or 0.0
+            )
             await self.rm.update_trade_result(
-                symbol, position_to_process_copy.pnl, exit_reason=reason
+                symbol,
+                position_to_process_copy.pnl - funding_already_reported,
+                exit_reason=reason,
             )  # Global risk update
 
             # NEW: CREATE PHANTOM TRADE FOR BE ANALYSIS

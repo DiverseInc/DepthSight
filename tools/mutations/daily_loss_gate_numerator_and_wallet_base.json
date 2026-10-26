@@ -1,0 +1,254 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the daily-loss gate fix",
+    "(2026-10-24): the gate's NUMERATOR must be the wallet's day PnL, and",
+    "its DENOMINATOR must never be invented by a read.",
+    "",
+    "N1 is the ENTRY leg not being booked -- the exact origin/main defect.",
+    "The entry fill is charged a commission and the wallet is debited, but",
+    "nothing books it to the risk manager, so the gate's numerator is short",
+    "by every entry commission ever paid:",
+    "    RM loss = DB loss - entry commissions.",
+    "The daily-loss gate then reads LOW and under-trips (a true 8.2767% was",
+    "published as 6.17% against a 5% threshold).",
+    "",
+    "N2 is a fill booking the GROSS instead of the NET, so the wallet and the",
+    "risk manager are told different numbers for the same fill.",
+    "",
+    "N3 is the forced close not booking its leg at all. The forced close does",
+    "not go through `place_order`, so it has to book its own leg where its",
+    "money moved -- and it must do so BEFORE the notifier, which flips the",
+    "position to CLOSING (an exit leg is only booked while the position is",
+    "still OPEN).",
+    "",
+    "N4 is the paper balance READ creating a $10,000 wallet for an account",
+    "that has none. The risk manager then stamps that $10,000 as the day's",
+    "opening balance: 5% of $10,000 is $500 of tolerated loss against 5% of a",
+    "real ~$756.28 base = $37.81 -- a 13.2x disarm of the gate.",
+    "",
+    "N5 and N6 are the two GET routes creating a wallet. A read must never",
+    "create money.",
+    "",
+    "N7 is the destructive wallet reset no longer requiring an explicit",
+    "`reset=True`, so any caller could wipe a live balance.",
+    "",
+    "N8 is the startup re-derive writing the MID-DAY balance as today's",
+    "opening balance. The live balance already contains today's PnL, so",
+    "restating the day's loss against it measures the loss against a",
+    "denominator that contains it -- it reads LOW, which is the same shape of",
+    "defect as a base captured on another day. The base must stay UNKNOWN and",
+    "the gate must fail CLOSED instead.",
+    "",
+    "N9 is the ONE opening-balance writer overwriting a base that already",
+    "belongs to today. Today's opening balance is a fact about the start of",
+    "the day.",
+    "",
+    "N10 is the restore not invalidating an UNBACKED base that was written",
+    "BEFORE it. A base captured while the persisted state could not be READ",
+    "is a guess -- the balance may already contain today's PnL -- so a later",
+    "payload that refuses the persisted base must refuse the guess too.",
+    "",
+    "N11 is the EXIT leg being booked TWICE. Twice would make the daily-loss",
+    "gate over-trip on a loss the account did not make. It is here because a",
+    "test that never exercises the exit leg cannot catch it: the SL/TP exit",
+    "only happens when the market price falls through the stop, so a test",
+    "that rests a stop and leaves the market still never triggers it.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/daily_loss_gate_numerator_and_wallet_base.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "",
+    "N12 is the F3 hole: a process whose FIRST observation of the day is not",
+    "a UTC day transition capturing the live (MID-DAY) balance as today's",
+    "opening balance. An empty `last_known_day_str` means 'this process has",
+    "no known day yet', not 'the day changed': the live balance already",
+    "contains today's PnL, so installing it measures the day's loss against",
+    "a denominator that contains it. The review panel measured a gate",
+    "reading 0.0000% against a true 4.4188% loss, with trading ALLOWED.",
+    "",
+    "N13 is a previous-day payload NOT invalidating an unbacked base that is",
+    "already stamped with today's day key. A payload from a previous day",
+    "proves the account has traded, so today's opening balance is UNKNOWN",
+    "and an unbacked base stamped today must be dropped -- including the",
+    "guess captured while the persisted state could not be read.",
+    "",
+    "N16 is every opening balance counting as unbacked, so a base this",
+    "process VOUCHED for (captured at a genuine UTC rollover, captured for",
+    "an account that had never traded, restored from a payload that says it",
+    "belongs to today) is thrown away when a later payload arrives. That",
+    "blocks a healthy account for the rest of the day for no gain",
+    "",
+    "N14 is the finalization counting the FUNDING a second time. The funding",
+    "is reported to the risk manager the moment it is charged (the wallet",
+    "moved then), and it is part of the position's booked PnL, so the close",
+    "would count it twice without subtracting the already-reported part.",
+    "",
+    "N15 is the funding never being reported to the risk manager at all: the",
+    "wallet is debited and the gate never hears about it, so the daily-loss",
+    "guard cannot see a loss that has already happened.",
+    "",
+    "N17 REVERTS the funding booking: the funding is charged to the wallet",
+    "but never booked onto the position's PnL, so the close reports a net",
+    "result that does not include the money the wallet actually moved.",
+    "",
+    "N18 is the close subtracting the already-reported funding even when it",
+    "was NEVER reported (the risk manager refused it). The funding would",
+    "then be taken out of the risk manager's PnL entirely -- the loss",
+    "disappears instead of being counted once.",
+    "",
+    "N19 is the GENUINE UTC rollover capture being disabled: the day transition",
+    "this process observed no longer installs the new day's opening balance,",
+    "so the base stays UNKNOWN and the gate never recovers a denominator. This",
+    "is the positive half of the base's identity: refusing to guess on a fresh",
+    "start is only safe if the real transition DOES install the right base.",
+    "",
+    "N20 is the FIRST-BOOT capture being disabled: an account that has never",
+    "traded no longer gets an opening balance either, so nothing can ever",
+    "measure a day against a denominator it can vouch for.",
+    "",
+    "N21 is the RECOMPUTE close not adding the funding back at all. That close",
+    "rebuilds position.pnl from the fill prices and the commissions, so the",
+    "funding has to be put back by hand; without it the money the wallet paid",
+    "is erased from the position and never reaches the risk manager.",
+    "",
+    "N22 is the BOOKED funding not being tracked, so the recompute close has",
+    "nothing to add back and the funding is lost the same way."
+  ],
+  "pytest_target": "tests/test_paper_daily_loss_gate_numerator.py tests/test_daily_loss_base_is_current_day.py tests/test_daily_loss_base_previous_day_payload.py tests/test_daily_loss_gate_reconciles_with_the_wallet.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "N1: the ENTRY leg is not booked to the risk manager",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n",
+      "replace": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=False\n                        )\n"
+    },
+    {
+      "label": "N2: a fill books the GROSS instead of the NET",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n",
+      "replace": "                        await self._book_fill_pnl_to_position(\n                            symbol, realized_pnl, is_entry_leg=not is_reducing_trade\n                        )\n"
+    },
+    {
+      "label": "N3: the forced close does not book its leg",
+      "file": "bot_module/paper_executor.py",
+      "needle": "        await self._book_fill_pnl_to_position(\n            symbol,\n            net_realized_pnl(realized_pnl, commission),\n            is_entry_leg=False,\n        )\n",
+      "replace": "        pass  # MUTATED: the forced close never books its leg\n"
+    },
+    {
+      "label": "N4: a balance READ creates a $10,000 wallet",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                logger.error(\n                    f\"[PaperExecutor] No paper wallet exists for user \"\n                    f\"{self.user_id}. The balance is UNKNOWN and no wallet is \"\n                    \"created by a read. The risk manager will fail closed \"\n                    \"until a wallet exists (POST /api/v1/account/paper/reset \"\n                    \"creates one).\"\n                )\n                return None\n",
+      "replace": "                wallet_assets = await crud.init_or_reset_paper_wallet(\n                    self.db, user_id=self.user_id\n                )\n"
+    },
+    {
+      "label": "N5: the portfolio GET creates a wallet",
+      "file": "api/routes/portfolio.py",
+      "needle": "        wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)\n        # A READ NEVER CREATES MONEY. A wallet-less account is reported with\n",
+      "replace": "        wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)\n        if not wallet_assets:\n            wallet_assets = await crud.init_or_reset_paper_wallet(\n                db, user_id=current_user.id\n            )\n            await db.commit()\n        # A READ NEVER CREATES MONEY. A wallet-less account is reported with\n"
+    },
+    {
+      "label": "N6: the paper account GET creates a wallet",
+      "file": "api/routes/account.py",
+      "needle": "    wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)\n\n    return {\"data\": wallet_assets}\n",
+      "replace": "    wallet_assets = await crud.get_paper_wallet(db, user_id=current_user.id)\n\n    if not wallet_assets:\n        wallet_assets = await crud.init_or_reset_paper_wallet(\n            db, user_id=current_user.id\n        )\n        await db.commit()\n\n    return {\"data\": wallet_assets}\n"
+    },
+    {
+      "label": "N7: the destructive wallet reset no longer needs an explicit opt-in",
+      "file": "api/crud.py",
+      "needle": "    if reset:\n        # Delete existing wallet entries for the user\n",
+      "replace": "    if True:\n        # Delete existing wallet entries for the user\n"
+    },
+    {
+      "label": "N8: the startup re-derive writes a mid-day balance as today's opening balance",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                # Leave the base unusable: a base captured on another day must\n                # not linger where something could read it, and an absent\n                # base must not be filled with a guess. `_daily_loss_base_is_usable()`\n                # therefore returns False and `_check_risk_limits()` closes the\n                # gate with `RISK_GUARD_BASE_UNKNOWN_REASON`.\n                self.stats.start_of_day_balance = 0.0\n                self.stats.start_of_day_day_str = \"\"\n",
+      "replace": "                self.stats.start_of_day_balance = self.stats.current_balance\n                self.stats.start_of_day_day_str = current_trading_day_str_utc_actual\n"
+    },
+    {
+      "label": "N9: the opening-balance writer overwrites a base that already belongs to today",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        if (\n            getattr(self.stats, \"start_of_day_day_str\", None) == day_str\n            and self.stats.start_of_day_balance > 1e-9\n        ):\n            return False\n",
+      "replace": "        if False:\n            return False\n"
+    },
+    {
+      "label": "N11: the SL/TP exit leg is DOUBLE-booked",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n",
+      "replace": "                        await self._book_fill_pnl_to_position(\n                            symbol, net_pnl, is_entry_leg=not is_reducing_trade\n                        )\n                        if is_reducing_trade:\n                            await self._book_fill_pnl_to_position(\n                                symbol, net_pnl, is_entry_leg=False\n                            )\n"
+    },
+    {
+      "label": "N10: the restore does not invalidate an UNBACKED base written before it",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            if (\n                getattr(self.stats, \"start_of_day_day_str\", None) == current_day_str\n                and self._opening_base_is_unbacked()\n            ):\n                logger.critical(\n                    \"[RiskGuard] Invalidating an opening balance that was \"\n",
+      "replace": "            if False:\n                logger.critical(\n                    \"[RiskGuard] Invalidating an opening balance that was \"\n"
+    },
+    {
+      "label": "N12: a first observation (no known previous day) captures the mid-day balance as today's base",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            if self.stats.last_known_day_str:\n                if self._write_start_of_day_base(\n                    self.stats.current_balance, current_day_str_utc\n                ):\n",
+      "replace": "            if True:\n                if self._write_start_of_day_base(\n                    self.stats.current_balance, current_day_str_utc\n                ):\n"
+    },
+    {
+      "label": "N13: a previous-day payload does not invalidate an UNBACKED base stamped today",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            if (\n                getattr(self.stats, \"start_of_day_day_str\", None) == current_day_str\n                and self._opening_base_is_unbacked()\n            ):\n                logger.critical(\n                    \"[RiskGuard] Invalidating the opening balance: the \"\n",
+      "replace": "            if False:\n                logger.critical(\n                    \"[RiskGuard] Invalidating the opening balance: the \"\n"
+    },
+    {
+      "label": "N16: every opening balance counts as unbacked, so a vouched-for base is dropped",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        provenance = getattr(self, \"_start_of_day_base_provenance\", None)\n        return provenance is None or provenance == \"unknown_history\"\n",
+      "replace": "        return True  # MUTATED: every base counts as unbacked\n"
+    },
+
+    {
+      "label": "N14: the finalization counts the funding a second time",
+      "file": "bot_module/controller.py",
+      "needle": "                position_to_process_copy.pnl - funding_already_reported,\n",
+      "replace": "                position_to_process_copy.pnl,\n"
+    },
+    {
+      "label": "N15: the funding is never reported to the risk manager",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                funding_reported = bool(await rm.apply_funding_pnl(symbol, amount))\n",
+      "replace": "                funding_reported = False  # MUTATED: the funding is never reported\n"
+    },
+    {
+      "label": "N17: the funding is never booked onto the position's PnL",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                position.pnl = previous_pnl + amount\n",
+      "replace": "                position.pnl = previous_pnl  # MUTATED: the funding is never booked\n"
+    },
+    {
+      "label": "N18: the close subtracts a funding that was never reported",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                if funding_reported:",
+      "replace": "                if True:  # MUTATED: subtracted even when it was never reported"
+    },
+    {
+      "label": "N19: the genuine UTC rollover capture is disabled",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            if self.stats.last_known_day_str:\n                if self._write_start_of_day_base(\n",
+      "replace": "            if False:  # MUTATED: the rollover capture is disabled\n                if self._write_start_of_day_base(\n"
+    },
+    {
+      "label": "N20: the first-boot capture is disabled",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        self._capture_first_boot_base(current_day_str_utc)\n",
+      "replace": "        pass  # MUTATED: the first-boot capture is disabled\n"
+    },
+    {
+      "label": "N21: the recompute close does not add the funding back",
+      "file": "bot_module/controller.py",
+      "needle": "                    position.pnl += float(\n                        getattr(position, \"funding_pnl_booked\", 0.0) or 0.0\n                    )\n",
+      "replace": "                    position.pnl += 0.0  # MUTATED: the funding is not added back\n"
+    },
+    {
+      "label": "N22: the booked funding is not tracked",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                position.funding_pnl_booked = float(\n                    getattr(position, \"funding_pnl_booked\", 0.0) or 0.0\n                ) + amount\n",
+      "replace": "                position.funding_pnl_booked = 0.0  # MUTATED: not tracked\n"
+    }
+  ]
+}

@@ -360,7 +360,14 @@ async def test_update_or_create_symbol_strategy_performance(db_session, test_use
 
 @pytest.mark.asyncio
 async def test_init_or_reset_paper_wallet(db_session, test_user):
-    """Tests creating and resetting a paper wallet."""
+    """Tests creating and resetting a paper wallet.
+
+    The RESET is destructive, so it now requires an explicit `reset=True`.
+    The default is create-if-absent: a wallet that already exists is returned
+    UNTOUCHED, because a caller that does not know it is resetting must never
+    be able to wipe a live balance. Only
+    `POST /api/v1/account/paper/reset` may destroy one.
+    """
     # 1. Initial creation
     wallet = await crud.init_or_reset_paper_wallet(db_session, user_id=test_user.id)
     await db_session.commit()
@@ -373,8 +380,21 @@ async def test_init_or_reset_paper_wallet(db_session, test_user):
     wallet[0].balance = 5000.0
     await db_session.commit()
 
-    reset_wallet = await crud.init_or_reset_paper_wallet(
+    # 2a. WITHOUT the explicit opt-in, an existing wallet is left alone.
+    untouched = await crud.init_or_reset_paper_wallet(
         db_session, user_id=test_user.id, initial_balance=15000.0
+    )
+    await db_session.commit()
+
+    assert len(untouched) == 1
+    assert untouched[0].balance == 5000.0, (
+        "the default path re-seeded an existing wallet: only an explicit "
+        "`reset=True` may destroy a live balance"
+    )
+
+    # 2b. WITH the explicit opt-in, the wallet is reset.
+    reset_wallet = await crud.init_or_reset_paper_wallet(
+        db_session, user_id=test_user.id, initial_balance=15000.0, reset=True
     )
     await db_session.commit()
 
