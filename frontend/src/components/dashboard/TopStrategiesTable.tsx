@@ -213,10 +213,17 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 										</Badge>
 									</TableCell>
 									<TableCell
-										className={`text-right font-medium mono ${strategy.pnl >= 0 ? "text-profit" : "text-loss"}`}
+										className={`text-right font-medium mono ${
+											strategy.pnl == null
+											? "text-muted-foreground"
+											: strategy.pnl >= 0
+												? "text-profit"
+												: "text-loss"
+										}`}
 									>
-										{strategy.pnl >= 0 ? "+" : ""}
-										{strategy.pnl.toFixed(2)}
+										{strategy.pnl == null
+											? "—"
+											: `${strategy.pnl >= 0 ? "+" : ""}${strategy.pnl.toFixed(2)}`}
 									</TableCell>
 									<TableCell className="text-right text-sm text-muted-foreground">
 										{calculateRuntime(strategy.started_at)}

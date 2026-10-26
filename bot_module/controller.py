@@ -4548,6 +4548,67 @@ class TradingController:
             "emergency_stop_source": emergency_stop_source,
         }
 
+    async def _fetch_strategy_pnl_aggregates(
+        self, config_ids: List[str]
+    ) -> Optional[Dict[Tuple[str, str], Dict[str, Any]]]:
+        """The TRUE realized PnL of every running strategy, in ONE query.
+
+        WHY THE RISK MANAGER LEDGER CANNOT ANSWER THIS
+        ---------------------------------------------
+        The publisher used to ask
+        `self.rm.get_pnl_for_strategy(symbol=None, strategy_name=instance.NAME)`.
+        That ledger is keyed `(symbol, strategy_name)`, so the
+        `(None, class_name)` key it looked up could never exist: it
+        returned 0.0 for EVERY strategy, on EVERY mode -- which is exactly
+        what production showed on 2026-10-25 (two running strategies, both
+        `pnl=0.0`). The money was in the trades table the whole time: the
+        first strategy had realized -5689.15 over the 89 rows whose
+        `is_final_exit` is true. (Read by its other flag -- the 90 rows
+        whose `exit_type` says FINAL* -- the same book is -5690.86; the two
+        differ by exactly one row, trade id 941.)
+
+        Even if the key had matched, it could not have been right:
+          * `instance.NAME` is the strategy CLASS name, so every
+            visual-builder strategy asks for the SAME bucket;
+          * the ledger carries no trading mode, so paper and live share it;
+          * it is a session/symbol ledger, not a per-strategy one.
+
+        The DB `trades` table is the authoritative record: the paper
+        wallet is credited `row.pnl - row.commission` for every row, and
+        the final-exit rows carry the strategy's realized result.
+
+        PERFORMANCE
+        -----------
+        ONE aggregate query per publish cycle, whatever the number of
+        strategies -- never one query per strategy. Returns None when the
+        numbers are UNKNOWN (the database is unreachable), so the caller
+        can publish "unknown" instead of a false 0.0.
+        """
+        if not config_ids:
+            return {}
+
+        try:
+            # Owned session: the same idiom as every other session read in
+            # this controller. `async for db in session_gen:` abandons the
+            # generator when the body returns, so the transaction stays OPEN
+            # and the pooled connection stays checked out until the garbage
+            # collector happens to finalise it -- at fleet scale that is what
+            # drained the pool. This session is released either way.
+            async with self._owned_session() as db:
+                return await crud.get_strategy_realized_pnl_aggregates(
+                    db,
+                    user_id=self.user_id,
+                    strategy_config_ids=[str(c) for c in config_ids],
+                )
+        except Exception as e_pnl:
+            logger.error(
+                f"[PublishState:User{self.user_id}] Could not read the realized "
+                f"PnL of the running strategies: {e_pnl}. The published PnL "
+                f"will be reported as unknown rather than as 0.0.",
+                exc_info=True,
+            )
+            return None
+
     async def _publish_state_to_redis(self):
         """
         Collects data on running strategies, active positions, and the OVERALL portfolio state,
@@ -4695,6 +4756,18 @@ class TradingController:
         async with self.instances_lock:
             instances_copy = dict(self.running_strategy_instances)
 
+        # ONE aggregate query for the whole cycle: the realized PnL of every
+        # running strategy, keyed by (config id, mode). Never one query per
+        # strategy -- the publisher runs on a 2-second loop.
+        pnl_aggregates = await self._fetch_strategy_pnl_aggregates(
+            list(instances_copy.keys())
+        )
+        # None means "the numbers are unknown" (the database is unreachable).
+        # Publishing 0.0 in that case would be a LIE -- the same lie this
+        # whole fix exists to remove -- so the strategies report an unknown
+        # PnL instead of a fake break-even.
+        pnl_known = pnl_aggregates is not None
+
         for config_id, (instance, config_dict) in instances_copy.items():
             symbols_str = "Dynamic (All)"
             # FIXED and STATIC are BOTH explicit-symbol modes
@@ -4709,10 +4782,27 @@ class TradingController:
                 symbols_list = config_dict.get("symbols") or []
                 symbols_str = ", ".join(symbols_list) if symbols_list else "None"
 
-            # Strategy PnL = Realized (from RM) + Unrealized (from current positions)
-            realized_pnl = self.rm.get_pnl_for_strategy(
-                symbol=None, strategy_name=instance.NAME
+            # The realized PnL of THIS strategy: its own config id and its own
+            # trading mode, read from the authoritative trades table. The
+            # strategy CLASS name is NOT an identity -- every visual-builder
+            # strategy shares "VisualBuilderStrategy", so keying on it gave
+            # every strategy the same (always 0.0) number.
+            #
+            # FAIL CLOSED on an unknown mode. A payload whose mode is missing
+            # or is not one of the two books must NOT be pointed at the live
+            # book: that would report live money as if it were the strategy's
+            # own. An unknown book means an unknown number.
+            _strategy_mode = str(config_dict.get("mode") or "").strip().lower()
+            _mode_known = _strategy_mode in ("live", "paper")
+            _agg = (
+                (pnl_aggregates or {}).get((str(config_id), _strategy_mode.upper()))
+                if (pnl_known and _mode_known)
+                else None
             )
+            _numbers_known = pnl_known and _mode_known
+            realized_pnl = float(_agg["realized_net"]) if _agg else 0.0
+            finalized_trade_count = int(_agg["finalized_count"]) if _agg else 0
+            net_cash_flow = float(_agg["net_cash_flow"]) if _agg else 0.0
 
             unrealized_pnl_strat = 0.0
             instance_open_positions = 0
@@ -4756,7 +4846,31 @@ class TradingController:
                     instance_open_positions, _cannot_trade_reason
                 ),
                 "status_detail": _cannot_trade_reason,
-                "pnl": round(total_instance_pnl, 4),
+                # `pnl` keeps its meaning: what the strategy is worth RIGHT
+                # NOW = the money it realized (from the trades table) plus
+                # what its open positions are worth. The realized part used
+                # to come from a RiskManager lookup that could never hit, so
+                # it was always 0.0; the breakdown is published next to it
+                # so the number can be checked.
+                "pnl": (
+                    round(total_instance_pnl, 4) if _numbers_known else None
+                ),
+                "realized_pnl": (
+                    round(realized_pnl, 4) if _numbers_known else None
+                ),
+                "unrealized_pnl": round(unrealized_pnl_strat, 4),
+                # How many trades produced the realized number.
+                "trade_count": (finalized_trade_count if _numbers_known else None),
+                # The strategy's WHOLE effect on the wallet: every trade row
+                # of this config id and mode, so EVERY commission it paid --
+                # the entry commission of a closed trade as well as the
+                # commission of a position that was never closed -- and the
+                # PnL of the partial exits. It differs from `realized_pnl`
+                # by those, and both are published so the user sees the
+                # whole picture.
+                "net_cash_flow": (
+                    round(net_cash_flow, 4) if _numbers_known else None
+                ),
                 "open_positions": instance_open_positions,
                 "started_at": config_dict.get(
                     "started_at", datetime.now(timezone.utc).isoformat()
