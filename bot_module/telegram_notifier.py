@@ -1443,11 +1443,26 @@ class TelegramNotifier:
 
                 # Update DB
                 db_gen = get_db_gen()
-                async with await anext(db_gen) as db:
-                    await crud.update_user_telegram_chat_id(
-                        db, user_id=user_id, chat_id=chat_id, username=username
-                    )
-                    await db.commit()
+                try:
+                    async with await anext(db_gen) as db:
+                        await crud.update_user_telegram_chat_id(
+                            db, user_id=user_id, chat_id=chat_id, username=username
+                        )
+                        await db.commit()
+                finally:
+                    # Close the generator, not just the session: `get_db` holds
+                    # an `async with AsyncSessionLocal()` that owns the pooled
+                    # connection, and leaving it suspended keeps the
+                    # transaction OPEN until the garbage collector finalises
+                    # it. This is the same defect class as the controller's
+                    # abandoned sessions.
+                    try:
+                        await db_gen.aclose()
+                    except Exception as e_close:
+                        logger.warning(
+                            f"Telegram DB session close failed: {e_close}",
+                            exc_info=True,
+                        )
 
                 # Success
                 await self.bot.reply_to(

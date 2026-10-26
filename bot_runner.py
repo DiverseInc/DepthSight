@@ -805,6 +805,27 @@ async def _run_command_listener(
     pubsub = redis_client.pubsub()
     await pubsub.subscribe(config.REDIS_COMMAND_CHANNEL)
 
+    # The listener reads with its OWN session.
+    #
+    # The `db` handed in here is the shard's SHARED session: the paper
+    # executor (bot_module/paper_executor.py:81) and the risk manager write
+    # through it, and they FLUSH now and COMMIT later (the wallet credit at
+    # paper_executor.py:275 is flushed, then an await on Redis happens at
+    # :280, and only paper_executor.py:422 commits it). Rolling THAT session
+    # back from the listener would discard those pending writes - a paper
+    # wallet balance credit, a trade row, or a risk-guard update that was
+    # already flushed but not yet committed. Upstream can roll the shared
+    # session back because upstream gives every controller its own session
+    # (upstream bot_runner.py `_controller_session()`); this fork still
+    # shares one, so the listener must not touch it.
+    #
+    # A private session gives the listener the release upstream's rollback
+    # provides: the read's transaction ends after every command, so the
+    # connection goes back to the pool instead of being pinned for the whole
+    # run - and it cannot discard anybody else's work.
+    listener_db_gen = get_db()
+    listener_db = await anext(listener_db_gen)
+
     while True:
         try:
             message = await pubsub.get_message(
@@ -841,9 +862,11 @@ async def _run_command_listener(
                                 )
                                 continue
 
-                            user = await crud.get_user_by_id(db, user_id=user_id)
+                            user = await crud.get_user_by_id(
+                                listener_db, user_id=user_id
+                            )
                             api_key_obj = await crud.get_api_key_by_id(
-                                db, user_id=user_id, key_id=api_key_id
+                                listener_db, user_id=user_id, key_id=api_key_id
                             )
 
                             if user and api_key_obj:
@@ -984,6 +1007,21 @@ async def _run_command_listener(
                     logger.error(f"Failed to parse command message: {e}")
                 except Exception as e:
                     logger.error(f"Error processing command: {e}", exc_info=True)
+                finally:
+                    # The listener session only reads, and a read opens a
+                    # transaction that is never closed - pinning one server
+                    # connection per worker for the whole run. Roll the
+                    # listener's OWN session back after every command so the
+                    # connection goes back. It must be the listener's own
+                    # session: rolling the shard's shared session back here
+                    # would discard the paper executor's and the risk
+                    # manager's flushed-but-not-yet-committed writes.
+                    try:
+                        await listener_db.rollback()
+                    except Exception as e_rel:
+                        logger.debug(
+                            f"Command listener session release failed: {e_rel}"
+                        )
 
         except asyncio.CancelledError:
             logger.info("Bot runner command listener task cancelled.")
@@ -992,7 +1030,17 @@ async def _run_command_listener(
             logger.error(f"Error in bot runner command listener: {e}", exc_info=True)
             await asyncio.sleep(5)
 
-    await pubsub.unsubscribe(config.REDIS_COMMAND_CHANNEL)
+    try:
+        await pubsub.unsubscribe(config.REDIS_COMMAND_CHANNEL)
+    finally:
+        # Close the listener's own session: the generator's exit path releases
+        # the connection it holds. A rollback does NOT release the connection
+        # - only the generator's close does - so this must run even when the
+        # unsubscribe fails, or the connection stays pinned until the GC.
+        try:
+            await listener_db_gen.aclose()
+        except Exception as e_close:
+            logger.debug(f"Command listener session close failed: {e_close}")
     logger.info("Bot runner command listener stopped.")
 
 
