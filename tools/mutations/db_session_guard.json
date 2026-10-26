@@ -86,8 +86,8 @@
     {
       "label": "GAP3: a close that may never run hides the leak",
       "file": "tools/db_session_guard.py",
-      "needle": "            cond = conditional\n",
-      "replace": "            cond = False  # MUTANT: the close only has to EXIST, not run\n"
+      "needle": "                if isinstance(child, (ast.If, ast.For, ast.AsyncFor, ast.While))\n",
+      "replace": "                if False  # MUTANT: the close only has to EXIST, not run\n"
     },
     {
       "label": "GAP2: the asend acquisition is no longer matched",
@@ -104,7 +104,7 @@
     {
       "label": "GAP2: the walrus binding is not read",
       "file": "tools/db_session_guard.py",
-      "needle": "        elif isinstance(node, ast.NamedExpr):\n            if isinstance(node.target, ast.Name) and node.target.id == name:\n                found = node.value\n",
+      "needle": "        elif isinstance(node, ast.NamedExpr):\n            if isinstance(node.target, ast.Name) and node.target.id == name:\n                value = node.value\n",
       "replace": "        elif isinstance(node, ast.NamedExpr):\n            pass  # MUTANT: the walrus binding is not read\n"
     },
     {
@@ -118,6 +118,36 @@
       "file": "tools/db_session_guard.py",
       "needle": "    failures: List[str] = []\n    for path in scanned_files(repo):\n",
       "replace": "    failures: List[str] = []\n    return failures  # MUTANT: parse failures are swallowed\n    for path in scanned_files(repo):\n"
+    },
+    {
+      "label": "GAP2: a close late in a try body is treated as unconditional",
+      "file": "tools/db_session_guard.py",
+      "needle": "                visit(stmt, conditional if index == 0 else True)\n",
+      "replace": "                visit(stmt, conditional)  # MUTANT: a late close in a try body counts\n"
+    },
+    {
+      "label": "GAP2: a loop that leaves early is no longer matched",
+      "file": "tools/db_session_guard.py",
+      "needle": "            if not (\n                _body_may_exit_early(node.body)\n                or _loop_var_is_used_as_session(target, node.body)\n            ):\n                continue\n",
+      "replace": "            if not _loop_var_is_used_as_session(target, node.body):\n                continue  # MUTANT: a loop that leaves early is not matched\n"
+    },
+    {
+      "label": "GAP2: an attribute-bound generator walked with async for is not matched",
+      "file": "tools/db_session_guard.py",
+      "needle": "            if (\n                isinstance(it, ast.Attribute)\n                and isinstance(it.value, ast.Name)\n                and it.value.id == \"self\"\n            ):\n                bound = _bound_attr_value(it.attr, scope, before=node.lineno)\n                if bound is not None and _is_factory_call(bound, scope):\n                    findings.append(f\"{path}:{node.lineno}\")\n",
+      "replace": "            if False:  # MUTANT: the attribute-bound generator is not matched\n                bound = _bound_attr_value(it.attr, scope, before=node.lineno)\n                if bound is not None and _is_factory_call(bound, scope):\n                    findings.append(f\"{path}:{node.lineno}\")\n"
+    },
+    {
+      "label": "GAP3: a close of a DIFFERENT generator hides the leak",
+      "file": "tools/db_session_guard.py",
+      "needle": "                if binding is not None and lineno is not None:\n                    # The close must refer to the same generator.\n                    same = _resolve_generator_at(gen_expr, scope, lineno)\n                    if same is not None and same is not binding:\n                        return\n",
+      "replace": "                if False:  # MUTANT: the close may refer to another generator\n                    pass\n"
+    },
+    {
+      "label": "GAP3: a close BEFORE the acquisition hides the leak",
+      "file": "tools/db_session_guard.py",
+      "needle": "                and (after is None or (lineno is not None and lineno > after))\n",
+      "replace": "                and True  # MUTANT: a close before the acquisition counts\n"
     }
   ]
 }

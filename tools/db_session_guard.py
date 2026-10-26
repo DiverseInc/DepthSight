@@ -247,26 +247,34 @@ def _bound_value(
     and a tuple target binds element-wise.
     """
     found: Optional[ast.AST] = None
+    found_lineno = -1
     for node in _own_nodes(scope):
         lineno = getattr(node, "lineno", None)
         if before is not None and (lineno is None or lineno > before):
             continue
+        value: Optional[ast.AST] = None
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, (ast.Tuple, ast.List)) and isinstance(
                     node.value, (ast.Tuple, ast.List)
                 ):
-                    for element, value in zip(target.elts, node.value.elts):
+                    for element, val in zip(target.elts, node.value.elts):
                         if _target_holds(element, name):
-                            found = value
+                            value = val
                 elif _target_holds(target, name):
-                    found = node.value
+                    value = node.value
         elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name) and node.target.id == name:
-                found = node.value
+                value = node.value
         elif isinstance(node, ast.NamedExpr):
             if isinstance(node.target, ast.Name) and node.target.id == name:
-                found = node.value
+                value = node.value
+        # The binding that was in effect at the use is the LAST one before
+        # it. Taking the first one found instead would let a later
+        # rebinding hide the acquisition.
+        if value is not None and lineno is not None and lineno > found_lineno:
+            found = value
+            found_lineno = lineno
     return found
 
 
@@ -384,8 +392,26 @@ def _loop_var_is_used_as_session(target: ast.AST, body: List[ast.stmt]) -> bool:
     return False
 
 
+def _body_may_exit_early(body: List[ast.stmt]) -> bool:
+    """Can the loop leave early, abandoning the generator?
+
+    A `break`, a `return`, a `raise` or an `await` inside the body can all
+    leave the generator suspended at its `yield`, with the `async with
+    AsyncSessionLocal()` inside it still OPEN. That is the leak, and it does
+    NOT depend on whether the loop variable is used - `async for db in
+    factory(): break` leaks with `db` never touched.
+
+    A body that exhausts the generator normally is safe: the generator
+    resumes, its `async with` exits, and the connection goes back.
+    """
+    for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+        if isinstance(node, (ast.Break, ast.Return, ast.Raise, ast.Await)):
+            return True
+    return False
+
+
 def _rule_a(tree: ast.AST, path: str) -> List[str]:
-    """`async for` over a factory, where the loop var is used as a session."""
+    """`async for` over a factory, where the loop can leave early."""
     findings: List[str] = []
     for scope in _function_scopes(tree):
         for node in _own_nodes(scope):
@@ -394,7 +420,10 @@ def _rule_a(tree: ast.AST, path: str) -> List[str]:
             target = node.target
             if not isinstance(target, ast.Name):
                 continue
-            if not _loop_var_is_used_as_session(target, node.body):
+            if not (
+                _body_may_exit_early(node.body)
+                or _loop_var_is_used_as_session(target, node.body)
+            ):
                 continue
             it = node.iter
             if _is_factory_call(it, scope):
@@ -404,16 +433,59 @@ def _rule_a(tree: ast.AST, path: str) -> List[str]:
                 bound = _resolved_bound_value(it.id, scope, before=node.lineno)
                 if bound is not None and _is_factory_call(bound, scope):
                     findings.append(f"{path}:{node.lineno}")
+                continue
+            if (
+                isinstance(it, ast.Attribute)
+                and isinstance(it.value, ast.Name)
+                and it.value.id == "self"
+            ):
+                bound = _bound_attr_value(it.attr, scope, before=node.lineno)
+                if bound is not None and _is_factory_call(bound, scope):
+                    findings.append(f"{path}:{node.lineno}")
     return findings
 
 
-def _generator_is_closed(gen_expr: ast.AST, scope: ast.AST) -> bool:
+def _resolve_generator_at(
+    gen_expr: ast.AST, scope: ast.AST, before: int
+) -> Optional[ast.AST]:
+    """What the generator expression is bound to just before line `before`.
+
+    Used to check that a close refers to the SAME generator as the
+    acquisition: `gen = get_db(); db = await anext(gen); gen = other();
+    await gen.aclose()` closes `other`, not the generator that leaked.
+    """
+    if isinstance(gen_expr, ast.Name):
+        return _resolved_bound_value(gen_expr.id, scope, before=before)
+    if (
+        isinstance(gen_expr, ast.Attribute)
+        and isinstance(gen_expr.value, ast.Name)
+        and gen_expr.value.id == "self"
+    ):
+        return _bound_attr_value(gen_expr.attr, scope, before=before)
+    return None
+
+
+def _generator_is_closed(
+    gen_expr: ast.AST,
+    scope: ast.AST,
+    after: Optional[int] = None,
+    binding: Optional[ast.AST] = None,
+) -> bool:
     """Is the generator closed on the path that actually runs?
 
     A close inside `if cond:`, inside a loop body or inside an `except`
     handler may never execute, and a close that may never execute closes
     nothing. A close in a `finally:` always runs, and so does one in the
     body of the function.
+
+    A close in the body of a `try:` only runs if nothing before it in that
+    body raised, so only the FIRST statement of the try body is guaranteed
+    to reach its close.
+
+    `after` is the line of the acquisition: a close BEFORE the acquisition
+    closes nothing. `binding` is what the generator was bound to at the
+    acquisition: a close that refers to a DIFFERENT binding closes
+    something else.
     """
     found = False
 
@@ -421,37 +493,60 @@ def _generator_is_closed(gen_expr: ast.AST, scope: ast.AST) -> bool:
         nonlocal found
         if found:
             return
+
+        if isinstance(node, ast.Try):
+            for index, stmt in enumerate(node.body):
+                # Only the FIRST statement of the try body is guaranteed to
+                # run: anything before a later close can raise and skip it.
+                visit(stmt, conditional if index == 0 else True)
+            for handler in node.handlers:
+                for stmt in handler.body:
+                    visit(stmt, True)
+            for stmt in node.orelse:
+                visit(stmt, True)
+            # A `finally` runs whenever the try block is ENTERED, so when
+            # the acquisition is inside that try, the finally runs after it
+            # and the close is unconditional.
+            inside = after is not None and any(
+                getattr(stmt, "lineno", None) is not None
+                and getattr(stmt, "lineno", 0) <= after <= getattr(stmt, "end_lineno", 0)
+                for stmt in node.body
+            )
+            for stmt in node.finalbody:
+                visit(stmt, False if inside else conditional)
+            return
+
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for stmt in node.body:
+                visit(stmt, True)
+            return
+
+        if isinstance(node, ast.Call):
+            callee = node.func
+            lineno = getattr(node, "lineno", None)
+            if (
+                isinstance(callee, ast.Attribute)
+                and callee.attr == "aclose"
+                and _same_expr(callee.value, gen_expr)
+                and not conditional
+                and (after is None or (lineno is not None and lineno > after))
+            ):
+                if binding is not None and lineno is not None:
+                    # The close must refer to the same generator.
+                    same = _resolve_generator_at(gen_expr, scope, lineno)
+                    if same is not None and same is not binding:
+                        return
+                found = True
+                return
+
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
-            cond = conditional
-            if isinstance(child, (ast.If, ast.For, ast.AsyncFor, ast.While)):
-                cond = True
-            elif isinstance(child, ast.Try):
-                for stmt in child.body:
-                    visit(stmt, cond)
-                for handler in child.handlers:
-                    for stmt in handler.body:
-                        visit(stmt, True)
-                for stmt in child.orelse:
-                    visit(stmt, True)
-                for stmt in child.finalbody:
-                    visit(stmt, cond)
-                continue
-            elif isinstance(child, (ast.With, ast.AsyncWith)):
-                for stmt in child.body:
-                    visit(stmt, True)
-                continue
-            if isinstance(child, ast.Call):
-                callee = child.func
-                if (
-                    isinstance(callee, ast.Attribute)
-                    and callee.attr == "aclose"
-                    and _same_expr(callee.value, gen_expr)
-                    and not cond
-                ):
-                    found = True
-                    return
+            cond = (
+                True
+                if isinstance(child, (ast.If, ast.For, ast.AsyncFor, ast.While))
+                else conditional
+            )
             visit(child, cond)
 
     visit(scope, False)
@@ -499,7 +594,7 @@ def _rule_b(tree: ast.AST, path: str) -> List[str]:
                 # Not a generator this rule can recognise (a parameter, an
                 # object with `__anext__`). Not the shape this rule is about.
                 continue
-            if _generator_is_closed(gen_expr, scope):
+            if _generator_is_closed(gen_expr, scope, after=node.lineno, binding=bound):
                 continue
             findings.append(f"{path}:{node.lineno}")
     return findings

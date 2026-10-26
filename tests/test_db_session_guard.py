@@ -200,6 +200,63 @@ async def handler(self):
     config = await crud.get_config(db, user_id=self.user_id)
 """
 
+# The loop leaves early and never touches the session. The leak does not
+# depend on the loop variable being used.
+LEAK_EARLY_EXIT_UNUSED_VARIABLE = """
+async def handler(self):
+    async for db in self.get_db_session():
+        break
+"""
+
+# The loop exhausts the generator: the generator resumes, its `async with`
+# exits, and the connection goes back. Not a leak.
+EXHAUSTS_THE_GENERATOR = """
+async def handler(self):
+    async for db in self.get_db_session():
+        pass
+"""
+
+# The generator is held on the object and walked with `async for`.
+LEAK_ATTRIBUTE_BOUND_ASYNC_FOR = """
+async def handler(self):
+    self.db_gen = get_db()
+    async for db in self.db_gen:
+        await crud.get_config(db, user_id=self.user_id)
+"""
+
+# A close in the body of a `try:` is skipped when the statement before it
+# raises.
+CLOSED_LATE_IN_A_TRY_BODY = """
+async def handler(self):
+    db_gen = get_db()
+    db = await anext(db_gen)
+    try:
+        await something()
+        await db_gen.aclose()
+    except Exception:
+        pass
+"""
+
+# A close BEFORE the acquisition closes nothing.
+CLOSED_BEFORE_THE_ACQUISITION = """
+async def handler(self):
+    db_gen = get_db()
+    await db_gen.aclose()
+    db = await anext(db_gen)
+    config = await crud.get_config(db, user_id=self.user_id)
+"""
+
+# The name is rebound before the close, so the close refers to a DIFFERENT
+# generator than the one that was acquired.
+CLOSED_A_DIFFERENT_GENERATOR = """
+async def handler(self):
+    gen = get_db()
+    db = await anext(gen)
+    gen = something_else()
+    await gen.aclose()
+    config = await crud.get_config(db, user_id=self.user_id)
+"""
+
 # A loop that has nothing to do with the database.
 NOT_A_SESSION = """
 async def handler(websocket):
@@ -427,6 +484,49 @@ def test_the_rule_does_not_let_a_conditional_close_hide_a_leak():
     offenders = find_offenders_in_source(CLOSED_ONLY_CONDITIONALLY)
     assert len(offenders) == 1, offenders
     assert offenders[0].endswith(":4"), offenders
+
+
+def test_the_rule_flags_a_loop_that_leaves_early():
+    """The leak does not depend on the loop variable being used.
+
+    `async for db in factory(): break` abandons the generator with `db`
+    never touched.
+    """
+    assert find_offenders_in_source(LEAK_EARLY_EXIT_UNUSED_VARIABLE), (
+        "the rule missed a loop that leaves early"
+    )
+
+
+def test_the_rule_does_not_flag_a_loop_that_exhausts_the_generator():
+    """A body that exhausts the generator releases the connection."""
+    assert not find_offenders_in_source(EXHAUSTS_THE_GENERATOR), (
+        "the rule flagged a loop that exhausts the generator"
+    )
+
+
+def test_the_rule_flags_an_attribute_bound_generator_in_an_async_for():
+    """`async for db in self.db_gen:` - the generator is on the object."""
+    assert find_offenders_in_source(LEAK_ATTRIBUTE_BOUND_ASYNC_FOR), (
+        "the rule missed an attribute-bound generator walked with async for"
+    )
+
+
+def test_the_rule_does_not_let_a_late_close_in_a_try_body_hide_a_leak():
+    """A close in a try body is skipped when the statement before it raises."""
+    offenders = find_offenders_in_source(CLOSED_LATE_IN_A_TRY_BODY)
+    assert len(offenders) == 1, offenders
+
+
+def test_the_rule_does_not_let_a_close_before_the_acquisition_hide_a_leak():
+    """A close before the acquisition closes nothing."""
+    offenders = find_offenders_in_source(CLOSED_BEFORE_THE_ACQUISITION)
+    assert len(offenders) == 1, offenders
+
+
+def test_the_rule_does_not_let_a_close_of_another_generator_hide_a_leak():
+    """The name is rebound, so the close refers to a different generator."""
+    offenders = find_offenders_in_source(CLOSED_A_DIFFERENT_GENERATOR)
+    assert len(offenders) == 1, offenders
 
 
 def test_the_guard_reports_files_it_cannot_parse(tmp_path):
