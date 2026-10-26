@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     Enum,
+    Index,
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -359,6 +360,22 @@ class ApiKey(Base):
 
 class Trade(Base):
     __tablename__ = "trades"
+
+    # The per-strategy realized PnL aggregate the state publisher runs is
+    # shaped exactly like this: one user, a set of strategy config ids, a
+    # trading mode, and the finalized flag. The single-column indexes alone
+    # force that query to filter off the heap; this composite index is the
+    # one it can actually use.
+    # (Migration: alembic/versions/b2c3d4e5f6a7_add_trades_strategy_pnl_index.py)
+    __table_args__ = (
+        Index(
+            "ix_trades_user_config_mode_final",
+            "user_id",
+            "strategy_config_id",
+            "trade_mode",
+            "is_final_exit",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)

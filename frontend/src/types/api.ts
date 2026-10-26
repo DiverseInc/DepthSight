@@ -66,6 +66,22 @@ export interface StrategyData {
 	 */
 	status_detail?: string | null;
 	pnl: number;
+	/**
+	 * The breakdown of `pnl`, so the number can be checked instead of taken
+	 * on faith. `realized_pnl` is the money the strategy actually kept
+	 * (finalized trades, net of commission) for THIS config id and THIS
+	 * trading mode. Null means unknown -- never a fake 0.0.
+	 */
+	realized_pnl?: number | null;
+	unrealized_pnl?: number | null;
+	/** How many finalized trades produced `realized_pnl`. */
+	trade_count?: number | null;
+	/**
+	 * The strategy's whole effect on the wallet, entry commissions included.
+	 * It differs from `realized_pnl` by the commissions of positions that
+	 * were opened and never closed.
+	 */
+	net_cash_flow?: number | null;
 	open_positions: number;
 	started_at: string;
 	params: Record<string, unknown>;

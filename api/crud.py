@@ -1876,6 +1876,110 @@ async def create_trade(
         raise
 
 
+async def get_strategy_realized_pnl_aggregates(
+    db: AsyncSession,
+    user_id: int,
+    strategy_config_ids: List[str],
+    trade_modes: Optional[List[str]] = None,
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """The TRUE realized PnL of many strategies, in ONE aggregate query.
+
+    THE DEFECT THIS REPLACES
+    -----------------------
+    The state publisher asked the RiskManager for
+    `get_pnl_for_strategy(symbol=None, strategy_name=instance.NAME)`. That
+    ledger is keyed `(symbol, strategy_name)`, so the `(None, class_name)`
+    key it looked up could never exist -- the published PnL was 0.0 for
+    every strategy, on every mode. It also could not have been right even
+    if it had hit: the class name is shared by every visual-builder
+    strategy, so it cannot tell two strategies apart, and it carries no
+    trading mode, so it cannot tell paper from live.
+
+    WHAT THIS RETURNS
+    -----------------
+    Keyed by `(strategy_config_id, trade_mode)` -- the strategy's identity
+    and its book, never its class name:
+
+      * `realized_net`      SUM(pnl - commission) over the FINALIZED rows
+                            (`is_final_exit IS TRUE`). This is the number
+                            the strategy card must show: the money the
+                            strategy actually kept.
+      * `finalized_count`   How many finalized trades produced it.
+      * `net_cash_flow`     SUM(pnl - commission) over EVERY row of that
+                            config id and mode -- the strategy's total
+                            effect on the wallet, entry commissions
+                            included. Published alongside `realized_net`
+                            so the user can reconcile the two.
+
+    `pnl` is stored GROSS and `commission` separately, on every row and in
+    both modes, so `pnl - commission` is the net result of that row and
+    summing it adds up to the cash the account actually moved.
+
+    WHY `is_final_exit` AND NOT `exit_type`
+    --------------------------------------
+    `is_final_exit` is the DB's boolean statement of "this row closed the
+    position", and it is written on EVERY path: the live trade row sets
+    it (bot_module/controller.py) and so does the paper executor.
+    `exit_type` is only written by the paper executor -- live rows leave
+    it NULL -- so a definition that reads `exit_type` would compute
+    nothing at all for live mode.
+
+    The two flags DISAGREE on exactly one production row (trade id 941:
+    `exit_type = FINAL_EXIT`, `is_final_exit = FALSE`, commission
+    1.70948467008). On the measured book that is the difference between
+    -5689.1548615014922809 (89 rows, the flag this function filters on)
+    and -5690.8643461715722809 (90 rows, the label). Both are published:
+    `realized_net` is the first, and the all-rows `net_cash_flow`
+    (-9356.1794634944660301) is the wallet's cash movement, so the whole
+    picture is visible. The flag disagreement itself is a separate defect
+    and is NOT fixed here.
+
+    PERFORMANCE
+    -----------
+    ONE query for the whole publish cycle, whatever the number of
+    strategies: it aggregates in the database and returns one row per
+    (config id, mode). It is never a per-strategy query.
+    """
+    if not strategy_config_ids:
+        return {}
+
+    # `pnl` and `commission` are NULLable, so a missing value must not
+    # poison the whole sum with NULL.
+    net_of_row = (
+        func.coalesce(models.Trade.pnl, 0.0) - func.coalesce(models.Trade.commission, 0.0)
+    )
+    is_final = models.Trade.is_final_exit.is_(True)
+
+    stmt = (
+        select(
+            models.Trade.strategy_config_id,
+            models.Trade.trade_mode,
+            func.sum(case((is_final, net_of_row), else_=0.0)).label("realized_net"),
+            func.sum(case((is_final, 1), else_=0)).label("finalized_count"),
+            func.sum(net_of_row).label("net_cash_flow"),
+        )
+        .where(
+            models.Trade.user_id == user_id,
+            models.Trade.strategy_config_id.in_(strategy_config_ids),
+        )
+        .group_by(models.Trade.strategy_config_id, models.Trade.trade_mode)
+    )
+    if trade_modes:
+        stmt = stmt.where(
+            models.Trade.trade_mode.in_([str(m).upper() for m in trade_modes])
+        )
+
+    result = await db.execute(stmt)
+    aggregates: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for config_id, trade_mode, realized_net, finalized_count, net_cash_flow in result.all():
+        aggregates[(str(config_id), str(trade_mode).upper())] = {
+            "realized_net": float(realized_net or 0.0),
+            "finalized_count": int(finalized_count or 0),
+            "net_cash_flow": float(net_cash_flow or 0.0),
+        }
+    return aggregates
+
+
 async def get_last_open_trade_for_symbol(
     db: AsyncSession, user_id: int, symbol: str
 ) -> Optional[models.Trade]:

@@ -1084,6 +1084,34 @@ class StrategyInfo(StrategyRunRequest):  # For response
     pnl: Optional[float] = Field(
         None, json_schema_extra={"example": 123.45}
     )  # Made Optional as it might not always be present
+    # The breakdown of `pnl`, published so the number can be checked instead
+    # of taken on faith. `realized_pnl` is the money the strategy actually
+    # kept (finalized trades, net of commission), read from the trades table
+    # for THIS strategy config id and THIS trading mode.
+    realized_pnl: Optional[float] = Field(
+        None,
+        description=(
+            "Realized net PnL of this strategy (finalized trades, net of "
+            "commission). Null when it is unknown, never a fake 0.0."
+        ),
+    )
+    unrealized_pnl: Optional[float] = Field(
+        None, description="Open PnL of the positions the engine currently holds"
+    )
+    # How many finalized trades produced `realized_pnl`.
+    trade_count: Optional[int] = Field(
+        None, description="Number of finalized trades of this strategy"
+    )
+    # The strategy's whole effect on the wallet, entry commissions included.
+    # It differs from `realized_pnl` by the commissions of positions that
+    # were opened and never closed.
+    net_cash_flow: Optional[float] = Field(
+        None,
+        description=(
+            "Total net cash movement of this strategy across every trade row, "
+            "including the entry commissions of positions that never closed"
+        ),
+    )
     open_positions: Optional[int] = Field(
         None, json_schema_extra={"example": 1}
     )  # Made Optional

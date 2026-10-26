@@ -1,0 +1,84 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the strategy-PnL fix:",
+    "the published PnL of a strategy must be its TRUE realized net, scoped to",
+    "its own config id and its own trading mode.",
+    "",
+    "A is the ORIGINAL defect coming back: the publisher asks the RiskManager",
+    "ledger again, keyed by the strategy CLASS name. That ledger is keyed",
+    "(symbol, strategy_name), so the (None, class_name) lookup can never hit",
+    "and answers 0.0 for every strategy in every mode -- and it could not have",
+    "told two visual-builder strategies apart even if it had.",
+    "",
+    "B is the trading mode not being consulted: the lookup takes whichever",
+    "book has a row, so a config id traded in paper AND live reports one of",
+    "the two numbers for both.",
+    "",
+    "C is the sum forgetting the commission: the card would show the GROSS",
+    "result, and the user would be told the strategy earned money it never",
+    "earned.",
+    "",
+    "D is the partial exits being counted as final exits. A PARTIAL row is a",
+    "real cash movement but it did not close a position, so counting it as",
+    "finalized double counts it against the strategy's realized result.",
+    "",
+    "E is the owner filter being dropped, so another user's trades leak into",
+    "this user's strategy card.",
+    "",
+    "F is the publisher going back to one query per strategy. The publisher",
+    "runs on a 2-second loop, so this is a query storm, not a rounding error.",
+    "",
+    "G is an unreachable database publishing a false 0.0. A fake break-even is",
+    "exactly the lie this fix exists to remove.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/strategy_pnl_truth.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_strategy_pnl_truth.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the publisher asks the RiskManager ledger again, keyed by the class name",
+      "file": "bot_module/controller.py",
+      "needle": "            realized_pnl = float(_agg[\"realized_net\"]) if _agg else 0.0\n",
+      "replace": "            realized_pnl = self.rm.get_pnl_for_strategy(symbol=None, strategy_name=instance.NAME)\n"
+    },
+    {
+      "label": "B: the trading mode is not consulted, so paper and live mix",
+      "file": "bot_module/controller.py",
+      "needle": "            _agg = (\n                (pnl_aggregates or {}).get((str(config_id), _strategy_mode.upper()))\n                if pnl_known\n                else None\n            )\n",
+      "replace": "            _agg = (\n                next(\n                    (\n                        v\n                        for k, v in (pnl_aggregates or {}).items()\n                        if k[0] == str(config_id)\n                    ),\n                    None,\n                )\n                if pnl_known\n                else None\n            )\n"
+    },
+    {
+      "label": "C: the sum forgets the commission (gross instead of net)",
+      "file": "api/crud.py",
+      "needle": "    net_of_row = (\n        func.coalesce(models.Trade.pnl, 0.0) - func.coalesce(models.Trade.commission, 0.0)\n    )\n",
+      "replace": "    net_of_row = func.coalesce(models.Trade.pnl, 0.0)\n"
+    },
+    {
+      "label": "D: the partial exits are counted as final exits",
+      "file": "api/crud.py",
+      "needle": "    is_final = models.Trade.is_final_exit.is_(True)\n",
+      "replace": "    is_final = models.Trade.exit_type.notlike(\"ENTRY\")\n"
+    },
+    {
+      "label": "E: the owner filter is dropped, so another user's trades leak in",
+      "file": "api/crud.py",
+      "needle": "            models.Trade.user_id == user_id,\n            models.Trade.strategy_config_id.in_(strategy_config_ids),\n",
+      "replace": "            models.Trade.strategy_config_id.in_(strategy_config_ids),\n"
+    },
+    {
+      "label": "F: one query per strategy instead of one aggregate query",
+      "file": "bot_module/controller.py",
+      "needle": "            async for db in session_gen:\n                return await crud.get_strategy_realized_pnl_aggregates(\n                    db,\n                    user_id=self.user_id,\n                    strategy_config_ids=[str(c) for c in config_ids],\n                )\n",
+      "replace": "            async for db in session_gen:\n                merged = {}\n                for _one in config_ids:\n                    merged.update(\n                        await crud.get_strategy_realized_pnl_aggregates(\n                            db,\n                            user_id=self.user_id,\n                            strategy_config_ids=[str(_one)],\n                        )\n                    )\n                return merged\n"
+    },
+    {
+      "label": "G: an unreachable database publishes a false 0.0",
+      "file": "bot_module/controller.py",
+      "needle": "        pnl_known = pnl_aggregates is not None\n",
+      "replace": "        pnl_known = True\n"
+    }
+  ]
+}
