@@ -234,8 +234,8 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> Optional[pd.Series]:
         # Fill NaN at the beginning and possible NaN at the end
         initial_nans = result_series.isnull().sum()
         if initial_nans > 0:
-            result_series = result_series.bfill()  # Forward fill
-            result_series = result_series.ffill()  # Backward fill
+            result_series = result_series.bfill()  # Backward fill (from the next valid value)
+            result_series = result_series.ffill()  # Forward fill (from the previous valid value)
             result_series = result_series.fillna(
                 0.0
             )  # Fill remaining (if the entire column was NaN) with 0
