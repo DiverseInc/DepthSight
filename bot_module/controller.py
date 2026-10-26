@@ -4561,7 +4561,11 @@ class TradingController:
         `(None, class_name)` key it looked up could never exist: it
         returned 0.0 for EVERY strategy, on EVERY mode -- which is exactly
         what production showed on 2026-10-25 (two running strategies, both
-        `pnl=0.0`, one of them down -5690.86 realized).
+        `pnl=0.0`). The money was in the trades table the whole time: the
+        first strategy had realized -5689.15 over the 89 rows whose
+        `is_final_exit` is true. (Read by its other flag -- the 90 rows
+        whose `exit_type` says FINAL* -- the same book is -5690.86; the two
+        differ by exactly one row, trade id 941.)
 
         Even if the key had matched, it could not have been right:
           * `instance.NAME` is the strategy CLASS name, so every
