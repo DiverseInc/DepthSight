@@ -139,6 +139,16 @@ VERDICT_INSTRUCTION = (
     "'VERDICT: NO'."
 )
 
+# The protocol goes BEFORE the inline diff, never after it. MEASURED
+# 2026-10-26: hermes' CLI truncates its PROMPT at ~11,500 characters, so an
+# instruction placed after the diff never reached it -- hermes was told
+# nothing, noticed the diff was truncated, and answered anyway. An
+# instruction the reviewer cannot see is not an instruction.
+TRUNCATION_PROTOCOL = (
+    "If the diff below is truncated, or you cannot see all of it, reply "
+    "exactly 'DIFF TRUNCATED' and do NOT answer about a different file."
+)
+
 # MEASURED 2026-10-26: pointed at the repository, opencode read the diff in
 # 700-line chunks and then grepped the whole 32 MB / 1,337-file tree, blowing
 # past the 120s provider timeout. Six attempts at a 2400s cap produced no
@@ -493,6 +503,28 @@ def build_opencode_pack(diff: Path, repo: Path) -> Path:
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
 
+# A reviewer that says it could not SEE part of the change has reviewed a
+# partial view, whatever it concluded -- and it says so in its own words.
+# MEASURED 2026-10-26: hermes was given a diff truncated at ~11,500 of 63,508
+# characters, said exactly that ("the diff is truncated after ~11500 of 63508
+# characters ... is not visible here"), and then answered anyway. That is the
+# 2026-10-19 incident this tool exists to prevent.
+#
+# These patterns are deliberately NARROW. opencode, reviewing a diff of this
+# very tool, discussed the strings "diff truncated" and "please provide the
+# question" while correctly explaining itself, and a broad phrase match
+# silenced that real verdict. So this override keys on the reviewer saying it
+# could not SEE something, not on the word "truncated" appearing anywhere.
+_PARTIAL_VIEW = re.compile(
+    r"\bis not visible\b"
+    r"|\bnot visible (?:here|in what|to me|in this)\b"
+    r"|\b(?:could ?not|cannot|can't|did ?not|didn't) see\b"
+    r"|\bcan ?only see\b"
+    r"|\bthe (?:rest|remainder) of the diff (?:is|was) (?:not|is ?n.t|was ?n.t)\b"
+    r"|\btruncat\w*[^.\n]{0,60}after\s+~?\d[^.\n]{0,20}\d",
+    re.IGNORECASE,
+)
+
 # A reviewer that asks for the question instead of answering it has confirmed
 # NOTHING. On 2026-10-19 two of five reviewers (dsh, opencode) replied "What is
 # the question?" and the >=5-words test scored both as RETURNED -- the same
@@ -624,6 +656,14 @@ def parse_verdict(text: str) -> tuple[str | None, str]:
 
     verdict, bad = _extract_verdict(cleaned)
     if verdict is not None:
+        # The marker is authoritative -- UNLESS the reviewer says in its own
+        # words that it could not see all of the change. A verdict about a
+        # partial view is not a verdict on the change.
+        if _PARTIAL_VIEW.search(cleaned):
+            return None, (
+                "the reviewer says it could not SEE the whole change, so its "
+                "verdict is about a partial view -- NO VERDICT"
+            )
         return verdict, f"VERDICT: {verdict}"
     if bad is not None:
         return None, (
@@ -905,9 +945,14 @@ def dsh_prompt(question: str, diff_text: str) -> str:
     DEFECT 1 (measured 2026-10-26): DSH was handed `Diff at <path>`. It
     cannot open a path named in a prompt, so it returned only its MCP startup
     lines and no verdict -- while the fan-out counted it as having returned.
+
+    The protocol comes FIRST, so it is still there if the engine truncates
+    the prompt.
     """
     return (
-        f"{question} {VERDICT_INSTRUCTION}\n\n"
+        f"{question}\n\n"
+        f"{VERDICT_INSTRUCTION}\n\n"
+        f"{TRUNCATION_PROTOCOL}\n\n"
         f"Review THIS diff, pasted inline. It is the complete diff:\n\n"
         f"```diff\n{diff_text}\n```\n\n"
         f"Answer only from the diff above. If it does not contain enough "
@@ -1000,7 +1045,9 @@ def reviewers(
             "ollama",
             "run",
             OLLAMA_MODEL,
-            f"{question} {VERDICT_INSTRUCTION}\n\n"
+            f"{question}\n\n"
+            f"{VERDICT_INSTRUCTION}\n\n"
+            f"{TRUNCATION_PROTOCOL}\n\n"
             f"Review THIS diff, pasted inline. It is the complete diff:\n\n"
             f"```diff\n{ollama_text}\n```\n\n"
             f"Answer only from the diff above. If it does not contain enough "
@@ -1013,8 +1060,19 @@ def reviewers(
         [
             "hermes",
             "-z",
-            f"{question} {VERDICT_INSTRUCTION}\n\n"
-            f"Review THIS diff, pasted inline:\n\n"
+            f"{question}\n\n"
+            f"{VERDICT_INSTRUCTION}\n\n"
+            f"{TRUNCATION_PROTOCOL}\n\n"
+            + (
+                f"NOTE: the inline copy below IS truncated -- its own CLI "
+                f"cuts the prompt at about {HERMES_DIFF_CHARS} characters, so "
+                f"the note at the end of this prompt may never reach you. The "
+                f"COMPLETE diff is on disk at {diff_s}; read that file "
+                f"instead of relying on the copy below.\n\n"
+                if hermes_truncated
+                else ""
+            )
+            + f"Review THIS diff, pasted inline:\n\n"
             f"```diff\n{hermes_text}\n```\n\n"
             f"Answer only from the diff above. If the inline copy is "
             f"truncated, say exactly 'DIFF TRUNCATED' and do not answer about "

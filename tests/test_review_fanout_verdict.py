@@ -188,6 +188,38 @@ def test_the_last_marker_wins():
     assert verdict == "NO"
 
 
+def test_reviewer_that_says_it_cannot_see_the_whole_change_is_not_a_verdict():
+    """MEASURED 2026-10-26: hermes was given a diff truncated at ~11,500 of
+    63,508 characters, said exactly that, and then answered anyway -- the
+    2026-10-19 incident this tool exists to prevent."""
+    fanout = _load_tool()
+    output = (
+        "Note: the diff is truncated after ~11500 of 63508 characters "
+        "(`.review/review.diff` holds the rest), so the parser "
+        "implementation in tools/review_fanout.py is not visible here -- the "
+        "above is from the test file only.\n"
+        "VERDICT: NO\n"
+    )
+    verdict, reason = fanout.parse_verdict(output)
+    assert verdict is None, reason
+    assert "NO VERDICT" in reason
+
+
+def test_reviewer_discussing_truncation_is_not_a_partial_view():
+    """The opposite case, measured: opencode DISCUSSED this tool's own
+    vocabulary while reasoning and must still be scored on its marker."""
+    fanout = _load_tool()
+    output = (
+        "The tool checks `_TRUNCATED`, whose patterns include "
+        "\"diff truncated\" and \"the reviewer reported the diff was TRUNCATED "
+        "for it -- it reviewed only part of the change\".\n"
+        "truncated              -> verdict=None\n"
+        "VERDICT: NO\n"
+    )
+    verdict, reason = fanout.parse_verdict(output)
+    assert verdict == "NO", reason
+
+
 # --------------------------------------------------------------------------
 # The engine runner: the old behaviour counted a blocked run as a "return"
 # --------------------------------------------------------------------------
