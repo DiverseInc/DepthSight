@@ -1,6 +1,7 @@
 {
 	"cardTitle": "Create an account",
 	"cardDescription": "Enter your details below to create your account.",
+	"selectedPlan": "You selected the {{plan}} plan. New accounts start on the plan they are entitled to — upgrade any time from your account.",
 	"usernameLabel": "Username",
 	"usernamePlaceholder": "Your username",
 	"emailLabel": "Email",

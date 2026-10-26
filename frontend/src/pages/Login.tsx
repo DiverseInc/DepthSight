@@ -28,6 +28,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/components/ui/use-toast";
 import { useAuth } from "@/context/AuthContext";
+import { isDemoCredentialsEnabled } from "@/lib/demoAccess";
 import { GoogleLogin } from "@react-oauth/google";
 
 // Validation schema for the login form
@@ -121,6 +122,10 @@ export default function LoginPage() {
 	const { t } = useTranslation(["login", "common"]);
 	const { toast } = useToast();
 	const [showPassword, setShowPassword] = useState(false);
+	// The demo helper is OFF unless the build asks for it (VITE_SHOW_DEMO).
+	const showDemoCredentials = isDemoCredentialsEnabled(
+		import.meta.env as unknown as Record<string, unknown>,
+	);
 
 	const form = useForm<LoginFormValues>({
 		resolver: zodResolver(loginSchema(t)),
@@ -301,46 +306,51 @@ export default function LoginPage() {
 					</CardContent>
 				</Card>
 
-				{/* Demo helper — surfaces test login for the investor preview */}
-				<Card className="border-dashed border-primary/30 bg-primary/5">
-					<CardContent className="pt-5">
-						<div className="flex items-start gap-3">
-							<div className="mt-0.5 inline-flex items-center justify-center w-8 h-8 rounded-full bg-primary/15 shrink-0">
-								<Sparkles className="h-4 w-4 text-primary" />
-							</div>
-							<div className="flex-1 space-y-2">
-								<div>
-									<p className="text-sm font-medium">
-										Touring the platform?
-									</p>
-									<p className="text-xs text-muted-foreground">
-										Use the seeded demo account — password is pre-filled.
-									</p>
+				{/* Demo helper — surfaces test login for the investor preview.
+				    OFF by default: the login page is public, so this must only
+				    appear in a build that explicitly asks for it
+				    (VITE_SHOW_DEMO=true). */}
+				{showDemoCredentials && (
+					<Card className="border-dashed border-primary/30 bg-primary/5">
+						<CardContent className="pt-5">
+							<div className="flex items-start gap-3">
+								<div className="mt-0.5 inline-flex items-center justify-center w-8 h-8 rounded-full bg-primary/15 shrink-0">
+									<Sparkles className="h-4 w-4 text-primary" />
 								</div>
-								<div className="rounded-md bg-background/60 border border-border/60 px-3 py-2 font-mono text-xs">
-									<div className="flex justify-between gap-2">
-										<span className="text-muted-foreground">user</span>
-										<span>{DEMO_USERNAME}</span>
+								<div className="flex-1 space-y-2">
+									<div>
+										<p className="text-sm font-medium">
+											Touring the platform?
+										</p>
+										<p className="text-xs text-muted-foreground">
+											Use the seeded demo account — password is pre-filled.
+										</p>
 									</div>
-									<div className="flex justify-between gap-2">
-										<span className="text-muted-foreground">pass</span>
-										<span>{DEMO_PASSWORD}</span>
+									<div className="rounded-md bg-background/60 border border-border/60 px-3 py-2 font-mono text-xs">
+										<div className="flex justify-between gap-2">
+											<span className="text-muted-foreground">user</span>
+											<span>{DEMO_USERNAME}</span>
+										</div>
+										<div className="flex justify-between gap-2">
+											<span className="text-muted-foreground">pass</span>
+											<span>{DEMO_PASSWORD}</span>
+										</div>
 									</div>
+									<Button
+										type="button"
+										variant="outline"
+										size="sm"
+										className="w-full"
+										onClick={fillDemoCredentials}
+									>
+										<Sparkles className="mr-2 h-3.5 w-3.5" />
+										Use demo credentials
+									</Button>
 								</div>
-								<Button
-									type="button"
-									variant="outline"
-									size="sm"
-									className="w-full"
-									onClick={fillDemoCredentials}
-								>
-									<Sparkles className="mr-2 h-3.5 w-3.5" />
-									Use demo credentials
-								</Button>
 							</div>
-						</div>
-					</CardContent>
-				</Card>
+						</CardContent>
+					</Card>
+				)}
 
 				<p className="text-center text-xs text-muted-foreground">
 					By signing in you agree to our Terms and Privacy Policy.

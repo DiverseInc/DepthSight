@@ -28,6 +28,13 @@ export interface PortfolioData {
 	balance: number;
 	today_pnl: number;
 	is_trading_allowed: boolean;
+	/**
+	 * WHY trading is blocked, when `is_trading_allowed` is false.
+	 * The backend computes this (e.g. "DailyLoss: -120.00 USD <= -50.00 USD")
+	 * and used to send it to a frontend that threw it away, so a client whose
+	 * bot was blocked saw a normal dashboard with no explanation.
+	 */
+	trading_disabled_reason?: string | null;
 	consecutive_losses: number;
 	timestamp_utc: string;
 	market_type?: MarketScope;

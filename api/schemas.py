@@ -49,6 +49,12 @@ class UserCreate(UserBase):
     password: str
     ref_code: Optional[str] = None
     source: Optional[str] = None  # 'pwa' or 'desktop'
+    # Plan the visitor asked for when they signed up (e.g. `?plan=standard`
+    # from the pricing page). It is a REQUEST, not a grant: the server only
+    # honours it when the new account is actually entitled to start on that
+    # tier (the registration trial tier), and otherwise starts the account on
+    # the `free` plan. A paid tier is never granted at signup.
+    plan: Optional[str] = None
 
     @field_validator("username")
     def username_must_be_safe(cls, v: str) -> str:

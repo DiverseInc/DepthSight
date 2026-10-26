@@ -14,8 +14,13 @@ Run inside the api container so SQLAlchemy + DB are reachable:
 
     docker compose cp scripts/seed_demo_data.py api:/tmp/seed_demo_data.py
     docker compose exec api python /tmp/seed_demo_data.py
+
+SAFETY: this script creates FAKE users with fabricated trade history. It
+refuses to run against a non-local database. To override (e.g. against a
+staging database on purpose), pass --force or set ALLOW_DEMO_SEED=1.
 """
 import asyncio
+import argparse
 import os
 import random
 import sys
@@ -27,6 +32,7 @@ sys.path.insert(0, "/app")
 from sqlalchemy import select  # noqa: E402
 
 from api.database import AsyncSessionLocal, engine  # noqa: E402
+from api.demo_seed import DEMO_SEED_ADMIN_NOTES  # noqa: E402
 from api.models import (  # noqa: E402
     Base,
     User,
@@ -35,19 +41,70 @@ from api.models import (  # noqa: E402
     AffiliatePayout,
 )
 
-DEMO_MARKER = "demo_seed_v1"
+# One definition of the marker, shared with the API (api/demo_seed.py) so the
+# public statistics can exclude seeded rows with the same rule.
+DEMO_MARKER = DEMO_SEED_ADMIN_NOTES
 
 
-# Realistic-looking investor personas
+# --- Safety guard ---------------------------------------------------------
+# This script creates FAKE users with fabricated trade history. Running it
+# against a production database puts those accounts in front of real
+# customers, so it refuses to touch anything that is not a local/dev database
+# unless the operator explicitly forces it.
+LOCAL_DB_HOSTS = {
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "0.0.0.0",
+    "host.docker.internal",
+    # docker-compose service names for the local dev stack
+    "postgres",
+    "db",
+}
+
+
+def assert_local_database(force: bool = False) -> None:
+    """Abort unless the target database is local, or the operator forced it."""
+    host = (getattr(engine.url, "host", "") or "").lower()
+    if host in LOCAL_DB_HOSTS:
+        return
+
+    env_override = os.environ.get("ALLOW_DEMO_SEED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if force or env_override:
+        print(
+            f"[seed] WARNING: seeding demo data into a NON-LOCAL database "
+            f"(host={host!r}) because it was explicitly forced."
+        )
+        return
+
+    raise SystemExit(
+        f"[seed] REFUSING to seed demo data into a non-local database "
+        f"(host={host!r}).\n"
+        "[seed] These are fake users with fabricated trade history; they must "
+        "not end up in front of real customers.\n"
+        "[seed] If you really mean it, re-run with --force (or set "
+        "ALLOW_DEMO_SEED=1)."
+    )
+
+
+# Realistic-looking investor personas.
+# `plan` must be a REAL tier (free / standard / pro). An unknown tier falls
+# back to empty permissions and empty quotas, and an empty quota is treated
+# as UNLIMITED by api/quota_manager.py -- which would make a seeded demo
+# account an unthrottled "premium" user.
 DEMO_USERS = [
     # username, email, plan, days_since_join, strategy_archetype
-    ("alex_trader",   "alex@example.com",     "pro",     45, "rsi_breakout"),
-    ("sarah_quant",   "sarah@example.com",   "premium", 90, "ma_crossover"),
-    ("mike_scalper",  "mike@example.com",    "pro",     30, "scalping"),
-    ("lina_hodler",   "lina@example.com",    "free",    14, None),  # new user, no strategy yet
-    ("raj_algo",      "raj@example.com",     "premium", 120, "grid_dca"),
-    ("emma_retail",   "emma@example.com",    "pro",     60, "mean_reversion"),
-    ("demo_inactive", "old@example.com",     "free",    200, None),  # churned
+    ("alex_trader",   "alex@example.com",     "pro",      45, "rsi_breakout"),
+    ("sarah_quant",   "sarah@example.com",   "standard", 90, "ma_crossover"),
+    ("mike_scalper",  "mike@example.com",    "pro",      30, "scalping"),
+    ("lina_hodler",   "lina@example.com",    "free",     14, None),  # new user, no strategy yet
+    ("raj_algo",      "raj@example.com",     "standard", 120, "grid_dca"),
+    ("emma_retail",   "emma@example.com",    "pro",      60, "mean_reversion"),
+    ("demo_inactive", "old@example.com",     "free",     200, None),  # churned
 ]
 
 STRATEGY_NAMES = {
@@ -71,7 +128,10 @@ def jitter_dt(base: datetime, hours: int = 48) -> datetime:
     return base - timedelta(hours=random.randint(0, hours))
 
 
-async def seed():
+async def seed(force: bool = False):
+    # Refuse to seed a non-local database before doing anything else.
+    assert_local_database(force=force)
+
     # Schema is created by alembic migrations at container start — no need to create_all here.
     now = datetime.now(timezone.utc)
 
@@ -222,4 +282,16 @@ async def seed():
 
 
 if __name__ == "__main__":
-    asyncio.run(seed())
+    parser = argparse.ArgumentParser(
+        description="Seed demo (fake) users, strategies and backtests."
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Allow seeding a NON-LOCAL database. Without this the script "
+            "refuses to run against anything that is not a local/dev database."
+        ),
+    )
+    args = parser.parse_args()
+    asyncio.run(seed(force=args.force))

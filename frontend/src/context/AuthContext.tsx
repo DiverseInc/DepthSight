@@ -18,6 +18,19 @@ import type { User } from "@/types/api";
 interface AuthContextType {
 	user: User | null;
 	token: string | null;
+	/**
+	 * Whether there is a signed-in user.
+	 *
+	 * This used to be missing from the interface AND from the provider value,
+	 * so `useAuth().isAuthenticated` was `undefined` at runtime in every
+	 * consumer. That silently killed the global paper-trading banner
+	 * (`PaperModeBanner` returns null when it is falsy) and stopped the
+	 * marketing page from redirecting a signed-in user to their dashboard.
+	 *
+	 * It is derived from the real state -- there is no separate source of
+	 * truth that could drift.
+	 */
+	isAuthenticated: boolean;
 	isLoading: boolean;
 	login: (data: {
 		token: { access_token: string; refresh_token: string };
@@ -184,6 +197,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 			value={{
 				user,
 				token,
+				// Derived from the real state, never a separate flag that can
+				// disagree with it.
+				isAuthenticated: !!user,
 				isLoading,
 				login,
 				logout,

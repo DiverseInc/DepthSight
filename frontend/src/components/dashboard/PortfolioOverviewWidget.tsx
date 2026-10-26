@@ -7,6 +7,7 @@ import { useTranslation } from "react-i18next";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
+import { TradingDisabledBanner } from "@/components/dashboard/TradingDisabledBanner";
 import { usePortfolioMode } from "@/context/PortfolioModeContext";
 import { usePortfolioStatus, usePositions } from "@/lib/api";
 
@@ -117,45 +118,52 @@ export const PortfolioOverviewWidget: React.FC = () => {
 	const equity = portfolioStatus ? portfolioStatus.balance + unrealizedPnl : 0;
 
 	return (
-		<div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-			<StatCard
-				title={t("index:portfolioOverview.balance")}
-				value={
-					portfolioStatus?.balance.toLocaleString(i18n.language, {
+		<div className="space-y-4">
+			{/* The backend already tells us WHY trading is blocked; show it. */}
+			<TradingDisabledBanner
+				isTradingAllowed={portfolioStatus?.is_trading_allowed}
+				reason={portfolioStatus?.trading_disabled_reason}
+			/>
+			<div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+				<StatCard
+					title={t("index:portfolioOverview.balance")}
+					value={
+						portfolioStatus?.balance.toLocaleString(i18n.language, {
+							style: "currency",
+							currency: "USD",
+						}) ?? "0.00"
+					}
+					isLoading={isLoading}
+				/>
+				<StatCard
+					title={t("index:portfolioOverview.unrealizedPnl")}
+					value={unrealizedPnl.toLocaleString(i18n.language, {
 						style: "currency",
 						currency: "USD",
-					}) ?? "0.00"
-				}
-				isLoading={isLoading}
-			/>
-			<StatCard
-				title={t("index:portfolioOverview.unrealizedPnl")}
-				value={unrealizedPnl.toLocaleString(i18n.language, {
-					style: "currency",
-					currency: "USD",
-					signDisplay: "always",
-				})}
-				isLoading={isLoading}
-				colorClass={unrealizedPnl >= 0 ? "text-profit" : "text-loss"}
-			/>
-			<StatCard
-				title={t("index:portfolioOverview.equity")}
-				value={
-					equity.toLocaleString(i18n.language, {
+						signDisplay: "always",
+					})}
+					isLoading={isLoading}
+					colorClass={unrealizedPnl >= 0 ? "text-profit" : "text-loss"}
+				/>
+				<StatCard
+					title={t("index:portfolioOverview.equity")}
+					value={
+						equity.toLocaleString(i18n.language, {
+							style: "currency",
+							currency: "USD",
+						}) ?? "0.00"
+					}
+					isLoading={isLoading}
+				/>
+				<StatCard
+					title={t("index:portfolioOverview.marginUsage")}
+					value={marginUsed.toLocaleString(i18n.language, {
 						style: "currency",
 						currency: "USD",
-					}) ?? "0.00"
-				}
-				isLoading={isLoading}
-			/>
-			<StatCard
-				title={t("index:portfolioOverview.marginUsage")}
-				value={marginUsed.toLocaleString(i18n.language, {
-					style: "currency",
-					currency: "USD",
-				})}
-				isLoading={isLoading}
-			/>
+					})}
+					isLoading={isLoading}
+				/>
+			</div>
 		</div>
 	);
 };

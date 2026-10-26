@@ -13,6 +13,7 @@ from .. import crud, schemas, security
 from ..database import get_db
 from ..audit_logger import audit_logger, get_client_ip, get_user_agent
 from ..gamification import check_and_grant_retroactive_achievements
+from ..plans import plans_config
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +365,21 @@ async def register_user(
     logger.info(
         f"REGISTRATION REQUEST: username={user.username}, email={user.email}, source={user.source}"
     )
+
+    # The requested plan is a REQUEST, never a grant. It is validated here so
+    # an unknown value is a clear 400 instead of a silent downgrade, and the
+    # actual entitlement is decided in crud.create_user: a new account starts
+    # on the registration trial tier (when a trial is really running) or on
+    # `free`. A paid tier is never granted at signup.
+    if user.plan:
+        requested_plan = user.plan.strip().lower()
+        if requested_plan not in plans_config.get_all_plans():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unknown plan requested.",
+            )
+        user.plan = requested_plan
+
     db_user = await crud.get_user_by_username(db, username=user.username)
     if db_user:
         raise HTTPException(

@@ -210,6 +210,8 @@ const StrategyEditorPage = () => {
 
 	const { user } = useAuth();
 	const setUserTier = useStrategyEditorStore((state) => state.setUserTier);
+	// The tier the palette uses to decide whether PRO blocks are locked.
+	const userTier = useStrategyEditorStore((state) => state.userTier);
 
 	// Sync user tier from AuthContext
 	useEffect(() => {
@@ -767,7 +769,30 @@ const StrategyEditorPage = () => {
 						{activeDragItem ? (
 							activeDragItem.isPaletteItem ? (
 								<DraggablePaletteItem
-									{...(activeDragItem as unknown as Record<string, unknown>)}
+									// The drag payload names the component `componentType`,
+									// but the component expects `type`, and it needs the
+									// user's tier to decide whether PRO blocks are locked.
+									// Spreading the raw payload passed neither, so the ghost
+									// preview rendered with `type === undefined`.
+									type={
+										(activeDragItem as unknown as { componentType: ComponentType })
+											.componentType
+									}
+									category={
+										(activeDragItem as unknown as { category: ComponentCategory })
+											.category
+									}
+									title={
+										(activeDragItem as unknown as { title: string }).title
+									}
+									description={
+										(activeDragItem as unknown as { description: string })
+											.description
+									}
+									icon={
+										(activeDragItem as unknown as { icon: React.ReactNode }).icon
+									}
+									userTier={userTier}
 								/>
 							) : (
 								<Card className="p-2 shadow-lg opacity-90">

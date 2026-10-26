@@ -104,6 +104,12 @@ export default function RegisterPage() {
 	const { t } = useTranslation(["register", "common"]);
 	const location = useLocation();
 	const [refCode, setRefCode] = useState<string | undefined>(undefined);
+	// The plan the visitor picked on the pricing page (`?plan=standard`).
+	// It is forwarded to the server as a REQUEST; the server decides what the
+	// new account is actually entitled to start on.
+	const [requestedPlan, setRequestedPlan] = useState<string | undefined>(
+		undefined,
+	);
 	const [agreedToTerms, setAgreedToTerms] = useState(false);
 	const [registrationSuccess, setRegistrationSuccess] = useState(false);
 	const [registeredEmail, setRegisteredEmail] = useState<string>("");
@@ -116,11 +122,16 @@ export default function RegisterPage() {
 		const params = new URLSearchParams(location.search);
 		const refFromUrl = params.get("ref");
 		const savedRef = localStorage.getItem("referralCode");
+		const planFromUrl = params.get("plan");
 
 		if (refFromUrl) {
 			setRefCode(refFromUrl);
 		} else if (savedRef) {
 			setRefCode(savedRef);
+		}
+
+		if (planFromUrl) {
+			setRequestedPlan(planFromUrl.trim().toLowerCase());
 		}
 	}, [location]);
 
@@ -149,6 +160,12 @@ export default function RegisterPage() {
 	const onSubmit = (data: RegisterFormValues) => {
 		const submissionData = { ...data };
 		delete (submissionData as Partial<RegisterFormValues>).confirmPassword;
+		// Forward the requested plan. The server honours it only when the new
+		// account is entitled to start on that tier (the registration trial
+		// tier); otherwise the account starts on the free plan.
+		if (requestedPlan) {
+			(submissionData as Record<string, unknown>).plan = requestedPlan;
+		}
 		setRegisteredEmail(data.email);
 		registerMutation.mutate(submissionData);
 	};
@@ -252,6 +269,11 @@ export default function RegisterPage() {
 					<CardDescription>{t("cardDescription")}</CardDescription>
 				</CardHeader>
 				<CardContent>
+					{requestedPlan && (
+						<p className="mb-4 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+							{t("selectedPlan", { plan: requestedPlan })}
+						</p>
+					)}
 					<Form {...form}>
 						<form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
 							<FormField

@@ -238,6 +238,15 @@ export const FoundationChart = ({
 			},
 		});
 
+		// `uniqueKlines` used to be declared ~15 lines BELOW its first use,
+		// which put it in the temporal dead zone: the effect threw a
+		// ReferenceError every time it ran and the chart never appeared.
+		// Compute the sorted, de-duplicated series first, then use it.
+		const sortedKlines = [...klines].sort((a, b) => a.time - b.time);
+		const uniqueKlines = sortedKlines.filter(
+			(k, i, arr) => i === 0 || k.time > arr[i - 1].time,
+		);
+
 		const effectiveTickSize = tickSize || estimateTickSize(uniqueKlines);
 		const candleSeries = chart.addSeries(CandlestickSeries, {
 			upColor: "#22c55e",
@@ -252,11 +261,6 @@ export const FoundationChart = ({
 			},
 		});
 		const markers = createSeriesMarkers(candleSeries);
-
-		const sortedKlines = [...klines].sort((a, b) => a.time - b.time);
-		const uniqueKlines = sortedKlines.filter(
-			(k, i, arr) => i === 0 || k.time > arr[i - 1].time,
-		);
 
 		const klineData: CandlestickData[] = uniqueKlines.map((k) => ({
 			time: k.time as UTCTimestamp,
