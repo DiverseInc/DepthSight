@@ -48,6 +48,7 @@ from tools.db_session_guard import (  # noqa: E402
     SKIP_DIR_NAMES,
     find_offenders,
     find_offenders_in_source,
+    find_parse_failures,
     scanned_files,
 )
 
@@ -148,11 +149,70 @@ async def handler(self):
         config = await crud.get_config(db, user_id=self.user_id)
 """
 
+# The session method is called ON the loop variable (`await db.get(...)`),
+# not passed to a call. The loop variable is the RECEIVER.
+LEAK_RECEIVER_SESSION_METHOD = """
+async def handler(self):
+    async for db in self.get_db_session():
+        row = await db.get(models.User, 1)
+        break
+"""
+
+# `asend` hands the session out exactly like `anext` does.
+LEAK_ASEND = """
+async def handler(self):
+    db_gen = get_db()
+    db = await db_gen.asend(None)
+    config = await crud.get_config(db, user_id=self.user_id)
+"""
+
+# The generator is held on the object, not on a local name.
+LEAK_ATTRIBUTE_BOUND_GENERATOR = """
+async def handler(self):
+    self.db_gen = get_db()
+    db = await self.db_gen.__anext__()
+    config = await crud.get_config(db, user_id=self.user_id)
+"""
+
+# The walrus operator binds the generator.
+LEAK_WALRUS = """
+async def handler(self):
+    if (db_gen := get_db()):
+        db = await anext(db_gen)
+        config = await crud.get_config(db, user_id=self.user_id)
+"""
+
+# The factory called WITH an argument. `self.get_db_session(user_id)` is
+# still a session factory.
+LEAK_FACTORY_WITH_ARGUMENT = """
+async def handler(self, user_id):
+    async for db in self.get_db_session(user_id):
+        config = await crud.get_config(db, user_id=user_id)
+"""
+
+# A close that may never run closes nothing.
+CLOSED_ONLY_CONDITIONALLY = """
+async def handler(self):
+    db_gen = get_db()
+    db = await anext(db_gen)
+    if ready:
+        await db_gen.aclose()
+    config = await crud.get_config(db, user_id=self.user_id)
+"""
+
 # A loop that has nothing to do with the database.
 NOT_A_SESSION = """
 async def handler(websocket):
     async for message in websocket:
         await websocket.send_json(message)
+"""
+
+# A loop over a call that takes arguments and is not a session factory.
+# `redis.scan_iter(match=..., count=...)` is the shape this must NOT flag.
+NOT_A_SESSION_WITH_ARGUMENTS = """
+async def handler(self):
+    async for k in self.redis_client.scan_iter(match="running:*", count=100):
+        keys.append(k)
 """
 
 
@@ -313,6 +373,74 @@ def test_the_rule_does_not_flag_an_owned_session():
 def test_the_rule_does_not_flag_a_loop_that_is_not_a_session():
     assert not find_offenders_in_source(NOT_A_SESSION), (
         "the rule flagged a websocket loop"
+    )
+
+
+def test_the_rule_does_not_flag_a_loop_over_a_call_with_arguments():
+    """`redis.scan_iter(match=..., count=...)` is not a session factory."""
+    assert not find_offenders_in_source(NOT_A_SESSION_WITH_ARGUMENTS), (
+        "the rule flagged a redis scan loop"
+    )
+
+
+def test_the_rule_flags_a_session_method_called_on_the_loop_variable():
+    """`await db.get(...)` - the loop variable is the RECEIVER."""
+    assert find_offenders_in_source(LEAK_RECEIVER_SESSION_METHOD), (
+        "the rule missed a leak whose only session use is a method call"
+    )
+
+
+def test_the_rule_flags_an_asend_acquisition():
+    """`asend` hands the session out exactly like `anext`."""
+    assert find_offenders_in_source(LEAK_ASEND), (
+        "the rule missed an unclosed asend acquisition"
+    )
+
+
+def test_the_rule_flags_an_attribute_bound_generator():
+    """`await self.db_gen.__anext__()` - the generator is on the object."""
+    assert find_offenders_in_source(LEAK_ATTRIBUTE_BOUND_GENERATOR), (
+        "the rule missed an unclosed attribute-bound generator"
+    )
+
+
+def test_the_rule_flags_a_walrus_bound_generator():
+    """`if (db_gen := get_db()):` binds the generator."""
+    assert find_offenders_in_source(LEAK_WALRUS), (
+        "the rule missed an unclosed walrus-bound generator"
+    )
+
+
+def test_the_rule_flags_a_factory_called_with_an_argument():
+    """`self.get_db_session(user_id)` is still a session factory."""
+    assert find_offenders_in_source(LEAK_FACTORY_WITH_ARGUMENT), (
+        "the rule missed a leak from a factory called with an argument"
+    )
+
+
+def test_the_rule_does_not_let_a_conditional_close_hide_a_leak():
+    """A close that may never run closes nothing.
+
+    `if ready: await gen.aclose()` does not close the generator on the path
+    that leaks, so the acquisition is still an acquisition with no release.
+    """
+    offenders = find_offenders_in_source(CLOSED_ONLY_CONDITIONALLY)
+    assert len(offenders) == 1, offenders
+    assert offenders[0].endswith(":4"), offenders
+
+
+def test_the_guard_reports_files_it_cannot_parse(tmp_path):
+    """A guard that silently skips a file it cannot read always reports OK."""
+    broken = tmp_path / "broken.py"
+    broken.write_text("def oops(:\n", encoding="utf-8")
+
+    failures = find_parse_failures(tmp_path)
+    assert len(failures) == 1, failures
+    assert "broken.py" in failures[0], failures
+
+    # And the repo itself must be fully readable.
+    assert find_parse_failures() == [], (
+        f"the guard could not read: {find_parse_failures()}"
     )
 
 

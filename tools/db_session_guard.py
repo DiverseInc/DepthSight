@@ -41,23 +41,32 @@ all - so it would never have flagged the very bug it was written for.
 
 This version matches the SHAPE of the acquisition instead:
 
-* Rule A - an `async for` over a ZERO-ARGUMENT CALL (a factory), or over a
-  local name bound to one, whose loop variable is then HANDED TO an awaited
-  call or has a session method called on it. A zero-argument call is what
-  distinguishes a session factory from `exchange.watch_order_book(...)` or
-  `redis.scan_iter(...)`, both of which take arguments. A rename of the
-  factory does not change any of this, and neither does binding it to
-  another name first.
+* Rule A - an `async for` over a session FACTORY CALL, or over a local name
+  bound to one, whose loop variable is then HANDED TO an awaited call or has
+  a session method called on it.
 
-* Rule B - an `await anext(gen)` (or `await gen.__anext__()`), or an
-  `await anext(<factory call>)`, where the generator is a local bound to a
-  call and `gen.aclose()` is never called in the SAME FUNCTION. That is the
-  acquisition with no release. An inline `await anext(factory())` has no
-  name to close it by, so it is leaked by construction.
+  A "factory call" is a call with no arguments, OR a call with arguments
+  whose callee is one of this function's own parameters
+  (`db_session_factory(...)`) or a method of this object
+  (`self.get_db_session(...)`). The zero-argument case is what separates a
+  session factory from `redis.scan_iter(match=..., count=100)` and
+  `exchange.watch_order_book(symbol, None, params)`, both of which are
+  loops over a call that is NOT a session.
+
+* Rule B - an `await anext(gen)` (or `await gen.__anext__()`, or
+  `await gen.asend(None)`), or an `await anext(<factory call>)`, where the
+  generator is a local bound to a call and the generator is never CLOSED on
+  the path that leaks. An inline `await anext(factory())` has no name to
+  close it by, so it is leaked by construction.
 
 Both rules look at how the value is USED, never at what the factory is
 CALLED, so renaming `self.get_db_session` to `self._db_session` does not
-hide a leak.
+hide a leak - and neither does binding it to another name first.
+
+A close only counts when it is on the path that actually runs: a close
+inside `if cond:`, inside a loop body, or inside an `except` handler may
+never execute, and a close that may never execute closes nothing. A close
+in a `finally:` always runs, and so does one in the body of the function.
 
 SCOPE - the whole repo
 ----------------------
@@ -68,6 +77,9 @@ factory is defined), `bot_module/`, `tools/`, `tests/` and the rest.
 A guard that only scanned `bot_module/` would have been blind to the command
 listener in `bot_runner.py` - one of the largest leaks this fix closed - and
 blind to `api/`, where the session factory itself lives.
+
+A file that does not parse is reported, not skipped: a guard that silently
+ignores a file it cannot read is a guard that always reports OK.
 
 Usage
 -----
@@ -122,11 +134,14 @@ SESSION_METHODS = frozenset(
         "add",
         "add_all",
         "begin",
+        "bulk_save_objects",
         "commit",
         "delete",
         "execute",
         "expire",
+        "expire_all",
         "flush",
+        "get",
         "merge",
         "refresh",
         "rollback",
@@ -153,25 +168,17 @@ ALLOWED: Dict[Tuple[str, int], str] = {
 }
 
 
-def _dotted(node: ast.AST) -> Optional[str]:
-    """`crud.get_config` -> "crud.get_config"; `db.commit` -> "db.commit"."""
-    parts: List[str] = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if isinstance(node, ast.Name):
-        parts.append(node.id)
-    else:
-        return None
-    return ".".join(reversed(parts))
-
-
-def _is_zero_arg_call(node: ast.AST) -> bool:
-    return isinstance(node, ast.Call) and not node.args and not node.keywords
-
-
 def _is_call(node: Optional[ast.AST]) -> bool:
     return isinstance(node, ast.Call)
+
+
+def _same_expr(a: ast.AST, b: ast.AST) -> bool:
+    """Structural equality for the two spellings of one generator."""
+    if isinstance(a, ast.Name) and isinstance(b, ast.Name):
+        return a.id == b.id
+    if isinstance(a, ast.Attribute) and isinstance(b, ast.Attribute):
+        return a.attr == b.attr and _same_expr(a.value, b.value)
+    return False
 
 
 def _own_nodes(scope: ast.AST) -> Iterator[ast.AST]:
@@ -205,22 +212,82 @@ def _function_scopes(tree: ast.AST) -> List[ast.AST]:
     return scopes
 
 
+def _scope_parameters(scope: ast.AST) -> Set[str]:
+    """The parameter names of a function scope."""
+    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return set()
+    args = scope.args
+    names = {
+        a.arg
+        for a in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
+    }
+    if args.vararg:
+        names.add(args.vararg.arg)
+    if args.kwarg:
+        names.add(args.kwarg.arg)
+    return names
+
+
+def _target_holds(target: ast.AST, name: str) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id == name
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return any(_target_holds(element, name) for element in target.elts)
+    return False
+
+
 def _bound_value(
     name: str, scope: ast.AST, before: Optional[int] = None
 ) -> Optional[ast.AST]:
     """The value a local `name` was bound to, if any.
 
     `before` is the line of the use, so the binding that was in effect at
-    that point wins. Only bindings made in THIS scope count.
+    that point wins. Only bindings made in THIS scope count. Plain
+    assignment, annotated assignment and the walrus operator are all read,
+    and a tuple target binds element-wise.
     """
+    found: Optional[ast.AST] = None
+    for node in _own_nodes(scope):
+        lineno = getattr(node, "lineno", None)
+        if before is not None and (lineno is None or lineno > before):
+            continue
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, (ast.Tuple, ast.List)) and isinstance(
+                    node.value, (ast.Tuple, ast.List)
+                ):
+                    for element, value in zip(target.elts, node.value.elts):
+                        if _target_holds(element, name):
+                            found = value
+                elif _target_holds(target, name):
+                    found = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == name:
+                found = node.value
+        elif isinstance(node, ast.NamedExpr):
+            if isinstance(node.target, ast.Name) and node.target.id == name:
+                found = node.value
+    return found
+
+
+def _bound_attr_value(
+    attr: str, scope: ast.AST, before: Optional[int] = None
+) -> Optional[ast.AST]:
+    """The value `self.<attr>` was bound to, if any."""
     found: Optional[ast.AST] = None
     for node in _own_nodes(scope):
         if not isinstance(node, ast.Assign):
             continue
-        if before is not None and node.lineno > before:
+        lineno = getattr(node, "lineno", None)
+        if before is not None and (lineno is None or lineno > before):
             continue
         for target in node.targets:
-            if isinstance(target, ast.Name) and target.id == name:
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == attr
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
                 found = node.value
     return found
 
@@ -242,6 +309,34 @@ def _resolved_bound_value(
     return value
 
 
+def _is_factory_call(node: Optional[ast.AST], scope: ast.AST) -> bool:
+    """Is this call a session factory?
+
+    * a call with NO arguments - the shape every session factory in this
+      repo has (`self.get_db_session()`, `db_session_factory()`). It is also
+      what separates a factory from `redis.scan_iter(match=..., count=100)`
+      and `exchange.watch_order_book(symbol, None, params)`, which are loops
+      over a call that is not a session;
+    * a call WITH arguments whose callee is one of this function's own
+      parameters (`db_session_factory(user_id)`) or a method of this object
+      (`self.get_db_session(user_id)`).
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    if not node.args and not node.keywords:
+        return True
+    callee = node.func
+    if isinstance(callee, ast.Name):
+        return callee.id in _scope_parameters(scope)
+    if (
+        isinstance(callee, ast.Attribute)
+        and isinstance(callee.value, ast.Name)
+        and callee.value.id == "self"
+    ):
+        return True
+    return False
+
+
 def _awaited_calls(body: List[ast.stmt]) -> Set[int]:
     """The ids of the calls that are directly awaited."""
     awaited: Set[int] = set()
@@ -260,8 +355,9 @@ def _loop_var_is_used_as_session(target: ast.AST, body: List[ast.stmt]) -> bool:
         await crud.get_config(db, user_id=...)      -> matched
         await crud.create_trade(db=db, ...)         -> matched
 
-    The SECONDARY signal is a session method called on it (`db.commit()`),
-    which catches a body that only touches the session directly.
+    The SECONDARY signal is a session method called on it (`db.commit()`,
+    `db.get(...)`), which catches a body that only touches the session
+    directly.
     """
     if not isinstance(target, ast.Name):
         return False
@@ -301,30 +397,65 @@ def _rule_a(tree: ast.AST, path: str) -> List[str]:
             if not _loop_var_is_used_as_session(target, node.body):
                 continue
             it = node.iter
-            if _is_zero_arg_call(it):
+            if _is_factory_call(it, scope):
                 findings.append(f"{path}:{node.lineno}")
                 continue
             if isinstance(it, ast.Name):
                 bound = _resolved_bound_value(it.id, scope, before=node.lineno)
-                if bound is not None and _is_zero_arg_call(bound):
+                if bound is not None and _is_factory_call(bound, scope):
                     findings.append(f"{path}:{node.lineno}")
     return findings
 
 
-def _generator_is_closed(name: str, scope: ast.AST) -> bool:
-    """Is `name.aclose()` called in THIS scope?"""
-    for node in _own_nodes(scope):
-        if not isinstance(node, ast.Call):
-            continue
-        callee = node.func
-        if (
-            isinstance(callee, ast.Attribute)
-            and callee.attr == "aclose"
-            and isinstance(callee.value, ast.Name)
-            and callee.value.id == name
-        ):
-            return True
-    return False
+def _generator_is_closed(gen_expr: ast.AST, scope: ast.AST) -> bool:
+    """Is the generator closed on the path that actually runs?
+
+    A close inside `if cond:`, inside a loop body or inside an `except`
+    handler may never execute, and a close that may never execute closes
+    nothing. A close in a `finally:` always runs, and so does one in the
+    body of the function.
+    """
+    found = False
+
+    def visit(node: ast.AST, conditional: bool) -> None:
+        nonlocal found
+        if found:
+            return
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            cond = conditional
+            if isinstance(child, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+                cond = True
+            elif isinstance(child, ast.Try):
+                for stmt in child.body:
+                    visit(stmt, cond)
+                for handler in child.handlers:
+                    for stmt in handler.body:
+                        visit(stmt, True)
+                for stmt in child.orelse:
+                    visit(stmt, True)
+                for stmt in child.finalbody:
+                    visit(stmt, cond)
+                continue
+            elif isinstance(child, (ast.With, ast.AsyncWith)):
+                for stmt in child.body:
+                    visit(stmt, True)
+                continue
+            if isinstance(child, ast.Call):
+                callee = child.func
+                if (
+                    isinstance(callee, ast.Attribute)
+                    and callee.attr == "aclose"
+                    and _same_expr(callee.value, gen_expr)
+                    and not cond
+                ):
+                    found = True
+                    return
+            visit(child, cond)
+
+    visit(scope, False)
+    return found
 
 
 def _rule_b(tree: ast.AST, path: str) -> List[str]:
@@ -342,10 +473,9 @@ def _rule_b(tree: ast.AST, path: str) -> List[str]:
             if isinstance(callee, ast.Name) and callee.id in ("anext", "__anext__"):
                 if call.args:
                     gen_expr = call.args[0]
-            elif (
-                isinstance(callee, ast.Attribute)
-                and callee.attr == "__anext__"
-                and isinstance(callee.value, ast.Name)
+            elif isinstance(callee, ast.Attribute) and callee.attr in (
+                "__anext__",
+                "asend",
             ):
                 gen_expr = callee.value
             if gen_expr is None:
@@ -355,14 +485,21 @@ def _rule_b(tree: ast.AST, path: str) -> List[str]:
                 # name to close it by, so it is abandoned by construction.
                 findings.append(f"{path}:{node.lineno}")
                 continue
-            if not isinstance(gen_expr, ast.Name):
-                continue
-            bound = _resolved_bound_value(gen_expr.id, scope, before=node.lineno)
+            if isinstance(gen_expr, ast.Name):
+                bound = _resolved_bound_value(gen_expr.id, scope, before=node.lineno)
+            elif (
+                isinstance(gen_expr, ast.Attribute)
+                and isinstance(gen_expr.value, ast.Name)
+                and gen_expr.value.id == "self"
+            ):
+                bound = _bound_attr_value(gen_expr.attr, scope, before=node.lineno)
+            else:
+                bound = None
             if not _is_call(bound):
                 # Not a generator this rule can recognise (a parameter, an
                 # object with `__anext__`). Not the shape this rule is about.
                 continue
-            if _generator_is_closed(gen_expr.id, scope):
+            if _generator_is_closed(gen_expr, scope):
                 continue
             findings.append(f"{path}:{node.lineno}")
     return findings
@@ -407,6 +544,28 @@ def find_offenders(repo: Path = REPO) -> List[str]:
     return sorted(set(offenders))
 
 
+def find_parse_failures(repo: Path = REPO) -> List[str]:
+    """The files the guard could NOT read.
+
+    A guard that silently skips a file it cannot parse is a guard that
+    always reports OK, so these are reported loudly.
+    """
+    failures: List[str] = []
+    for path in scanned_files(repo):
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            failures.append(f"{path.relative_to(repo).as_posix()}: unreadable")
+            continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            try:
+                ast.parse(source)
+            except SyntaxError as exc:
+                failures.append(f"{path.relative_to(repo).as_posix()}: {exc}")
+    return failures
+
+
 def _key(offender: str) -> Tuple[str, int]:
     path, _, line = offender.rpartition(":")
     return path, int(line)
@@ -418,6 +577,7 @@ def main() -> int:
     args = parser.parse_args()
 
     offenders = find_offenders()
+    parse_failures = find_parse_failures()
     allowed = {_key(o) for o in offenders if _key(o) in ALLOWED}
     unexpected = [o for o in offenders if _key(o) not in ALLOWED]
 
@@ -428,6 +588,7 @@ def main() -> int:
                     "offenders": offenders,
                     "allowed": sorted(allowed),
                     "unexpected": unexpected,
+                    "parse_failures": parse_failures,
                 },
                 indent=2,
             )
@@ -439,9 +600,14 @@ def main() -> int:
                 print(f"ALLOWED  {offender}  {ALLOWED[key]}")
             else:
                 print(f"LEAK     {offender}")
-        print(f"\n{len(offenders)} flagged, {len(unexpected)} not allowed.")
+        for failure in parse_failures:
+            print(f"UNREADABLE  {failure}")
+        print(
+            f"\n{len(offenders)} flagged, {len(unexpected)} not allowed, "
+            f"{len(parse_failures)} unreadable."
+        )
 
-    return 1 if unexpected else 0
+    return 1 if unexpected or parse_failures else 0
 
 
 if __name__ == "__main__":

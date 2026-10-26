@@ -1,19 +1,26 @@
 {
   "_comment": [
     "Mutations that reopen the FOUR gaps the review panel raised in the",
-    "session-leak guard. Each one takes the guard (or the session release)",
-    "back to the broken shape; every one of them must be KILLED by",
+    "session-leak guard, plus the follow-up holes the panel's second round",
+    "found. Each one takes the guard (or the session release) back to the",
+    "broken shape; every one of them must be KILLED by",
     "tests/test_db_session_guard.py.",
     "",
     "GAP 1 (SCOPE)  - A1 stops the guard scanning `api/`; A2 stops it scanning",
     "                  the repo root.",
     "GAP 2 (SHAPE)  - A3 removes the `await anext(...)` acquisition rule; A4",
     "                  removes the assign-then-iterate form; A5 removes the",
-    "                  inline `await anext(factory())` form.",
+    "                  inline `await anext(factory())` form; A11 removes the",
+    "                  `asend` form; A12 removes the attribute-bound generator;",
+    "                  A13 removes the walrus binding; A14 stops matching a",
+    "                  factory called with an argument.",
     "GAP 3 (NAMES)  - A6 puts the factory NAME list back; A7 lets a close in",
     "                  one function hide a leak in another; A9 writes the leak",
-    "                  again with a RENAMED factory - the rename mutant.",
+    "                  again with a RENAMED factory - the rename mutant; A10",
+    "                  lets a close that may never run hide a leak.",
     "GAP 4 (SWALLOW) - A8 swallows the close failure again.",
+    "",
+    "A15 makes the guard swallow a file it cannot parse.",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/db_session_guard.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -43,7 +50,7 @@
     {
       "label": "GAP2: the assign-then-iterate form is no longer matched",
       "file": "tools/db_session_guard.py",
-      "needle": "            if isinstance(it, ast.Name):\n                bound = _resolved_bound_value(it.id, scope, before=node.lineno)\n                if bound is not None and _is_zero_arg_call(bound):\n                    findings.append(f\"{path}:{node.lineno}\")\n",
+      "needle": "            if isinstance(it, ast.Name):\n                bound = _resolved_bound_value(it.id, scope, before=node.lineno)\n                if bound is not None and _is_factory_call(bound, scope):\n                    findings.append(f\"{path}:{node.lineno}\")\n",
       "replace": "            if isinstance(it, ast.Name):\n                # MUTANT: the assign-then-iterate form is no longer matched.\n                pass\n"
     },
     {
@@ -55,8 +62,8 @@
     {
       "label": "GAP3: the guard matches the factory by NAME again",
       "file": "tools/db_session_guard.py",
-      "needle": "def _is_zero_arg_call(node: ast.AST) -> bool:\n    return isinstance(node, ast.Call) and not node.args and not node.keywords\n",
-      "replace": "def _is_zero_arg_call(node: ast.AST) -> bool:\n    # MUTANT: the factory is matched by NAME again, so a rename defeats the rule.\n    if not (isinstance(node, ast.Call) and not node.args and not node.keywords):\n        return False\n    callee = node.func\n    called = getattr(callee, \"attr\", getattr(callee, \"id\", \"\"))\n    return called in (\"get_db_session\", \"db_session_factory\")\n"
+      "needle": "    if not isinstance(node, ast.Call):\n        return False\n    if not node.args and not node.keywords:\n        return True\n",
+      "replace": "    if not isinstance(node, ast.Call):\n        return False\n    # MUTANT: the factory is matched by NAME again, so a rename defeats the rule.\n    callee = node.func\n    called = getattr(callee, \"attr\", getattr(callee, \"id\", \"\"))\n    return called in (\"get_db_session\", \"db_session_factory\")\n"
     },
     {
       "label": "GAP3: a close in one function hides a leak in another",
@@ -75,6 +82,42 @@
       "file": "bot_module/controller.py",
       "needle": "    async def load_symbol_selection_config(self) -> bool:\n",
       "replace": "    async def _gap3_renamed_factory_leak(self):\n        \"\"\"MUTANT: the leak, written with a factory name the old guard did not\n        know. A shape-based guard must still see it.\"\"\"\n        async for db in self._db_session():\n            await crud.get_config(db, user_id=self.user_id)\n\n    async def load_symbol_selection_config(self) -> bool:\n"
+    },
+    {
+      "label": "GAP3: a close that may never run hides the leak",
+      "file": "tools/db_session_guard.py",
+      "needle": "            cond = conditional\n",
+      "replace": "            cond = False  # MUTANT: the close only has to EXIST, not run\n"
+    },
+    {
+      "label": "GAP2: the asend acquisition is no longer matched",
+      "file": "tools/db_session_guard.py",
+      "needle": "            elif isinstance(callee, ast.Attribute) and callee.attr in (\n                \"__anext__\",\n                \"asend\",\n            ):\n",
+      "replace": "            elif isinstance(callee, ast.Attribute) and callee.attr == \"__anext__\":\n"
+    },
+    {
+      "label": "GAP2: an attribute-bound generator is no longer matched",
+      "file": "tools/db_session_guard.py",
+      "needle": "            elif (\n                isinstance(gen_expr, ast.Attribute)\n                and isinstance(gen_expr.value, ast.Name)\n                and gen_expr.value.id == \"self\"\n            ):\n                bound = _bound_attr_value(gen_expr.attr, scope, before=node.lineno)\n",
+      "replace": "            elif False:  # MUTANT: the attribute-bound generator is not matched\n                bound = _bound_attr_value(gen_expr.attr, scope, before=node.lineno)\n"
+    },
+    {
+      "label": "GAP2: the walrus binding is not read",
+      "file": "tools/db_session_guard.py",
+      "needle": "        elif isinstance(node, ast.NamedExpr):\n            if isinstance(node.target, ast.Name) and node.target.id == name:\n                found = node.value\n",
+      "replace": "        elif isinstance(node, ast.NamedExpr):\n            pass  # MUTANT: the walrus binding is not read\n"
+    },
+    {
+      "label": "GAP2: a factory called with an argument is no longer matched",
+      "file": "tools/db_session_guard.py",
+      "needle": "    if not node.args and not node.keywords:\n        return True\n    callee = node.func\n",
+      "replace": "    if not node.args and not node.keywords:\n        return True\n    return False  # MUTANT: a factory called with an argument is not matched\n    callee = node.func\n"
+    },
+    {
+      "label": "the guard swallows a file it cannot parse",
+      "file": "tools/db_session_guard.py",
+      "needle": "    failures: List[str] = []\n    for path in scanned_files(repo):\n",
+      "replace": "    failures: List[str] = []\n    return failures  # MUTANT: parse failures are swallowed\n    for path in scanned_files(repo):\n"
     }
   ]
 }
