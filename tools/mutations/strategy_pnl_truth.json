@@ -47,8 +47,8 @@
     {
       "label": "B: the trading mode is not consulted, so paper and live mix",
       "file": "bot_module/controller.py",
-      "needle": "            _agg = (\n                (pnl_aggregates or {}).get((str(config_id), _strategy_mode.upper()))\n                if pnl_known\n                else None\n            )\n",
-      "replace": "            _agg = (\n                next(\n                    (\n                        v\n                        for k, v in (pnl_aggregates or {}).items()\n                        if k[0] == str(config_id)\n                    ),\n                    None,\n                )\n                if pnl_known\n                else None\n            )\n"
+      "needle": "            _agg = (\n                (pnl_aggregates or {}).get((str(config_id), _strategy_mode.upper()))\n                if (pnl_known and _mode_known)\n                else None\n            )\n",
+      "replace": "            _agg = (\n                next(\n                    (\n                        v\n                        for k, v in (pnl_aggregates or {}).items()\n                        if k[0] == str(config_id)\n                    ),\n                    None,\n                )\n                if (pnl_known and _mode_known)\n                else None\n            )\n"
     },
     {
       "label": "C: the sum forgets the commission (gross instead of net)",
@@ -79,6 +79,12 @@
       "file": "bot_module/controller.py",
       "needle": "        pnl_known = pnl_aggregates is not None\n",
       "replace": "        pnl_known = True\n"
+    },
+    {
+      "label": "H: an unknown trading mode is pointed at the live book",
+      "file": "bot_module/controller.py",
+      "needle": "            _strategy_mode = str(config_dict.get(\"mode\") or \"\").strip().lower()\n",
+      "replace": "            _strategy_mode = str(config_dict.get(\"mode\") or \"live\").strip().lower()\n"
     }
   ]
 }

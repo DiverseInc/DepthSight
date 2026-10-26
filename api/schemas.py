@@ -1102,14 +1102,17 @@ class StrategyInfo(StrategyRunRequest):  # For response
     trade_count: Optional[int] = Field(
         None, description="Number of finalized trades of this strategy"
     )
-    # The strategy's whole effect on the wallet, entry commissions included.
-    # It differs from `realized_pnl` by the commissions of positions that
-    # were opened and never closed.
+    # The strategy's whole effect on the wallet: the net of EVERY trade row
+    # of this config id and mode. It therefore includes EVERY commission the
+    # strategy paid -- the entry commission of a closed trade as well as the
+    # commission of a position that was opened and never closed -- and the
+    # PnL of the partial exits, which `realized_pnl` does not carry.
     net_cash_flow: Optional[float] = Field(
         None,
         description=(
-            "Total net cash movement of this strategy across every trade row, "
-            "including the entry commissions of positions that never closed"
+            "Net of every trade row of this strategy: all its commissions "
+            "(entry fees of closed trades included) and the PnL of the "
+            "partial exits"
         ),
     )
     open_positions: Optional[int] = Field(

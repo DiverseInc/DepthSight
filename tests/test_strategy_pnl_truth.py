@@ -721,6 +721,59 @@ async def test_the_publisher_issues_one_aggregate_query_per_cycle(
 
 
 @pytest.mark.asyncio
+async def test_an_unknown_mode_is_reported_as_unknown_not_as_the_live_book(db_session):
+    """A strategy whose book is not known must not borrow the live book.
+
+    `StrategyStartRequest.mode` is an unconstrained string, so a payload can
+    arrive with a mode that is missing, misspelled or something new. Reading
+    the live book for it would report live money as if it were the
+    strategy's own -- the exact "wrong book" failure this fix exists to
+    prevent. Fail closed: an unknown book means an unknown number.
+
+    Two cases, because they fail differently:
+      * the mode key is MISSING -- the strategy-start path always sets it
+        (api/routes/strategies.py), so a payload without it did not come
+        from that path and its book cannot be assumed;
+      * the mode is a value that is neither "live" nor "paper".
+    """
+    missing = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
+    unknown = "ffffffff-6666-4666-8666-ffffffffffff"
+    await _seed_strategy_config(db_session, missing, "no-mode")
+    await _seed_strategy_config(db_session, unknown, "mystery-mode")
+    for config_id in (missing, unknown):
+        await _seed_trade_rows(
+            db_session,
+            config_id=config_id,
+            mode="LIVE",
+            rows=[("FINAL_TAKE_PROFIT", 2, 500.0, 450.0, 2)],
+        )
+
+    counter = {"queries": 0}
+    strategies = {
+        missing: (
+            _strategy_instance(),
+            {"user_id": USER_ID, "config_data": {}},  # no mode key at all
+        ),
+        unknown: (
+            _strategy_instance(),
+            {"mode": "leverage", "user_id": USER_ID, "config_data": {}},
+        ),
+    }
+    controller, redis_client = _build_controller(db_session, counter, strategies)
+
+    published = await _publish(controller, redis_client)
+
+    for config_id in (missing, unknown):
+        card = published[config_id]
+        assert card["pnl"] is None, (
+            "a strategy whose book is unknown must not borrow the live "
+            f"book's number, got {card['pnl']!r}"
+        )
+        assert card["realized_pnl"] is None
+        assert card["trade_count"] is None
+
+
+@pytest.mark.asyncio
 async def test_an_unreachable_database_is_reported_as_unknown_not_as_zero(db_session):
     """A false 0.0 is the bug this whole fix exists to remove.
 

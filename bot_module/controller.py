@@ -4768,12 +4768,19 @@ class TradingController:
             # strategy CLASS name is NOT an identity -- every visual-builder
             # strategy shares "VisualBuilderStrategy", so keying on it gave
             # every strategy the same (always 0.0) number.
-            _strategy_mode = str(config_dict.get("mode") or "live").strip().lower()
+            #
+            # FAIL CLOSED on an unknown mode. A payload whose mode is missing
+            # or is not one of the two books must NOT be pointed at the live
+            # book: that would report live money as if it were the strategy's
+            # own. An unknown book means an unknown number.
+            _strategy_mode = str(config_dict.get("mode") or "").strip().lower()
+            _mode_known = _strategy_mode in ("live", "paper")
             _agg = (
                 (pnl_aggregates or {}).get((str(config_id), _strategy_mode.upper()))
-                if pnl_known
+                if (pnl_known and _mode_known)
                 else None
             )
+            _numbers_known = pnl_known and _mode_known
             realized_pnl = float(_agg["realized_net"]) if _agg else 0.0
             finalized_trade_count = int(_agg["finalized_count"]) if _agg else 0
             net_cash_flow = float(_agg["net_cash_flow"]) if _agg else 0.0
@@ -4827,19 +4834,24 @@ class TradingController:
                 # it was always 0.0; the breakdown is published next to it
                 # so the number can be checked.
                 "pnl": (
-                    round(total_instance_pnl, 4) if pnl_known else None
+                    round(total_instance_pnl, 4) if _numbers_known else None
                 ),
                 "realized_pnl": (
-                    round(realized_pnl, 4) if pnl_known else None
+                    round(realized_pnl, 4) if _numbers_known else None
                 ),
                 "unrealized_pnl": round(unrealized_pnl_strat, 4),
                 # How many trades produced the realized number.
-                "trade_count": (finalized_trade_count if pnl_known else None),
-                # The strategy's WHOLE effect on the wallet, entry
-                # commissions included -- it differs from `realized_pnl`
-                # by the commissions of positions that were opened and
-                # never closed. Published so both numbers are visible.
-                "net_cash_flow": (round(net_cash_flow, 4) if pnl_known else None),
+                "trade_count": (finalized_trade_count if _numbers_known else None),
+                # The strategy's WHOLE effect on the wallet: every trade row
+                # of this config id and mode, so EVERY commission it paid --
+                # the entry commission of a closed trade as well as the
+                # commission of a position that was never closed -- and the
+                # PnL of the partial exits. It differs from `realized_pnl`
+                # by those, and both are published so the user sees the
+                # whole picture.
+                "net_cash_flow": (
+                    round(net_cash_flow, 4) if _numbers_known else None
+                ),
                 "open_positions": instance_open_positions,
                 "started_at": config_dict.get(
                     "started_at", datetime.now(timezone.utc).isoformat()
