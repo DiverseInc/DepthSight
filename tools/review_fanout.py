@@ -92,13 +92,17 @@ OLLAMA_DIFF_CHARS = 12000
 # point hermes at the diff file for the rest.
 HERMES_DIFF_CHARS = 11500
 
-# Windows caps a CreateProcess command line at 32,767 characters, and DSH is
-# launched with the whole prompt as ONE argv entry. A diff of any real size
-# will not fit, so the inline copy is capped here. The cap is a GUARD, not a
-# measured DSH limit: when it bites, the prompt says so explicitly and the
-# reviewer is told to answer "DIFF TRUNCATED", which scores as NO VERDICT
-# rather than as a verdict about a partial view.
-DSH_DIFF_CHARS = 20000
+# MEASURED 2026-10-26: Windows caps a CreateProcess command line at 32,767
+# characters, and a 40,000-character argv prompt fails with
+# "FileNotFoundError: [WinError 206] The filename or extension is too long" --
+# a misleading diagnostic that looks like a missing binary. DSH is therefore
+# handed its prompt on STDIN, which has no such limit (MEASURED: `dsh headless`
+# with the prompt on stdin answers correctly). The cap below is a GUARD
+# against handing a model more diff than it can read, not a process limit:
+# when it bites, the prompt says so explicitly and the reviewer is told to
+# answer "DIFF TRUNCATED", which scores as NO VERDICT rather than as a
+# verdict about a partial view.
+DSH_DIFF_CHARS = 80000
 
 # MEASURED 2026-10-18 on a real diff whose correct answer was already known:
 # 7b answered both questions CORRECTLY, and also answered both correctly with
@@ -748,10 +752,17 @@ def _run_dsh(prompt: str, timeout: int = DEFAULT_TIMEOUT) -> ReviewOutcome:
     and no verdict -- while the fan-out counted it as having returned. The
     diff now travels INSIDE the prompt.
 
-    Launched as `node <dsh>/lib/bin.js headless <prompt>` rather than through
-    the `dsh.ps1` npm shim: the shim runs under `powershell -File`, whose
-    argument parsing stops at the first newline and would silently truncate
-    the inline diff to its first line.
+    Two launch details, both measured:
+
+    * it is launched as `node <dsh>/lib/bin.js headless <prompt>` rather than
+      through the `dsh.ps1` npm shim: the shim runs under `powershell -File`,
+      whose argument parsing stops at the first newline and would silently
+      truncate the inline diff to its first line;
+    * the prompt travels on STDIN, not in argv. Windows caps a command line at
+      32,767 characters and a 40,000-character argv prompt fails with
+      "[WinError 206] The filename or extension is too long". `dsh headless`
+      reads its prompt from stdin correctly, so stdin is how a diff of any
+      size reaches it.
     """
     entry = resolve_dsh_entry()
     node = resolve_node()
@@ -763,10 +774,11 @@ def _run_dsh(prompt: str, timeout: int = DEFAULT_TIMEOUT) -> ReviewOutcome:
     if node is None:
         return "dsh", "node is not on PATH -- NO VERDICT", False
 
-    argv = [node, str(entry), "headless", prompt]
+    argv = [node, str(entry), "headless"]
     try:
         p = subprocess.run(
             argv,
+            input=prompt,
             cwd=str(REPO),
             capture_output=True,
             encoding="utf-8",

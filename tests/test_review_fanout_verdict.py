@@ -261,6 +261,47 @@ def test_dsh_prompt_asks_for_the_verdict_marker():
     assert "VERDICT: YES" in prompt and "VERDICT: NO" in prompt, prompt
 
 
+def test_dsh_is_launched_with_the_prompt_on_stdin_not_as_a_path():
+    """The diff must travel INSIDE the prompt, and the prompt must fit.
+
+    MEASURED 2026-10-26: a 40,000-character argv prompt fails on Windows
+    with "[WinError 206] The filename or extension is too long", so the
+    prompt goes on stdin -- which `dsh headless` reads correctly.
+    """
+    fanout = _load_tool()
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="VERDICT: YES\n", stderr=""
+        )
+
+    orig = (
+        fanout.subprocess,
+        fanout.resolve_dsh_entry,
+        fanout.resolve_node,
+    )
+    try:
+        fanout.subprocess = types.SimpleNamespace(
+            run=fake_run, TimeoutExpired=subprocess.TimeoutExpired
+        )
+        fanout.resolve_dsh_entry = lambda: Path("fake-dsh") / "bin.js"
+        fanout.resolve_node = lambda: "fake-node"
+        name, out, ok = fanout._run_dsh(
+            fanout.dsh_prompt("Is the clear path idempotent?", "UNIQUE-DIFF-LINE")
+        )
+    finally:
+        fanout.subprocess, fanout.resolve_dsh_entry, fanout.resolve_node = orig
+
+    assert ok is True, out
+    # No prompt in argv: argv carries only the launcher and the subcommand.
+    assert captured["argv"] == ["fake-node", str(Path("fake-dsh") / "bin.js"), "headless"]
+    # The diff is inside the prompt, on stdin.
+    assert "UNIQUE-DIFF-LINE" in captured["kwargs"]["input"]
+
+
 # --------------------------------------------------------------------------
 # DEFECT 3: opencode gets an isolated pack, never the repository
 # --------------------------------------------------------------------------
