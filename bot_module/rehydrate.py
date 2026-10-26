@@ -49,6 +49,7 @@ import json
 import logging
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from bot_module.db_session import owned_session
 from bot_module.runtime_dependencies import crud
 
 logger = logging.getLogger(__name__)
@@ -130,11 +131,16 @@ async def refresh_payload_config_from_db(
 
     try:
         row = None
-        async for db in db_session_factory():
+        # An owned session, not `async for db in db_session_factory():`: the
+        # latter abandons the generator when the body raises or breaks, and
+        # the abandoned generator keeps its transaction OPEN - holding a
+        # pooled connection until the garbage collector finalises it. Every
+        # restart rehydrates every strategy, so this pinned one connection
+        # per strategy lookup.
+        async with owned_session(db_session_factory) as db:
             row = await crud.get_strategy_config(
                 db, user_id=user_id_int, config_id=config_id
             )
-            break
 
         if row is None:
             # Config deleted, or owned by a different user than the key claims.
