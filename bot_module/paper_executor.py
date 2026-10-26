@@ -1099,6 +1099,14 @@ class PaperTradingExecutor:
                     return
                 previous_pnl = float(position.pnl or 0.0)
                 position.pnl = previous_pnl + amount
+                # The funding is in the position's net result WHATEVER the risk
+                # manager did with it: the WALLET moved. This is the number the
+                # close needs to put back if it rebuilds `position.pnl` from
+                # the fill prices, because that rebuild knows nothing about
+                # funding.
+                position.funding_pnl_booked = float(
+                    getattr(position, "funding_pnl_booked", 0.0) or 0.0
+                ) + amount
                 if funding_reported:
                     position.funding_pnl_reported = float(
                         getattr(position, "funding_pnl_reported", 0.0) or 0.0

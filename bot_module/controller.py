@@ -340,6 +340,16 @@ class LivePosition(BasePosition):
     # close reports the position's cumulative pnl, and would count
     # the same funding a second time without this.
     funding_pnl_reported: float = 0.0
+    # The FUNDING booked INTO this position's `pnl`. A funding charge moves
+    # the wallet between the entry and the close, so it is added to the
+    # position's net result whether or not the RiskManager took it.
+    #
+    # This is NOT the same number as `funding_pnl_reported`: a funding the
+    # risk manager REFUSED is booked into the position but was never reported,
+    # so the close still has to carry it. A close that REBUILDS `pnl` from
+    # the fill prices (the `exit_price > 0` branch) has to put the whole of
+    # this back, and then subtract only the part already reported.
+    funding_pnl_booked: float = 0.0
     closed_time: Optional[float] = None
     exit_reason: Optional[str] = None
     total_commission: Optional[float] = None
@@ -11151,10 +11161,18 @@ class TradingController:
                     # would be short by exactly the funding -- the same
                     # under-trip this whole change exists to close.
                     #
+                    # The WHOLE of the funding that was booked into the
+                    # position is put back, not only the part the risk
+                    # manager took: a funding the risk manager REFUSED is
+                    # still in the position's net result, and this is the last
+                    # chance to carry it. Adding back only the reported part
+                    # would ERASE a refused funding here, and the loss would
+                    # disappear from the risk manager's PnL for good.
+                    #
                     # A LIVE position never has funding (`check_funding` is
                     # the paper executor's), so this is a no-op there.
                     position.pnl += float(
-                        getattr(position, "funding_pnl_reported", 0.0) or 0.0
+                        getattr(position, "funding_pnl_booked", 0.0) or 0.0
                     )
                     # The GROSS result travels separately. The Trade row, the
                     # trader diary and the trade log store the gross result

@@ -104,7 +104,15 @@
     "",
     "N20 is the FIRST-BOOT capture being disabled: an account that has never",
     "traded no longer gets an opening balance either, so nothing can ever",
-    "measure a day against a denominator it can vouch for."
+    "measure a day against a denominator it can vouch for.",
+    "",
+    "N21 is the RECOMPUTE close not adding the funding back at all. That close",
+    "rebuilds position.pnl from the fill prices and the commissions, so the",
+    "funding has to be put back by hand; without it the money the wallet paid",
+    "is erased from the position and never reaches the risk manager.",
+    "",
+    "N22 is the BOOKED funding not being tracked, so the recompute close has",
+    "nothing to add back and the funding is lost the same way."
   ],
   "pytest_target": "tests/test_paper_daily_loss_gate_numerator.py tests/test_daily_loss_base_is_current_day.py tests/test_daily_loss_base_previous_day_payload.py tests/test_daily_loss_gate_reconciles_with_the_wallet.py",
   "timeout_s": 1800,
@@ -229,6 +237,18 @@
       "file": "bot_module/risk_manager.py",
       "needle": "        self._capture_first_boot_base(current_day_str_utc)\n",
       "replace": "        pass  # MUTATED: the first-boot capture is disabled\n"
+    },
+    {
+      "label": "N21: the recompute close does not add the funding back",
+      "file": "bot_module/controller.py",
+      "needle": "                    position.pnl += float(\n                        getattr(position, \"funding_pnl_booked\", 0.0) or 0.0\n                    )\n",
+      "replace": "                    position.pnl += 0.0  # MUTATED: the funding is not added back\n"
+    },
+    {
+      "label": "N22: the booked funding is not tracked",
+      "file": "bot_module/paper_executor.py",
+      "needle": "                position.funding_pnl_booked = float(\n                    getattr(position, \"funding_pnl_booked\", 0.0) or 0.0\n                ) + amount\n",
+      "replace": "                position.funding_pnl_booked = 0.0  # MUTATED: not tracked\n"
     }
   ]
 }

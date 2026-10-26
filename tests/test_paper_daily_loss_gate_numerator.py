@@ -361,17 +361,22 @@ def _move_market_to(paper_executor, price: float) -> None:
     paper_executor.data_consumer.price = float(price)
 
 
-async def _finalize(controller, reason: str):
+async def _finalize(controller, reason: str, exit_price: float = 0.0):
     """Runs the REAL controller finalization of a paper close.
 
     A finalization-only close (`exit_price=0.0`): the money already moved in
     the fill, so the finalization preserves the PnL the fill booked instead
     of recomputing it.
+
+    With `exit_price > 0` it is the OTHER branch: the finalization REBUILDS
+    `position.pnl` from the fill prices and the commissions. That is the
+    branch `close_position` reaches for a paper position, because it passes
+    the ticker price as the exit price.
     """
     await controller._handle_final_exit(
         SYMBOL,
         reason,
-        exit_price=0.0,
+        exit_price=exit_price,
         commission=0.0,
         commission_asset=None,
         order_id=None,
@@ -1028,4 +1033,61 @@ async def test_a_funding_charge_the_risk_manager_refused_is_reported_by_the_clos
         f"the risk manager was told {rm.stats.today_pnl:.8f} but the wallet "
         f"moved {_wallet_total(money):.8f} in total. The funding the risk "
         "manager refused must be reported by the close, exactly once."
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_recompute_close_carries_a_funding_the_risk_manager_refused(
+    money, monkeypatch
+):
+    """The OTHER close branch must not erase the funding.
+
+    `close_position` reaches `_handle_final_exit(exit_price=<the ticker
+    price>)` for a PAPER position too, and that branch REBUILDS
+    `position.pnl` from the fill prices and the commissions -- a number that
+    contains no funding at all. The funding has to be put back, or the money
+    the wallet paid disappears from the risk manager's PnL for good.
+
+    This is the branch the finalization-only close (`exit_price=0.0`) never
+    reaches, so the refused-funding test above does not cover it.
+    """
+    controller, paper_executor, rm = _build_controller(ENTRY_PRICE)
+    _pin_day(rm)
+    position, entry_result = await _run_real_entry(controller, paper_executor)
+    entry_commission = sum(
+        float(f.get("commission") or 0.0) for f in entry_result.get("fills", [])
+    )
+
+    async def _refuse(symbol, funding_pnl):
+        raise RuntimeError("the risk manager is unavailable")
+
+    monkeypatch.setattr(rm, "apply_funding_pnl", _refuse)
+
+    now = datetime.now(timezone.utc)
+    paper_executor._positions[SYMBOL]["last_funding_timestamp"] = (
+        paper_executor._last_funding_boundary_before(
+            now, PAPER_FUNDING_INTERVAL_HOURS
+        )
+        - timedelta(hours=PAPER_FUNDING_INTERVAL_HOURS)
+    )
+
+    wallet_before = _wallet_total(money)
+    await paper_executor.check_funding()
+    charged = _wallet_total(money) - wallet_before
+    assert charged < 0, "the funding must have been charged to the wallet"
+
+    # A close that REBUILDS `position.pnl` from the fill prices.
+    EXIT_PRICE = ENTRY_PRICE - 3.0
+    await _finalize(controller, "MANUAL_CLOSE", exit_price=EXIT_PRICE)
+
+    # The rebuilt net result: (exit - entry) * qty, minus the commission that
+    # was actually paid, PLUS the funding the position paid.
+    expected = (EXIT_PRICE - ENTRY_PRICE) * QTY - entry_commission + charged
+    assert rm.stats.today_pnl == pytest.approx(expected), (
+        f"the risk manager was told {rm.stats.today_pnl:.8f} but the close's "
+        f"net result is {expected:.8f}: "
+        f"({EXIT_PRICE} - {ENTRY_PRICE}) * {QTY} - {entry_commission:.8f} "
+        f"(commission) + {charged:.8f} (funding). The funding was erased by "
+        "the rebuild, so the loss the wallet paid is invisible to the "
+        "daily-loss gate."
     )
