@@ -1429,14 +1429,16 @@ def main() -> int:
         if name in ADVISORY_REVIEWERS:
             flag += " / TRIAGE ONLY - NOT A VERDICT"
         print(f"\n--- {name}  [{flag}] ---")
-        if reason:
+        if reason and not out.startswith(reason):
             print(f"[{name}] {reason}")
         body = out.strip()
         print(redact(body[-1800:]) if body else "(empty response)")
         OUT_DIR.mkdir(exist_ok=True)
         # The saved file is the EVIDENCE: the full output, plus the reason
         # when there is no verdict. Never a truncated slice.
-        saved = out if ok else f"{reason}\n\n{out}"
+        saved = out if ok else (
+            out if out.startswith(reason) else f"{reason}\n\n{out}"
+        )
         (OUT_DIR / f"{name}.txt").write_text(redact(saved), encoding="utf-8")
 
     print("\n" + "=" * 70)
