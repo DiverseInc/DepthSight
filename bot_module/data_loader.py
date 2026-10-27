@@ -255,9 +255,22 @@ def _download_klines_from_api_with_archive_fallback(
         frame = fetch_klines_from_bulk_archive(
             symbol, timeframe, start_dt, end_dt, market_type
         )
+        if frame is None or frame.empty:
+            # The archive produced no candles.  That is a FAILURE, and it
+            # must look like one: an empty frame is not "no data loaded",
+            # and trainer.py / data_consumer.py / portfolio_backtester.py
+            # key on that difference to decide whether to hard-stop.
+            logger.error(
+                f"Bulk archive returned no klines for {symbol} ({timeframe}) "
+                f"between {start_dt} and {end_dt}."
+            )
+            logger.info(
+                f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0"
+            )
+            return None
         logger.info(
             f"klines_source=bulk_archive symbol={symbol} timeframe={timeframe} "
-            f"rows={0 if frame is None else len(frame)}"
+            f"rows={len(frame)}"
         )
         return frame
     except BulkArchiveCoverageError as coverage_error:

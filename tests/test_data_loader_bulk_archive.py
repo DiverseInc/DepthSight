@@ -15,12 +15,17 @@ import io
 import logging
 import zipfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import pytest
 import requests
 
 from bot_module import bulk_archive, config, data_loader
+
+# REAL Binance archives, committed as fixtures so the parser is pinned to
+# real values instead of synthetic rows.
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "binance_bulk_archive"
 
 # Binance's own header for the 12 positional archive columns.
 ARCHIVE_HEADER = (
@@ -180,6 +185,15 @@ def _add_month(month_start):
     if month_start.month == 12:
         return month_start.replace(year=month_start.year + 1, month=1)
     return month_start.replace(month=month_start.month + 1)
+
+
+def _fixture(name):
+    """Reads one REAL committed Binance archive."""
+    path = FIXTURE_DIR / name
+    assert path.exists(), f"missing fixture: {path}"
+    payload = path.read_bytes()
+    assert payload[:4] == b"PK\x03\x04", f"{name} is not a real ZIP archive"
+    return payload
 
 
 def _month_starts(start_dt, end_dt):
@@ -556,7 +570,7 @@ async def test_missing_future_day_within_publication_lag_still_succeeds(
 
     # And the gap is REPORTED, not hidden.
     messages = [record.getMessage() for record in caplog.records]
-    assert any("days_missing=3" in message for message in messages), messages
+    assert any("days_absent=3" in message for message in messages), messages
 
 
 # ==============================================================================
@@ -892,3 +906,267 @@ async def test_spot_archive_without_header_and_microsecond_timestamps(
 
     pd.testing.assert_frame_equal(rest_frame, archive_frame)
     assert archive_frame.index[0] == pd.Timestamp("2025-01-01T00:00:00Z")
+
+
+# ==============================================================================
+# R1: "not listed yet" is not a hole; a mid-range hole still is
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_window_starting_before_the_listing_loads_the_shorter_history(
+    archive_server, monkeypatch
+):
+    """The symbol was not listed until June: the archive holds no Jan-May data.
+
+    That is SHORT HISTORY, not a hole: the load must succeed with the bars
+    the archive actually has, instead of dying because the pre-listing months
+    have no published archive.
+    """
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    june_rows = _make_rows(datetime(2024, 6, 1, tzinfo=timezone.utc), 24, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 6),
+        _make_zip(_rows_to_csv(june_rows), "BTCUSDT-1h-2024-06.csv"),
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 6, 30, 23, tzinfo=timezone.utc)
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
+
+    # No exception, and only the history the archive actually holds.
+    assert frame is not None
+    assert not frame.empty
+    assert frame.index[0] == pd.Timestamp("2024-06-01T00:00:00Z")
+    assert len(frame) == 24
+
+
+@pytest.mark.asyncio
+async def test_a_mid_range_hole_still_fails_loudly(archive_server, monkeypatch):
+    """The symbol traded on BOTH sides of 19 January: its archive is missing.
+
+    That IS a hole, and the load must fail rather than ship a gapped frame.
+    This is the guard on the R1 relaxation: it must not let real holes
+    through.
+    """
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    # January has no monthly archive; its daily files are used instead, and
+    # the 19th is missing.
+    for day in (15, 16, 17, 18, 20):
+        rows = _make_rows(datetime(2024, 1, day, tzinfo=timezone.utc), 24, 60)
+        archive_server.add(
+            _daily_url("BTCUSDT", "1h", FUTURES, 2024, 1, day),
+            _make_zip(_rows_to_csv(rows), f"BTCUSDT-1h-2024-01-{day:02d}.csv"),
+        )
+    # February IS published, so the symbol demonstrably traded after the hole.
+    feb_rows = _make_rows(datetime(2024, 2, 1, tzinfo=timezone.utc), 24, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 2),
+        _make_zip(_rows_to_csv(feb_rows), "BTCUSDT-1h-2024-02.csv"),
+    )
+
+    start = datetime(2024, 1, 15, tzinfo=timezone.utc)
+    end = datetime(2024, 2, 29, 23, tzinfo=timezone.utc)
+
+    with pytest.raises(bulk_archive.BulkArchiveCoverageError):
+        bulk_archive.fetch_klines_from_bulk_archive(
+            "BTCUSDT", "1h", start, end, FUTURES
+        )
+
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_an_empty_daily_file_is_not_a_hole(archive_server, monkeypatch):
+    """A file that EXISTS with no candles means "no trades that day"."""
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    for day in (15, 17):
+        rows = _make_rows(datetime(2024, 1, day, tzinfo=timezone.utc), 24, 60)
+        archive_server.add(
+            _daily_url("BTCUSDT", "1h", FUTURES, 2024, 1, day),
+            _make_zip(_rows_to_csv(rows), f"BTCUSDT-1h-2024-01-{day:02d}.csv"),
+        )
+    # The 16th exists but holds no candles: the symbol did not trade.
+    archive_server.add(
+        _daily_url("BTCUSDT", "1h", FUTURES, 2024, 1, 16),
+        _make_zip(_rows_to_csv([]), "BTCUSDT-1h-2024-01-16.csv"),
+    )
+
+    start = datetime(2024, 1, 15, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 17, 23, tzinfo=timezone.utc)
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
+
+    assert frame is not None
+    assert len(frame) == 48
+
+
+# ==============================================================================
+# R2: the wrapper returns None whenever it cannot produce candles
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_archive_with_no_candles_yields_none_not_an_empty_frame(
+    archive_server, monkeypatch
+):
+    """REST 451 + an archive with nothing => None, so the hard stops fire."""
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+
+    assert result is None, "an empty frame is not 'no data loaded'"
+
+
+# ==============================================================================
+# R3: the archive picks its venue exactly like the REST path does
+# ==============================================================================
+
+
+def test_archive_market_path_uses_the_rest_path_comparison():
+    """Exactly the comparison the REST path uses (market_type == "spot")."""
+    assert bulk_archive._archive_market_path("spot") == "spot"
+    assert bulk_archive._archive_market_path("futures_usdtm") == "futures/um"
+    assert bulk_archive._archive_market_path("futures_coinm") == "futures/cm"
+    # A market type that merely CONTAINS "spot" must NOT get spot candles:
+    # the REST path would have queried the futures host.
+    assert bulk_archive._archive_market_path("spot_usdtm") == "futures/um"
+    assert bulk_archive._archive_market_path("spot_perp") == "futures/um"
+
+
+@pytest.mark.asyncio
+async def test_a_market_type_containing_spot_does_not_get_spot_candles(
+    archive_server, monkeypatch
+):
+    """"spot_usdtm" must resolve to the FUTURES archive, like the REST path."""
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 24, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        _make_zip(_rows_to_csv(rows), "BTCUSDT-1h-2024-01.csv"),
+    )
+
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h",
+        datetime(2024, 1, 1, tzinfo=timezone.utc),
+        datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
+        "spot_usdtm",
+    )
+
+    assert len(frame) == 24
+    # The futures archive was requested; the spot one was not.
+    assert archive_server.monthly_urls() == [
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1)
+    ]
+    assert not any("/spot/" in url for url in archive_server.requested)
+
+
+# ==============================================================================
+# R4: the parser is pinned to REAL Binance values
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_real_futures_archive_values_are_pinned(archive_server):
+    """Real Binance bytes: exact row count and exact first/last bar."""
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        _fixture("BTCUSDT-1h-2024-01-futures-um.zip"),
+    )
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 2),
+        _fixture("BTCUSDT-1h-2024-02-futures-um.zip"),
+    )
+    archive_server.add(
+        _daily_url("BTCUSDT", "1h", FUTURES, 2024, 3, 1),
+        _fixture("BTCUSDT-1h-2024-03-01-futures-um.zip"),
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 3, 1, tzinfo=timezone.utc)
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
+
+    # 744 (Jan) + 696 (Feb) + 1 (the 1 March bar) = 1441
+    assert len(frame) == 1441
+    assert frame.index[0] == pd.Timestamp("2024-01-01T00:00:00Z")
+    assert frame.index[-1] == pd.Timestamp("2024-03-01T00:00:00Z")
+    assert frame.index.is_monotonic_increasing
+    assert not frame.index.duplicated().any()
+
+    first = frame.iloc[0]
+    assert first["open"] == 42314.0
+    assert first["high"] == 42603.2
+    assert first["low"] == 42289.6
+    assert first["close"] == 42503.5
+    assert first["volume"] == 8459.477
+    assert first["number_of_trades"] == 88278
+
+    # The single month on its own is exactly the 744 hours of January.
+    january = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h",
+        datetime(2024, 1, 1, tzinfo=timezone.utc),
+        datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
+        FUTURES,
+    )
+    assert len(january) == 744
+    assert january.index[0] == pd.Timestamp("2024-01-01T00:00:00Z")
+    assert january.index[-1] == pd.Timestamp("2024-01-31T23:00:00Z")
+
+
+@pytest.mark.asyncio
+async def test_real_spot_archive_values_differ_from_futures(archive_server):
+    """The spot archive is a DIFFERENT venue: pin both and assert they differ."""
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", SPOT, 2024, 1),
+        _fixture("BTCUSDT-1h-2024-01-spot.zip"),
+    )
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        _fixture("BTCUSDT-1h-2024-01-futures-um.zip"),
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    spot = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, SPOT
+    )
+
+    assert len(spot) == 744
+    first = spot.iloc[0]
+    assert first["open"] == 42283.58
+    assert first["number_of_trades"] == 47134
+
+    # The same window on the futures venue is a different market entirely.
+    futures = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
+    assert len(futures) == 744
+    assert futures.iloc[0]["open"] == 42314.0
+    assert futures.iloc[0]["number_of_trades"] == 88278
+    assert spot.iloc[0]["open"] != futures.iloc[0]["open"]
+    assert spot.iloc[0]["number_of_trades"] != futures.iloc[0]["number_of_trades"]

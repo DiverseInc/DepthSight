@@ -134,11 +134,18 @@ _INTERVAL_ALIASES = {
 
 
 def _archive_market_path(market_type: str) -> str:
-    """Maps a loader ``market_type`` onto the archive's folder layout."""
-    mt = (market_type or "").strip().lower()
-    if "spot" in mt:
+    """Maps a loader ``market_type`` onto the archive's folder layout.
+
+    The comparison is EXACTLY the one the REST path uses to choose its host
+    (``market_type == "spot"`` in ``data_loader._make_api_request``).  A
+    substring test would be a silent venue swap: a market type that merely
+    CONTAINS "spot" would get spot candles from the archive while the REST
+    path had queried the futures host.
+    """
+    mt = (market_type or "").strip()
+    if mt == "spot":
         return "spot"
-    if "coinm" in mt or "coin_m" in mt:
+    if mt in ("futures_coinm", "futures_cm", "coinm"):
         return "futures/cm"
     return "futures/um"
 
@@ -236,12 +243,20 @@ def _parse_archive_csv(text: str) -> pd.DataFrame:
     except ValueError:
         skiprows = 1
 
-    frame = pd.read_csv(
-        io.StringIO(text),
-        header=None,
-        skiprows=skiprows,
-        dtype=str,
-    )
+    if not text.strip() or len(text.strip().splitlines()) <= skiprows:
+        # A file with no rows at all: the symbol did not trade that day.
+        return _empty_result()
+
+    try:
+        frame = pd.read_csv(
+            io.StringIO(text),
+            header=None,
+            skiprows=skiprows,
+            dtype=str,
+        )
+    except pd.errors.EmptyDataError:
+        # A file with nothing in it: the symbol did not trade that day.
+        return _empty_result()
     if frame.empty:
         return _empty_result()
 
@@ -322,6 +337,35 @@ def _is_missing_day_a_hole(day: datetime, now: datetime) -> bool:
     return (day + timedelta(days=1)) <= (now - _PUBLICATION_LAG)
 
 
+def _is_absent_day_a_hole(
+    day: datetime, first_bar: datetime, last_bar: datetime, now: datetime
+) -> bool:
+    """True when an ABSENT daily file for ``day`` is a genuine HOLE.
+
+    An absent file only means "there is a hole" when the symbol demonstrably
+    existed on that day.  Judged against the bars actually loaded for this
+    window:
+
+    * before the first observed bar -> the symbol was not listed yet (or was
+      delisted and relisted); there is no hole, the history simply starts
+      later;
+    * after the last observed bar -> delisted, or the trailing publication
+      lag; there is no hole;
+    * in between -> the symbol traded on both sides of the day, so the file
+      should have existed.  If it did not, the month has a hole in it and
+      the load must fail rather than ship a gapped frame.
+    """
+    if not _is_missing_day_a_hole(day, now):
+        return False
+    if day + timedelta(days=1) <= first_bar:
+        # Entirely before the first observed bar: not listed yet.
+        return False
+    if day > last_bar:
+        # Entirely after the last observed bar: delisted / trailing edge.
+        return False
+    return True
+
+
 def _load_monthly_archive(
     symbol: str, interval: str, market_type: str, month_start: datetime
 ) -> Optional[pd.DataFrame]:
@@ -349,29 +393,32 @@ def _load_daily_archives(
 ) -> Tuple[List[pd.DataFrame], List[datetime]]:
     """Fetches the daily archives of one month that overlap the window.
 
-    Returns the parsed frames and the days whose archive was NOT available.
-    A file that exists but holds no candle counts as missing: it carries no
-    data for that day, and pretending otherwise would ship a silent hole.
+    Returns the parsed frames and the days whose archive was ABSENT (HTTP
+    404, i.e. Binance has not published that file).
+
+    A file that EXISTS but holds no candle is NOT an absent day: that is
+    Binance saying the symbol did not trade that day, which is legitimate
+    data, not a publication hole.  Only an absent file can be a hole.
     """
     frames: List[pd.DataFrame] = []
-    missing_days: List[datetime] = []
+    absent_days: List[datetime] = []
     day = month_start
     while day < next_month:
         if day <= end_dt and (day + timedelta(days=1)) > start_dt:
             url = _daily_url(symbol, interval, market_type, day)
             payload = fetch_archive_bytes(url)
             if payload is None:
-                missing_days.append(day)
+                absent_days.append(day)
                 logger.debug(f"Bulk archive: daily file not published {url}")
             else:
                 frame = parse_archive_candles(payload)
                 if frame.empty:
-                    missing_days.append(day)
-                    logger.warning(f"Bulk archive: daily archive is empty {url}")
+                    # The file exists: the symbol did not trade that day.
+                    logger.debug(f"Bulk archive: daily archive has no candles {url}")
                 else:
                     frames.append(frame)
         day += timedelta(days=1)
-    return frames, missing_days
+    return frames, absent_days
 
 
 # ==============================================================================
@@ -395,11 +442,23 @@ def fetch_klines_from_bulk_archive(
     month, while Binance is still publishing -- are the DAILY archives of the
     overlapping days used instead.
 
-    COVERAGE IS FAIL-CLOSED.  If a daily file for a day that should already
-    be published is missing and no monthly archive can complete that month,
+    COVERAGE IS FAIL-CLOSED, BUT ONLY WHERE THERE IS A HOLE.  An absent
+    daily file is a hole when the symbol demonstrably existed on that day:
+    the day falls after the first bar observed for this window and before
+    the last one, and it is older than the publication lag.  Then
     :class:`BulkArchiveCoverageError` is raised rather than a gapped frame
-    being returned.  A backtest that silently trades a hole produces a P&L
-    that looks valid and is not; a wrong number is worse than no number.
+    being returned -- a backtest that silently trades a hole produces a P&L
+    that looks valid and is not, and a wrong number is worse than no number.
+
+    A day before the first observed bar is NOT a hole: the symbol was not
+    listed yet, and the window simply carries the shorter history the
+    archive holds.  A day after the last observed bar is not a hole either
+    (delisted, or the trailing publication lag).
+
+    KNOWN DIFFERENCES FROM THE REST PATH, both inherent to the source and
+    reported in the log line below: the archive holds only CLOSED bars (REST
+    also returns the still-forming one), and the trailing edge of a window
+    that runs to "now" is short by the publication lag.
 
     Returns a DataFrame shaped exactly like the REST path's output, or an
     empty DataFrame when Binance has no archive for the window at all.
@@ -412,8 +471,8 @@ def fetch_klines_from_bulk_archive(
     interval = _normalise_interval(timeframe)
     now = datetime.now(timezone.utc)
     frames: List[pd.DataFrame] = []
+    absent_days: List[datetime] = []
     months = 0
-    days_missing = 0
 
     for month_start in _iter_months(start_dt, end_dt):
         next_month = _add_month(month_start)
@@ -426,30 +485,11 @@ def fetch_klines_from_bulk_archive(
 
         # The monthly archive is not published: fall back to the daily files
         # of the days the window touches.
-        daily, missing_days = _load_daily_archives(
+        daily, month_absent = _load_daily_archives(
             symbol, interval, market_type, start_dt, end_dt, month_start, next_month
         )
-        days_missing += len(missing_days)
-
-        holes = [day for day in missing_days if _is_missing_day_a_hole(day, now)]
-        if holes:
-            hole_text = ", ".join(day.strftime("%Y-%m-%d") for day in holes[:5])
-            if len(holes) > 5:
-                hole_text += f", ... (+{len(holes) - 5} more)"
-            raise BulkArchiveCoverageError(
-                f"Bulk archive cannot cover {symbol} ({timeframe}): "
-                f"{len(holes)} day(s) in {month_start:%Y-%m} have no published "
-                f"archive and the monthly archive for that month is missing "
-                f"too ({hole_text}). Refusing to return a gapped frame."
-            )
-
+        absent_days.extend(month_absent)
         frames.extend(daily)
-
-    logger.info(
-        f"Bulk archive coverage: symbol={symbol} timeframe={timeframe} "
-        f"months={months} days_missing={days_missing} "
-        f"window={start_dt.isoformat()}..{end_dt.isoformat()}"
-    )
 
     if not frames:
         logger.warning(
@@ -463,5 +503,39 @@ def fetch_klines_from_bulk_archive(
     result = result[~result.index.duplicated(keep="first")]
     result = result[(result.index >= start_dt) & (result.index <= end_dt)]
     if result.empty:
+        logger.warning(
+            f"Bulk archive: no klines inside the requested window for {symbol} "
+            f"({timeframe}) between {start_dt} and {end_dt}."
+        )
         return _empty_result()
+
+    # Judge the absent days against the bars that were actually loaded: only
+    # a day the symbol demonstrably traded through can be a hole.
+    first_bar = result.index[0]
+    last_bar = result.index[-1]
+    holes = [
+        day
+        for day in absent_days
+        if _is_absent_day_a_hole(day, first_bar, last_bar, now)
+    ]
+    if holes:
+        hole_text = ", ".join(day.strftime("%Y-%m-%d") for day in holes[:5])
+        if len(holes) > 5:
+            hole_text += f", ... (+{len(holes) - 5} more)"
+        raise BulkArchiveCoverageError(
+            f"Bulk archive cannot cover {symbol} ({timeframe}): "
+            f"{len(holes)} day(s) inside the traded range "
+            f"{first_bar.isoformat()}..{last_bar.isoformat()} have no published "
+            f"archive ({hole_text}). Refusing to return a gapped frame."
+        )
+
+    trailing_absent = [day for day in absent_days if day > last_bar]
+    logger.info(
+        f"Bulk archive coverage: symbol={symbol} timeframe={timeframe} "
+        f"months={months} days_absent={len(absent_days)} "
+        f"trailing_days_absent={len(trailing_absent)} "
+        f"first_bar={first_bar.isoformat()} last_bar={last_bar.isoformat()} "
+        f"rows={len(result)} "
+        f"window={start_dt.isoformat()}..{end_dt.isoformat()}"
+    )
     return result
