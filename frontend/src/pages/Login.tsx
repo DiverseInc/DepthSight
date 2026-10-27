@@ -28,7 +28,11 @@ import {
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/components/ui/use-toast";
 import { useAuth } from "@/context/AuthContext";
-import { isDemoCredentialsEnabled } from "@/lib/demoAccess";
+import {
+	areDemoCredentialsAvailable,
+	DEMO_CREDENTIALS,
+	isDemoCredentialsEnabled,
+} from "@/lib/demoAccess";
 import { GoogleLogin } from "@react-oauth/google";
 
 // Validation schema for the login form
@@ -40,10 +44,15 @@ const loginSchema = (t: (key: string) => string) =>
 
 type LoginFormValues = z.infer<ReturnType<typeof loginSchema>>;
 
-// Demo credentials surfaced for the investor preview.
-// These map to the rows created by scripts/seed_demo_data.py.
-const DEMO_USERNAME = "alex_trader";
-const DEMO_PASSWORD = "DemoPassword123!";
+// The seeded demo account, surfaced for the investor preview.
+// It maps to the rows created by scripts/seed_demo_data.py.
+//
+// The credentials are NOT written here. They are injected at BUILD time by
+// Vite's `define` (frontend/demo-build-flag.ts), which resolves to `null`
+// unless the build asked for the demo helper. A production bundle therefore
+// does not contain the username or the password at all -- previously they sat
+// in module-level constants here and were readable in the shipped JavaScript
+// even though the panel itself was gated off.
 
 // Google OAuth client id from Vite env. If not configured, we hide the
 // Google button entirely instead of rendering a broken OAuth flow.
@@ -123,9 +132,12 @@ export default function LoginPage() {
 	const { toast } = useToast();
 	const [showPassword, setShowPassword] = useState(false);
 	// The demo helper is OFF unless the build asks for it (VITE_SHOW_DEMO).
-	const showDemoCredentials = isDemoCredentialsEnabled(
-		import.meta.env as unknown as Record<string, unknown>,
-	);
+	// Both conditions must hold: the build must have asked for it, and the
+	// credentials must actually have been compiled in.
+	const showDemoCredentials =
+		isDemoCredentialsEnabled(
+			import.meta.env as unknown as Record<string, unknown>,
+		) && areDemoCredentialsAvailable;
 
 	const form = useForm<LoginFormValues>({
 		resolver: zodResolver(loginSchema(t)),
@@ -142,11 +154,12 @@ export default function LoginPage() {
 	};
 
 	const fillDemoCredentials = () => {
-		form.setValue("username", DEMO_USERNAME);
-		form.setValue("password", DEMO_PASSWORD);
+		if (!DEMO_CREDENTIALS) return;
+		form.setValue("username", DEMO_CREDENTIALS.username);
+		form.setValue("password", DEMO_CREDENTIALS.password);
 		toast({
 			title: "Demo credentials loaded",
-			description: "Click Sign in to continue as alex_trader.",
+			description: `Click Sign in to continue as ${DEMO_CREDENTIALS.username}.`,
 		});
 	};
 
@@ -329,11 +342,11 @@ export default function LoginPage() {
 									<div className="rounded-md bg-background/60 border border-border/60 px-3 py-2 font-mono text-xs">
 										<div className="flex justify-between gap-2">
 											<span className="text-muted-foreground">user</span>
-											<span>{DEMO_USERNAME}</span>
+											<span>{DEMO_CREDENTIALS?.username}</span>
 										</div>
 										<div className="flex justify-between gap-2">
 											<span className="text-muted-foreground">pass</span>
-											<span>{DEMO_PASSWORD}</span>
+											<span>{DEMO_CREDENTIALS?.password}</span>
 										</div>
 									</div>
 									<Button

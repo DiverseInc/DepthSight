@@ -13,11 +13,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
+import { demoDefine } from "./demo-build-flag";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
 	plugins: [react()],
+	// The same build-time define the app build uses, so the demo credentials
+	// are `null` in the test runner too unless the test build asks for them.
+	// Without this the `__DEMO_CREDENTIALS__` global would be undefined here.
+	define: demoDefine(process.env.VITE_SHOW_DEMO),
 	resolve: {
 		alias: {
 			"@": path.resolve(__dirname, "./src"),
