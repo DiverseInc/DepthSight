@@ -134,6 +134,38 @@ def _dual_mode_risk_manager(redis_client, day=TODAY, user_id=1, api_key_id=7):
     return rm
 
 
+def _paper_only_risk_manager(redis_client, day=TODAY, user_id=1, api_key_id=7):
+    """A real RiskManager for a keyless PAPER account (no live executor).
+
+    `bot_runner.py:563` builds exactly this: `executor=None,
+    paper_executor=paper_executor`. There is no live account behind it.
+    """
+    paper_executor = AsyncMock()
+    paper_executor.get_account_balance.return_value = {
+        "USDT": {"free": f"{PAPER_BALANCE:.8f}", "locked": "0.00"}
+    }
+    rm = RiskManager(
+        executor=None,
+        paper_executor=paper_executor,
+        user_id=user_id,
+        db_session=None,
+        user_settings={
+            "risk_management": {"maxConsecutiveLosses": MAX_CONSECUTIVE_LOSSES}
+        },
+        api_key_name=None,
+    )
+    rm.redis_client = redis_client
+    rm.api_key_id = api_key_id
+    rm.executor = None
+    rm.paper_executor = paper_executor
+    rm._fake_day = day
+    rm._get_current_day_start_info = lambda: (
+        datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp(),
+        rm._fake_day,
+    )
+    return rm
+
+
 def _guard_key(rm):
     return f"{GUARD_STATE_NAMESPACE}:{rm.user_id}:{rm.api_key_id}"
 
@@ -350,6 +382,30 @@ async def test_the_persisted_guard_keeps_one_key_and_carries_both_sandboxes(
     assert "paper" in payload
     assert payload["paper"]["consecutive_losses"] == 1
     assert payload["paper"]["today_pnl"] == pytest.approx(-10.0)
+
+
+async def test_a_keyless_paper_accounts_funding_lands_in_the_paper_sandbox(
+    redis_store,
+):
+    """A keyless PAPER account has no live account, so its funding is paper funding.
+
+    The paper executor is the only caller of `apply_funding_pnl()`, and for a
+    keyless account the paper executor IS the account. Its funding must
+    therefore be booked against the PAPER sandbox -- the one the controller
+    publishes for it -- and must not touch the live counters.
+    """
+    rm = _paper_only_risk_manager(FakeRedis(redis_store))
+    await rm.initialize_balance()
+    assert rm.paper_stats.current_balance == pytest.approx(PAPER_BALANCE)
+
+    applied = await rm.apply_funding_pnl("BTCUSDT", -25.0)
+
+    assert applied is True
+    assert rm.paper_stats.today_pnl == pytest.approx(-25.0)
+    assert rm.stats.today_pnl == pytest.approx(0.0), (
+        "the paper wallet's funding charge was booked against the LIVE "
+        "day's PnL"
+    )
 
 
 async def test_a_payload_written_before_this_change_is_still_restored(

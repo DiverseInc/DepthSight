@@ -1595,7 +1595,7 @@ class RiskManager:
         self._capture_first_boot_base(current_day_str_utc)
 
     async def apply_funding_pnl(
-        self, symbol: str, funding_pnl: float, mode: str = "live"
+        self, symbol: str, funding_pnl: float, mode: Optional[str] = None
     ) -> bool:
         """Record a FUNDING charge against the day's PnL.
 
@@ -1614,8 +1614,15 @@ class RiskManager:
         `mode` says which sandbox the funding belongs to. A PAPER funding
         charge must land in the PAPER counters: it is simulated money, and
         the LIVE daily-loss gate is what stands between the account and
-        real money. The default is "live" so a caller that omits it cannot
-        accidentally book a live funding charge into the paper sandbox.
+        real money.
+
+        With no explicit mode, the sandbox follows the ACCOUNT, exactly as
+        `update_balance()` does: a keyless PAPER account has no live
+        executor, so the paper executor IS its account and its funding
+        belongs to the paper sandbox -- which is also the sandbox the
+        controller publishes for it. An account WITH a live executor has a
+        live wallet whose day PnL the live gate measures; its funding is
+        booked there.
 
         Returns True when the funding IS in today's PnL. The caller needs
         that distinction: the close subtracts the funding that was ALREADY
@@ -1623,6 +1630,8 @@ class RiskManager:
         subtracted -- otherwise the close would report it a second time, or
         the gate would never hear about it at all.
         """
+        if mode is None:
+            mode = "live" if self.executor is not None else "paper"
         mode = self._normalize_mode(mode)
         stats = self._mode_stats(mode)
         if mode == "paper":
