@@ -225,6 +225,13 @@ BINANCE_SPOT_DATA_API_URL_FOR_LOADER = "https://api.binance.com/api/v3"
 BINANCE_FUTURES_USDTM_DATA_API_URL_FOR_LOADER = "https://fapi.binance.com/fapi/v1"
 BINANCE_FUTURES_COINM_DATA_API_URL_FOR_LOADER = "https://dapi.binance.com/dapi/v1"
 
+# Binance's public bulk-archive host. It serves the SAME klines as the REST
+# market-data endpoints above, but on a different host that stays reachable
+# when those are geo/IP-blocked (they answer HTTP 451 from some networks).
+# Used only as a FALLBACK; the REST path above is still tried first and is
+# unchanged.
+BINANCE_BULK_ARCHIVE_DATA_URL = "https://data.binance.vision/data"
+
 # These are already defined above, but we ensure they exist for clarity in DataLoader context
 # BINANCE_SPOT_TESTNET_API_URL_FOR_LOADER = "https://testnet.binance.vision/api/v3"
 # BINANCE_FUTURES_TESTNET_API_URL_FOR_LOADER = "https://testnet.binancefuture.com/fapi/v1"

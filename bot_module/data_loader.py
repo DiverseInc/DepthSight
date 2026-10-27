@@ -10,6 +10,7 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 
 from . import config
+from .bulk_archive import fetch_klines_from_bulk_archive
 from .utils import (
     add_relative_volume,
     calculate_scalper_natr,
@@ -172,6 +173,82 @@ def _download_klines_from_api(
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
     df = df[~df.index.duplicated(keep="first")]
     return df[["open", "high", "low", "close", "volume", "number_of_trades"]]
+
+
+def _is_binance_location_block(error: Exception) -> bool:
+    """True when the REST endpoint refused us because of where we are.
+
+    Binance answers HTTP 451 ("Service unavailable from a restricted
+    location according to 'b. Eligibility' ...") from geo/IP-blocked
+    networks -- the signature documented in market_data_service.py.  A
+    transport-level failure (DNS/TLS/timeout) counts too: the REST host could
+    not be reached at all, while the archive lives on a different host.
+
+    Every OTHER failure (a 4xx/5xx answer, a bad request, a bug) keeps the
+    behaviour it has today, so a genuine API fault is never masked by
+    silently serving archive data instead.
+    """
+    if isinstance(error, requests.exceptions.HTTPError):
+        response = getattr(error, "response", None)
+        return response is not None and response.status_code == 451
+    return isinstance(
+        error, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
+    )
+
+
+def _download_klines_from_api_with_archive_fallback(
+    symbol: str, timeframe: str, start_dt: datetime, end_dt: datetime, market_type: str
+) -> Optional[pd.DataFrame]:
+    """Downloads klines via the Binance REST API, falling back to the bulk archive.
+
+    The Binance REST market-data endpoints (api.binance.com / fapi.binance.com)
+    answer HTTP 451 -- "Service unavailable from a restricted location" -- from
+    geo/IP-blocked networks, which makes every backtest fail with "Failed to
+    load historical data for <symbol>". Binance publishes the SAME candles as
+    downloadable archives on data.binance.vision, so the loader can still
+    produce data for the same venue, symbol and window.
+
+    The REST path itself is untouched: it is still tried first and it is still
+    what wins whenever it answers. The archive is a strictly additive third
+    source, used only when the REST path fails with a location block or a
+    transport error.
+    """
+    try:
+        frame = _download_klines_from_api(
+            symbol, timeframe, start_dt, end_dt, market_type
+        )
+        logger.info(
+            f"klines_source=rest_api symbol={symbol} timeframe={timeframe} "
+            f"rows={0 if frame is None else len(frame)}"
+        )
+        return frame
+    except Exception as api_error:
+        if not _is_binance_location_block(api_error):
+            # Not a location block: keep the behaviour this loader has today.
+            raise
+        logger.warning(
+            f"Binance REST klines unavailable for {symbol} ({timeframe}): "
+            f"{api_error}. Falling back to the Binance bulk archive."
+        )
+
+    try:
+        frame = fetch_klines_from_bulk_archive(
+            symbol, timeframe, start_dt, end_dt, market_type
+        )
+        logger.info(
+            f"klines_source=bulk_archive symbol={symbol} timeframe={timeframe} "
+            f"rows={0 if frame is None else len(frame)}"
+        )
+        return frame
+    except Exception as archive_error:
+        logger.error(
+            f"Bulk archive klines failed for {symbol} ({timeframe}): {archive_error}",
+            exc_info=True,
+        )
+        logger.info(
+            f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0"
+        )
+        return pd.DataFrame()
 
 
 def _download_agg_trades_from_api(
@@ -346,6 +423,10 @@ async def download_klines(
                 logger.info(
                     "Local data is complete and contains indicators. Returning from cache."
                 )
+                logger.info(
+                    f"klines_source=local_cache symbol={symbol} timeframe={timeframe} "
+                    f"rows={len(df_local)}"
+                )
                 return df_local
 
         api_start_dt = start_dt_utc
@@ -354,7 +435,7 @@ async def download_klines(
 
         df_api = await loop.run_in_executor(
             None,
-            _download_klines_from_api,
+            _download_klines_from_api_with_archive_fallback,
             symbol,
             timeframe,
             api_start_dt,
