@@ -1016,6 +1016,7 @@ def reviewers(
     # hermes gets its own copy, capped and MARKED, because its CLI truncates
     # silently around 12,000 characters. A marked truncation is recoverable
     # (it can read the rest from the file); a silent one is not.
+    hermes_truncated = len(full_text) > HERMES_DIFF_CHARS
     hermes_text = _inline(
         full_text,
         HERMES_DIFF_CHARS,
@@ -1039,67 +1040,69 @@ def reviewers(
 
     jobs: dict[str, Callable[[], ReviewOutcome]] = {}
 
-    jobs["ollama"] = lambda: _run(
+    # Every prompt is built HERE, not inside the lambda. A NameError in a
+    # prompt must surface when the panel is assembled, not 90 seconds later
+    # inside a subprocess call: MEASURED 2026-10-26, a typo in the hermes
+    # prompt made hermes fail with "NameError: name 'hermes_truncated' is
+    # not defined", which the panel honestly reported as NO VERDICT but
+    # which cost a whole reviewer slot.
+    ollama_argv = [
         "ollama",
-        [
-            "ollama",
-            "run",
-            OLLAMA_MODEL,
-            f"{question}\n\n"
-            f"{VERDICT_INSTRUCTION}\n\n"
-            f"{TRUNCATION_PROTOCOL}\n\n"
-            f"Review THIS diff, pasted inline. It is the complete diff:\n\n"
-            f"```diff\n{ollama_text}\n```\n\n"
-            f"Answer only from the diff above. If it does not contain enough "
-            f"to answer, say exactly that.",
-        ],
-    )
+        "run",
+        OLLAMA_MODEL,
+        f"{question}\n\n"
+        f"{VERDICT_INSTRUCTION}\n\n"
+        f"{TRUNCATION_PROTOCOL}\n\n"
+        f"Review THIS diff, pasted inline. It is the complete diff:\n\n"
+        f"```diff\n{ollama_text}\n```\n\n"
+        f"Answer only from the diff above. If it does not contain enough "
+        f"to answer, say exactly that.",
+    ]
+    jobs["ollama"] = lambda: _run("ollama", ollama_argv)
 
-    jobs["hermes"] = lambda: _run(
+    hermes_argv = [
         "hermes",
-        [
-            "hermes",
-            "-z",
-            f"{question}\n\n"
-            f"{VERDICT_INSTRUCTION}\n\n"
-            f"{TRUNCATION_PROTOCOL}\n\n"
-            + (
-                f"NOTE: the inline copy below IS truncated -- its own CLI "
-                f"cuts the prompt at about {HERMES_DIFF_CHARS} characters, so "
-                f"the note at the end of this prompt may never reach you. The "
-                f"COMPLETE diff is on disk at {diff_s}; read that file "
-                f"instead of relying on the copy below.\n\n"
-                if hermes_truncated
-                else ""
-            )
-            + f"Review THIS diff, pasted inline:\n\n"
-            f"```diff\n{hermes_text}\n```\n\n"
-            f"Answer only from the diff above. If the inline copy is "
-            f"truncated, say exactly 'DIFF TRUNCATED' and do not answer about "
-            f"a different file.",
-        ],
-    )
+        "-z",
+        f"{question}\n\n"
+        f"{VERDICT_INSTRUCTION}\n\n"
+        f"{TRUNCATION_PROTOCOL}\n\n"
+        + (
+            f"NOTE: the inline copy below IS truncated -- its own CLI cuts "
+            f"the prompt at about {HERMES_DIFF_CHARS} characters, so a note "
+            f"placed at the END of this prompt may never reach you. The "
+            f"COMPLETE diff is on disk at {diff_s}; read that file instead of "
+            f"relying on the copy below.\n\n"
+            if hermes_truncated
+            else ""
+        )
+        + f"Review THIS diff, pasted inline:\n\n"
+        f"```diff\n{hermes_text}\n```\n\n"
+        f"Answer only from the diff above. If the inline copy is truncated, "
+        f"say exactly 'DIFF TRUNCATED' and do not answer about a different "
+        f"file.",
+    ]
+    jobs["hermes"] = lambda: _run("hermes", hermes_argv)
 
     # DEFECT 1 FIX: the diff travels inside the prompt.
-    jobs["dsh"] = lambda: _run_dsh(dsh_prompt(question, dsh_text))
+    dsh_p = dsh_prompt(question, dsh_text)
+    jobs["dsh"] = lambda: _run_dsh(dsh_p)
 
     # DEFECT 3 FIX: an ISOLATED evidence pack, never the repository.
     pack = build_opencode_pack(diff, REPO)
     attach = pack / "review.diff"
+    oc_message = opencode_message(question)
     jobs["opencode"] = lambda: _run_opencode(
-        opencode_message(question), pack, attach, OPENCODE_TIMEOUT
+        oc_message, pack, attach, OPENCODE_TIMEOUT
     )
 
     if include_paid:
-        jobs["copilot"] = lambda: _run(
+        copilot_argv = [
             "copilot",
-            [
-                "copilot",
-                "-p",
-                f"{question} {VERDICT_INSTRUCTION} The diff under review is at "
-                f"{diff_s}; read that file. Repo root: {REPO}.",
-            ],
-        )
+            "-p",
+            f"{question} {VERDICT_INSTRUCTION} The diff under review is at "
+            f"{diff_s}; read that file. Repo root: {REPO}.",
+        ]
+        jobs["copilot"] = lambda: _run("copilot", copilot_argv)
     return jobs
 
 

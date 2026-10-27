@@ -382,6 +382,24 @@ def test_dsh_is_launched_with_the_prompt_on_stdin_not_as_a_path():
 # --------------------------------------------------------------------------
 
 
+def test_the_panel_is_assembled_without_error():
+    """MEASURED 2026-10-26: a NameError inside the hermes prompt made hermes
+    fail with "NameError: name 'hermes_truncated' is not defined". Every
+    prompt is built when the panel is assembled, so that class of bug
+    surfaces here instead of 90 seconds into a subprocess call.
+    """
+    fanout = _load_tool()
+    with tempfile.TemporaryDirectory() as tmp:
+        diff = Path(tmp) / "review.diff"
+        diff.write_text(
+            "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", encoding="utf-8"
+        )
+        jobs = fanout.reviewers(diff, "Is this correct?")
+        assert set(jobs) == {"ollama", "hermes", "dsh", "opencode"}
+        for name, job in jobs.items():
+            assert callable(job), name
+
+
 def test_opencode_pack_is_isolated_from_the_repository():
     fanout = _load_tool()
     with tempfile.TemporaryDirectory() as tmp:
