@@ -122,6 +122,69 @@ class TestTheTwoOgImageHandlersDoNotCollide:
             )
 
 
+class TestTheServedDirectoryHoldsNothingElse:
+    """Caddy must not be able to serve an arbitrary file from /srv/frontend.
+
+    docker-compose.yml bind-mounts the WHOLE frontend/ directory read-only at
+    /srv/frontend so that Caddy can serve frontend/welcome.html. That
+    directory holds the whole frontend source tree, so a `file_server` that
+    could reach an arbitrary path under it would publish the source -- and
+    anything else that ever lands in frontend/.
+
+    Two rules keep that impossible:
+
+      * the @welcome handler rewrites every request to /welcome.html, so it
+        can only ever return that one file;
+      * the @ogimage handler matches three exact filenames.
+
+    The demo credentials used to live in frontend/demo-build-flag.ts; they
+    now live in tools/demo-build-flag.ts, outside the mounted directory
+    entirely.
+    """
+
+    def test_the_welcome_handler_can_only_serve_welcome_html(self, config):
+        body = _handle_body(config, "@welcome")
+        assert "rewrite * /welcome.html" in body, (
+            "the @welcome handler must rewrite every request to "
+            "/welcome.html, so it cannot serve another file from the "
+            "mounted frontend/ directory"
+        )
+
+    def test_no_handler_serves_the_mounted_directory_without_a_pinned_path(self, config):
+        """A file_server with no rewrite could serve anything under the root."""
+        for match in re.finditer(r"(?m)^\s*handle\s*([^\s{]*)\s*\{(?P<body>[^}]*)\}", config):
+            body = match.group("body")
+            if "file_server" not in body:
+                continue
+            assert "rewrite * /welcome.html" in body or "@ogimage" in match.group(1), (
+                f"the handle {match.group(1)!r} serves files from the "
+                "mounted frontend/ directory without pinning the path"
+            )
+
+    def test_the_demo_credentials_are_not_in_the_served_directory(self):
+        """The plaintext demo login must not sit in the shipped tree.
+
+        frontend/ is bind-mounted read-only at /srv/frontend for Caddy, so
+        anything with the demo login in it is one handler change away from
+        being published. Test files are exempt: they are never bundled and
+        never served -- frontend/src/__tests__/loginDemoCredentials.test.tsx
+        asserts the opposite and has to name the strings to do it.
+        """
+        served = REPO_ROOT / "frontend"
+        for path in served.rglob("*"):
+            if not path.is_file():
+                continue
+            if "__tests__" in path.parts:
+                continue
+            if path.suffix.lower() not in {".ts", ".tsx", ".js", ".json", ".html", ".txt", ".md"}:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            assert "alex_trader" not in text, (
+                f"{path.relative_to(REPO_ROOT)} holds the demo username and "
+                "sits in the directory Caddy serves from"
+            )
+
+
 class TestTheCatchAllStillRunsLast:
     def test_the_spa_catch_all_is_present(self, config):
         assert "reverse_proxy frontend:80" in config

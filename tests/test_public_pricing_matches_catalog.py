@@ -330,6 +330,28 @@ def _bybit_live_allowance(raw_plan: dict) -> int:
 BYBIT_LIVE_LABEL = "Live trading on Bybit (up to {n} live trading strategies)"
 OTHER_VENUES_LABEL = "Live trading on other venues"
 
+# The venues the platform routes to. Measured from the live-trading modal in
+# the frontend (frontend/src/components/.../live-trading) and from
+# api/routes/strategies.py:538-554, which restricts a tier to Bybit ONLY when
+# the tier has no `allow_real_trading` permission.
+ALL_VENUES = ("OKX", "Binance", "Bybit", "Bitget", "Gate.io", "BingX")
+ALL_VENUES_LABEL = "Live trading on all six exchanges ({venues})".format(
+    venues=", ".join(ALL_VENUES)
+)
+
+
+def _allows_every_venue(raw_plan: dict) -> bool:
+    """True when the tier may trade live on every venue the platform has.
+
+    api/routes/strategies.py:538-554 rejects a key for a venue the tier may
+    not use ONLY when the tier has no `allow_real_trading` permission, so a
+    paid tier can trade on all six; and
+    api/depthsight_api.py:545-548 (allows_all_keys) keeps every active key
+    for such a tier.
+    """
+    permissions = raw_plan.get("permissions", []) or []
+    return "allow_real_trading" in permissions
+
 
 def _can_save_strategies(raw_plan: dict) -> bool:
     """True when the tier can save strategy configurations.
@@ -367,6 +389,14 @@ def _expected_included_labels(plan: dict, raw_plan: dict) -> set:
         labels.add(
             BYBIT_LIVE_LABEL.format(n=_bybit_live_allowance(raw_plan))
         )
+
+    if _allows_every_venue(raw_plan):
+        # The catalog's label names three of the six venues
+        # (api/plans.py:280) while the backend lets a paid tier trade on all
+        # six (api/routes/strategies.py:538-554). The card says what the
+        # backend actually allows.
+        labels.discard("Live trading on OKX, Binance, Bybit")
+        labels.add(ALL_VENUES_LABEL)
 
     if _can_save_strategies(raw_plan):
         labels.add("Saved strategies")
@@ -668,7 +698,7 @@ class TestTheBacktestAllowanceNamesTheEngine:
 class TestTheLiveTradingAndPurchaseClaims:
     """The card must say what the tier CAN trade, and how to get a paid tier."""
 
-    def test_a_bybit_only_tier_says_it_can_trade_live_on_bybit(
+    def test_a_tier_with_the_bybit_exception_says_it_can_trade_live_on_bybit(
         self, cards, plans_by_name, raw_plans
     ):
         """The derived label says "Live trading" is excluded -- and is wrong.
@@ -712,6 +742,37 @@ class TestTheLiveTradingAndPurchaseClaims:
         assert seen, (
             "no tier in the catalog has the Bybit-only live-trading "
             "exception; re-measure this test"
+        )
+
+    def test_a_tier_that_may_trade_everywhere_says_so(self, cards, plans_by_name, raw_plans):
+        """A paid tier may trade on every venue the platform has.
+
+        api/routes/strategies.py:538-554 restricts a tier to Bybit ONLY when
+        it has no `allow_real_trading` permission, so a paid tier is not
+        limited to the three venues the catalog's label names.
+        """
+        seen = False
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+            raw = raw_plans[plan["key"]]
+
+            if not _allows_every_venue(raw):
+                continue
+            seen = True
+
+            assert ALL_VENUES_LABEL in card["included"], (
+                f"the {card['name']} card must list {ALL_VENUES_LABEL!r}: this "
+                "tier may trade live on every venue the platform routes to"
+            )
+            assert "Live trading on OKX, Binance, Bybit" not in card["included"], (
+                f"the {card['name']} card names only three venues, but this "
+                "tier may trade on all of them"
+            )
+
+        assert seen, (
+            "no tier has the allow_real_trading permission; re-measure this "
+            "test"
         )
 
     def test_the_page_advertises_no_feature_that_does_not_exist(self, page):

@@ -1,7 +1,7 @@
-// frontend/demo-build-flag.ts
+// tools/demo-build-flag.ts
 //
-// WHY THIS FILE LIVES OUTSIDE src/
-// ---------------------------------
+// WHY THIS FILE LIVES OUTSIDE frontend/
+// --------------------------------------
 // The seeded demo account's username and password used to live in
 // src/pages/Login.tsx as module-level constants. The demo panel was already
 // gated behind `isDemoCredentialsEnabled()`, so the panel was not RENDERED
@@ -9,13 +9,18 @@
 // shipped JavaScript. Anyone who opened devtools on the public login page
 // could read the demo password without clicking anything.
 //
-// They live here instead. This file is imported ONLY by vite.config.ts and
-// vitest.config.ts -- it is not reachable from the application entry point,
-// so the bundler never sees it. The credentials reach the app as a BUILD-TIME
-// `define`, which Vite substitutes with the literal `null` unless the build
-// explicitly asks for the demo helper. A production bundle therefore does
-// not contain the strings AT ALL, rather than containing them behind a
+// They live here instead. This file is imported ONLY by frontend/vite.config.ts
+// and frontend/vitest.config.ts -- it is not reachable from the application
+// entry point, so the bundler never sees it. The credentials reach the app as
+// a BUILD-TIME `define`, which Vite substitutes with the literal `null` unless
+// the build explicitly asks for the demo helper. A production bundle therefore
+// does not contain the strings AT ALL, rather than containing them behind a
 // runtime `if`.
+//
+// It is ALSO outside frontend/ on purpose: docker-compose.yml bind-mounts the
+// whole frontend/ directory read-only at /srv/frontend for Caddy, so a file
+// kept there would sit in the directory the web server serves from. Out here,
+// the plaintext is not in the served tree at all.
 
 /** The environment variable that opts a build into showing the demo helper. */
 export const DEMO_ENV_FLAG = "VITE_SHOW_DEMO";
