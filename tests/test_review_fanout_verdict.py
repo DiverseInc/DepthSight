@@ -226,7 +226,7 @@ def test_quoting_this_tool_does_not_downgrade_a_real_verdict():
 # --------------------------------------------------------------------------
 
 
-def _run_with_output(fanout, text, name="opencode"):
+def _run_with_output(fanout, text, name="opencode", diff_complete=True):
     """Drive the tool's runner with a faked subprocess, no engine launched."""
     completed = subprocess.CompletedProcess(
         args=[], returncode=1, stdout="", stderr=text
@@ -240,7 +240,9 @@ def _run_with_output(fanout, text, name="opencode"):
     try:
         fanout.subprocess = fake_subprocess
         fanout.shutil = fake_shutil
-        return fanout._run(name, ["opencode", "run", "hello"])
+        return fanout._run(
+            name, ["opencode", "run", "hello"], diff_complete=diff_complete
+        )
     finally:
         fanout.subprocess = orig_subprocess
         fanout.shutil = orig_shutil
@@ -383,6 +385,34 @@ def test_dsh_is_launched_with_the_prompt_on_stdin_not_as_a_path():
 # --------------------------------------------------------------------------
 
 
+def test_the_pack_directory_is_configurable():
+    """The pack must not be pinned to the system temp directory.
+
+    A sandbox that denies writes to tempfile.gettempdir() must not take the
+    parser down with it, and the pack must be placeable where the caller
+    wants it.
+    """
+    fanout = _load_tool()
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / "packs"
+        base.mkdir()
+        repo = Path(tmp) / "repo"
+        repo.mkdir()
+        diff = repo / "review.diff"
+        diff.write_text(
+            "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n", encoding="utf-8"
+        )
+        pack = fanout.build_opencode_pack(diff, repo, root=base)
+        try:
+            assert pack.parent == base, pack
+            assert (pack / "review.diff").is_file()
+            assert (pack / "README.txt").is_file()
+        finally:
+            import shutil
+
+            shutil.rmtree(pack, ignore_errors=True)
+
+
 def test_the_panel_is_assembled_without_error():
     """MEASURED 2026-10-26: a NameError inside the hermes prompt made hermes
     fail with "NameError: name 'hermes_truncated' is not defined". Every
@@ -460,6 +490,161 @@ def test_opencode_pack_keeps_large_files_as_excerpts_and_index():
             import shutil
 
             shutil.rmtree(pack, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# RESIDUAL 1a: the reviewer's prompt budget.
+#
+# The clip applies to the WHOLE argument the CLI receives -- framing,
+# instructions AND diff -- not to the diff alone. The tool must therefore
+# budget the diff against what is left after the framing, and a reviewer that
+# was handed only part of the change must not be counted as approving it.
+# --------------------------------------------------------------------------
+
+
+def test_the_prompt_never_exceeds_the_reviewer_budget():
+    fanout = _load_tool()
+    prompt, complete = fanout.assemble_prompt(
+        "INSTRUCTIONS " * 40,
+        "\nTHE END",
+        "D" * 40000,
+        fanout.HERMES_PROMPT_LIMIT,
+    )
+    assert len(prompt) <= fanout.HERMES_PROMPT_LIMIT, len(prompt)
+    assert complete is False, "a 40,000-character diff cannot fit hermes"
+    assert "TRUNCATED" in prompt, "the cut must be marked"
+
+
+def test_a_diff_that_fits_is_delivered_whole():
+    fanout = _load_tool()
+    diff = "D" * 1000
+    prompt, complete = fanout.assemble_prompt(
+        "INSTRUCTIONS ", "\nTHE END", diff, fanout.HERMES_PROMPT_LIMIT
+    )
+    assert complete is True
+    assert diff in prompt
+    assert len(prompt) <= fanout.HERMES_PROMPT_LIMIT
+
+
+def test_a_run_over_an_incomplete_diff_is_never_an_approving_verdict():
+    """The TOOL scores it. The tool must not hope the reviewer notices."""
+    fanout = _load_tool()
+    for text in ("VERDICT: YES\n", "VERDICT: NO\n"):
+        _, _, ok = _run_with_output(fanout, text, diff_complete=False)
+        assert ok is False, (
+            "a reviewer that saw only part of the change must never be "
+            "counted, whatever it said"
+        )
+
+
+def test_a_run_over_a_complete_diff_is_still_counted():
+    fanout = _load_tool()
+    _, _, ok = _run_with_output(fanout, "VERDICT: NO\n", diff_complete=True)
+    assert ok is True
+
+
+def test_every_engine_prompt_fits_its_budget():
+    """No engine may be handed a prompt its CLI will clip."""
+    fanout = _load_tool()
+    diff = "D" * 200000
+    for limit in (
+        fanout.HERMES_PROMPT_LIMIT,
+        fanout.OLLAMA_PROMPT_LIMIT,
+        fanout.DSH_PROMPT_LIMIT,
+    ):
+        prompt, _complete = fanout.assemble_prompt(
+            "INSTRUCTIONS " * 20, "\nTHE END", diff, limit
+        )
+        assert len(prompt) <= limit, (limit, len(prompt))
+
+
+# --------------------------------------------------------------------------
+# RESIDUAL 1b: a blocked reviewer must never be counted, even with a marker.
+# --------------------------------------------------------------------------
+
+
+def test_a_blocked_run_with_a_marker_is_not_a_verdict():
+    """The measured shape of a blocked run: a runtime error, then a marker."""
+    fanout = _load_tool()
+    output = (
+        "Let me read the diff first.\n"
+        "Error: The user rejected permission to use this specific tool call.\n"
+        "VERDICT: YES\n"
+    )
+    verdict, reason = fanout.parse_verdict(output)
+    assert verdict is None, reason
+    assert "NO VERDICT" in reason
+
+
+def test_a_blocked_run_whose_error_comes_last_is_not_a_verdict():
+    fanout = _load_tool()
+    output = (
+        "I will check the stop handler.\n"
+        "VERDICT: YES\n"
+        "Error: The user rejected permission to use this specific tool call.\n"
+    )
+    verdict, reason = fanout.parse_verdict(output)
+    assert verdict is None, reason
+    assert "NO VERDICT" in reason
+
+
+def test_a_reviewer_explaining_the_tool_still_delivers_its_verdict():
+    """The other half of the same constraint: quoting the tool's own
+    vocabulary must not silence it."""
+    fanout = _load_tool()
+    output = (
+        "The old code counted a permission rejection as a return, because the "
+        "output had enough words in it. The measured run ended in \"Error: The "
+        "user rejected permission to use this specific tool call.\" and was "
+        "still counted.\n"
+        "That path is gone now: the marker is required.\n"
+        "VERDICT: NO\n"
+    )
+    verdict, reason = fanout.parse_verdict(output)
+    assert verdict == "NO", reason
+
+
+# --------------------------------------------------------------------------
+# RESIDUAL 2: an ambiguous marker is not a decision.
+# --------------------------------------------------------------------------
+
+
+def test_ambiguous_markers_are_not_verdicts():
+    fanout = _load_tool()
+    for text in (
+        "VERDICT: YES or NO\n",
+        "VERDICT: YES maybe\n",
+        "VERDICT: YES / VERDICT: NO\n",
+        "VERDICT: NO possibly\n",
+        "VERDICT: MAYBE\n",
+        "VERDICT: Y\n",
+        "VERDICT:\n",
+    ):
+        verdict, reason = fanout.parse_verdict(text)
+        assert verdict is None, (text, verdict, reason)
+        assert "NO VERDICT" in reason, (text, reason)
+
+
+def test_a_list_of_options_is_not_a_decision():
+    """Two markers in a row are a MENU, not a choice."""
+    fanout = _load_tool()
+    output = "Choose one of:\nVERDICT: YES\nVERDICT: NO\n"
+    verdict, reason = fanout.parse_verdict(output)
+    assert verdict is None, reason
+    assert "NO VERDICT" in reason
+
+
+def test_a_quoted_example_earlier_does_not_spoil_the_conclusion():
+    """Prose between the two markers means the second one is the conclusion."""
+    fanout = _load_tool()
+    output = (
+        "An earlier quoted example:\n"
+        "VERDICT: YES\n"
+        "But the reviewer actually concluded the opposite.\n"
+        "VERDICT: NO\n"
+    )
+    verdict, reason = fanout.parse_verdict(output)
+    assert verdict == "NO", reason
 
 
 # --------------------------------------------------------------------------

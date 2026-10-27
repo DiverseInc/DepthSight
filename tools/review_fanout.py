@@ -78,31 +78,50 @@ from typing import Callable
 REPO = Path(__file__).resolve().parent.parent
 OUT_DIR = REPO / ".review"
 
-# How much diff text to paste inline for `ollama`. It runs a 7B model locally,
-# so tokens are free; this only bounds prompt size and wall time.
-OLLAMA_DIFF_CHARS = 12000
+# --------------------------------------------------------------------------
+# PROMPT BUDGETS -- how much of the change each reviewer can actually see.
+#
+# The budget applies to the WHOLE argument the reviewer receives (framing +
+# instructions + diff), not to the diff alone, so what the diff gets is what
+# is LEFT after the framing. A reviewer that was handed only part of the
+# change cannot give a verdict on the change, so the TOOL scores such a run
+# NO VERDICT. It must not hope the reviewer notices.
+#
+# MEASURED 2026-10-27 (measure_hermes_limit2.py): the hermes CLI does NOT
+# clip its -z argument. The tail of the prompt -- including the final line --
+# was still visible to the model at 32,000 characters: seven consecutive
+# probes (6,000 / 12,000 / 20,000 / 28,000 / 31,000 / 32,000) each put a
+# token in the TAIL ONLY and asked the model to repeat it, and the model
+# repeated it every time. The note this file used to carry -- "the hermes CLI
+# truncates a long inline prompt at about 12,000 characters" -- was a
+# MISDIAGNOSIS of this tool's OWN inline cap, which cut the diff at 11,500
+# characters and then still called it "the complete diff".
+#
+# The binding limit is the Windows command line: CreateProcess caps
+# lpCommandLine at 32,767 characters, and a 40,000-character argument fails
+# with FileNotFoundError [WinError 206] -- a diagnostic that reads like a
+# missing binary.
+HERMES_PROMPT_LIMIT = 30000
 
-# MEASURED 2026-10-19: the `hermes` CLI truncates a long inline prompt at about
-# 12,000 characters, and it does so SILENTLY -- the prompt's own words "It is
-# the complete diff" become false. In that round the `tools/prepush_guard.py`
-# hunk began at byte 13,679 of a 20,797-byte diff, so hermes never saw the file
-# it was asked about. It answered NO anyway -- confidently, and about the wrong
-# code. A reviewer that never received the change must never be recorded as
-# having reviewed it, so: cap the inline text here, MARK it as truncated, and
-# point hermes at the diff file for the rest.
-HERMES_DIFF_CHARS = 11500
+# `ollama run` runs a 7B model with a small context. This is a model-context
+# guard, not a CLI limit.
+OLLAMA_PROMPT_LIMIT = 12000
+
+# DSH's prompt travels on STDIN, so there is no command-line cap. This is a
+# model-context guard.
+DSH_PROMPT_LIMIT = 80000
+
+# What survives from the 2026-10-19 hermes incident is the RULE, not the
+# number: a reviewer that never received the change must never be recorded
+# as having reviewed it. The cap now lives in HERMES_PROMPT_LIMIT, the cut
+# is MARKED in the prompt, and the tool scores the run NO VERDICT itself.
 
 # MEASURED 2026-10-26: Windows caps a CreateProcess command line at 32,767
 # characters, and a 40,000-character argv prompt fails with
 # "FileNotFoundError: [WinError 206] The filename or extension is too long" --
 # a misleading diagnostic that looks like a missing binary. DSH is therefore
 # handed its prompt on STDIN, which has no such limit (MEASURED: `dsh headless`
-# with the prompt on stdin answers correctly). The cap below is a GUARD
-# against handing a model more diff than it can read, not a process limit:
-# when it bites, the prompt says so explicitly and the reviewer is told to
-# answer "DIFF TRUNCATED", which scores as NO VERDICT rather than as a
-# verdict about a partial view.
-DSH_DIFF_CHARS = 80000
+# with the prompt on stdin answers correctly).
 
 # MEASURED 2026-10-18 on a real diff whose correct answer was already known:
 # 7b answered both questions CORRECTLY, and also answered both correctly with
@@ -428,7 +447,9 @@ def _line_index(lines: list[str], limit: int) -> str:
     return "\n".join(out)
 
 
-def build_opencode_pack(diff: Path, repo: Path) -> Path:
+def build_opencode_pack(
+    diff: Path, repo: Path, root: Path | None = None
+) -> Path:
     """Build an ISOLATED evidence directory for opencode.
 
     It holds ONLY the diff under review plus curated excerpts of the files
@@ -436,18 +457,27 @@ def build_opencode_pack(diff: Path, repo: Path) -> Path:
     opencode walks the whole tree and times out (measured: six attempts at a
     2400s cap, no answer). The directory is unique per run so nothing is ever
     deleted or overwritten.
+
+    Where it lands is configurable: `root` wins, then the REVIEW_PACK_DIR
+    environment variable, then the system temp directory. The parser does
+    not depend on any of them.
     """
     diff_text = diff.read_text(encoding="utf-8", errors="replace")
     digest = hashlib.sha256(diff_text.encode("utf-8", "replace")).hexdigest()[:10]
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    root = (
-        Path(tempfile.gettempdir())
+    if root is None:
+        env_root = os.environ.get("REVIEW_PACK_DIR")
+        base = Path(env_root) if env_root else Path(tempfile.gettempdir())
+    else:
+        base = root
+    pack_root = (
+        base
         / f"depthsight-review-pack-{_slug(_branch_name(repo))}-{digest}-{stamp}"
     )
-    context = root / "context"
+    context = pack_root / "context"
     context.mkdir(parents=True, exist_ok=True)
 
-    _write_utf8(root / "review.diff", diff_text)
+    _write_utf8(pack_root / "review.diff", diff_text)
 
     notes: list[str] = []
     for target in _parse_diff_targets(diff_text):
@@ -493,8 +523,8 @@ def build_opencode_pack(diff: Path, repo: Path) -> Path:
         "Answer the question using ONLY the files in this directory. Do NOT try "
         "to read files outside it.\n" + VERDICT_INSTRUCTION + "\n"
     )
-    _write_utf8(root / "README.txt", readme)
-    return root
+    _write_utf8(pack_root / "README.txt", readme)
+    return pack_root
 
 
 # --------------------------------------------------------------------------
@@ -572,6 +602,24 @@ _PERMISSION_DENIED = re.compile(
     re.IGNORECASE,
 )
 
+# A permission BLOCK, as opposed to a permission MENTION.
+#
+# The runtime reports a rejected tool call as its own error line:
+#     Error: The user rejected permission to use this specific tool call.
+# A reviewer that is EXPLAINING this tool quotes that text inside a
+# sentence, not as a line that starts with "Error:". The distinction matters
+# because a block must beat the marker (a blocked reviewer confirmed
+# nothing) while a mention must not (quoting the tool must not silence the
+# tool).
+_PERMISSION_ERROR_LINE = re.compile(
+    r"^[ \t>]*Error:[^\n]*\b(?:permission|denied|rejected|blocked)\b[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# A reviewer that merely MENTIONED a permission problem while explaining is
+# caught by _PERMISSION_DENIED above; it is NOT a block. The block is the
+# runtime error line.
+
 # MEASURED 2026-10-26: DSH's MCP startup lines look like this. They are the
 # tool talking about itself, not a reviewer answering the question.
 _MCP_BANNER = re.compile(
@@ -586,6 +634,47 @@ _VERDICT_LINE = re.compile(
     r"^[ \t>*#`\-]*(?P<marker>VERDICT)[ \t]*:(?P<rest>.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
+
+# An AMBIGUOUS value is not a decision. "VERDICT: YES or NO" and "VERDICT:
+# YES maybe" both start with a decision token and then say something that
+# cancels it. The tail is checked only at the START of what follows the
+# token, so an explanation ("VERDICT: NO - because ...") is unaffected.
+_AMBIGUOUS_TAIL = re.compile(
+    r"^[\s\-—:;,/|.]*"
+    r"(?:or|and|but|maybe|perhaps|possibly|either|yes|no|y|n|verdict)\b",
+    re.IGNORECASE,
+)
+
+
+def _blocked_by_permission(cleaned: str) -> bool:
+    """Did this reviewer get BLOCKED, rather than merely mentioning a block?
+
+    Three signals, in order of strength:
+
+    1. the runtime's own error line ("Error: ... permission ...") -- that is
+       a tool call the reviewer was not allowed to make;
+    2. no verdict marker at all -- a blocked run never concluded;
+    3. the permission complaint is the last thing it said -- the run ended
+       on the complaint.
+
+    A reviewer that is EXPLAINING this tool quotes the complaint inside a
+    sentence and then concludes. That is not a block, and it must not be
+    silenced.
+    """
+    complaint = _PERMISSION_DENIED.search(cleaned)
+    if not complaint:
+        return False
+    if _PERMISSION_ERROR_LINE.search(cleaned):
+        return True
+    markers = list(_VERDICT_LINE.finditer(cleaned))
+    if not markers:
+        return True
+    tail = cleaned[complaint.end():]
+    tail = re.sub(r"^[ \t]*(?:MCP\s+Server\s+running\s+on\s+\S+[ \t]*\n?)*", "", tail)
+    if not re.search(r"[A-Za-z]{2,}", tail):
+        # The complaint is the last thing it said.
+        return True
+    return False
 
 
 def _meaningful(text: str) -> str:
@@ -608,23 +697,50 @@ def _extract_verdict(text: str) -> tuple[str | None, str | None]:
 
     Returns (verdict, bad_value). `verdict` is "YES"/"NO" when a marker line
     carries one of those values. `bad_value` is the text of a marker line
-    whose value was not YES/NO, so the caller can say so precisely.
+    whose value was not a decision, so the caller can say so precisely.
 
-    The LAST marker wins: the contract asks the reviewer to END its reply with
-    the verdict, so a marker quoted earlier in the analysis does not override
-    the one the reviewer actually concluded with.
+    Two rules, both measured:
+
+    * the LAST marker decides -- the contract asks the reviewer to END its
+      reply with the verdict, so a marker quoted earlier in the analysis does
+      not override the one the reviewer actually concluded with;
+    * markers with NOTHING between them are a MENU, not a choice, so they
+      are ambiguous rather than a decision.
     """
+    markers = list(_VERDICT_LINE.finditer(text))
+    if not markers:
+        return None, None
+
+    # A MENU: two markers with no prose between them.
+    for first, second in zip(markers, markers[1:]):
+        between = text[first.end():second.start()].strip()
+        between = between.strip("*`'\"").strip()
+        if not between:
+            return None, (
+                "a LIST of options: two verdict markers with nothing between "
+                "them, which is a menu rather than a decision"
+            )
+
     bad: str | None = None
-    for m in reversed(list(_VERDICT_LINE.finditer(text))):
+    for m in reversed(markers):
         rest = (m.group("rest") or "").strip().strip("*`'\" \t")
         word = re.match(r"[A-Za-z]+", rest)
         if not word:
-            bad = rest or "(empty)"
+            bad = f"not a decision ({rest or '(empty)'!r})"
             continue
         token = word.group(0).upper()
-        if token in (VERDICT_YES, VERDICT_NO):
-            return token, None
-        bad = rest
+        if token not in (VERDICT_YES, VERDICT_NO):
+            bad = f"not a decision ({rest!r})"
+            continue
+        tail = rest[word.end():]
+        if _AMBIGUOUS_TAIL.match(tail):
+            # "VERDICT: YES or NO", "VERDICT: YES maybe" -- a token that
+            # cancels itself is not a decision.
+            return None, (
+                f"AMBIGUOUS ({rest!r}): it names a decision and then takes it "
+                f"back"
+            )
+        return token, None
     return None, bad
 
 
@@ -653,6 +769,16 @@ def parse_verdict(text: str) -> tuple[str | None, str]:
 
     verdict, bad = _extract_verdict(cleaned)
     if verdict is not None:
+        # A reviewer that was BLOCKED never reached a conclusion. The block
+        # beats the marker -- otherwise a run that ended in "Error: The user
+        # rejected permission to use this specific tool call." would be
+        # recorded as an approval. A reviewer that merely QUOTED that text
+        # while explaining the tool is not blocked, and keeps its verdict.
+        if _blocked_by_permission(cleaned):
+            return None, (
+                "the reviewer was BLOCKED by a permission rejection and never "
+                "answered -- NO VERDICT"
+            )
         # The marker is authoritative -- UNLESS the reviewer used the
         # protocol to report that it could not see the whole change. A
         # verdict about a partial view is not a verdict on the change.
@@ -663,10 +789,7 @@ def parse_verdict(text: str) -> tuple[str | None, str]:
             )
         return verdict, f"VERDICT: {verdict}"
     if bad is not None:
-        return None, (
-            f"a VERDICT: marker was present but its value ({bad!r}) is not "
-            f"YES or NO -- NO VERDICT"
-        )
+        return None, f"the verdict marker is {bad} -- NO VERDICT"
 
     # No marker: the reviewer never answered in the required form.
     # A reviewer that was BLOCKED never answered, whatever else it printed.
@@ -738,8 +861,20 @@ def redact(text: str) -> str:
 ReviewOutcome = tuple[str, str, bool]
 
 
-def _run(name: str, cmd: list[str], timeout: int = DEFAULT_TIMEOUT) -> ReviewOutcome:
-    """Run an engine that takes an argv list."""
+def _run(
+    name: str,
+    cmd: list[str],
+    timeout: int = DEFAULT_TIMEOUT,
+    diff_complete: bool = True,
+) -> ReviewOutcome:
+    """Run an engine that takes an argv list.
+
+    `diff_complete` says whether this reviewer was handed the WHOLE change.
+    When it was not, the run is scored NO VERDICT by the TOOL, whatever the
+    reviewer said: a reviewer that saw part of the change cannot give a
+    verdict on the change. The engine still runs, so the evidence is saved
+    and a human can judge it -- but it is never counted.
+    """
     resolved = _resolve_argv(cmd)
     if resolved is None:
         return name, (
@@ -783,6 +918,11 @@ def _run(name: str, cmd: list[str], timeout: int = DEFAULT_TIMEOUT) -> ReviewOut
         # The FULL output is returned, never a truncated slice: the saved
         # file is the evidence, and a truncation that hides the tail of a
         # review is how a blocked run gets mistaken for an answer.
+        if not diff_complete:
+            return name, (
+                f"PARTIAL DIFF: {name} was handed only part of the change, so "
+                f"its answer is about a partial view -- NO VERDICT\n\n{out}"
+            ), False
         return name, out, verdict is not None
     except FileNotFoundError:
         return name, (
@@ -800,7 +940,9 @@ def _run(name: str, cmd: list[str], timeout: int = DEFAULT_TIMEOUT) -> ReviewOut
         ), False
 
 
-def _run_dsh(prompt: str, timeout: int = DEFAULT_TIMEOUT) -> ReviewOutcome:
+def _run_dsh(
+    prompt: str, timeout: int = DEFAULT_TIMEOUT, diff_complete: bool = True
+) -> ReviewOutcome:
     """Run DSH with the diff INLINE.
 
     DEFECT 1 (measured 2026-10-26): DSH was handed `Diff at <path>`. It cannot
@@ -844,6 +986,11 @@ def _run_dsh(prompt: str, timeout: int = DEFAULT_TIMEOUT) -> ReviewOutcome:
         raw = (p.stdout or "") + (p.stderr or "")
         out = _meaningful(raw)
         verdict, _reason = parse_verdict(out)
+        if not diff_complete:
+            return "dsh", (
+                "PARTIAL DIFF: dsh was handed only part of the change, so its "
+                "answer is about a partial view -- NO VERDICT\n\n" + out
+            ), False
         return "dsh", out, verdict is not None
     except subprocess.TimeoutExpired:
         return "dsh", f"ENGINE FAILURE: TIMED OUT after {timeout}s -- NO VERDICT", False
@@ -855,7 +1002,11 @@ def _run_dsh(prompt: str, timeout: int = DEFAULT_TIMEOUT) -> ReviewOutcome:
 
 
 def _run_opencode(
-    message: str, pack: Path, attach: Path, timeout: int = OPENCODE_TIMEOUT
+    message: str,
+    pack: Path,
+    attach: Path,
+    timeout: int = OPENCODE_TIMEOUT,
+    diff_complete: bool = True,
 ) -> ReviewOutcome:
     """Run opencode against an ISOLATED evidence pack.
 
@@ -904,6 +1055,11 @@ def _run_opencode(
         raw = (p.stdout or "") + (p.stderr or "")
         out = _meaningful(raw)
         verdict, _reason = parse_verdict(out)
+        if not diff_complete:
+            return "opencode", (
+                "PARTIAL DIFF: opencode was handed only part of the change, so "
+                "its answer is about a partial view -- NO VERDICT\n\n" + out
+            ), False
         return "opencode", out, verdict is not None
     except subprocess.TimeoutExpired:
         return "opencode", (
@@ -921,19 +1077,27 @@ def _run_opencode(
 # --------------------------------------------------------------------------
 
 
-def _inline(text: str, cap: int, note: str = "") -> str:
-    """Cap inline text and MARK the truncation.
+def dsh_prompt_parts(question: str) -> tuple[str, str]:
+    """The framing that goes AROUND the inline diff for DSH.
 
-    A marked truncation is recoverable (the reviewer knows it is looking at a
-    partial view and is told what to do); a silent one is not.
+    The protocol comes FIRST, so it is still there if the engine truncates
+    the prompt.
     """
-    if len(text) <= cap:
-        return text
-    return (
-        text[:cap]
-        + f"\n\n... [TRUNCATED: showing the first {cap} of {len(text)} "
-        f"characters. {note}] ...\n"
+    prefix = (
+        f"{question}\n\n"
+        f"{VERDICT_INSTRUCTION}\n\n"
+        f"{TRUNCATION_PROTOCOL}\n\n"
+        f"Review THIS diff, pasted inline. If it carries a TRUNCATED marker, "
+        f"it is incomplete -- reply exactly 'DIFF TRUNCATED' and do not "
+        f"answer.\n\n"
+        f"```diff\n"
     )
+    suffix = (
+        "\n```\n\n"
+        f"Answer only from the diff above. If it does not contain enough "
+        f"to answer, say exactly that."
+    )
+    return prefix, suffix
 
 
 def dsh_prompt(question: str, diff_text: str) -> str:
@@ -942,19 +1106,9 @@ def dsh_prompt(question: str, diff_text: str) -> str:
     DEFECT 1 (measured 2026-10-26): DSH was handed `Diff at <path>`. It
     cannot open a path named in a prompt, so it returned only its MCP startup
     lines and no verdict -- while the fan-out counted it as having returned.
-
-    The protocol comes FIRST, so it is still there if the engine truncates
-    the prompt.
     """
-    return (
-        f"{question}\n\n"
-        f"{VERDICT_INSTRUCTION}\n\n"
-        f"{TRUNCATION_PROTOCOL}\n\n"
-        f"Review THIS diff, pasted inline. It is the complete diff:\n\n"
-        f"```diff\n{diff_text}\n```\n\n"
-        f"Answer only from the diff above. If it does not contain enough "
-        f"to answer, say exactly that."
-    )
+    prefix, suffix = dsh_prompt_parts(question)
+    return prefix + diff_text + suffix
 
 
 def opencode_message(question: str) -> str:
@@ -1002,89 +1156,80 @@ def reviewers(
 
     full_text = diff.read_text(encoding="utf-8", errors="replace")
 
-    # `ollama run` has NO file-reading tool. Handed only a path -- which is what
-    # this did until 2026-10-18 -- it answers from an empty context, which is
-    # worse than no reviewer at all: it produces a confident, grounded-sounding
-    # verdict about code it never saw. It returned "I found no issues with..."
-    # for a diff that contained a stop-loss-disabling bug. Ollama is local and
-    # free, so inlining the diff costs nothing but text.
-    ollama_text = _inline(full_text, OLLAMA_DIFF_CHARS)
-
-    # hermes gets its own copy, capped and MARKED, because its CLI truncates
-    # silently around 12,000 characters. A marked truncation is recoverable
-    # (it can read the rest from the file); a silent one is not.
-    hermes_truncated = len(full_text) > HERMES_DIFF_CHARS
-    hermes_text = _inline(
-        full_text,
-        HERMES_DIFF_CHARS,
-        note=(
-            f"The COMPLETE diff is on disk at {diff_s} -- read that file for "
-            f"the rest."
-        ),
-    )
-
-    # DSH gets the diff INLINE, capped and MARKED. DSH cannot open a path
-    # named in a prompt, so when the cap bites the honest instruction is to
-    # say so rather than to answer about a partial view.
-    dsh_text = _inline(
-        full_text,
-        DSH_DIFF_CHARS,
-        note=(
-            "This copy is incomplete and you cannot open the full diff "
-            "yourself. Reply exactly 'DIFF TRUNCATED' and do not answer."
-        ),
-    )
-
-    jobs: dict[str, Callable[[], ReviewOutcome]] = {}
-
-    # Every prompt is built HERE, not inside the lambda. A NameError in a
-    # prompt must surface when the panel is assembled, not 90 seconds later
+    # Every prompt is assembled HERE, not inside the lambda, and every
+    # prompt is assembled against a BUDGET: the reviewer receives the whole
+    # argument -- framing, instructions and diff -- so the diff gets what is
+    # left after the framing. A prompt that would exceed the budget is cut,
+    # the cut is MARKED, and the run is scored NO VERDICT by the TOOL: a
+    # reviewer that saw part of the change cannot give a verdict on the
+    # change.
+    #
+    # A NameError in a prompt must also surface here, not 90 seconds later
     # inside a subprocess call: MEASURED 2026-10-26, a typo in the hermes
     # prompt made hermes fail with "NameError: name 'hermes_truncated' is
     # not defined", which the panel honestly reported as NO VERDICT but
     # which cost a whole reviewer slot.
-    ollama_argv = [
-        "ollama",
-        "run",
-        OLLAMA_MODEL,
+    ollama_prefix = (
         f"{question}\n\n"
         f"{VERDICT_INSTRUCTION}\n\n"
         f"{TRUNCATION_PROTOCOL}\n\n"
-        f"Review THIS diff, pasted inline. It is the complete diff:\n\n"
-        f"```diff\n{ollama_text}\n```\n\n"
+        f"Review THIS diff, pasted inline. If it carries a TRUNCATED marker, "
+        f"it is incomplete -- reply exactly 'DIFF TRUNCATED' and do not "
+        f"answer.\n\n"
+        f"```diff\n"
+    )
+    ollama_suffix = (
+        "\n```\n\n"
         f"Answer only from the diff above. If it does not contain enough "
-        f"to answer, say exactly that.",
-    ]
-    jobs["ollama"] = lambda: _run("ollama", ollama_argv)
+        f"to answer, say exactly that."
+    )
+    ollama_prompt, ollama_complete = assemble_prompt(
+        ollama_prefix, ollama_suffix, full_text, OLLAMA_PROMPT_LIMIT
+    )
 
-    hermes_argv = [
-        "hermes",
-        "-z",
+    hermes_prefix = (
         f"{question}\n\n"
         f"{VERDICT_INSTRUCTION}\n\n"
         f"{TRUNCATION_PROTOCOL}\n\n"
-        + (
-            f"NOTE: the inline copy below IS truncated -- its own CLI cuts "
-            f"the prompt at about {HERMES_DIFF_CHARS} characters, so a note "
-            f"placed at the END of this prompt may never reach you. The "
-            f"COMPLETE diff is on disk at {diff_s}; read that file instead of "
-            f"relying on the copy below.\n\n"
-            if hermes_truncated
-            else ""
-        )
-        + f"Review THIS diff, pasted inline:\n\n"
-        f"```diff\n{hermes_text}\n```\n\n"
+        f"The COMPLETE diff is on disk at {diff_s}. If the inline copy below "
+        f"carries a TRUNCATED marker, read that file instead of relying on "
+        f"the copy.\n\n"
+        f"Review THIS diff, pasted inline:\n\n"
+        f"```diff\n"
+    )
+    hermes_suffix = (
+        "\n```\n\n"
         f"Answer only from the diff above. If the inline copy is truncated, "
         f"say exactly 'DIFF TRUNCATED' and do not answer about a different "
-        f"file.",
-    ]
-    jobs["hermes"] = lambda: _run("hermes", hermes_argv)
+        f"file."
+    )
+    hermes_prompt, hermes_complete = assemble_prompt(
+        hermes_prefix, hermes_suffix, full_text, HERMES_PROMPT_LIMIT
+    )
+
+    dsh_prefix, dsh_suffix = dsh_prompt_parts(question)
+    dsh_prompt_text, dsh_complete = assemble_prompt(
+        dsh_prefix, dsh_suffix, full_text, DSH_PROMPT_LIMIT
+    )
+
+    jobs: dict[str, Callable[[], ReviewOutcome]] = {}
+
+    ollama_argv = ["ollama", "run", OLLAMA_MODEL, ollama_prompt]
+    jobs["ollama"] = lambda: _run(
+        "ollama", ollama_argv, diff_complete=ollama_complete
+    )
+
+    hermes_argv = ["hermes", "-z", hermes_prompt]
+    jobs["hermes"] = lambda: _run(
+        "hermes", hermes_argv, diff_complete=hermes_complete
+    )
 
     # DEFECT 1 FIX: the diff travels inside the prompt.
-    dsh_p = dsh_prompt(question, dsh_text)
-    jobs["dsh"] = lambda: _run_dsh(dsh_p)
+    jobs["dsh"] = lambda: _run_dsh(dsh_prompt_text, diff_complete=dsh_complete)
 
-    # DEFECT 3 FIX: an ISOLATED evidence pack, never the repository.
+    # DEFECT 3 FIX: an ISOLATED evidence pack, never the repository. The
+    # diff reaches opencode as a FILE, so it is never truncated by a prompt
+    # budget -- this engine always sees the whole change.
     pack = build_opencode_pack(diff, REPO)
     attach = pack / "review.diff"
     oc_message = opencode_message(question)
@@ -1120,13 +1265,49 @@ def run_all(jobs: dict[str, Callable[[], ReviewOutcome]]) -> dict[str, ReviewOut
     return results
 
 
+def assemble_prompt(
+    prefix: str, suffix: str, diff_text: str, limit: int
+) -> tuple[str, bool]:
+    """Assemble prefix + diff + suffix so the WHOLE prompt fits `limit`.
+
+    Returns (prompt, diff_complete).
+
+    The budget belongs to the WHOLE argument the reviewer receives -- framing,
+    instructions and diff together -- not to the diff alone. A reviewer's
+    CLI sees the whole thing, so the diff gets what is LEFT after the
+    framing.
+
+    When the diff does not fit, it is cut and the cut is MARKED in the
+    prompt, and `diff_complete` is False. The caller must then score the
+    run NO VERDICT: a reviewer that saw part of the change cannot give a
+    verdict on the change, and the tool must not leave that to the
+    reviewer's diligence.
+    """
+    reserve = 220  # room for the truncation marker itself
+    budget = limit - len(prefix) - len(suffix) - reserve
+    if budget < 0:
+        budget = 0
+    if len(diff_text) <= budget:
+        return prefix + diff_text + suffix, True
+    marker = (
+        f"\n\n... [TRUNCATED: only the first {budget} of {len(diff_text)} "
+        f"characters of this diff are shown. Do NOT answer about a partial "
+        f"view.] ...\n"
+    )
+    prompt = prefix + diff_text[:budget] + marker + suffix
+    if len(prompt) > limit:
+        over = len(prompt) - limit
+        prompt = prefix + diff_text[: max(0, budget - over)] + marker + suffix
+    return prompt, False
+
+
 def _no_verdict_reason(out: str) -> str:
     """Why this reviewer has no verdict.
 
     An engine-level failure diagnostic already explains itself; anything else
     is scored by the parser.
     """
-    if out.startswith("ENGINE FAILURE:"):
+    if out.startswith("ENGINE FAILURE:") or out.startswith("PARTIAL DIFF:"):
         return out.splitlines()[0]
     _, reason = parse_verdict(out)
     return reason
