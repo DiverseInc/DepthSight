@@ -18,6 +18,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/components/ui/use-toast";
 import { useAuth } from "@/context/AuthContext";
 import { useBacktestRun, useShareBacktest } from "@/lib/api";
+import { resolveHubApiUrl } from "@/lib/hubApi";
 
 interface ShareBacktestDialogProps {
 	open: boolean;
@@ -71,9 +72,7 @@ export const ShareBacktestDialog: React.FC<ShareBacktestDialogProps> = ({
 	}, [user]);
 
 	const handleGenerateLink = () => {
-		const HUB_API_URL =
-			import.meta.env.VITE_HUB_API_URL ||
-			"https://depthsight.diverseinc.net/api/v1/hub";
+		const HUB_API_URL = resolveHubApiUrl(import.meta.env.VITE_HUB_API_URL);
 
 		shareBacktest(
 			{

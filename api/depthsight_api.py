@@ -124,6 +124,7 @@ from .routes.model_lab import create_model_lab_router
 from .routes.notifications import notifications_router
 from .routes.public import public_router
 from .routes.registry import include_application_routers
+from .main import BodySizeLimitMiddleware
 from .routes.support import admin_support_router, support_router
 from .routes.users import users_extra_router
 from bot_module import data_loader
@@ -1596,6 +1597,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Bound the size of every incoming request body at the ASGI layer, BEFORE
+# Starlette parses (and spools to disk) the body. Added last so it is the
+# outermost user middleware and therefore sees the raw byte stream. The cap
+# is resolved per request from MAX_REQUEST_BODY_BYTES.
+app.add_middleware(BodySizeLimitMiddleware)
 
 api_router = APIRouter(prefix="/api/v1", tags=["v1"])
 

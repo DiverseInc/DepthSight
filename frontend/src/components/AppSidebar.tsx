@@ -48,6 +48,7 @@ import {
 import { useAuth } from "@/context/AuthContext";
 import { useAccountStatus, useSystemStatus } from "@/lib/api";
 import { apiClient } from "@/lib/apiClient";
+import { resolveHubApiUrl } from "@/lib/hubApi";
 import { cn } from "@/lib/utils";
 
 // Define navigation item structure
@@ -126,9 +127,7 @@ export function AppSidebar() {
 	const [masterVersion, setMasterVersion] = React.useState<string | null>(null);
 
 	React.useEffect(() => {
-		const hubApiUrl =
-			import.meta.env.VITE_HUB_API_URL ||
-			"https://depthsight.diverseinc.net/api/v1/hub";
+		const hubApiUrl = resolveHubApiUrl(import.meta.env.VITE_HUB_API_URL);
 		fetch(`${hubApiUrl}/nodes`)
 			.then((res) => {
 				if (!res.ok) throw new Error();

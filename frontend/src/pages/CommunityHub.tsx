@@ -76,6 +76,7 @@ import {
 	type StrategyStyle,
 } from "@/lib/strategyIdeas";
 import { cn } from "@/lib/utils";
+import { resolveHubApiUrl } from "@/lib/hubApi";
 
 interface NewsItem {
 	id?: number;
@@ -819,8 +820,10 @@ const CommunityHub = () => {
 	const saveConfig = useSaveStrategyConfig();
 	const updateConfig = useUpdateConfig();
 	const { user, token } = useAuth();
-	const hubApiUrl =
-		import.meta.env.VITE_HUB_API_URL || "https://depthsight.diverseinc.net/api/v1/hub";
+	// Same-origin by default: an absolute fallback would ship the user's
+	// bearer token to a third-party origin on any deployment that is not
+	// hosted on that domain.
+	const hubApiUrl = resolveHubApiUrl(import.meta.env.VITE_HUB_API_URL);
 
 	// The hub's support-ticket routes require an authenticated user: an
 	// anonymous request is rejected with 401, and a ticket may only be read

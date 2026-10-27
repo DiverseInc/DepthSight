@@ -333,7 +333,12 @@ async def test_asset_path_resolution_refuses_to_escape_the_data_root(
     inside = simulation_router._resolve_asset_parquet_path("BTCUSDT")
     assert inside == (data_root / "BTCUSDT" / "kline_1m.parquet")
 
-    for escaping in ("..", "....", "../..", "a/../.."):
+    # NOTE: a four-dot component ("....") is deliberately not in this list.
+    # Windows strips trailing dots from a path component so "...." collapses to
+    # the parent directory there, but on POSIX it is an ordinary directory name
+    # that stays INSIDE the data root - asserting it is refused would fail on
+    # Linux.
+    for escaping in ("..", "../..", "a/../.."):
         with pytest.raises(HTTPException) as exc_info:
             simulation_router._resolve_asset_parquet_path(escaping)
         assert exc_info.value.status_code == 404

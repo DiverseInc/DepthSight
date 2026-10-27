@@ -181,6 +181,36 @@ PROJECT_ROOT = Path(__file__).parent.parent
 # Use 'actual' folder which contains more recent data
 DATA_STORAGE_PATH = PROJECT_ROOT / "data_storage" / "actual" / "binance" / "futures"
 
+
+def _resolve_asset_parquet_path(asset: str) -> Path:
+    """Resolve the parquet file for an asset, refusing to escape the data root.
+
+    `asset` arrives in the request (URL path or JSON body), so it must not be
+    able to walk out of DATA_STORAGE_PATH with `..` segments.
+    """
+    data_root = DATA_STORAGE_PATH.resolve()
+    parquet_path = (DATA_STORAGE_PATH / asset / "kline_1m.parquet").resolve()
+    try:
+        parquet_path.relative_to(data_root)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Asset data not found: {asset}",
+        )
+    return parquet_path
+
+
+def _validate_asset_names(assets: List[str]) -> None:
+    """Fail closed if any requested asset name would escape the data root.
+
+    Called at the top of a handler, before any work is done, so that an
+    escaping name is refused with a 404 instead of being swallowed by a
+    per-asset error handler further down.
+    """
+    for asset in assets:
+        _resolve_asset_parquet_path(asset)
+
+
 # --- Pydantic Models ---
 
 
@@ -1350,6 +1380,9 @@ async def run_inspector_stream(request: InspectorRequest):
     SSE Streaming Inspector - returns results as backtests complete.
     Format: Server-Sent Events (SSE)
     """
+    # Refuse an asset name that would escape the data root BEFORE the stream
+    # starts, so the client gets a 404 instead of a truncated event stream.
+    _validate_asset_names(request.assets)
     logger.info(f"[SSE] Inspector stream started in worker PID: {os.getpid()}.")
     logger.info(f"Dates received: start={request.start_date}, end={request.end_date}")
     logger.info(f"Downloader available: {DOWNLOADER_AVAILABLE}")
@@ -1386,7 +1419,7 @@ async def run_inspector_stream(request: InspectorRequest):
         for asset_idx, asset in enumerate(request.assets):
             try:
                 # Data loading - path to parquet file
-                parquet_path = DATA_STORAGE_PATH / asset / "kline_1m.parquet"
+                parquet_path = _resolve_asset_parquet_path(asset)
                 if not parquet_path.exists():
                     logger.warning(f"No parquet file for {asset}: {parquet_path}")
                     for variant in request.variants:
@@ -1651,12 +1684,13 @@ async def run_inspector_stream(request: InspectorRequest):
 )
 async def run_backtest(request: BacktestRequest):
     """Run vector backtest for a list of assets"""
+    _validate_asset_names(request.assets)
     results = []
 
     for asset in request.assets:
         try:
             # Load asset data
-            parquet_path = DATA_STORAGE_PATH / asset / "kline_1m.parquet"
+            parquet_path = _resolve_asset_parquet_path(asset)
             if not parquet_path.exists():
                 logger.warning(f"Asset data not found: {parquet_path}")
                 continue
@@ -1722,6 +1756,7 @@ async def run_backtest(request: BacktestRequest):
 )
 async def run_inspector(request: InspectorRequest):
     """Run Inspector Matrix for multiple assets and variants (synchronous, without streaming)"""
+    _validate_asset_names(request.assets)
     if not BACKTESTER_AVAILABLE or not LOADER_AVAILABLE:
         raise HTTPException(
             status_code=503, detail="Backtester or loader not available"
@@ -1734,7 +1769,7 @@ async def run_inspector(request: InspectorRequest):
 
         try:
             # Load data
-            parquet_path = DATA_STORAGE_PATH / asset / "kline_1m.parquet"
+            parquet_path = _resolve_asset_parquet_path(asset)
             if not parquet_path.exists():
                 logger.warning(f"No parquet file for {asset}")
                 for variant in request.variants:
@@ -1943,6 +1978,7 @@ async def run_portfolio_full(request: PortfolioFullRequest):
     3. Passes them to SequentialPortfolioSimulator
     4. Returns results
     """
+    _validate_asset_names(request.assets)
     import pandas as pd
 
     # Detailed diagnostic of module availability
@@ -1970,7 +2006,7 @@ async def run_portfolio_full(request: PortfolioFullRequest):
         # 1. Collect trades from all assets and ALL variants
         for asset in request.assets:
             try:
-                parquet_path = DATA_STORAGE_PATH / asset / "kline_1m.parquet"
+                parquet_path = _resolve_asset_parquet_path(asset)
                 if not parquet_path.exists():
                     logger.warning(f"No parquet file for {asset}")
                     continue
@@ -2263,24 +2299,6 @@ async def upload_strategy(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-def _resolve_asset_parquet_path(asset: str) -> Path:
-    """Resolve the parquet file for an asset, refusing to escape the data root.
-
-    `asset` arrives in the URL path, so it must not be able to walk out of
-    DATA_STORAGE_PATH with `..` segments.
-    """
-    data_root = DATA_STORAGE_PATH.resolve()
-    parquet_path = (DATA_STORAGE_PATH / asset / "kline_1m.parquet").resolve()
-    try:
-        parquet_path.relative_to(data_root)
-    except ValueError:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Asset data not found: {asset}",
-        )
-    return parquet_path
 
 
 @simulation_router.post("/asset-detail/{asset}")
