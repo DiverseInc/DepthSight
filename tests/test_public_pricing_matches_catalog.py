@@ -331,6 +331,24 @@ BYBIT_LIVE_LABEL = "Live trading on Bybit (up to {n} live trading strategies)"
 OTHER_VENUES_LABEL = "Live trading on other venues"
 
 
+def _can_save_strategies(raw_plan: dict) -> bool:
+    """True when the tier can save strategy configurations.
+
+    The catalog derives "Saved strategies" from the `save_strategy_config`
+    PERMISSION, and that permission is enforced NOWHERE: the route
+    POST /api/v1/strategies/config (api/routes/strategies.py:308-317) takes
+    only `get_current_user` -- no `require_permission` -- and
+    crud.create_strategy_config (api/crud.py:2269-2277) has no plan check.
+    The frontend calls that route from the strategy editor with no plan gate
+    either (frontend/src/lib/api.ts:1210-1220).
+
+    So a tier without the permission can still save strategies, and the
+    card must not claim a restriction the backend does not impose.
+    """
+    permissions = raw_plan.get("permissions", []) or []
+    return "save_strategy_config" not in permissions
+
+
 def _expected_included_labels(plan: dict, raw_plan: dict) -> set:
     """The bullets a card must list, with the enforced exceptions applied."""
     labels = {e["label"] for e in plan["entitlements"] if e["included"]}
@@ -350,6 +368,9 @@ def _expected_included_labels(plan: dict, raw_plan: dict) -> set:
             BYBIT_LIVE_LABEL.format(n=_bybit_live_allowance(raw_plan))
         )
 
+    if _can_save_strategies(raw_plan):
+        labels.add("Saved strategies")
+
     return labels
 
 
@@ -363,6 +384,11 @@ def _expected_excluded_labels(plan: dict, raw_plan: dict) -> set:
         labels.discard("Live trading")
         labels.discard("Live trading strategies")
         labels.add(OTHER_VENUES_LABEL)
+
+    if _can_save_strategies(raw_plan):
+        # The backend does not enforce the permission, so the tier can save
+        # strategies and must not be told it cannot.
+        labels.discard("Saved strategies")
 
     return labels
 
@@ -509,25 +535,23 @@ class TestTheEntitlementsAreTheCatalogsOwn:
                 f"extra={sorted(set(card['included']) - granted)}"
             )
 
-    def test_no_card_claims_a_quota_from_another_tier(self, cards, plans_by_name):
+    def test_no_card_claims_a_quota_from_another_tier(
+        self, cards, plans_by_name, raw_plans
+    ):
         """The old page gave the $29 tier 'Unlimited backtest runs'."""
         for card in cards:
             plan = plans_by_name.get(card["name"])
             assert plan is not None
-            granted = {e["label"] for e in plan["entitlements"] if e["included"]}
+            mine = _expected_included_labels(plan, raw_plans[plan["key"]])
 
             for other_name, other in plans_by_name.items():
                 if other_name == card["name"]:
                     continue
-                for entitlement in other["entitlements"]:
-                    if not entitlement["included"]:
-                        continue
-                    if entitlement["label"] in granted:
-                        # Shared across tiers (e.g. "Paper trading"): not a claim.
-                        continue
-                    assert entitlement["label"] not in card["included"], (
+                theirs = _expected_included_labels(other, raw_plans[other["key"]])
+                for label in theirs - mine:
+                    assert label not in card["included"], (
                         f"the {card['name']} card claims "
-                        f"{entitlement['label']!r}, which belongs to the "
+                        f"{label!r}, which belongs to the "
                         f"{other_name} tier"
                     )
 
@@ -688,6 +712,68 @@ class TestTheLiveTradingAndPurchaseClaims:
         assert seen, (
             "no tier in the catalog has the Bybit-only live-trading "
             "exception; re-measure this test"
+        )
+
+    def test_the_page_advertises_no_feature_that_does_not_exist(self, page):
+        """The prose is a promise too, and it is not covered by the labels.
+
+        The page used to advertise "Walk-forward, monte-carlo, and genetic
+        optimization out of the box". There is no Monte-Carlo anything in
+        this codebase: a case-insensitive search for "monte" across api/ and
+        bot_module/ finds NOTHING, and the only walk-forward code is the
+        `walk_forward_oos_ratio` option inside the genetic strategy finder
+        (bot_module/genetic_strategy_finder.py:924).
+        """
+        implementation_dirs = [REPO_ROOT / "api", REPO_ROOT / "bot_module"]
+        for directory in implementation_dirs:
+            for path in directory.rglob("*.py"):
+                text = path.read_text(encoding="utf-8", errors="replace")
+                assert "monte" not in text.lower(), (
+                    f"{path.relative_to(REPO_ROOT)} now mentions 'monte': if "
+                    "that is a Monte-Carlo implementation, lift the ban below "
+                    "and say what the page may claim"
+                )
+
+        lowered = page.lower()
+        for phrase in ("monte-carlo", "monte carlo"):
+            assert phrase not in lowered, (
+                f"the page advertises {phrase!r}; the backend has no such "
+                "feature (no 'monte' anywhere in api/ or bot_module/)"
+            )
+
+    def test_a_tier_that_can_save_strategies_is_not_told_it_cannot(
+        self, cards, plans_by_name, raw_plans
+    ):
+        """The catalog's permission is not enforced, so do not claim it is.
+
+        `save_strategy_config` is enforced nowhere: POST
+        /api/v1/strategies/config (api/routes/strategies.py:308-317) takes
+        only `get_current_user`, and crud.create_strategy_config
+        (api/crud.py:2269-2277) has no plan check.
+        """
+        seen = False
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+            raw = raw_plans[plan["key"]]
+
+            if not _can_save_strategies(raw):
+                continue
+            seen = True
+
+            assert "Saved strategies" in card["included"], (
+                f"the {card['name']} card must list 'Saved strategies': this "
+                "tier can save strategy configurations -- the backend does "
+                "not enforce the permission"
+            )
+            assert "Saved strategies" not in card["not_included"], (
+                f"the {card['name']} card tells the reader it cannot save "
+                "strategies, but the backend lets it"
+            )
+
+        assert seen, (
+            "no tier lacks the save_strategy_config permission; re-measure "
+            "this test"
         )
 
     def test_an_indexed_live_trading_claim_names_the_tiers_it_is_about(
