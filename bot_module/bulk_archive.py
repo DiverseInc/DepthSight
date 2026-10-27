@@ -98,6 +98,23 @@ RESULT_COLUMNS = ["open", "high", "low", "close", "volume", "number_of_trades"]
 # century; epoch microseconds are ~1.0e15.  The threshold separates them.
 _MICROSECOND_THRESHOLD = 10**14
 
+# Binance publishes the daily klines archives with roughly a one day of lag
+# and the monthly ones with roughly two days, so the trailing edge of a window
+# that runs up to "now" legitimately has no file yet.  A missing daily file is
+# only a genuine HOLE once it is older than this lag.
+_PUBLICATION_LAG = timedelta(days=2)
+
+
+class BulkArchiveCoverageError(RuntimeError):
+    """The archives cannot cover the requested window.
+
+    Raised when a daily file for a day that should already be published is
+    missing and no monthly archive can complete that month.  Returning a
+    gapped frame would silently change the meaning of a backtest: the P&L
+    would look valid while trading a hole.  A wrong number is worse than no
+    number, so the load fails instead.
+    """
+
 # Binance's REST API accepts a couple of aliases the archive folders do not
 # use.  The interval is never lower-cased: "1m" is one minute and "1M" is one
 # month, and the archive keeps that distinction.
@@ -295,12 +312,14 @@ def _iter_months(start_dt: datetime, end_dt: datetime) -> Iterator[datetime]:
         month = _add_month(month)
 
 
-def _month_is_fully_covered(
-    month_start: datetime, start_dt: datetime, end_dt: datetime
-) -> bool:
-    """True when the window contains the WHOLE calendar month."""
-    month_last_instant = _add_month(month_start) - timedelta(microseconds=1)
-    return start_dt <= month_start and end_dt >= month_last_instant
+def _is_missing_day_a_hole(day: datetime, now: datetime) -> bool:
+    """True when a missing daily file for ``day`` is a genuine HOLE.
+
+    The trailing edge of a window that runs to "now" legitimately has no file
+    yet, because Binance publishes the daily archives with about a day of
+    lag.  A day that ended well before that lag window must have a file.
+    """
+    return (day + timedelta(days=1)) <= (now - _PUBLICATION_LAG)
 
 
 def _load_monthly_archive(
@@ -313,6 +332,7 @@ def _load_monthly_archive(
         return None
     frame = parse_archive_candles(payload)
     if frame.empty:
+        logger.warning(f"Bulk archive: monthly archive is empty {url}")
         return None
     logger.info(f"Bulk archive: loaded monthly archive {url}")
     return frame
@@ -326,28 +346,32 @@ def _load_daily_archives(
     end_dt: datetime,
     month_start: datetime,
     next_month: datetime,
-) -> Tuple[List[pd.DataFrame], int]:
+) -> Tuple[List[pd.DataFrame], List[datetime]]:
     """Fetches the daily archives of one month that overlap the window.
 
-    Returns the parsed frames and the number of days whose archive was not
-    available.
+    Returns the parsed frames and the days whose archive was NOT available.
+    A file that exists but holds no candle counts as missing: it carries no
+    data for that day, and pretending otherwise would ship a silent hole.
     """
     frames: List[pd.DataFrame] = []
-    missing = 0
+    missing_days: List[datetime] = []
     day = month_start
     while day < next_month:
         if day <= end_dt and (day + timedelta(days=1)) > start_dt:
             url = _daily_url(symbol, interval, market_type, day)
             payload = fetch_archive_bytes(url)
             if payload is None:
-                missing += 1
+                missing_days.append(day)
                 logger.debug(f"Bulk archive: daily file not published {url}")
             else:
                 frame = parse_archive_candles(payload)
-                if not frame.empty:
+                if frame.empty:
+                    missing_days.append(day)
+                    logger.warning(f"Bulk archive: daily archive is empty {url}")
+                else:
                     frames.append(frame)
         day += timedelta(days=1)
-    return frames, missing
+    return frames, missing_days
 
 
 # ==============================================================================
@@ -364,14 +388,21 @@ def fetch_klines_from_bulk_archive(
 ) -> Optional[pd.DataFrame]:
     """Loads klines for ``[start_dt, end_dt]`` from Binance's bulk archives.
 
-    Complete months inside the window are read from the MONTHLY archive (one
-    download each).  Months that the window only partially covers are read
-    from the DAILY archives of the overlapping days.  If a daily file turns
-    out to be missing, the monthly archive of that month is used instead so
-    a partial month never silently loses candles.
+    Every month in the window is read from its MONTHLY archive (one download
+    each) and clipped to the requested window, so a window that ends
+    mid-month costs the same single request as a window that covers it whole.
+    Only when a monthly archive has not been published yet -- the trailing
+    month, while Binance is still publishing -- are the DAILY archives of the
+    overlapping days used instead.
+
+    COVERAGE IS FAIL-CLOSED.  If a daily file for a day that should already
+    be published is missing and no monthly archive can complete that month,
+    :class:`BulkArchiveCoverageError` is raised rather than a gapped frame
+    being returned.  A backtest that silently trades a hole produces a P&L
+    that looks valid and is not; a wrong number is worse than no number.
 
     Returns a DataFrame shaped exactly like the REST path's output, or an
-    empty DataFrame when Binance has no archive for the window.
+    empty DataFrame when Binance has no archive for the window at all.
     """
     start_dt = _as_utc(start_dt)
     end_dt = _as_utc(end_dt)
@@ -379,39 +410,46 @@ def fetch_klines_from_bulk_archive(
         return _empty_result()
 
     interval = _normalise_interval(timeframe)
+    now = datetime.now(timezone.utc)
     frames: List[pd.DataFrame] = []
+    months = 0
+    days_missing = 0
 
     for month_start in _iter_months(start_dt, end_dt):
         next_month = _add_month(month_start)
+        months += 1
 
-        if _month_is_fully_covered(month_start, start_dt, end_dt):
-            frame = _load_monthly_archive(
-                symbol, interval, market_type, month_start
-            )
-            if frame is not None:
-                frames.append(frame)
-                continue
-            # Monthly archive not published: fall back to the daily files.
-            daily, _missing = _load_daily_archives(
-                symbol, interval, market_type, start_dt, end_dt, month_start, next_month
-            )
-            frames.extend(daily)
+        monthly = _load_monthly_archive(symbol, interval, market_type, month_start)
+        if monthly is not None:
+            frames.append(monthly)
             continue
 
-        # Partial month: the daily files carry just the part we need.
-        daily, missing = _load_daily_archives(
+        # The monthly archive is not published: fall back to the daily files
+        # of the days the window touches.
+        daily, missing_days = _load_daily_archives(
             symbol, interval, market_type, start_dt, end_dt, month_start, next_month
         )
-        if missing:
-            # A daily file was not published; prefer the complete monthly
-            # archive over a month with a hole in it.
-            frame = _load_monthly_archive(
-                symbol, interval, market_type, month_start
+        days_missing += len(missing_days)
+
+        holes = [day for day in missing_days if _is_missing_day_a_hole(day, now)]
+        if holes:
+            hole_text = ", ".join(day.strftime("%Y-%m-%d") for day in holes[:5])
+            if len(holes) > 5:
+                hole_text += f", ... (+{len(holes) - 5} more)"
+            raise BulkArchiveCoverageError(
+                f"Bulk archive cannot cover {symbol} ({timeframe}): "
+                f"{len(holes)} day(s) in {month_start:%Y-%m} have no published "
+                f"archive and the monthly archive for that month is missing "
+                f"too ({hole_text}). Refusing to return a gapped frame."
             )
-            if frame is not None:
-                frames.append(frame)
-                continue
+
         frames.extend(daily)
+
+    logger.info(
+        f"Bulk archive coverage: symbol={symbol} timeframe={timeframe} "
+        f"months={months} days_missing={days_missing} "
+        f"window={start_dt.isoformat()}..{end_dt.isoformat()}"
+    )
 
     if not frames:
         logger.warning(

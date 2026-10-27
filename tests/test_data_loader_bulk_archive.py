@@ -176,6 +176,38 @@ def _daily_url(symbol, interval, market_type, year, month, day):
     )
 
 
+def _add_month(month_start):
+    if month_start.month == 12:
+        return month_start.replace(year=month_start.year + 1, month=1)
+    return month_start.replace(month=month_start.month + 1)
+
+
+def _month_starts(start_dt, end_dt):
+    months = []
+    month = start_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    while month <= end_dt:
+        months.append(month)
+        month = _add_month(month)
+    return months
+
+
+class _FrozenDatetime(datetime):
+    """A datetime whose ``now()`` is pinned, so "the past" is deterministic."""
+
+    FROZEN = datetime(2026, 10, 27, 12, 0, 0, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.FROZEN.astimezone(tz) if tz else cls.FROZEN
+
+
+@pytest.fixture
+def frozen_now(monkeypatch):
+    """Pins the archive module's clock so the publication-lag rule is testable."""
+    monkeypatch.setattr(bulk_archive, "datetime", _FrozenDatetime)
+    return _FrozenDatetime.FROZEN
+
+
 # ==============================================================================
 # (a) The fallback is used when the REST path raises 451
 # ==============================================================================
@@ -348,12 +380,46 @@ async def test_two_month_window_concatenates_in_time_order(archive_server):
 
 
 @pytest.mark.asyncio
-async def test_mid_month_window_uses_daily_archives(archive_server):
-    """A window that starts/ends mid-month is served by the DAILY archives."""
-    for day in range(15, 21):
-        rows = _make_rows(
-            datetime(2024, 1, day, tzinfo=timezone.utc), 24, 60
+async def test_mid_month_window_uses_the_monthly_archive_and_is_clipped(
+    archive_server
+):
+    """A window that ends mid-month costs ONE monthly request, clipped to it."""
+    jan_rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 24 * 31, 60)
+    feb_rows = _make_rows(datetime(2024, 2, 1, tzinfo=timezone.utc), 24 * 29, 60)
+    mar_rows = _make_rows(datetime(2024, 3, 1, tzinfo=timezone.utc), 24 * 31, 60)
+    for year, month, rows in ((2024, 1, jan_rows), (2024, 2, feb_rows), (2024, 3, mar_rows)):
+        archive_server.add(
+            _monthly_url("BTCUSDT", "1h", FUTURES, year, month),
+            _make_zip(
+                _rows_to_csv(rows), f"BTCUSDT-1h-{year:04d}-{month:02d}.csv"
+            ),
         )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 3, 15, 12, tzinfo=timezone.utc)
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
+
+    # Three monthly archives, and NOT ONE daily file.
+    assert len(archive_server.monthly_urls()) == 3
+    assert archive_server.daily_urls() == []
+    # Clipped to the window: 31 + 29 whole days of hours, then 1 March to
+    # the 15th at 12:00 inclusive.
+    assert len(frame) == 24 * 31 + 24 * 29 + 14 * 24 + 13
+    assert frame.index[0] == pd.Timestamp("2024-01-01T00:00:00Z")
+    assert frame.index[-1] == pd.Timestamp("2024-03-15T12:00:00Z")
+    assert frame.index.is_monotonic_increasing
+    assert not frame.index.duplicated().any()
+
+
+@pytest.mark.asyncio
+async def test_daily_archives_are_used_when_the_monthly_is_not_published(
+    archive_server
+):
+    """The monthly archive not being published yet is what selects the dailies."""
+    for day in range(15, 21):
+        rows = _make_rows(datetime(2024, 1, day, tzinfo=timezone.utc), 24, 60)
         archive_server.add(
             _daily_url("BTCUSDT", "1h", FUTURES, 2024, 1, day),
             _make_zip(_rows_to_csv(rows), f"BTCUSDT-1h-2024-01-{day:02d}.csv"),
@@ -365,9 +431,10 @@ async def test_mid_month_window_uses_daily_archives(archive_server):
         "BTCUSDT", "1h", start, end, FUTURES
     )
 
+    assert archive_server.monthly_urls() == [
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1)
+    ]
     assert len(archive_server.daily_urls()) == 6  # 15th .. 20th
-    assert archive_server.monthly_urls() == []
-    # 5 full days (24 candles each) + 13 candles on the last day.
     assert len(frame) == 5 * 24 + 13
     assert frame.index.is_monotonic_increasing
     assert not frame.index.duplicated().any()
@@ -396,19 +463,142 @@ async def test_rows_outside_the_window_are_excluded(archive_server):
 
 
 # ==============================================================================
-# (d) No archive available -> clean empty result, no exception
+# (d) Coverage: a hole must fail loudly, a publication lag must not
 # ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_missing_past_day_fails_loudly_instead_of_returning_a_gap(
+    archive_server, monkeypatch
+):
+    """A day that should be published but is not is a HOLE: fail, do not ship it."""
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    # Every day of the window except the 19th.
+    for day in (15, 16, 17, 18, 20):
+        rows = _make_rows(datetime(2024, 1, day, tzinfo=timezone.utc), 24, 60)
+        archive_server.add(
+            _daily_url("BTCUSDT", "1h", FUTURES, 2024, 1, day),
+            _make_zip(_rows_to_csv(rows), f"BTCUSDT-1h-2024-01-{day:02d}.csv"),
+        )
+
+    start = datetime(2024, 1, 15, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 20, 12, tzinfo=timezone.utc)
+
+    # The archive refuses to return a gapped frame.
+    with pytest.raises(bulk_archive.BulkArchiveCoverageError):
+        bulk_archive.fetch_klines_from_bulk_archive(
+            "BTCUSDT", "1h", start, end, FUTURES
+        )
+
+    # And the loader reports "no data", not a frame with a hole in it.
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_missing_future_day_within_publication_lag_still_succeeds(
+    archive_server, monkeypatch, frozen_now, caplog
+):
+    """The trailing edge legitimately has no file yet; that is not a hole."""
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    now = frozen_now
+    start = now - timedelta(days=5)
+
+    # Serve the monthly archive for every month the window touches EXCEPT the
+    # current one, which Binance has not published yet.
+    for month in _month_starts(start, now):
+        if month.year == now.year and month.month == now.month:
+            continue
+        rows = _make_rows(month, 24, 60)
+        archive_server.add(
+            _monthly_url("BTCUSDT", "1h", FUTURES, month.year, month.month),
+            _make_zip(
+                _rows_to_csv(rows),
+                f"BTCUSDT-1h-{month.year:04d}-{month.month:02d}.csv",
+            ),
+        )
+
+    # Serve the daily files of the current month up to three days ago; the
+    # last three days are within the publication lag and have no file yet.
+    day = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    while day <= now:
+        if day + timedelta(days=3) <= now:
+            rows = _make_rows(day, 24, 60)
+            archive_server.add(
+                _daily_url(
+                    "BTCUSDT", "1h", FUTURES, day.year, day.month, day.day
+                ),
+                _make_zip(
+                    _rows_to_csv(rows),
+                    f"BTCUSDT-1h-{day.year:04d}-{day.month:02d}-{day.day:02d}.csv",
+                ),
+            )
+        day += timedelta(days=1)
+
+    with caplog.at_level(logging.INFO, logger="bot_module.bulk_archive"):
+        frame = bulk_archive.fetch_klines_from_bulk_archive(
+            "BTCUSDT", "1h", start, now, FUTURES
+        )
+
+    # The load succeeds: the trailing gap is a publication lag, not a hole.
+    assert frame is not None
+    assert not frame.empty
+    assert frame.index.is_monotonic_increasing
+    assert not frame.index.duplicated().any()
+
+    # And the gap is REPORTED, not hidden.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("days_missing=3" in message for message in messages), messages
+
+
+# ==============================================================================
+# (e) The None contract and the local cache
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_rest_451_and_archive_failure_returns_none(archive_server, monkeypatch):
+    """When BOTH sources fail the loader returns None, not an empty frame."""
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    def _explode(url):
+        raise RuntimeError("the archive host is down too")
+
+    monkeypatch.setattr(bulk_archive, "fetch_archive_bytes", _explode)
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+
+    # None, NOT an empty DataFrame: callers key on the difference.
+    assert result is None
 
 
 @pytest.mark.asyncio
 async def test_missing_archive_yields_empty_result_without_raising(
     archive_server, monkeypatch
 ):
-    """Nothing published for the window => empty/None, never an exception."""
+    """Nothing published for a window that is not in the past => empty, no raise."""
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
 
-    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    # A window that has not happened yet cannot have a coverage hole.
+    start = datetime.now(timezone.utc) + timedelta(days=30)
+    end = start + timedelta(days=1)
 
     frame = bulk_archive.fetch_klines_from_bulk_archive(
         "BTCUSDT", "1h", start, end, FUTURES
@@ -423,11 +613,6 @@ async def test_missing_archive_yields_empty_result_without_raising(
         market_type=FUTURES,
     )
     assert result is None or result.empty
-
-
-# ==============================================================================
-# (e) The local cache is still consulted first
-# ==============================================================================
 
 
 @pytest.mark.asyncio
@@ -460,6 +645,33 @@ async def test_non_451_api_error_keeps_todays_behaviour(
     # loader yields nothing. The archive is NOT consulted for a 500.
     assert result is None
     assert archive_server.requested == []
+
+
+@pytest.mark.asyncio
+async def test_testnet_never_uses_the_mainnet_archive(archive_server, monkeypatch):
+    """data.binance.vision holds MAINNET candles: testnet must never use it."""
+    monkeypatch.setattr(config, "ACTIVE_TRADING_ENVIRONMENT", "testnet")
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    rows = _make_rows(start, 24, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        _make_zip(_rows_to_csv(rows), "BTCUSDT-1h-2024-01.csv"),
+    )
+
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+
+    # The archive was never consulted, so no mainnet candle can appear.
+    assert archive_server.requested == []
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -590,6 +802,11 @@ async def test_complete_month_yields_hours_in_month_rows(
     assert frame.index[-1] == pd.Timestamp(
         f"{year:04d}-{month:02d}-{days_in_month:02d}T23:00:00Z"
     )
+
+
+# ==============================================================================
+# The source of a load is recorded in the log
+# ==============================================================================
 
 
 @pytest.mark.asyncio

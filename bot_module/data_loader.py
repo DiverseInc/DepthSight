@@ -10,7 +10,7 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 
 from . import config
-from .bulk_archive import fetch_klines_from_bulk_archive
+from .bulk_archive import BulkArchiveCoverageError, fetch_klines_from_bulk_archive
 from .utils import (
     add_relative_volume,
     calculate_scalper_natr,
@@ -212,6 +212,17 @@ def _download_klines_from_api_with_archive_fallback(
     what wins whenever it answers. The archive is a strictly additive third
     source, used only when the REST path fails with a location block or a
     transport error.
+
+    Two rules keep the venue honest and the failure honest:
+
+    * The archive holds MAINNET Binance candles only, so it is never used
+      when the loader is pointed at testnet.  A testnet request must never
+      be answered with mainnet candles.
+    * When the archive cannot supply the window, this returns ``None`` --
+      exactly what the loader returned before the fallback existed -- so the
+      existing hard stops still fire.  It never returns an empty frame in
+      place of a failure: an empty frame is not the same thing as "no data
+      loaded", and several callers treat them differently.
     """
     try:
         frame = _download_klines_from_api(
@@ -225,6 +236,15 @@ def _download_klines_from_api_with_archive_fallback(
     except Exception as api_error:
         if not _is_binance_location_block(api_error):
             # Not a location block: keep the behaviour this loader has today.
+            raise
+        if config.ACTIVE_TRADING_ENVIRONMENT == "testnet":
+            # data.binance.vision only publishes MAINNET candles. Serving them
+            # for a testnet request would silently swap the venue.
+            logger.error(
+                f"Binance REST klines unavailable for {symbol} ({timeframe}) on "
+                f"testnet: {api_error}. The bulk archive holds mainnet candles "
+                "only and is not used on testnet."
+            )
             raise
         logger.warning(
             f"Binance REST klines unavailable for {symbol} ({timeframe}): "
@@ -240,6 +260,16 @@ def _download_klines_from_api_with_archive_fallback(
             f"rows={0 if frame is None else len(frame)}"
         )
         return frame
+    except BulkArchiveCoverageError as coverage_error:
+        logger.error(
+            f"Bulk archive cannot cover the requested window for {symbol} "
+            f"({timeframe}): {coverage_error}",
+            exc_info=True,
+        )
+        logger.info(
+            f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0"
+        )
+        return None
     except Exception as archive_error:
         logger.error(
             f"Bulk archive klines failed for {symbol} ({timeframe}): {archive_error}",
@@ -248,7 +278,7 @@ def _download_klines_from_api_with_archive_fallback(
         logger.info(
             f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0"
         )
-        return pd.DataFrame()
+        return None
 
 
 def _download_agg_trades_from_api(
@@ -443,7 +473,16 @@ async def download_klines(
             market_type,
         )
 
-        if df_api is None and (df_local is None or df_local.empty):
+        if df_api is None:
+            # The remote source failed. Before the bulk-archive fallback this
+            # was the only way the load could end, and it failed the WHOLE
+            # load -- a partial local cache was never shipped on its own.
+            # Keep that contract: callers distinguish "no data loaded" (None)
+            # from "loaded, but empty", and only None fails the hard stops.
+            logger.error(
+                f"Klines unavailable for {symbol} ({timeframe}): no data from "
+                "the REST API or the bulk archive."
+            )
             return None
 
         df_final = pd.concat([df_local, df_api]) if df_local is not None else df_api
