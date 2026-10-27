@@ -163,6 +163,18 @@ class RiskManager:
         # ID is unique and stable across a rename.
         self.api_key_id: Optional[int] = None
         self.stats = TradeStats()
+        # THE PAPER SANDBOX. Its counters are a DIFFERENT set of numbers from
+        # the live ones above, on purpose: a loss taken on simulated money
+        # must never be able to close the gate on real money.
+        #
+        # Upstream DepthSight keeps the two in separate `TradeStats` objects
+        # (upstream `bot_module/risk_manager.py:294`). This fork had
+        # collapsed them into one, so a PAPER loss was added to the LIVE
+        # `today_pnl` / `consecutive_losses` and `_check_risk_limits()` then
+        # closed the LIVE gate on it -- real money blocked by a simulated
+        # loss. Everything that touches a counter must now ask which sandbox
+        # it is touching (see `_mode_stats`).
+        self.paper_stats = TradeStats()
         self.trade_history: List[Dict[str, Any]] = []
 
         self.telegram_notifier: Optional[Any] = None
@@ -229,6 +241,33 @@ class RiskManager:
         )
         self.max_consecutive_losses: int = get_ival(
             rm_settings, "maxConsecutiveLosses", config.DEFAULT_MAX_CONSECUTIVE_LOSSES
+        )
+
+        # THE PAPER SANDBOX'S OWN LIMITS (upstream `risk_manager.py:192`,
+        # `:200`, `:208`). Read from the PAPER settings, and DEFAULTING TO THE
+        # LIVE VALUES, so the paper gate is never LOOSER than the live one:
+        # a user who has configured no paper-specific limits gets exactly the
+        # live limits applied to the paper sandbox.
+        self.paper_max_drawdown_threshold: float = (
+            get_fval(
+                paper_rm_settings,
+                "maxDrawdown",
+                self.max_drawdown_threshold * 100.0,
+            )
+            / 100.0
+        )
+        self.paper_daily_max_loss_threshold: float = (
+            get_fval(
+                paper_rm_settings,
+                "dailyMaxLossPercent",
+                self.daily_max_loss_threshold * 100.0,
+            )
+            / 100.0
+        )
+        self.paper_max_consecutive_losses: int = get_ival(
+            paper_rm_settings,
+            "maxConsecutiveLosses",
+            self.max_consecutive_losses,
         )
 
         # Maximum number of simultaneous trades
@@ -308,6 +347,14 @@ class RiskManager:
             )
 
         self._is_trading_allowed = True
+        # THE PAPER SANDBOX'S OWN GATE (upstream `risk_manager.py:295`).
+        # Deliberately separate from `_is_trading_allowed`: the two sandboxes
+        # are judged independently, so a breach in one never closes the
+        # other's gate.
+        self._paper_is_trading_allowed = True
+        # Why the PAPER gate is off, when it is off for a reason other than
+        # the emergency stop. The live equivalent is `_global_gate_disable_reason`.
+        self._paper_global_gate_disable_reason: Optional[str] = None
         # Latching emergency stop. Deliberately separate from
         # _is_trading_allowed, which both the daily-stat reset and
         # _check_risk_limits() legitimately flip back to True on their own.
@@ -475,6 +522,65 @@ class RiskManager:
         if self._strategy_symbol_adjustment_enabled:
             logger.info("Strategy-Symbol dynamic risk adjustment ENABLED.")
 
+    # ------------------------------------------------------------------
+    # TRADING-MODE SELECTORS.
+    #
+    # Ported by hand from upstream DepthSight (`bot_module/risk_manager.py`
+    # `:351`-`:382`): upstream already separated the paper sandbox from the
+    # live one, and this fork had lost that separation. Everything that
+    # reads or writes a counter, a threshold or a gate flag goes through
+    # these helpers, so there is exactly ONE place that decides which
+    # sandbox a value belongs to.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_mode(mode: Optional[str]) -> str:
+        """Trading-mode gate selector: anything but an explicit 'paper' is live."""
+        return "paper" if str(mode or "live").lower() == "paper" else "live"
+
+    def _mode_stats(self, mode: Optional[str]) -> TradeStats:
+        """The stats object that owns this mode's counters.
+
+        Upstream `risk_manager.py:356`-`:357`. The PAPER sandbox's counters
+        live in `self.paper_stats`; the LIVE ones in `self.stats`.
+        """
+        return (
+            self.paper_stats
+            if self._normalize_mode(mode) == "paper"
+            else self.stats
+        )
+
+    def _mode_thresholds(self, mode: Optional[str]) -> Tuple[float, float, int]:
+        """(max_drawdown, daily_max_loss, max_consecutive_losses) for the mode.
+
+        Upstream `risk_manager.py:359`-`:370`. The paper sandbox has its own
+        limits (defaulting to the live ones), so the two sandboxes are never
+        measured against each other's thresholds.
+        """
+        if self._normalize_mode(mode) == "paper":
+            return (
+                self.paper_max_drawdown_threshold,
+                self.paper_daily_max_loss_threshold,
+                self.paper_max_consecutive_losses,
+            )
+        return (
+            self.max_drawdown_threshold,
+            self.daily_max_loss_threshold,
+            self.max_consecutive_losses,
+        )
+
+    def _is_mode_trading_allowed(self, mode: Optional[str]) -> bool:
+        """Is TRADING allowed in this mode? The two gates are independent."""
+        if self._normalize_mode(mode) == "paper":
+            return self._paper_is_trading_allowed
+        return self._is_trading_allowed
+
+    def _mode_disable_reason(self, mode: Optional[str]) -> Optional[str]:
+        """Why this mode's gate is off, when it is off."""
+        if self._normalize_mode(mode) == "paper":
+            return self._paper_global_gate_disable_reason
+        return self._global_gate_disable_reason
+
     def apply_user_settings(self, user_settings: Dict[str, Any]) -> None:
         """Applies fresh user settings in-place without recreating RiskManager."""
         settings = ensure_dict(user_settings)
@@ -572,6 +678,33 @@ class RiskManager:
             "maxConsecutiveLosses",
             "max_consecutive_losses",
             default=config.DEFAULT_MAX_CONSECUTIVE_LOSSES,
+        )
+        # The PAPER sandbox's own limits, refreshed with the rest of the
+        # settings and DEFAULTING TO THE LIVE VALUES, so a settings refresh
+        # can never leave the paper gate looser than the live one.
+        self.paper_max_drawdown_threshold = (
+            _get_float(
+                paper_rm_settings,
+                "maxDrawdown",
+                "max_drawdown",
+                default=self.max_drawdown_threshold * 100.0,
+            )
+            / 100.0
+        )
+        self.paper_daily_max_loss_threshold = (
+            _get_float(
+                paper_rm_settings,
+                "dailyMaxLossPercent",
+                "daily_max_loss_percent",
+                default=self.daily_max_loss_threshold * 100.0,
+            )
+            / 100.0
+        )
+        self.paper_max_consecutive_losses = _get_int(
+            paper_rm_settings,
+            "maxConsecutiveLosses",
+            "max_consecutive_losses",
+            default=self.max_consecutive_losses,
         )
         self.max_concurrent_trades = _get_int(
             rm_settings,
@@ -713,14 +846,48 @@ class RiskManager:
         await self.initialize_balance()
         logger.info(f"Async initialization complete for user_id: {self.user_id}.")
 
+    async def _initialize_paper_balance(self) -> None:
+        """Start-up for a keyless PAPER account (no live executor).
+
+        The paper wallet's balance is the account's balance, the paper
+        counters are the account's counters and the PAPER gate is the
+        account's gate. The live start-up machinery is NOT run here: it
+        exists to install the LIVE opening balance and to re-baseline the
+        LIVE day, and neither has anything to do with paper money.
+        """
+        success_fetch = await self.update_balance(mode="paper")
+        if not success_fetch:
+            logger.error(
+                "Failed to initialize the PAPER balance. Paper trading is disabled."
+            )
+            self._paper_is_trading_allowed = False
+            self._paper_global_gate_disable_reason = (
+                "paper balance could not be fetched at start-up — "
+                "paper trading disabled"
+            )
+            return
+        self._check_and_reset_paper_daily_stats()
+        self._anchor_paper_start_of_day_base(self.paper_stats.current_balance)
+        self._check_risk_limits(mode="paper")
+
     async def initialize_balance(self):
         logger.info("Initializing balance for RiskManager...")
+        # A keyless PAPER account has no live executor (bot_runner.py:563
+        # passes `executor=None, paper_executor=paper_executor`), so the
+        # paper executor IS its account. Its balance, its counters and its
+        # gate belong to the PAPER sandbox: the LIVE start-up machinery
+        # below installs the LIVE opening balance and re-baselines the LIVE
+        # day, and running it against paper money would put the paper
+        # wallet's balance into the live sandbox's base.
+        if self.executor is None:
+            await self._initialize_paper_balance()
+            return
         # BEFORE the first balance read: whether this account has EVER traded
         # decides whether the balance we are about to read may be installed as
         # today's OPENING balance. Resolving it after the read would be too
         # late -- the balance may already have been captured.
         await self._resolve_has_traded_before()
-        success_fetch = await self.update_balance()
+        success_fetch = await self.update_balance(mode="live")
 
         if success_fetch and self.stats.current_balance > 0:
             # The logic for resetting daily statistics remains the same, as it does not depend on the user
@@ -887,9 +1054,20 @@ class RiskManager:
                 "[InitializeBalance] Trading disabled: failed to fetch balance."
             )
 
-    async def update_balance(self) -> bool:
-        """Updates the current USDT balance from the executor (thread-safe)."""
+    async def update_balance(self, mode: Optional[str] = None) -> bool:
+        """Updates the current USDT balance from the executor (thread-safe).
+
+        `mode` says which sandbox the balance belongs to. It defaults to
+        the sandbox of the BALANCE SOURCE: a keyless PAPER account has no
+        live executor, so the paper executor IS its account and its balance
+        belongs to the paper sandbox. A dual-mode account has a live
+        executor, so its balance is the LIVE balance.
+        """
         log_prefix = "[RiskManager:UpdateBalance]"
+        if mode is None:
+            mode = "live" if self.executor is not None else "paper"
+        mode = self._normalize_mode(mode)
+        stats = self._mode_stats(mode)
         async with self._balance_lock:
             try:
                 # A paper-only account (no API key) is constructed with
@@ -949,27 +1127,27 @@ class RiskManager:
                     # Check for abnormally low balance if the previous one was significantly higher
                     # Suppose the balance should not drop by more than 90% in one call if it was not close to zero
                     if (
-                        self.stats.current_balance > 10
-                        and current_total_usdt < self.stats.current_balance * 0.1
+                        stats.current_balance > 10
+                        and current_total_usdt < stats.current_balance * 0.1
                         and current_total_usdt < self.min_balance_threshold / 2
                     ):
                         logger.warning(
-                            f"{log_prefix} Detected anomalously low new balance (${current_total_usdt:.2f}) compared to previous (${self.stats.current_balance:.2f}). "
+                            f"{log_prefix} Detected anomalously low new balance (${current_total_usdt:.2f}) compared to previous (${stats.current_balance:.2f}). "
                             f"This might be a temporary API issue. NOT UPDATING BALANCE THIS TIME."
                         )
                         # Retry logic can be added here or the update can simply be skipped
                         return False  # Return False to signal a possible data issue
 
                     if (
-                        abs(current_total_usdt - self.stats.current_balance) > 1e-9
+                        abs(current_total_usdt - stats.current_balance) > 1e-9
                     ):  # 1e-9 for float comparison
                         logger.info(
-                            f"{log_prefix} Balance updated: Previous=${self.stats.current_balance:.2f}, New=${current_total_usdt:.2f} (Free: {free_bal:.2f}, Locked: {locked_bal:.2f})"
+                            f"{log_prefix} Balance updated: Previous=${stats.current_balance:.2f}, New=${current_total_usdt:.2f} (Free: {free_bal:.2f}, Locked: {locked_bal:.2f})"
                         )
-                        self.stats.current_balance = current_total_usdt
+                        stats.current_balance = current_total_usdt
                     else:
                         logger.debug(
-                            f"{log_prefix} Balance unchanged: ${self.stats.current_balance:.2f}"
+                            f"{log_prefix} Balance unchanged: ${stats.current_balance:.2f}"
                         )
 
                     # A successful balance read is the only trustworthy evidence
@@ -1038,12 +1216,15 @@ class RiskManager:
                     # timer cannot clear a counter inside the same day. The
                     # emergency-stop latch is still checked before the gate is
                     # re-opened.
-                    self._check_and_reset_daily_stats()
-                    self._check_risk_limits()
+                    if mode == "paper":
+                        self._check_and_reset_paper_daily_stats()
+                    else:
+                        self._check_and_reset_daily_stats()
+                    self._check_risk_limits(mode=mode)
                     return True
                 else:
                     logger.warning(
-                        f"{log_prefix} USDT balance data not found in account info from executor. Current known balance: ${self.stats.current_balance:.2f}"
+                        f"{log_prefix} USDT balance data not found in account info from executor. Current known balance: ${stats.current_balance:.2f}"
                     )
                     # If there is no USDT but there are other assets, this could also be a problem for a USDT bot.
                     # If self.stats.current_balance is already 0 or very small, then this might be normal.
@@ -1350,7 +1531,9 @@ class RiskManager:
         # base that already belongs to today.
         self._capture_first_boot_base(current_day_str_utc)
 
-    async def apply_funding_pnl(self, symbol: str, funding_pnl: float) -> bool:
+    async def apply_funding_pnl(
+        self, symbol: str, funding_pnl: float, mode: str = "live"
+    ) -> bool:
         """Record a FUNDING charge against the day's PnL.
 
         Funding is a CARRY COST, not a trade: the paper wallet is debited (or
@@ -1365,19 +1548,31 @@ class RiskManager:
         payment is not a losing trade, and counting it could falsely trip the
         max-consecutive-losses guard) and it is not a trade timestamp.
 
+        `mode` says which sandbox the funding belongs to. A PAPER funding
+        charge must land in the PAPER counters: it is simulated money, and
+        the LIVE daily-loss gate is what stands between the account and
+        real money. The default is "live" so a caller that omits it cannot
+        accidentally book a live funding charge into the paper sandbox.
+
         Returns True when the funding IS in today's PnL. The caller needs
         that distinction: the close subtracts the funding that was ALREADY
         reported, so a funding that never reached this counter must NOT be
         subtracted -- otherwise the close would report it a second time, or
         the gate would never hear about it at all.
         """
-        self._check_and_reset_daily_stats()
+        mode = self._normalize_mode(mode)
+        stats = self._mode_stats(mode)
+        if mode == "paper":
+            self._check_and_reset_paper_daily_stats()
+        else:
+            self._check_and_reset_daily_stats()
         amount = float(funding_pnl or 0.0)
-        self.stats.today_pnl += amount
+        stats.today_pnl += amount
         logger.info(
             f"[RiskManager:Funding] Funding for {symbol}: "
             f"{amount:+.8f} USDT. "
-            f"GlobalTodayPnL={self.stats.today_pnl:.8f} "
+            f"GlobalTodayPnL={stats.today_pnl:.8f} "
+            f"(mode: {mode}) "
             f"(the consecutive-loss streak is unchanged: a funding payment is "
             f"a carry cost, not a losing trade)."
         )
@@ -1385,7 +1580,7 @@ class RiskManager:
         # a failure would reach the caller as "not applied", and the close
         # would then report the same funding a second time.
         try:
-            self._check_risk_limits()
+            self._check_risk_limits(mode=mode)
         except Exception as exc:
             logger.error(
                 f"[RiskManager:Funding] The limit check failed after the "
@@ -1403,19 +1598,38 @@ class RiskManager:
         return True
 
     async def update_trade_result(
-        self, symbol: str, pnl: float, exit_reason: Optional[str] = None
+        self,
+        symbol: str,
+        pnl: float,
+        exit_reason: Optional[str] = None,
+        mode: str = "live",
     ):
-        self._check_and_reset_daily_stats()
-        self.stats.today_pnl += pnl
-        self.stats.last_trade_time = time.time()
-        if pnl <= 0:
-            self.stats.consecutive_losses += 1
+        """Book a CLOSED trade into the sandbox that owns it.
+
+        `mode` says which sandbox the trade belongs to: "live" (real money)
+        or "paper" (simulated). Upstream `risk_manager.py:915`-`:936` takes
+        the same argument, for the same reason: a PAPER loss must not be
+        added to the LIVE counters, because those counters are what
+        `_check_risk_limits()` uses to decide whether REAL money may trade.
+        The default is "live" so an existing caller that forgets the argument
+        cannot accidentally book a loss into the paper sandbox.
+        """
+        mode = self._normalize_mode(mode)
+        stats = self._mode_stats(mode)
+        if mode == "paper":
+            self._check_and_reset_paper_daily_stats()
         else:
-            self.stats.consecutive_losses = 0
+            self._check_and_reset_daily_stats()
+        stats.today_pnl += pnl
+        stats.last_trade_time = time.time()
+        if pnl <= 0:
+            stats.consecutive_losses += 1
+        else:
+            stats.consecutive_losses = 0
         logger.info(
-            f"Global PnL Updated: PnL={pnl:.2f}, GlobalTodayPnL={self.stats.today_pnl:.2f}, GlobalConsecLosses={self.stats.consecutive_losses}"
+            f"Global PnL Updated: PnL={pnl:.2f}, GlobalTodayPnL={stats.today_pnl:.2f}, GlobalConsecLosses={stats.consecutive_losses} (mode: {mode})"
         )
-        self._check_risk_limits()
+        self._check_risk_limits(mode=mode)
 
         # Persist the guard state NOW, not on the controller's next periodic
         # tick: the streak is what closes the gate, so a process that dies
@@ -1773,12 +1987,25 @@ class RiskManager:
         """Record why the gate is refusing, for the log line and the API."""
         self._trading_disabled_reason = reason
 
-    async def is_symbol_trading_allowed(self, symbol: str) -> bool:
+    async def is_symbol_trading_allowed(
+        self, symbol: str, mode: str = "live"
+    ) -> bool:
         """
         Checks if trading is allowed for the given symbol.
         Includes checking the global flag and the user's blacklist.
         The blacklist is checked "on the fly" from the DB - changes are applied without a restart.
+
+        `mode` says which sandbox the question is about: "live" (real
+        money) or "paper" (simulated). The GLOBAL risk gate is per sandbox
+        (upstream `bot_module/risk_manager.py:1163` takes the same
+        argument), so a PAPER loss cannot refuse a LIVE symbol and a LIVE
+        loss cannot refuse a PAPER symbol.
+
+        The emergency stop and the blacklist stay SHARED: they are operator
+        and account level controls, not per-sandbox limits, and upstream
+        keeps them shared too.
         """
+        mode = self._normalize_mode(mode)
         # 0. Emergency stop latch. Checked before everything else so that no
         # other path can re-enable trading while an emergency stop is active.
         if self._emergency_stop_active:
@@ -1791,13 +2018,18 @@ class RiskManager:
             )
             return False
 
-        # 1. Check global flag (drawdown, consecutive losses, etc.)
-        if not self._is_trading_allowed:
+        # 1. Check the global flag for THIS sandbox (drawdown, consecutive
+        #    losses, etc.). The two sandboxes have separate counters,
+        #    separate thresholds and separate gates, so this is where the
+        #    paper/live isolation is enforced.
+        if not self._is_mode_trading_allowed(mode):
             self._set_trading_disabled_reason(
-                getattr(self, "_global_gate_disable_reason", None)
+                self._mode_disable_reason(mode)
                 or "trading disabled globally by the risk manager (reason not recorded)"
             )
-            logger.debug(f"[Blacklist:{symbol}] Trading globally disabled")
+            logger.debug(
+                f"[Blacklist:{symbol}] Trading globally disabled (mode: {mode})"
+            )
             return False
 
         # 2. Checking the blacklist (on-the-fly from the DB)
@@ -2181,7 +2413,23 @@ class RiskManager:
             return stamp == self._current_utc_day_str()
         return True
 
-    def _check_risk_limits(self):  # Global limits
+    def _check_risk_limits(self, mode: str = "live"):  # Global limits
+        """Evaluate the global risk limits for ONE sandbox.
+
+        `mode` selects the sandbox: "live" (real money) or "paper"
+        (simulated). The two are judged against SEPARATE counters, SEPARATE
+        thresholds and SEPARATE gates, so a PAPER loss can never close the
+        LIVE gate, and a LIVE loss can never close the PAPER gate.
+
+        The LIVE branch below is the code that was here before this argument
+        existed, unchanged: it is not loosened, not tightened and not
+        re-ordered. The PAPER branch delegates to `_check_paper_risk_limits`,
+        which mirrors it against the paper counters.
+        """
+        mode = self._normalize_mode(mode)
+        if mode == "paper":
+            self._check_paper_risk_limits()
+            return
         # A risk limit may only be treated as "within range" when the numbers
         # it is computed from are KNOWN. If the guard state could not be read
         # at start-up then the loss streak and the day's PnL are unknown, so
@@ -2193,6 +2441,12 @@ class RiskManager:
             self._global_gate_disable_reason = RISK_GUARD_UNVERIFIED_REASON
             if not getattr(self, "_emergency_stop_active", False):
                 self._trading_disabled_reason = RISK_GUARD_UNVERIFIED_REASON
+            # The persisted state carries the paper counters too, so it is
+            # unknown for the paper sandbox as well. The PAPER gate is closed
+            # on the same trigger -- this does not touch the live path.
+            self._close_paper_gate_for_unknown_guard_state(
+                RISK_GUARD_UNVERIFIED_REASON
+            )
             return
         if getattr(self, "_guard_state_lost", False):
             # The guard state is GONE, not merely unreadable. Today's PnL and
@@ -2204,6 +2458,12 @@ class RiskManager:
             self._global_gate_disable_reason = RISK_GUARD_STATE_LOST_REASON
             if not getattr(self, "_emergency_stop_active", False):
                 self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
+            # The persisted state carries the paper counters too, so it is
+            # lost for the paper sandbox as well. The PAPER gate is closed on
+            # the same trigger -- this does not touch the live path.
+            self._close_paper_gate_for_unknown_guard_state(
+                RISK_GUARD_STATE_LOST_REASON
+            )
             return
         should_be_allowed = True
         disable_reason = ""
@@ -2297,6 +2557,187 @@ class RiskManager:
                 )
                 self._is_trading_allowed = True
 
+    def _close_paper_gate_for_unknown_guard_state(self, reason: str) -> None:
+        """Close the PAPER gate because the persisted guard state is UNKNOWN.
+
+        The persisted guard state carries BOTH sandboxes (the live counters
+        at the top level and the paper counters under the "paper" key), so
+        "the state could not be read" or "the state was lost" is a fact
+        about the PAPER counters too. A paper-only account has no live
+        counters to protect, so without this its paper gate would stay OPEN
+        while the persisted state was unknown -- a weakening of the
+        fail-closed behaviour this fork relies on.
+        """
+        if self._paper_is_trading_allowed:
+            logger.critical(
+                f"Paper trading disabled! Reason: {reason}"
+            )
+        self._paper_is_trading_allowed = False
+        self._paper_global_gate_disable_reason = reason
+
+    def _paper_daily_loss_base_is_usable(self) -> bool:
+        """Can the paper sandbox's daily-loss / drawdown ratios be computed?
+
+        The paper sandbox has its OWN opening balance, anchored on the paper
+        wallet's balance (see `_anchor_paper_start_of_day_base`). It is
+        stamped with the UTC day it belongs to, exactly like the live base,
+        and the same rules apply: a base of zero cannot be divided by, and a
+        base stamped with a day that is not TODAY measures the day's loss
+        against the wrong denominator.
+        """
+        if self.paper_stats.start_of_day_balance <= 1e-9:
+            return False
+        stamp = self.paper_stats.start_of_day_day_str
+        if stamp:
+            return stamp == self._current_utc_day_str()
+        return True
+
+    def _anchor_paper_start_of_day_base(self, balance: float) -> bool:
+        """Install the PAPER wallet's balance as the paper day's opening balance.
+
+        The paper sandbox's own base, written once per UTC day and never
+        restated from a mid-session balance. It is anchored when the day's
+        balance is first observed; from then on the day's paper loss is
+        measured against the denominator that was in force when the day
+        started.
+        """
+        amount = float(balance or 0.0)
+        if amount <= 1e-9:
+            return False
+        current_day_str = self._current_utc_day_str()
+        if (
+            self.paper_stats.start_of_day_day_str == current_day_str
+            and self.paper_stats.start_of_day_balance > 1e-9
+        ):
+            return False
+        self.paper_stats.start_of_day_balance = amount
+        self.paper_stats.start_of_day_day_str = current_day_str
+        return True
+
+    def _check_and_reset_paper_daily_stats(self) -> None:
+        """Roll the PAPER sandbox over to the new UTC day.
+
+        Deliberately SEPARATE from `_check_and_reset_daily_stats()`: that
+        function owns the live sandbox's counters, its opening-balance
+        provenance and the lost-state latch, and the paper sandbox must not
+        inherit any of them. A paper day starts at zero paper PnL and a zero
+        paper loss streak, and the paper opening balance is re-anchored from
+        the paper wallet.
+        """
+        _, current_day_str_utc = self._get_current_day_start_info()
+        if self.paper_stats.last_known_day_str == current_day_str_utc:
+            return
+        logger.info(
+            "[RiskManager:PaperDailyReset] New trading day detected (UTC): %s. "
+            "The PAPER sandbox's day counters restart at zero.",
+            current_day_str_utc,
+        )
+        self.paper_stats.today_pnl = 0.0
+        self.paper_stats.consecutive_losses = 0
+        self.paper_stats.last_known_day_str = current_day_str_utc
+        # The paper wallet's balance at the rollover IS the day's opening
+        # balance, so the base is dropped and re-anchored from it.
+        self.paper_stats.start_of_day_balance = 0.0
+        self.paper_stats.start_of_day_day_str = ""
+        self._anchor_paper_start_of_day_base(self.paper_stats.current_balance)
+
+    def _check_paper_risk_limits(self) -> None:
+        """Evaluate the PAPER sandbox's limits against the PAPER counters.
+
+        The mirror of the live `_check_risk_limits()`: the same three
+        limits, the same fail-closed behaviour when the numbers are unknown,
+        and the same emergency-stop semantics -- but measured against
+        `self.paper_stats` and the paper thresholds, and writing to the
+        PAPER gate. A PAPER breach closes the PAPER gate and nothing else.
+        """
+        stats = self.paper_stats
+        max_dd, max_daily_loss, max_consec = self._mode_thresholds("paper")
+
+        # The persisted guard state carries both sandboxes, so an unknown or
+        # lost state is unknown for the paper counters too. Fail CLOSED.
+        if getattr(self, "_guard_state_unverified", False):
+            self._close_paper_gate_for_unknown_guard_state(
+                RISK_GUARD_UNVERIFIED_REASON
+            )
+            return
+        if getattr(self, "_guard_state_lost", False):
+            self._close_paper_gate_for_unknown_guard_state(
+                RISK_GUARD_STATE_LOST_REASON
+            )
+            return
+
+        should_be_allowed = True
+        disable_reason = ""
+        if stats.current_balance < self.min_balance_threshold:
+            should_be_allowed = False
+            disable_reason = (
+                f"[PAPER] Balance (${stats.current_balance:.2f}) < min "
+                f"(${self.min_balance_threshold:.2f})"
+            )
+        else:
+            if not self._paper_daily_loss_base_is_usable():
+                should_be_allowed = False
+                disable_reason = f"[PAPER] {RISK_GUARD_BASE_UNKNOWN_REASON}"
+            else:
+                drawdown_pct = (
+                    abs(stats.today_pnl / stats.start_of_day_balance)
+                    if stats.today_pnl < 0
+                    else 0
+                )
+                if drawdown_pct >= max_dd:
+                    should_be_allowed = False
+                    disable_reason = (
+                        f"[PAPER] Max drawdown ({drawdown_pct * 100:.2f}%) >= "
+                        f"limit ({max_dd * 100:.2f}%)"
+                    )
+                daily_loss_pct = (
+                    abs(stats.today_pnl / stats.start_of_day_balance)
+                    if stats.today_pnl < 0
+                    else 0
+                )
+                if daily_loss_pct >= max_daily_loss:
+                    should_be_allowed = False
+                    disable_reason = (
+                        f"[PAPER] Daily loss ({daily_loss_pct * 100:.2f}%) >= "
+                        f"limit ({max_daily_loss * 100:.2f}%)"
+                    )
+            if stats.consecutive_losses >= max_consec:
+                should_be_allowed = False
+                disable_reason = (
+                    f"[PAPER] Max consec losses ({stats.consecutive_losses}) >= "
+                    f"limit ({max_consec})"
+                )
+        if not should_be_allowed:
+            if self._paper_is_trading_allowed:
+                logger.critical(f"Paper trading disabled! Reason: {disable_reason}")
+                self._paper_is_trading_allowed = False
+                self._paper_last_disable_reason = disable_reason
+                if self.telegram_notifier and self.loop_from_controller:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self.telegram_notifier.risk_manager_alert(
+                                reason=disable_reason,
+                                alert_type="TRADE_DISABLED",
+                                current_balance=stats.current_balance,
+                                daily_pnl=stats.today_pnl,
+                                chat_id=self.user_telegram_chat_id,
+                                api_key_name=self.api_key_name,
+                            ),
+                            self.loop_from_controller,
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to schedule Telegram notification: {e}")
+            self._paper_global_gate_disable_reason = disable_reason
+        else:
+            self._paper_global_gate_disable_reason = None
+            if not self._paper_is_trading_allowed:
+                logger.info(
+                    "Paper risk limits are now within acceptable range. "
+                    "Re-enabling paper trading."
+                )
+                self._paper_is_trading_allowed = True
+                self._paper_last_disable_reason = None
+
     async def assess_signal(
         self,
         signal: StrategySignal,
@@ -2310,20 +2751,23 @@ class RiskManager:
             f"{log_prefix} --- STARTING SIGNAL ASSESSMENT (Mode: {mode.upper()}) ---"
         )
 
-        # BLACKLIST CHECK (on-the-fly)
-        # Check the blacklist at an early stage to avoid wasting resources on further checks
-        if not await self.is_symbol_trading_allowed(signal.symbol):
-            logger.warning(
-                f"{log_prefix} Signal REJECTED. Reason: Symbol is in blacklist or trading globally disabled."
-            )
-            return False, None, 0.0, "SYMBOL_BLACKLISTED"
-
         current_balance_val = 0.0
         risk_per_trade_base = 0.0
         max_stop_distance_pct_to_use = 0.0
         balance_updated_successfully = False
 
         if mode == "paper":
+            # THE PAPER BALANCE IS READ BEFORE THE GATE IS CONSULTED.
+            #
+            # The PAPER gate is judged against the PAPER wallet, and the
+            # paper wallet's balance is only known once it has been read.
+            # Judging it afterwards would evaluate the gate against a
+            # balance it has never seen (0.0), which closes the paper gate
+            # on the very first signal of the process -- and then nothing
+            # could re-open it, because the balance is only read on the very
+            # path the closed gate blocks. Upstream avoids the same
+            # deadlock by evaluating the paper limits inside the paper branch
+            # (upstream `bot_module/risk_manager.py:1695`-`:1700`).
             try:
                 paper_balances = await self.paper_executor.get_account_balance()
                 usdt_balance_data = (
@@ -2335,6 +2779,13 @@ class RiskManager:
                 risk_per_trade_base = self.paper_risk_per_trade
                 max_stop_distance_pct_to_use = self.paper_max_stop_distance_pct
                 balance_updated_successfully = True
+                # The PAPER wallet's balance belongs to the PAPER sandbox.
+                # It must never be written into `self.stats`, which is the
+                # LIVE account's balance.
+                self.paper_stats.current_balance = current_balance_val
+                self._check_and_reset_paper_daily_stats()
+                self._anchor_paper_start_of_day_base(current_balance_val)
+                self._check_risk_limits(mode="paper")
                 logger.info(
                     f"{log_prefix} Using PAPER settings. Balance: ${current_balance_val:.2f}, Risk/Trade: {risk_per_trade_base * 100:.2f}%"
                 )
@@ -2343,7 +2794,21 @@ class RiskManager:
                     f"{log_prefix} Failed to get paper balance: {e}", exc_info=True
                 )
                 return False, None, 0.0, "PAPER_BALANCE_FETCH_FAILED"
-        else:  # live
+
+        # BLACKLIST CHECK (on-the-fly)
+        # Check the blacklist at an early stage to avoid wasting resources on further checks
+        #
+        # The gate is consulted for THIS MODE: the live sandbox and the
+        # paper sandbox have separate counters, separate thresholds and
+        # separate gates, so a paper loss cannot refuse a live signal and a
+        # live loss cannot refuse a paper signal.
+        if not await self.is_symbol_trading_allowed(signal.symbol, mode=mode):
+            logger.warning(
+                f"{log_prefix} Signal REJECTED. Reason: Symbol is in blacklist or trading globally disabled."
+            )
+            return False, None, 0.0, "SYMBOL_BLACKLISTED"
+
+        if mode != "paper":  # live
             self._check_and_reset_daily_stats()
             if executor_override is not None and executor_override is not self.executor:
                 try:
@@ -2456,7 +2921,7 @@ class RiskManager:
             )
             return False, None, initial_base_risk_usd_planned, "EMERGENCY_STOP"
 
-        if not self._is_trading_allowed:
+        if not self._is_mode_trading_allowed(mode):
             logger.warning(
                 f"{log_prefix} Signal REJECTED. Reason: Trading disabled globally by portfolio risk limits."
             )
@@ -3154,6 +3619,33 @@ class RiskManager:
                 # against a denominator from days ago.
                 "start_of_day_day_str": self.stats.start_of_day_day_str or "",
                 "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                # THE PAPER SANDBOX'S STATE, IN THE SAME VALUE, UNDER THE SAME
+                # KEY.
+                #
+                # The key is `f"{redis_state_key}:{user_id}:{api_key_id}"` --
+                # per user and per api key, and NOT per mode. Adding a mode
+                # dimension to the KEY would mean the state that is already
+                # persisted under the old key is no longer found, which
+                # silently RESETS the trading guard for every account on
+                # deploy. So both sandboxes' state lives in ONE value: the
+                # LIVE counters keep their existing top-level names (so a
+                # payload written before this change is still read correctly,
+                # with no reset), and the PAPER counters sit under "paper".
+                #
+                # A payload that predates this change has no "paper" key; the
+                # paper counters then start at zero, which is CORRECT -- the
+                # paper sandbox was never persisted before.
+                "paper": {
+                    "day_str": self.paper_stats.last_known_day_str or "",
+                    "consecutive_losses": int(self.paper_stats.consecutive_losses),
+                    "today_pnl": float(self.paper_stats.today_pnl),
+                    "start_of_day_balance": float(
+                        self.paper_stats.start_of_day_balance
+                    ),
+                    "start_of_day_day_str": (
+                        self.paper_stats.start_of_day_day_str or ""
+                    ),
+                },
             }
             try:
                 await asyncio.wait_for(
@@ -3553,11 +4045,58 @@ class RiskManager:
         self.stats.last_known_day_str = current_day_str
         self._guard_state_restored = True
 
+        # THE PAPER SANDBOX'S OWN STATE, restored from the SAME payload.
+        # It lives under the "paper" key, so the LIVE counters above keep
+        # their existing top-level names and a payload written before this
+        # change still restores the live state correctly -- there is NO
+        # guard reset on deploy. A payload without a "paper" key simply
+        # leaves the paper counters at zero, which is correct: the paper
+        # sandbox was never persisted before.
+        paper_payload = payload.get("paper")
+        if isinstance(paper_payload, dict):
+            paper_day_str = str(paper_payload.get("day_str") or "")
+            if paper_day_str == current_day_str:
+                try:
+                    paper_consecutive_losses = int(
+                        paper_payload.get("consecutive_losses") or 0
+                    )
+                except (TypeError, ValueError):
+                    paper_consecutive_losses = 0
+                try:
+                    paper_today_pnl = float(paper_payload.get("today_pnl") or 0.0)
+                except (TypeError, ValueError):
+                    paper_today_pnl = 0.0
+                try:
+                    paper_start_of_day_balance = float(
+                        paper_payload.get("start_of_day_balance") or 0.0
+                    )
+                except (TypeError, ValueError):
+                    paper_start_of_day_balance = 0.0
+                self.paper_stats.consecutive_losses = max(0, paper_consecutive_losses)
+                self.paper_stats.today_pnl = paper_today_pnl
+                if paper_start_of_day_balance > 1e-9:
+                    self.paper_stats.start_of_day_balance = paper_start_of_day_balance
+                    self.paper_stats.start_of_day_day_str = str(
+                        paper_payload.get("start_of_day_day_str") or current_day_str
+                    )
+                self.paper_stats.last_known_day_str = current_day_str
+            else:
+                logger.info(
+                    "[RiskGuard] Discarding the persisted PAPER sandbox state: it "
+                    "belongs to UTC day %r and today is %r. The paper counters "
+                    "restart at zero, exactly like the live ones.",
+                    paper_day_str,
+                    current_day_str,
+                )
+
         # Re-evaluate the gate against the restored numbers. The start-up
         # path re-opened the gate on the way in (initialize_balance resets
         # the counters and the gate); this closes it again when the restored
         # streak still breaches the limit.
         self._check_risk_limits()
+        # The PAPER gate is re-evaluated against the PAPER counters, which
+        # were restored from the same payload.
+        self._check_risk_limits(mode="paper")
         if not self._is_trading_allowed and not self._emergency_stop_active:
             if self._global_gate_disable_reason:
                 self._trading_disabled_reason = self._global_gate_disable_reason

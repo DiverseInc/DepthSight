@@ -8903,38 +8903,6 @@ class TradingController:
                 # operator action required. An operator's kill switch is NOT
                 # affected: _maybe_release_unverified_emergency_stop() refuses
                 # to touch it.
-                await self._maybe_release_unverified_emergency_stop()
-
-                if not await self.rm.is_symbol_trading_allowed(signal.symbol):
-                    # Name the cause. The gate used to return a bare False and
-                    # every cause was logged as "(general block)", which is how
-                    # a full trading day was lost to an invisible latch on
-                    # 2026-10-19. The original wording is kept as a prefix so
-                    # existing log greps still match; the reason is APPENDED.
-                    block_reason = self.rm.get_trading_disabled_reason()
-                    block_reason_text = block_reason or "reason not recorded"
-                    logger.warning(
-                        f"{log_prefix} Signal REJECTED by rm.is_symbol_trading_allowed (general block). "
-                        f"Reason: {block_reason_text}"
-                    )
-                    self.trade_logger.log_event(
-                        event_type="SIGNAL_REJECTED_RISK_BLOCK",
-                        data={
-                            "symbol": signal.symbol,
-                            "strategy": signal.strategy_name,
-                            "direction": signal.direction.name,
-                            "reason": (
-                                "Symbol blocked by RiskManager (general block): "
-                                f"{block_reason_text}"
-                            ),
-                            "details": signal.details,
-                        },
-                    )
-                    # Cleanup the placeholder
-                    async with self._positions_dict_lock:
-                        self._active_position_pop(signal.symbol, initial_market_type)
-                    return
-
             # 2. CONFIGURATION SEARCH AND ML-FLAG CHECK
             running_instance_config = None
             instance_user_id = None
@@ -8975,6 +8943,56 @@ class TradingController:
             mode = running_instance_config.get(
                 "mode", "live"
             )  # Default to 'live' for safety
+
+            # THE RISK GATE IS CONSULTED FOR THIS SIGNAL'S OWN SANDBOX.
+            #
+            # The live sandbox and the paper sandbox have separate counters,
+            # separate thresholds and separate gates, so the gate has to be
+            # asked about the mode this signal trades in: a PAPER loss cannot
+            # refuse a LIVE signal, and a LIVE loss cannot refuse a PAPER
+            # signal. This check used to sit inside the symbol lock, BEFORE
+            # the mode was known, so it always consulted the LIVE gate and a
+            # live loss blocked paper trading as well.
+            #
+            # It also moved OUT of the symbol lock, because the mode is only
+            # known after the configuration search above. The RESERVING
+            # placeholder still protects the symbol meanwhile: a second
+            # signal for the same symbol is rejected by the
+            # "active position already exists" check above.
+            await self._maybe_release_unverified_emergency_stop()
+
+            if not await self.rm.is_symbol_trading_allowed(
+                signal.symbol, mode=mode
+            ):
+                # Name the cause. The gate used to return a bare False and
+                # every cause was logged as "(general block)", which is how
+                # a full trading day was lost to an invisible latch on
+                # 2026-10-19. The original wording is kept as a prefix so
+                # existing log greps still match; the reason is APPENDED.
+                block_reason = self.rm.get_trading_disabled_reason()
+                block_reason_text = block_reason or "reason not recorded"
+                logger.warning(
+                    f"{log_prefix} Signal REJECTED by rm.is_symbol_trading_allowed (general block). "
+                    f"Reason: {block_reason_text}"
+                )
+                self.trade_logger.log_event(
+                    event_type="SIGNAL_REJECTED_RISK_BLOCK",
+                    data={
+                        "symbol": signal.symbol,
+                        "strategy": signal.strategy_name,
+                        "direction": signal.direction.name,
+                        "reason": (
+                            "Symbol blocked by RiskManager (general block): "
+                            f"{block_reason_text}"
+                        ),
+                        "details": signal.details,
+                    },
+                )
+                # Cleanup the placeholder
+                async with self._positions_dict_lock:
+                    self._active_position_pop(signal.symbol, initial_market_type)
+                return
+
             market_type = self._market_type_for_strategy_config(running_instance_config)
             if isinstance(signal.details, dict):
                 signal.details["market_type"] = market_type
@@ -11431,11 +11449,19 @@ class TradingController:
             funding_already_reported = float(
                 getattr(position_to_process_copy, "funding_pnl_reported", 0.0) or 0.0
             )
+            # Route the close into the POSITION'S OWN sandbox: a PAPER close
+            # feeds the paper counters only, and a LIVE close feeds the live
+            # counters only. Without this, a loss on simulated money was
+            # added to the LIVE `today_pnl` / `consecutive_losses` and the
+            # LIVE gate closed on it -- real money blocked by a paper loss.
+            # Upstream does the same (`bot_module/controller.py:11360`-`:11365`).
+            close_mode = getattr(position_to_process_copy, "mode", "live") or "live"
             await self.rm.update_trade_result(
                 symbol,
                 position_to_process_copy.pnl - funding_already_reported,
                 exit_reason=reason,
-            )  # Global risk update
+                mode=close_mode,
+            )  # Per-mode risk update
 
             # NEW: CREATE PHANTOM TRADE FOR BE ANALYSIS
             # When exiting by STOP_LOSS_BE, create a phantom trade for tracking
