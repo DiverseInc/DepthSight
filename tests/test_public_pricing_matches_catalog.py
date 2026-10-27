@@ -70,6 +70,10 @@ COMPOSE_FILE = REPO_ROOT / "docker-compose.yml"
 # there is nothing to choose). Mirrors frontend/src/lib/pricing.ts.
 FREE_PLAN_KEY = "free"
 
+# The two backtest engines the catalog sells, as quota keys.
+VECTOR_QUOTA_KEY = "run_vector_backtest_per_day"
+KLINE_QUOTA_KEY = "run_kline_backtest_per_day"
+
 
 # --------------------------------------------------------------------------
 # Parsing helpers
@@ -250,6 +254,68 @@ def _compose_service_count() -> int:
 
 
 # --------------------------------------------------------------------------
+# Which engine does a tier's daily backtest allowance buy?
+# --------------------------------------------------------------------------
+def _quotas(raw_plan: dict) -> dict:
+    return raw_plan.get("quotas", {}) or {}
+
+
+def _is_precision_only_quoteless(raw_plan: dict) -> bool:
+    """True when the tier may NOT use the Precision (kline) backtest engine.
+
+    `run_kline_backtest_per_day: 0` means exactly that:
+    `check_usage_quota("run_kline_backtest")` (api/dependencies.py:99-114)
+    reads the limit, and `current_usage >= limit` is true on the very first
+    request, so every Precision run is answered with a 429. The allowance a
+    such a tier does have is therefore the OTHER engine -- the Turbo/vector
+    one -- and nothing else.
+    """
+    return _quotas(raw_plan).get(KLINE_QUOTA_KEY, 0) == 0
+
+
+def _vector_allowance(raw_plan: dict) -> int:
+    """The daily vector (Turbo/fast) backtest allowance of a tier."""
+    return int(_quotas(raw_plan).get(VECTOR_QUOTA_KEY, 0) or 0)
+
+
+def _fast_allowance_sentence(raw_plan: dict) -> str:
+    """The sentence a card must use for the daily backtest allowance.
+
+    `api/plans.py` derives the entitlement label "<N> backtests per day" from
+    the quota, and that label does not say WHICH engine it buys. The
+    backend's own words for the vector engine are "fast": the catalog's
+    free-tier feature copy says "20 fast backtests per day"
+    (api/plans_config.yml:39) and the AI assistant describes the Turbo
+    (vector) engine as "extremely fast" (api/ai_assistant.py:391).
+
+    A card that says "20 backtests per day" without that word is read as
+    "any backtest", so a Free reader would expect the Precision engine --
+    which their tier cannot run at all.
+    """
+    allowance = _vector_allowance(raw_plan)
+    assert allowance > 0, "this helper only applies to a tier with an allowance"
+    return f"{allowance} fast backtests per day"
+
+
+def _expected_included_labels(plan: dict, raw_plan: dict) -> set:
+    """The bullets a card must list, with the engine qualifier applied."""
+    labels = {e["label"] for e in plan["entitlements"] if e["included"]}
+
+    if not _is_precision_only_quoteless(raw_plan):
+        return labels
+
+    allowance = _vector_allowance(raw_plan)
+    if allowance <= 0:
+        return labels
+
+    plain = f"{allowance} backtests per day"
+    if plain in labels:
+        labels.discard(plain)
+        labels.add(f"{allowance} fast backtests per day")
+    return labels
+
+
+# --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
 @pytest.fixture(scope="module")
@@ -265,6 +331,18 @@ def catalog() -> dict:
 @pytest.fixture(scope="module")
 def plans_by_name(catalog) -> dict:
     return {plan["name"]: plan for plan in catalog["plans"]}
+
+
+@pytest.fixture(scope="module")
+def raw_plans() -> dict:
+    """The raw plans_config.yml, keyed by plan key.
+
+    The catalog builder derives labels from the quotas; this fixture gives the
+    test the quotas themselves, so a rule can be written against the machine-
+    readable value (0, -1, 20, ...) instead of against a label.
+    """
+    config = yaml.safe_load(PLANS_CONFIG.read_text(encoding="utf-8"))
+    return config["plans"]
 
 
 @pytest.fixture(scope="module")
@@ -366,12 +444,12 @@ class TestThePageSellsExactlyTheCatalog:
 # --------------------------------------------------------------------------
 class TestTheEntitlementsAreTheCatalogsOwn:
     def test_every_included_bullet_is_a_label_the_tier_grants(
-        self, cards, plans_by_name
+        self, cards, plans_by_name, raw_plans
     ):
         for card in cards:
             plan = plans_by_name.get(card["name"])
             assert plan is not None
-            granted = {e["label"] for e in plan["entitlements"] if e["included"]}
+            granted = _expected_included_labels(plan, raw_plans[plan["key"]])
 
             assert set(card["included"]) == granted, (
                 f"the {card['name']} card does not list exactly the entitlements "
@@ -413,6 +491,98 @@ class TestTheEntitlementsAreTheCatalogsOwn:
                 assert label in excluded, (
                     f"the {card['name']} card lists {label!r} as not included, "
                     "but the catalog does not exclude it"
+                )
+
+
+# --------------------------------------------------------------------------
+# The daily backtest allowance must name the engine it buys
+# --------------------------------------------------------------------------
+class TestTheBacktestAllowanceNamesTheEngine:
+    """A tier without the Precision engine may only run the fast one.
+
+    `run_kline_backtest_per_day` is 0 for Free and Standard, and
+    `check_usage_quota` (api/dependencies.py:99-114) answers every request
+    with a 429 once `current_usage >= limit`. Their daily allowance buys
+    the Turbo/vector engine ONLY -- which the backend itself calls "fast"
+    (api/plans_config.yml:39, api/ai_assistant.py:391).
+    """
+
+    def test_a_tier_without_the_precision_engine_says_fast_backtests(
+        self, cards, plans_by_name, raw_plans
+    ):
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+            raw = raw_plans[plan["key"]]
+
+            if not _is_precision_only_quoteless(raw):
+                continue
+            allowance = _vector_allowance(raw)
+            if allowance <= 0:
+                continue
+
+            expected = f"{allowance} fast backtests per day"
+            assert expected in card["included"], (
+                f"the {card['name']} card must say {expected!r}: this tier may "
+                f"not use the Precision (kline) engine "
+                f"({KLINE_QUOTA_KEY} is 0), so its {allowance} daily backtests "
+                f"are the fast (Turbo/vector) engine only"
+            )
+            assert f"{allowance} backtests per day" not in card["included"], (
+                f"the {card['name']} card states {allowance} backtests per day "
+                "without saying which engine that is"
+            )
+
+    def test_the_page_never_states_an_allowance_without_the_engine(
+        self, page, catalog, raw_plans
+    ):
+        """The wording rule holds in EVERY block, not just in the cards.
+
+        The same number can be quoted in a bullet, in the indexed JSON-LD
+        offer description and in the contact section; none of them may drop
+        the qualifier.
+        """
+        for plan in catalog["plans"]:
+            raw = raw_plans[plan["key"]]
+            if not _is_precision_only_quoteless(raw):
+                continue
+            allowance = _vector_allowance(raw)
+            if allowance <= 0:
+                continue
+
+            qualified = f"{allowance} fast backtests per day"
+            plain = f"{allowance} backtests per day"
+            remainder = page.replace(qualified, "")
+
+            assert plain not in remainder, (
+                f"the page states {plain!r} somewhere without the word 'fast'. "
+                f"This tier has {KLINE_QUOTA_KEY}: 0, so every one of its "
+                f"backtests is the fast (Turbo/vector) engine"
+            )
+
+    def test_a_tier_without_the_precision_engine_lists_it_as_excluded(
+        self, cards, plans_by_name, raw_plans
+    ):
+        """The card must also say which engine is NOT included."""
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+            raw = raw_plans[plan["key"]]
+
+            if not _is_precision_only_quoteless(raw):
+                continue
+
+            excluded = {e["label"] for e in plan["entitlements"] if not e["included"]}
+            kline_labels = {label for label in excluded if "kline" in label.lower()}
+            assert kline_labels, (
+                f"the catalog does not exclude the Precision engine from the "
+                f"{card['name']} tier, so this test needs re-measuring"
+            )
+
+            for label in kline_labels:
+                assert label in card["not_included"], (
+                    f"the {card['name']} card must list {label!r} as not "
+                    "included: the tier cannot run that engine at all"
                 )
 
 
@@ -546,6 +716,52 @@ class TestTheJsonLdOffers:
                     "belongs to another tier"
                 )
 
+    def test_the_indexed_block_makes_no_claim_the_cards_do_not_make(self, page):
+        """The indexed block is a PUBLIC promise, so it obeys the same rules.
+
+        Google indexes this JSON-LD. A promise that only exists here is
+        still a promise a prospect reads.
+        """
+        for block in _json_ld_blocks(page):
+            text = json.dumps(block)
+            lowered = text.lower()
+
+            assert "cancel" not in lowered, (
+                "the indexed block promises a cancellation the backend does "
+                "not implement"
+            )
+            for phrase in ("read-only", "read only", "readonly"):
+                assert phrase not in lowered, (
+                    f"the indexed block advertises {phrase!r} API keys; the "
+                    "product has no read-only key concept (AGENTS.md:71)"
+                )
+
+    def test_the_indexed_offer_description_uses_the_same_backtest_wording(
+        self, page, plans_by_name, raw_plans
+    ):
+        """The JSON-LD is what a search engine reads: same rule as the card."""
+        for offer in _software_application(page)["offers"]:
+            plan = plans_by_name.get(offer["name"])
+            assert plan is not None
+            raw = raw_plans[plan["key"]]
+
+            if not _is_precision_only_quoteless(raw):
+                continue
+            allowance = _vector_allowance(raw)
+            if allowance <= 0:
+                continue
+
+            description = offer.get("description", "")
+            assert f"{allowance} fast backtests per day" in description, (
+                f"the indexed {offer['name']} offer must say "
+                f"{allowance} fast backtests per day: this tier may not use "
+                f"the Precision (kline) engine ({KLINE_QUOTA_KEY} is 0)"
+            )
+            assert f"{allowance} backtests per day" not in description, (
+                f"the indexed {offer['name']} offer states the backtest "
+                "allowance without saying which engine it buys"
+            )
+
 
 # --------------------------------------------------------------------------
 # Promises the backend does not keep
@@ -575,6 +791,124 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
             "registration_trial.days is 0, so no trial is granted and none "
             "may be advertised"
         )
+
+    def test_the_page_promises_no_cancellation(self, page):
+        """There is no route in the backend that cancels a subscription.
+
+        Every "cancel" in api/ is something else: a Bitcart invoice status
+        string (api/routes/payments.py:331-332), a websocket task
+        cancellation (api/websocket_server.py) and the onboarding-email
+        opt-out (api/onboarding_emails.py:275). Nothing cancels a plan, so
+        the page may not promise it -- not as a headline and not in a
+        footnote.
+        """
+        lowered = page.lower()
+        assert "cancel" not in lowered, (
+            "the backend has no cancellation route, so the page must not "
+            "promise that a subscription can be cancelled"
+        )
+
+    def test_the_page_does_not_claim_read_only_api_keys(self, page):
+        """The product has no read-only key concept.
+
+        The only "read-only" in api/ describes the emergency-stop endpoint
+        (api/routes/portfolio.py:802,811) -- a report that never changes
+        state. The product's own rule for the keys a trader hands over is
+        "API keys are Trade-only. Never Withdraw." (AGENTS.md:71), so a
+        card may not advertise read-only keys: the trader creates them.
+        """
+        lowered = page.lower()
+        for phrase in ("read-only", "read only", "readonly"):
+            assert phrase not in lowered, (
+                f"the page still advertises {phrase!r} API keys. The product "
+                "has no read-only key concept; its own rule is 'API keys are "
+                "Trade-only. Never Withdraw.' (AGENTS.md:71)"
+            )
+
+    def test_portfolio_backtesting_follows_the_permission_not_the_quota(
+        self, cards, plans_by_name, raw_plans
+    ):
+        """Portfolio backtesting is gated by a PERMISSION.
+
+        `run_portfolio_backtest_per_day` is 0 for every tier, but that quota
+        is enforced NOWHERE. There are exactly two quota mechanisms in the
+        backend and neither touches the portfolio route:
+
+          * `check_usage_quota` (api/dependencies.py:90) is wired up only on
+            the two backtest engines (api/routes/backtests.py:232) and on
+            genetic search (api/routes/discovery.py:112);
+          * `QuotaManager.check_and_consume` (api/quota_manager.py:22, whose
+            limit 0 means "forbidden", api/quota_manager.py:71-72) is called
+            from exactly one place: api/ai_assistant.py:1474, with the
+            feature "use_ai_assistant".
+
+        The portfolio endpoint (api/routes/portfolio.py:917-925) checks the
+        `run_portfolio_backtest` PERMISSION and the concurrent-task limit,
+        and the Celery task (tasks.py:1869-1902) checks no daily quota at
+        all. The live catalog agrees: GET /api/v1/public/plans returns
+        "Portfolio backtesting" as INCLUDED for Standard and Professional,
+        and the live OpenAPI publishes /api/v1/portfolio-backtests.
+
+        So the capability follows the permission -- Standard and Pro hold
+        it, Free does not -- and the page must follow the permission too.
+        """
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+            permissions = raw_plans[plan["key"]].get("permissions", []) or []
+            holds = "run_portfolio_backtest" in permissions
+
+            claims = "Portfolio backtesting" in card["included"]
+            assert claims == holds, (
+                f"the {card['name']} card {'claims' if claims else 'does not claim'} "
+                "portfolio backtesting, but that tier "
+                f"{'holds' if holds else 'does not hold'} the "
+                "run_portfolio_backtest permission"
+            )
+
+    def test_a_tier_without_a_capability_says_so(self, cards, plans_by_name):
+        """The page states the boundary in BOTH directions.
+
+        A card that says "Portfolio backtesting" on Standard and says
+        nothing about it on Free leaves the reader guessing. The catalog
+        excludes the capability from Free, so the Free card must say it.
+        """
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+            excluded = {e["label"] for e in plan["entitlements"] if not e["included"]}
+
+            for label in excluded:
+                if label not in ("Portfolio backtesting",):
+                    continue
+                assert label in card["not_included"], (
+                    f"the {card['name']} card must list {label!r} as not "
+                    "included: the catalog excludes it from that tier"
+                )
+
+    def test_no_card_quotes_a_number_that_is_not_a_quota_of_that_tier(
+        self, cards, plans_by_name
+    ):
+        """A number next to a quota word must be one of THIS tier's numbers.
+
+        Comparing labels catches a wrong label; this catches the same lie
+        reworded ("100 backtest runs / day"), which no label comparison
+        would notice.
+        """
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+
+            own = set()
+            for entitlement in plan["entitlements"]:
+                own.update(re.findall(r"\d+", entitlement["label"]))
+
+            quoted = _quota_numbers(" ".join(card["included"] + card["not_included"]))
+            for number in quoted:
+                assert number in own, (
+                    f"the {card['name']} card quotes {number} next to a quota "
+                    "word, but the catalog grants that tier no such quota"
+                )
 
     def test_the_page_advertises_no_team_or_seat_tier(self, page):
         """The old page sold a $99 Team tier with 5 seats and RBAC.

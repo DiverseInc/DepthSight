@@ -26,12 +26,27 @@ made of: a credential sitting in a source file the bundler cannot eliminate
 is the same defect one step earlier, and this check runs even when no bundle
 has been built (the Python CI job does not build the frontend).
 
+It then BUILDS the frontend twice -- once with the demo flag off and once
+with it on -- and asserts both halves of the truth:
+
+  * a build without VITE_SHOW_DEMO contains neither string;
+  * a build WITH VITE_SHOW_DEMO contains both.
+
+The second half is the negative control. Without it, "the bundle has no
+credentials" could be true for a reason that has nothing to do with this
+change (a bundler that dropped the panel, a build that failed, a grep that
+never matched anything) and the first half would prove nothing.
+
 To run the full check:
 
     cd frontend && npm run build && cd ..
     python -m pytest tests/test_production_bundle_excludes_demo_credentials.py
 """
 
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -47,6 +62,10 @@ FORBIDDEN = ("DemoPassword123", "alex_trader")
 # Files that end up in the bundle: the app sources, the Vite entry template
 # and everything copied verbatim out of public/.
 TEXT_SUFFIXES = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".css", ".html", ".json"}
+
+# A production build of this app takes well under a minute on a warm
+# machine; two of them plus a slow machine still fit in ten minutes.
+BUILD_TIMEOUT_SECONDS = 900
 
 
 def _read(path: Path) -> str:
@@ -71,6 +90,87 @@ def _bundled_source_files():
 
 def _built_assets():
     yield from sorted(DIST.rglob("*"))
+
+
+# --------------------------------------------------------------------------
+# Building the bundle for real
+# --------------------------------------------------------------------------
+def _npm_is_available() -> bool:
+    return shutil.which("npm") is not None or shutil.which("npm.cmd") is not None
+
+
+def _build_into(out_dir: Path, demo_flag: str | None) -> None:
+    """Run a real production build into `out_dir`.
+
+    `demo_flag` is the value VITE_SHOW_DEMO is set to for the build, or None
+    to make sure the variable is absent from the environment entirely.
+    """
+    env = dict(os.environ)
+    env.pop("VITE_SHOW_DEMO", None)
+    if demo_flag is not None:
+        env["VITE_SHOW_DEMO"] = demo_flag
+
+    command = f'npm run build -- --outDir "{out_dir}" --emptyOutDir'
+    result = subprocess.run(
+        command,
+        shell=True,
+        cwd=str(FRONTEND),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=BUILD_TIMEOUT_SECONDS,
+    )
+
+    assert result.returncode == 0, (
+        "the production build failed, so the bundle check could not run:\n"
+        + (result.stdout or "")[-2000:]
+        + (result.stderr or "")[-2000:]
+    )
+
+
+@pytest.fixture(scope="module")
+def production_builds():
+    """Two real production builds: with the demo flag off, and with it on."""
+    if not _npm_is_available():
+        pytest.skip("npm is not available on this machine")
+    if not (FRONTEND / "node_modules").is_dir():
+        pytest.skip("frontend/node_modules is not installed")
+
+    tmp = Path(tempfile.mkdtemp(prefix="depthsight-demo-build-"))
+    try:
+        without_demo = tmp / "without-demo"
+        with_demo = tmp / "with-demo"
+        without_demo.mkdir()
+        with_demo.mkdir()
+
+        _build_into(without_demo, None)
+        _build_into(with_demo, "true")
+
+        yield {"without": without_demo, "with": with_demo}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _needles_found(out_dir: Path, needles) -> tuple:
+    """Which of `needles` occur in `out_dir`, and in which files.
+
+    Both credential strings end up in the SAME bundle file, so the count that
+    matters is the number of needles found, not the number of files.
+    """
+    found = set()
+    files = []
+    for path in sorted(out_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        text = _read(path)
+        hit = False
+        for needle in needles:
+            if needle in text:
+                found.add(needle)
+                hit = True
+        if hit:
+            files.append(path.name)
+    return found, files
 
 
 class TestTheDemoCredentialsAreNotShipped:
@@ -137,3 +237,43 @@ class TestTheDemoCredentialsAreNotShipped:
                     "compiles the seeded demo credentials into the production "
                     "bundle."
                 )
+
+
+class TestTheBundleCheckIsNotVacuous:
+    """The bundle check is only worth something if it CAN fail.
+
+    These two tests build the frontend for real, twice: once the way a
+    production build is made, and once with the demo helper explicitly
+    asked for. The first must not contain the credentials; the second must.
+    """
+
+    def test_a_build_without_the_demo_flag_ships_no_demo_credentials(
+        self, production_builds
+    ):
+        found, files = _needles_found(production_builds["without"], FORBIDDEN)
+
+        assert not found, (
+            "a production build without VITE_SHOW_DEMO contains the seeded "
+            "demo credentials. A visitor can read them out of the public "
+            "JavaScript without clicking anything. Files: "
+            + ", ".join(files)
+        )
+
+    def test_a_build_with_the_demo_flag_ships_them_so_the_check_can_fail(
+        self, production_builds
+    ):
+        """The negative control.
+
+        If the flag-on build did NOT contain the credentials, then the
+        flag-off build not containing them would prove nothing at all: the
+        strings could be missing because the mechanism is broken, or because
+        the grep never matches.
+        """
+        found, files = _needles_found(production_builds["with"], FORBIDDEN)
+
+        assert found == set(FORBIDDEN), (
+            "a build WITH VITE_SHOW_DEMO=true did not contain both seeded "
+            "demo credentials, so the check above cannot fail and proves "
+            f"nothing. Found {len(found)} of {len(FORBIDDEN)} in "
+            f"{len(files)} file(s)."
+        )
