@@ -901,6 +901,18 @@ class RiskManager:
             return
         self._check_and_reset_paper_daily_stats()
         self._anchor_paper_start_of_day_base(self.paper_stats.current_balance)
+        # A successful start-up read re-opens the PAPER gate, exactly as the
+        # live start-up re-opens the LIVE gate (see `initialize_balance`): the
+        # gate must not stay closed because of a failure that has since
+        # healed. The limit check below closes it again if a limit really is
+        # breached.
+        if (
+            not self._emergency_stop_active
+            and not self._guard_state_is_unknown()
+        ):
+            self._paper_is_trading_allowed = True
+            self._paper_global_gate_disable_reason = None
+            self._paper_last_disable_reason = None
         self._check_risk_limits(mode="paper")
 
     async def initialize_balance(self):

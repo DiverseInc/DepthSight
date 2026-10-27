@@ -330,9 +330,10 @@ async def test_the_persisted_guard_keeps_one_key_and_carries_both_sandboxes(
         f"the guard state must be persisted under {key!r} -- the SAME key as "
         "before, so the already-persisted state is not lost"
     )
-    assert len(redis_store) == 1, (
-        f"exactly one key may be written, got {sorted(redis_store)} -- a "
-        "second, mode-scoped key would leave the existing state behind"
+    assert set(redis_store) == {key, f"{key}:seen"}, (
+        f"the only keys may be the guard key and the pre-existing 'has "
+        f"traded before' marker, got {sorted(redis_store)} -- a mode-scoped "
+        "key would leave the already-persisted state behind"
     )
 
     payload = json.loads(redis_store[key])
