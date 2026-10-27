@@ -818,9 +818,19 @@ const CommunityHub = () => {
 	const navigate = useNavigate();
 	const saveConfig = useSaveStrategyConfig();
 	const updateConfig = useUpdateConfig();
-	const { user } = useAuth();
+	const { user, token } = useAuth();
 	const hubApiUrl =
 		import.meta.env.VITE_HUB_API_URL || "https://depthsight.diverseinc.net/api/v1/hub";
+
+	// The hub's support-ticket routes require an authenticated user: an
+	// anonymous request is rejected with 401, and a ticket may only be read
+	// or replied to by the user who owns it (or by an admin). The token is
+	// memoised so the polling callbacks below keep a stable identity.
+	const hubAuthHeaders = React.useMemo<Record<string, string>>(() => {
+		const headers: Record<string, string> = {};
+		if (token) headers.Authorization = `Bearer ${token}`;
+		return headers;
+	}, [token]);
 
 	// Tier hierarchy: free < standard < pro < premium.
 	// Used to gate which verified templates the user can import.
@@ -969,7 +979,9 @@ const CommunityHub = () => {
 			localFeedbackTickets.map(async (ticket) => {
 				const ticketId = ticket.id as string;
 				try {
-					const res = await fetch(`${hubApiUrl}/tickets/${ticketId}/messages`);
+					const res = await fetch(`${hubApiUrl}/tickets/${ticketId}/messages`, {
+						headers: hubAuthHeaders,
+					});
 					if (res.ok) {
 						const data = await res.json();
 						newMessagesMap[ticketId] = data;
@@ -984,7 +996,7 @@ const CommunityHub = () => {
 			}),
 		);
 		setHubTicketsMessages((prev) => ({ ...prev, ...newMessagesMap }));
-	}, [localFeedbackTickets, hubApiUrl]);
+	}, [localFeedbackTickets, hubApiUrl, hubAuthHeaders]);
 
 	useEffect(() => {
 		fetchAllHubMessages();
@@ -1026,7 +1038,9 @@ const CommunityHub = () => {
 	useEffect(() => {
 		if (selectedHubTicket) {
 			const ticketId = selectedHubTicket.id as string;
-			fetch(`${hubApiUrl}/tickets/${ticketId}/status`)
+			fetch(`${hubApiUrl}/tickets/${ticketId}/status`, {
+				headers: hubAuthHeaders,
+			})
 				.then((res) => {
 					if (!res.ok) throw new Error();
 					return res.json();
@@ -1039,7 +1053,9 @@ const CommunityHub = () => {
 				});
 
 			setLoadingHubMessages(true);
-			fetch(`${hubApiUrl}/tickets/${ticketId}/messages`)
+			fetch(`${hubApiUrl}/tickets/${ticketId}/messages`, {
+				headers: hubAuthHeaders,
+			})
 				.then((res) => {
 					if (!res.ok) throw new Error();
 					return res.json();
@@ -1052,7 +1068,7 @@ const CommunityHub = () => {
 					setLoadingHubMessages(false);
 				});
 		}
-	}, [selectedHubTicket, hubApiUrl]);
+	}, [selectedHubTicket, hubApiUrl, hubAuthHeaders]);
 
 	// Detailed View Dialog State
 	const [selectedTopic, setSelectedTopic] = useState<HubTopicResponse | null>(
@@ -1865,6 +1881,7 @@ const CommunityHub = () => {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
+					...hubAuthHeaders,
 				},
 				body: JSON.stringify({
 					category,
@@ -1943,6 +1960,7 @@ const CommunityHub = () => {
 					method: "POST",
 					headers: {
 						"Content-Type": "application/json",
+						...hubAuthHeaders,
 					},
 					body: JSON.stringify({
 						text: newHubReply.trim(),
@@ -1977,6 +1995,7 @@ const CommunityHub = () => {
 					method: "PATCH",
 					headers: {
 						"Content-Type": "application/json",
+						...hubAuthHeaders,
 					},
 					body: JSON.stringify({
 						status: "CLOSED",

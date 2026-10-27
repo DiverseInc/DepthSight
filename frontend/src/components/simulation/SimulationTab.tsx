@@ -119,6 +119,9 @@ export const SimulationTab: React.FC = () => {
 			try {
 				const response = await fetch(
 					`${API_BASE}/api/simulation/inspector/celery/stream/${taskId}`,
+					{
+						headers: token ? { Authorization: `Bearer ${token}` } : {},
+					},
 				);
 
 				if (!response.ok) {
@@ -217,7 +220,7 @@ export const SimulationTab: React.FC = () => {
 				store.setLoading(false);
 			}
 		},
-		[toast, t],
+		[toast, t, token],
 	);
 
 	useEffect(() => {
@@ -229,6 +232,9 @@ export const SimulationTab: React.FC = () => {
 			try {
 				const response = await fetch(
 					`${API_BASE}/api/simulation/inspector/status/${activeTask.taskId}`,
+					{
+						headers: token ? { Authorization: `Bearer ${token}` } : {},
+					},
 				);
 				if (!response.ok) return;
 				const status = await response.json();

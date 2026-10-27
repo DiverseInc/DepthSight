@@ -16,12 +16,16 @@ def ensure_hub_router_registered():
     """
     Dynamically registers the hub router on the app if it was not loaded on startup
     due to IS_CENTRAL_HUB being False by default.
+
+    FastAPI 0.162 wraps included routers in an `_IncludedRouter` object that
+    hides the individual paths from `app.routes`, so "is it already mounted?"
+    cannot be answered from `app.routes`. An explicit marker on the app object
+    is used instead, so the router is mounted exactly once per test session
+    even though more than one test module needs it.
     """
-    has_hub = any(
-        getattr(route, "path", "").startswith("/api/v1/hub") for route in app.routes
-    )
-    if not has_hub:
+    if not getattr(app, "_depthsight_hub_router_mounted", False):
         app.include_router(hub_router)
+        app._depthsight_hub_router_mounted = True
 
 
 async def test_get_hub_strategies(test_client: AsyncClient):
@@ -390,9 +394,19 @@ async def test_admin_manage_presets_and_news(
     assert not any(s["id"] == strat_id for s in response.json())
 
 
-async def test_hub_ticket_chat(test_client: AsyncClient, db_session: AsyncSession):
+async def test_hub_ticket_chat(
+    test_client: AsyncClient,
+    db_session: AsyncSession,
+    authenticated_client_factory,
+):
     """
     Test the complete ticket chat flow for a remote hub user.
+
+    The hub ticket routes require an authenticated user (an anonymous request
+    is rejected with 401) and only the owner of a ticket - or an admin - may
+    read or reply to it. The feedback endpoint is deliberately still open to
+    anonymous callers and parks the ticket it creates on an admin account, so
+    the chat below runs as that admin.
     """
     # 1. Create a mock user
     mock_user = models.User(
@@ -401,11 +415,13 @@ async def test_hub_ticket_chat(test_client: AsyncClient, db_session: AsyncSessio
         hashed_password="fakehashpassword",
         role="admin",
         plan="pro",
+        is_active=True,
         xp=0,
         level=1,
     )
     db_session.add(mock_user)
     await db_session.commit()
+    await db_session.refresh(mock_user)
 
     # 2. Submit feedback via Hub endpoint
     payload = {
@@ -421,37 +437,43 @@ async def test_hub_ticket_chat(test_client: AsyncClient, db_session: AsyncSessio
     ticket_id = data["ticket_id"]
     assert ticket_id is not None
 
-    # 3. Retrieve status of the ticket from Hub endpoint
-    status_res = await test_client.get(f"/api/v1/hub/tickets/{ticket_id}/status")
-    assert status_res.status_code == 200
-    status_data = status_res.json()
-    assert status_data["status"] == "OPEN"
-    assert status_data["category"] == "bug"
+    # 3. The ticket routes are authenticated: an anonymous caller gets 401.
+    anon_status = await test_client.get(f"/api/v1/hub/tickets/{ticket_id}/status")
+    assert anon_status.status_code == 401
 
-    # 4. Post reply from the remote user via Hub endpoint
-    msg_payload = {"text": "Hello, any update on this?", "senderName": "RemoteUser"}
-    msg_res = await test_client.post(
-        f"/api/v1/hub/tickets/{ticket_id}/messages", json=msg_payload
-    )
-    assert msg_res.status_code == 201
-    msg_data = msg_res.json()
-    assert msg_data["text"] == "Hello, any update on this?"
-    assert msg_data["senderName"] == "RemoteUser"
-    assert msg_data["isAdmin"] is False
+    auth_client = await authenticated_client_factory(mock_user)
+    async with auth_client:
+        # 4. Retrieve status of the ticket from Hub endpoint
+        status_res = await auth_client.get(f"/api/v1/hub/tickets/{ticket_id}/status")
+        assert status_res.status_code == 200
+        status_data = status_res.json()
+        assert status_data["status"] == "OPEN"
+        assert status_data["category"] == "bug"
 
-    # 5. Fetch message list from Hub endpoint
-    list_res = await test_client.get(f"/api/v1/hub/tickets/{ticket_id}/messages")
-    assert list_res.status_code == 200
-    messages = list_res.json()
-    assert len(messages) == 1
-    assert messages[0]["text"] == "Hello, any update on this?"
+        # 5. Post reply from the remote user via Hub endpoint
+        msg_payload = {"text": "Hello, any update on this?", "senderName": "RemoteUser"}
+        msg_res = await auth_client.post(
+            f"/api/v1/hub/tickets/{ticket_id}/messages", json=msg_payload
+        )
+        assert msg_res.status_code == 201
+        msg_data = msg_res.json()
+        assert msg_data["text"] == "Hello, any update on this?"
+        assert msg_data["senderName"] == "RemoteUser"
+        assert msg_data["isAdmin"] is False
 
-    # 6. Update ticket status (e.g. resolve/close it) from Hub endpoint
-    update_res = await test_client.patch(
-        f"/api/v1/hub/tickets/{ticket_id}/status", json={"status": "CLOSED"}
-    )
-    assert update_res.status_code == 200
-    assert update_res.json()["status"] == "CLOSED"
+        # 6. Fetch message list from Hub endpoint
+        list_res = await auth_client.get(f"/api/v1/hub/tickets/{ticket_id}/messages")
+        assert list_res.status_code == 200
+        messages = list_res.json()
+        assert len(messages) == 1
+        assert messages[0]["text"] == "Hello, any update on this?"
+
+        # 7. Update ticket status (e.g. resolve/close it) from Hub endpoint
+        update_res = await auth_client.patch(
+            f"/api/v1/hub/tickets/{ticket_id}/status", json={"status": "CLOSED"}
+        )
+        assert update_res.status_code == 200
+        assert update_res.json()["status"] == "CLOSED"
 
 
 async def test_hub_node_lifecycle(test_client: AsyncClient, db_session: AsyncSession):

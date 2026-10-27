@@ -16,6 +16,7 @@ import type React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useAuth } from "@/context/AuthContext";
 import { useSimulationStore } from "./simulationStore";
 
 const getApiBase = () => {
@@ -54,6 +55,7 @@ interface AssetDetailData {
 
 export const AssetDeepDiveView: React.FC = () => {
 	const { t } = useTranslation("simulation");
+	const { token } = useAuth();
 	const {
 		activeAsset,
 		setActiveAsset,
@@ -122,7 +124,10 @@ export const AssetDeepDiveView: React.FC = () => {
 					`${API_BASE}/api/simulation/asset-detail/${activeAsset}`,
 					{
 						method: "POST",
-						headers: { "Content-Type": "application/json" },
+						headers: {
+							"Content-Type": "application/json",
+							...(token ? { Authorization: `Bearer ${token}` } : {}),
+						},
 						body: JSON.stringify({
 							strategy_json: strategyJson || {}, // Send an empty object if there is no strategy
 							variants: strategyJson ? ["raw", "oracle_be"] : [], // Without a strategy, we don't receive trades from the backtest
@@ -168,7 +173,7 @@ export const AssetDeepDiveView: React.FC = () => {
 		};
 
 		loadData();
-	}, [activeAsset, strategyJson, config, inspectorResult]);
+	}, [activeAsset, strategyJson, config, inspectorResult, token]);
 
 	// Sync overlay - draw Oracle zones and trade points
 	const syncOverlay = useCallback(() => {

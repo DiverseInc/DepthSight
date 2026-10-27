@@ -16,10 +16,18 @@ from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .auth import get_current_user
 from .dependencies import require_permission
+from . import models
 
 logger = logging.getLogger(__name__)
 HIDDEN_TRADE_EXIT_REASONS = {"END_OF_DATA"}
+
+# Hard cap on the size of an uploaded strategy file. The file is only ever
+# parsed as JSON and returned to the caller (it is never written to disk),
+# but without a cap an anonymous caller could make the server buffer an
+# arbitrarily large body in memory.
+MAX_UPLOAD_STRATEGY_BYTES = 5 * 1024 * 1024  # 5 MB
 
 # Optional imports
 try:
@@ -1211,7 +1219,9 @@ async def start_inspector_task(request: InspectorRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@simulation_router.get("/inspector/status/{task_id}")
+@simulation_router.get(
+    "/inspector/status/{task_id}", dependencies=[Depends(get_current_user)]
+)
 async def get_inspector_task_status(task_id: str):
     """Return current Celery/Redis state for an Inspector Matrix task."""
     try:
@@ -1299,7 +1309,9 @@ def _simulation_inspector_stream_response(
     )
 
 
-@simulation_router.get("/inspector/celery/stream/{task_id}")
+@simulation_router.get(
+    "/inspector/celery/stream/{task_id}", dependencies=[Depends(get_current_user)]
+)
 async def stream_existing_inspector_task(task_id: str):
     """Stream Redis-backed progress for an already queued Inspector Matrix task."""
     return _simulation_inspector_stream_response(task_id)
@@ -2221,10 +2233,23 @@ async def run_portfolio_full(request: PortfolioFullRequest):
 
 
 @simulation_router.post("/upload-strategy")
-async def upload_strategy(file: UploadFile = File(...)):
-    """Load strategy JSON file"""
+async def upload_strategy(
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Load strategy JSON file.
+
+    The file is parsed as JSON and echoed back to the caller. It is NEVER
+    written to disk, so the client-supplied filename is never used as a
+    filesystem path.
+    """
     try:
-        content = await file.read()
+        content = await file.read(MAX_UPLOAD_STRATEGY_BYTES + 1)
+        if len(content) > MAX_UPLOAD_STRATEGY_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="Strategy file too large (max 5MB).",
+            )
         strategy = json.loads(content.decode("utf-8"))
 
         # Validate structure
@@ -2234,12 +2259,36 @@ async def upload_strategy(file: UploadFile = File(...)):
         return {"filename": file.filename, "strategy": strategy, "valid": True}
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _resolve_asset_parquet_path(asset: str) -> Path:
+    """Resolve the parquet file for an asset, refusing to escape the data root.
+
+    `asset` arrives in the URL path, so it must not be able to walk out of
+    DATA_STORAGE_PATH with `..` segments.
+    """
+    data_root = DATA_STORAGE_PATH.resolve()
+    parquet_path = (DATA_STORAGE_PATH / asset / "kline_1m.parquet").resolve()
+    try:
+        parquet_path.relative_to(data_root)
+    except ValueError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Asset data not found: {asset}",
+        )
+    return parquet_path
+
+
 @simulation_router.post("/asset-detail/{asset}")
-async def get_asset_detail(asset: str, request: AssetDetailRequest):
+async def get_asset_detail(
+    asset: str,
+    request: AssetDetailRequest,
+    current_user: models.User = Depends(get_current_user),
+):
     """Get detailed asset data for Deep Dive view"""
     if not BACKTESTER_AVAILABLE or not LOADER_AVAILABLE:
         raise HTTPException(
@@ -2250,7 +2299,7 @@ async def get_asset_detail(asset: str, request: AssetDetailRequest):
         import pandas as pd
 
         # 1. Load data WITH ORACLE - use the same method as inspector
-        parquet_path = DATA_STORAGE_PATH / asset / "kline_1m.parquet"
+        parquet_path = _resolve_asset_parquet_path(asset)
         if not parquet_path.exists():
             raise HTTPException(
                 status_code=404, detail=f"Asset data not found: {asset}"

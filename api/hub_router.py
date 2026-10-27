@@ -12,6 +12,7 @@ from sqlalchemy.future import select
 
 from .database import get_db
 from . import schemas, crud, models
+from .auth import get_current_user
 from .depthsight_api import limiter, get_limit_value, APP_VERSION
 
 import hmac
@@ -92,6 +93,47 @@ def make_news_comment_response(
     res.author_name = clean_name
     res.is_admin = is_admin
     return res
+
+
+def _ensure_ticket_owner(
+    ticket: models.SupportTicket, current_user: models.User, action: str
+) -> None:
+    """Refuse access to a support ticket that belongs to somebody else.
+
+    This mirrors the ownership rule the first-party support router already
+    uses (api/routes/support.py): the owner may act on their own ticket, an
+    admin may act on any ticket, and nobody else may. Without it, a leaked
+    ticket id was enough to read another user's support conversation.
+    """
+    if current_user.role == "admin" or ticket.user_id == current_user.id:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=f"Not authorized to {action} this ticket.",
+    )
+
+
+async def get_optional_current_user(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    db: AsyncSession = Depends(get_db),
+) -> Optional[models.User]:
+    """Resolve the caller when a valid bearer token is supplied.
+
+    Never rejects. This exists so that a route which must stay open can still
+    record WHO submitted something, without turning it into an authenticated
+    route. Token validation is delegated to get_current_user so there is only
+    one implementation of it.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        return None
+    try:
+        return await get_current_user(request, token, db)
+    except HTTPException:
+        return None
 
 
 router = APIRouter(prefix="/api/v1/hub", tags=["Federation Hub"])
@@ -415,11 +457,17 @@ async def get_news_comments(news_id: int, db: AsyncSession = Depends(get_db)):
 async def post_hub_feedback(
     feedback: schemas.HubFeedbackCreate,
     request: Request,
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Receives feedback or bug reports, stores them in the database,
     and creates a corresponding admin support ticket.
+
+    This route stays open to anonymous callers on purpose (it is a community
+    feedback channel). When the caller IS authenticated, the ticket is
+    attributed to them so that the ticket id we hand back is one they are
+    actually allowed to read back under the ticket ownership rule.
     """
     try:
         # IP is not stored to respect complete user privacy
@@ -429,14 +477,16 @@ async def post_hub_feedback(
         from sqlalchemy.future import select
         from . import models
 
-        stmt_admin = select(models.User).filter(models.User.role == "admin").limit(1)
-        res_admin = await db.execute(stmt_admin)
-        assoc_user = res_admin.scalars().first()
+        assoc_user = current_user
+        if assoc_user is None:
+            stmt_admin = select(models.User).filter(models.User.role == "admin").limit(1)
+            res_admin = await db.execute(stmt_admin)
+            assoc_user = res_admin.scalars().first()
 
-        if not assoc_user:
-            stmt_any = select(models.User).order_by(models.User.id.asc()).limit(1)
-            res_any = await db.execute(stmt_any)
-            assoc_user = res_any.scalars().first()
+            if not assoc_user:
+                stmt_any = select(models.User).order_by(models.User.id.asc()).limit(1)
+                res_any = await db.execute(stmt_any)
+                assoc_user = res_any.scalars().first()
 
         if assoc_user:
             email_info = (
@@ -761,10 +811,14 @@ async def unverify_topic(
 @router.get(
     "/tickets/{ticket_id}/status", response_model=schemas.SupportTicketStatusResponse
 )
-async def get_hub_ticket_status(ticket_id: str, db: AsyncSession = Depends(get_db)):
+async def get_hub_ticket_status(
+    ticket_id: str,
+    current_user: models.User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Returns public details (status, subject, category) of a support ticket.
-    Authenticated by knowing the unguessable ticket_id UUID.
+    Returns the status of a support ticket to the user who owns it.
+    An admin may read any ticket.
     """
     try:
         from sqlalchemy.future import select
@@ -776,6 +830,7 @@ async def get_hub_ticket_status(ticket_id: str, db: AsyncSession = Depends(get_d
         ticket = result.scalar_one_or_none()
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found.")
+        _ensure_ticket_owner(ticket, current_user, "view")
         return ticket
     except HTTPException:
         raise
@@ -791,10 +846,14 @@ async def get_hub_ticket_status(ticket_id: str, db: AsyncSession = Depends(get_d
     "/tickets/{ticket_id}/status", response_model=schemas.SupportTicketStatusResponse
 )
 async def update_hub_ticket_status(
-    ticket_id: str, status_in: Dict[str, str], db: AsyncSession = Depends(get_db)
+    ticket_id: str,
+    status_in: Dict[str, str],
+    current_user: models.User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
-    Allows a remote user to update their support ticket status (e.g. close it).
+    Allows the owner of a support ticket to update its status (e.g. close it).
+    An admin may update any ticket.
     """
     try:
         from sqlalchemy.future import select
@@ -806,6 +865,7 @@ async def update_hub_ticket_status(
         ticket = result.scalar_one_or_none()
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found.")
+        _ensure_ticket_owner(ticket, current_user, "update")
 
         new_status = status_in.get("status")
         if new_status:
@@ -829,9 +889,14 @@ async def update_hub_ticket_status(
     "/tickets/{ticket_id}/messages",
     response_model=List[schemas.SupportTicketMessageResponse],
 )
-async def get_hub_ticket_messages(ticket_id: str, db: AsyncSession = Depends(get_db)):
+async def get_hub_ticket_messages(
+    ticket_id: str,
+    current_user: models.User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Retrieves message history for a hub support ticket.
+    Retrieves message history for a support ticket, for the user who owns it.
+    An admin may read any ticket.
     """
     try:
         from sqlalchemy.future import select
@@ -843,6 +908,7 @@ async def get_hub_ticket_messages(ticket_id: str, db: AsyncSession = Depends(get
         ticket = result.scalar_one_or_none()
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found.")
+        _ensure_ticket_owner(ticket, current_user, "read messages for")
 
         msg_result = await db.execute(
             select(models.SupportTicketMessage)
@@ -870,10 +936,12 @@ async def post_hub_ticket_message(
     request: Request,
     ticket_id: str,
     msg_in: schemas.SupportTicketMessageCreate,
+    current_user: models.User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Appends a user reply to a hub support ticket.
+    Appends a user reply to a support ticket, for the user who owns it.
+    An admin may reply to any ticket.
     """
     try:
         from sqlalchemy.future import select
@@ -885,6 +953,7 @@ async def post_hub_ticket_message(
         ticket = result.scalar_one_or_none()
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found.")
+        _ensure_ticket_owner(ticket, current_user, "reply to")
 
         sender_name = msg_in.sender_name or "User"
         db_msg = models.SupportTicketMessage(
