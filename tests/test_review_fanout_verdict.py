@@ -188,16 +188,13 @@ def test_the_last_marker_wins():
     assert verdict == "NO"
 
 
-def test_reviewer_that_says_it_cannot_see_the_whole_change_is_not_a_verdict():
-    """MEASURED 2026-10-26: hermes was given a diff truncated at ~11,500 of
-    63,508 characters, said exactly that, and then answered anyway -- the
-    2026-10-19 incident this tool exists to prevent."""
+def test_a_protocol_truncation_report_is_not_a_verdict():
+    """The protocol for a reviewer that cannot see the whole change is to
+    reply exactly 'DIFF TRUNCATED'. That is a STANDALONE-LINE check."""
     fanout = _load_tool()
     output = (
-        "Note: the diff is truncated after ~11500 of 63508 characters "
-        "(`.review/review.diff` holds the rest), so the parser "
-        "implementation in tools/review_fanout.py is not visible here -- the "
-        "above is from the test file only.\n"
+        "I could only see the first part of the change.\n"
+        "DIFF TRUNCATED\n"
         "VERDICT: NO\n"
     )
     verdict, reason = fanout.parse_verdict(output)
@@ -205,14 +202,18 @@ def test_reviewer_that_says_it_cannot_see_the_whole_change_is_not_a_verdict():
     assert "NO VERDICT" in reason
 
 
-def test_reviewer_discussing_truncation_is_not_a_partial_view():
-    """The opposite case, measured: opencode DISCUSSED this tool's own
-    vocabulary while reasoning and must still be scored on its marker."""
+def test_quoting_this_tool_does_not_downgrade_a_real_verdict():
+    """MEASURED 2026-10-26: dsh and opencode, both reviewing a diff of this
+    very tool, quoted this tool's own sentence -- "says it could not see the
+    whole change" -- while explaining themselves, and a free-text phrase
+    match threw away BOTH of their real verdicts. Quoting the tool must not
+    silence the tool.
+    """
     fanout = _load_tool()
     output = (
-        "The tool checks `_TRUNCATED`, whose patterns include "
-        "\"diff truncated\" and \"the reviewer reported the diff was TRUNCATED "
-        "for it -- it reviewed only part of the change\".\n"
+        "Note the converse: a marker alone is not sufficient -- the "
+        "truncation check downgrades even a real `VERDICT: NO` to NO VERDICT, "
+        "so it says it could not see the whole change.\n"
         "truncated              -> verdict=None\n"
         "VERDICT: NO\n"
     )

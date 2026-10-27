@@ -503,26 +503,23 @@ def build_opencode_pack(diff: Path, repo: Path) -> Path:
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
 
-# A reviewer that says it could not SEE part of the change has reviewed a
-# partial view, whatever it concluded -- and it says so in its own words.
-# MEASURED 2026-10-26: hermes was given a diff truncated at ~11,500 of 63,508
-# characters, said exactly that ("the diff is truncated after ~11500 of 63508
-# characters ... is not visible here"), and then answered anyway. That is the
-# 2026-10-19 incident this tool exists to prevent.
+# The protocol for a reviewer that cannot see the whole change is to reply
+# exactly 'DIFF TRUNCATED'. That is checked as a STANDALONE LINE, and it is
+# the ONLY truncation check that can override a marker.
 #
-# These patterns are deliberately NARROW. opencode, reviewing a diff of this
-# very tool, discussed the strings "diff truncated" and "please provide the
-# question" while correctly explaining itself, and a broad phrase match
-# silenced that real verdict. So this override keys on the reviewer saying it
-# could not SEE something, not on the word "truncated" appearing anywhere.
-_PARTIAL_VIEW = re.compile(
-    r"\bis not visible\b"
-    r"|\bnot visible (?:here|in what|to me|in this)\b"
-    r"|\b(?:could ?not|cannot|can't|did ?not|didn't) see\b"
-    r"|\bcan ?only see\b"
-    r"|\bthe (?:rest|remainder) of the diff (?:is|was) (?:not|is ?n.t|was ?n.t)\b"
-    r"|\btruncat\w*[^.\n]{0,60}after\s+~?\d[^.\n]{0,20}\d",
-    re.IGNORECASE,
+# A free-text phrase match cannot tell a self-report from a QUOTE, and
+# MEASURED 2026-10-26 proved it: dsh and opencode, both reviewing a diff of
+# this very tool, quoted this tool's own sentence -- "says it could not see
+# the whole change" -- while explaining themselves, and the phrase match
+# threw away BOTH of their real verdicts. Quoting the tool must not silence
+# the tool.
+#
+# The protection against a partial review is therefore structural, not
+# lexical: the protocol goes FIRST in every prompt (so an engine whose prompt
+# is truncated still receives it), and a reviewer that follows it emits
+# 'DIFF TRUNCATED' and no marker.
+_PROTOCOL_TRUNCATED = re.compile(
+    r"^[ \t>*#`\-]*DIFF TRUNCATED\b.*$", re.MULTILINE
 )
 
 # A reviewer that asks for the question instead of answering it has confirmed
@@ -656,13 +653,13 @@ def parse_verdict(text: str) -> tuple[str | None, str]:
 
     verdict, bad = _extract_verdict(cleaned)
     if verdict is not None:
-        # The marker is authoritative -- UNLESS the reviewer says in its own
-        # words that it could not see all of the change. A verdict about a
-        # partial view is not a verdict on the change.
-        if _PARTIAL_VIEW.search(cleaned):
+        # The marker is authoritative -- UNLESS the reviewer used the
+        # protocol to report that it could not see the whole change. A
+        # verdict about a partial view is not a verdict on the change.
+        if _PROTOCOL_TRUNCATED.search(cleaned):
             return None, (
-                "the reviewer says it could not SEE the whole change, so its "
-                "verdict is about a partial view -- NO VERDICT"
+                "the reviewer reported DIFF TRUNCATED, so it could not see "
+                "the whole change -- NO VERDICT"
             )
         return verdict, f"VERDICT: {verdict}"
     if bad is not None:
