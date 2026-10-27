@@ -8,6 +8,12 @@ import {
 } from "@tanstack/react-query";
 import type { PlanEntitlement, PublicPlanCatalog } from "@/lib/pricing";
 import type {
+	PublicPlatformStats,
+	PublicPublishedResults,
+	PublicStrategyTemplate,
+	ResultCategory,
+} from "@/lib/screener";
+import type {
 	AccountStatusData,
 	Achievement,
 	AddApiKeyPayload,
@@ -630,6 +636,50 @@ export const usePublicPlans = () =>
 	useQuery<PublicPlanCatalog, Error>({
 		queryKey: ["publicPlans"],
 		queryFn: () => apiClient<PublicPlanCatalog>("/public/plans"),
+		staleTime: 60 * 60 * 1000, // 1 hour
+	});
+
+/**
+ * The PUBLIC strategy template catalogue.
+ *
+ * The screener page is a public route, so it reads the same public endpoint
+ * the Discovery Hub reads (`GET /api/v1/strategy-templates`) rather than the
+ * authenticated one. The list is already filtered to the active templates by
+ * the backend.
+ */
+export const usePublicStrategyTemplates = () =>
+	useQuery<PublicStrategyTemplate[], Error>({
+		queryKey: ["publicStrategyTemplates"],
+		queryFn: () => apiClient<PublicStrategyTemplate[]>("/strategy-templates"),
+		staleTime: 60 * 60 * 1000, // 1 hour
+	});
+
+/**
+ * The PUBLIC feed of backtest results users published for comparison.
+ *
+ * Public by construction: the endpoint returns published backtest metrics
+ * only and carries no owner identity and no account state.
+ */
+export const usePublicPublishedResults = (category: ResultCategory) =>
+	useQuery<PublicPublishedResults, Error>({
+		queryKey: ["publicPublishedResults", category],
+		queryFn: () =>
+			apiClient<PublicPublishedResults>(
+				`/public/published-results?category=${encodeURIComponent(category)}`,
+			),
+		staleTime: 5 * 60 * 1000, // 5 minutes
+	});
+
+/**
+ * The PUBLIC platform counters.
+ *
+ * The backend excludes the seeded demo accounts from these counts, so the
+ * number a visitor sees is the number of genuine users.
+ */
+export const usePublicPlatformStats = () =>
+	useQuery<PublicPlatformStats, Error>({
+		queryKey: ["publicPlatformStats"],
+		queryFn: () => apiClient<PublicPlatformStats>("/stats/platform"),
 		staleTime: 60 * 60 * 1000, // 1 hour
 	});
 
