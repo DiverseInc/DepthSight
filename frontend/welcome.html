@@ -52,12 +52,12 @@
       "description": "Build, backtest, and deploy crypto trading strategies on OKX, Binance, Bybit, Bitget, Gate.io, and BingX. Paper trade first, graduate to live when ready.",
       "offers": [
         { "@type": "Offer", "name": "Free", "price": "0", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/register", "description": "20 fast backtests per day, 10 AI Assistant queries per day, paper trading" },
-        { "@type": "Offer", "name": "Standard", "price": "30", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/register?plan=standard", "description": "50 fast backtests per day, 20 AI Assistant queries per day, 10 live trading strategies" },
-        { "@type": "Offer", "name": "Professional", "price": "100", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/register?plan=pro", "description": "Unlimited backtests, PRO blocks, genetic strategy search, 30 live trading strategies" }
+        { "@type": "Offer", "name": "Standard", "price": "30", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/welcome#pricing", "description": "50 fast backtests per day, 20 AI Assistant queries per day, 10 live trading strategies" },
+        { "@type": "Offer", "name": "Professional", "price": "100", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/welcome#pricing", "description": "Unlimited backtests, PRO blocks, genetic strategy search, 30 live trading strategies" }
       ],
       "featureList": [
         "Paper trading against real candles",
-        "Live trading on 6 exchanges",
+        "Live trading on 6 exchanges for paid plans (Bybit only on Free)",
         "Verified strategy templates you can import",
         "Visual no-code strategy builder",
         "Genetic strategy search",
@@ -393,8 +393,8 @@
 <section id="pricing">
   <div class="wrap">
     <span class="eyebrow">Pricing</span>
-    <h2>Simple tiers. <span class="grad">Upgrade when you're ready.</span></h2>
-    <p class="sub">Prices are per month, in USD. All plans include the backtester, paper-trading, and the Discovery Hub. Paid plans add live trading, more AI usage, and saved strategies.</p>
+    <h2>Simple tiers. <span class="grad">Start free.</span></h2>
+    <p class="sub">Prices are per month, in USD. All plans include the backtester, paper-trading, the Discovery Hub and live trading on Bybit. Paid plans add the other venues, more AI usage, and saved strategies.</p>
 
     <div class="price-grid">
       <div class="price" data-plan-key="free">
@@ -408,13 +408,13 @@
           <li>90-day backtest history</li>
           <li>Standard blocks (Logic, Indicators, Proximity)</li>
           <li>Paper trading</li>
+          <li>Live trading on Bybit (up to 5 live trading strategies)</li>
         </ul>
         <p class="notinc-title">Not included</p>
         <ul class="notinc">
           <li>Kline backtests</li>
           <li>Portfolio backtesting</li>
-          <li>Live trading</li>
-          <li>Live trading strategies</li>
+          <li>Live trading on other venues</li>
           <li>PRO blocks (Tape, Book, Open Interest)</li>
           <li>Optimization runs</li>
           <li>Genetic searches</li>
@@ -449,7 +449,7 @@
           <li>ML Model Laboratory</li>
           <li>Kline backtests</li>
         </ul>
-        <a class="btn btn-primary" href="/register?plan=standard">Choose Standard</a>
+        <a class="btn btn-primary" href="/register?plan=standard">Sign up for Standard</a>
       </div>
 
       <div class="price" data-plan-key="pro">
@@ -479,11 +479,11 @@
           <li>Standard blocks (Logic, Indicators, Proximity)</li>
           <li>Paper trading</li>
         </ul>
-        <a class="btn btn-ghost" href="/register?plan=pro">Choose Professional</a>
+        <a class="btn btn-ghost" href="/register?plan=pro">Sign up for Professional</a>
       </div>
     </div>
 
-    <p class="fineprint">New accounts start on the Free plan. You can upgrade to Standard or Professional at any time from your account. Prices are monthly, in USD. Source available under AGPL v3.</p>
+    <p class="fineprint">New accounts start on the Free plan. Standard and Professional are $30 and $100 per month — sign up, then tell us which plan you want and we will set it up for your account. Prices are monthly, in USD. Source available under AGPL v3.</p>
   </div>
 </section>
 
@@ -508,6 +508,8 @@
           <textarea name="message" rows="3" placeholder="What are you looking for? (optional)" style="margin-bottom:10px;font-family:inherit"></textarea>
           <select name="service" style="margin-bottom:14px">
             <option value="">What interests you most? (optional)</option>
+            <option>Standard plan ($30/month)</option>
+            <option>Professional plan ($100/month)</option>
             <option>Paper trading</option>
             <option>Live trading</option>
             <option>Portfolio backtesting</option>
@@ -530,7 +532,7 @@
           <li>✓ Free plan access — no card required</li>
           <li>✓ 20 fast backtests per day and 10 AI Assistant queries per day</li>
           <li>✓ Paper trading on live market data</li>
-          <li>✓ Upgrade to Standard or Professional from your account at any time</li>
+          <li>✓ Tell us which plan you want and we will set it up for your account</li>
         </ul>
       </div>
     </div>

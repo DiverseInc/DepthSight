@@ -297,21 +297,73 @@ def _fast_allowance_sentence(raw_plan: dict) -> str:
     return f"{allowance} fast backtests per day"
 
 
+def _has_bybit_live_exception(raw_plan: dict) -> bool:
+    """True when the tier may trade live on Bybit ONLY.
+
+    `allow_free_bybit_trading: true` with no `allow_real_trading` permission
+    means exactly that. The enforcement is real and measured:
+
+      * api/routes/strategies.py:538-549 rejects any non-Bybit key for such
+        a tier with 403 ("Trading on your plan is only allowed using Bybit
+        API keys.");
+      * api/depthsight_api.py:634-640 caps that tier at
+        `max_free_bybit_live_strategies` live strategies.
+
+    The catalog's derived label ("Live trading", excluded) cannot express
+    that exception, so the card has to say it in words.
+    """
+    limits = raw_plan.get("limits", {}) or {}
+    permissions = raw_plan.get("permissions", []) or []
+    return bool(limits.get("allow_free_bybit_trading", False)) and (
+        "allow_real_trading" not in permissions
+    )
+
+
+def _bybit_live_allowance(raw_plan: dict) -> int:
+    """How many live strategies a Bybit-only tier may run."""
+    limits = raw_plan.get("limits", {}) or {}
+    return int(limits.get("max_free_bybit_live_strategies", 0) or 0)
+
+
+# The two bullets a Bybit-only tier must show instead of the blanket
+# "Live trading" / "Live trading strategies" exclusions.
+BYBIT_LIVE_LABEL = "Live trading on Bybit (up to {n} live trading strategies)"
+OTHER_VENUES_LABEL = "Live trading on other venues"
+
+
 def _expected_included_labels(plan: dict, raw_plan: dict) -> set:
-    """The bullets a card must list, with the engine qualifier applied."""
+    """The bullets a card must list, with the enforced exceptions applied."""
     labels = {e["label"] for e in plan["entitlements"] if e["included"]}
 
     if not _is_precision_only_quoteless(raw_plan):
-        return labels
+        pass
+    else:
+        allowance = _vector_allowance(raw_plan)
+        if allowance > 0:
+            plain = f"{allowance} backtests per day"
+            if plain in labels:
+                labels.discard(plain)
+                labels.add(f"{allowance} fast backtests per day")
 
-    allowance = _vector_allowance(raw_plan)
-    if allowance <= 0:
-        return labels
+    if _has_bybit_live_exception(raw_plan):
+        labels.add(
+            BYBIT_LIVE_LABEL.format(n=_bybit_live_allowance(raw_plan))
+        )
 
-    plain = f"{allowance} backtests per day"
-    if plain in labels:
-        labels.discard(plain)
-        labels.add(f"{allowance} fast backtests per day")
+    return labels
+
+
+def _expected_excluded_labels(plan: dict, raw_plan: dict) -> set:
+    """The "not included" labels a card may list."""
+    labels = {e["label"] for e in plan["entitlements"] if not e["included"]}
+
+    if _has_bybit_live_exception(raw_plan):
+        # The blanket exclusions are wrong for this tier: it DOES get live
+        # trading, on Bybit only.
+        labels.discard("Live trading")
+        labels.discard("Live trading strategies")
+        labels.add(OTHER_VENUES_LABEL)
+
     return labels
 
 
@@ -480,12 +532,12 @@ class TestTheEntitlementsAreTheCatalogsOwn:
                     )
 
     def test_every_not_included_label_is_genuinely_excluded(
-        self, cards, plans_by_name
+        self, cards, plans_by_name, raw_plans
     ):
         for card in cards:
             plan = plans_by_name.get(card["name"])
             assert plan is not None
-            excluded = {e["label"] for e in plan["entitlements"] if not e["included"]}
+            excluded = _expected_excluded_labels(plan, raw_plans[plan["key"]])
 
             for label in card["not_included"]:
                 assert label in excluded, (
@@ -587,6 +639,125 @@ class TestTheBacktestAllowanceNamesTheEngine:
 
 
 # --------------------------------------------------------------------------
+# What a tier may actually trade live on, and how a paid tier is obtained
+# --------------------------------------------------------------------------
+class TestTheLiveTradingAndPurchaseClaims:
+    """The card must say what the tier CAN trade, and how to get a paid tier."""
+
+    def test_a_bybit_only_tier_says_it_can_trade_live_on_bybit(
+        self, cards, plans_by_name, raw_plans
+    ):
+        """The derived label says "Live trading" is excluded -- and is wrong.
+
+        `allow_free_bybit_trading: true` (api/plans_config.yml:87-88) lets a
+        Free account trade live on Bybit, up to
+        `max_free_bybit_live_strategies` strategies. The backend enforces it
+        (api/routes/strategies.py:538-549 rejects any other exchange with a
+        403; api/depthsight_api.py:634-640 applies the cap), and the catalog's
+        derived label cannot express the exception, so the card must.
+        """
+        seen = False
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+            raw = raw_plans[plan["key"]]
+
+            if not _has_bybit_live_exception(raw):
+                continue
+            seen = True
+
+            expected = BYBIT_LIVE_LABEL.format(n=_bybit_live_allowance(raw))
+            assert expected in card["included"], (
+                f"the {card['name']} card must list {expected!r}: this tier "
+                "may trade live on Bybit, up to "
+                f"{_bybit_live_allowance(raw)} live strategies"
+            )
+            assert "Live trading" not in card["not_included"], (
+                f"the {card['name']} card lists 'Live trading' as not "
+                "included, but this tier DOES get live trading on Bybit"
+            )
+            assert "Live trading strategies" not in card["not_included"], (
+                f"the {card['name']} card lists 'Live trading strategies' as "
+                "not included, but this tier may run live strategies"
+            )
+            assert OTHER_VENUES_LABEL in card["not_included"], (
+                f"the {card['name']} card must say {OTHER_VENUES_LABEL!r}: "
+                "every other venue is blocked for this tier"
+            )
+
+        assert seen, (
+            "no tier in the catalog has the Bybit-only live-trading "
+            "exception; re-measure this test"
+        )
+
+    def test_an_indexed_live_trading_claim_names_the_tiers_it_is_about(
+        self, page
+    ):
+        """The featureList is indexed, so its claims are tiered too.
+
+        The Free tier gets live trading on Bybit only, so an unscoped
+        "Live trading on 6 exchanges" tells a search engine -- and a
+        prospect -- that every tier gets all six.
+        """
+        for feature in _software_application(page).get("featureList", []):
+            if "live trading" not in feature.lower():
+                continue
+            assert "paid plan" in feature.lower(), (
+                f"the indexed feature {feature!r} claims live trading without "
+                "saying which tiers get it: the Free tier gets Bybit only"
+            )
+
+    def test_the_page_promises_no_self_serve_upgrade(self, page):
+        """There is no self-serve upgrade in the deployment.
+
+        A paid tier is granted by the payment webhook (api/routes/payments.py)
+        or by an operator. The webhook needs a payment provider, and the
+        repository ships no provider in its default deployment: docker-compose.yml
+        has no Bitcart service, the provider arrives only through the opt-in
+        docker-compose.bitcart.yml overlay (deploy.sh:135,222-228), and
+        api/routes/payments.py:121-125 raises "Payment provider is not
+        configured" without it.
+
+        So the page may not promise an upgrade the visitor cannot perform.
+        """
+        lowered = page.lower()
+        assert "upgrade" not in lowered, (
+            "the page promises an upgrade path that the deployment does not "
+            "provide: the payment provider is opt-in and is not running"
+        )
+        assert "new accounts start on the free plan" in lowered, (
+            "the page must say that a new account starts on the Free tier"
+        )
+
+    def test_a_paid_offer_is_not_indexed_at_a_signup_that_cannot_grant_it(
+        self, page, plans_by_name
+    ):
+        """A paid tier is never granted at signup.
+
+        api/routes/auth.py:369-373 and api/crud.py:1078-1089: the plan in
+        the signup is a REQUEST, the account starts on the tier it is
+        entitled to (the trial tier, otherwise free), and a paid tier is
+        never granted at signup. Indexing a $30 offer at the signup URL
+        tells a search engine the tier can be bought there.
+        """
+        for offer in _software_application(page)["offers"]:
+            plan = plans_by_name.get(offer["name"])
+            assert plan is not None
+
+            if plan["key"] == FREE_PLAN_KEY:
+                assert offer["url"].startswith(
+                    "https://depthsight.diverseinc.net/register"
+                ), "the Free offer is indexed at the signup, where a free account really can be created"
+                continue
+
+            assert "/register" not in offer["url"], (
+                f"the indexed {offer['name']} offer points at {offer['url']!r}, "
+                "but a paid tier is never granted at signup"
+            )
+            assert offer["url"].startswith("https://depthsight.diverseinc.net")
+
+
+# --------------------------------------------------------------------------
 # A prospect must be able to START
 # --------------------------------------------------------------------------
 class TestAProspectCanActuallySignUp:
@@ -665,9 +836,12 @@ class TestTheJsonLdOffers:
             )
             assert offer["priceCurrency"] == "USD"
 
-    def test_the_indexed_offers_point_at_the_registration_path(self, page):
+    def test_the_indexed_offers_point_at_this_site(self, page):
         for offer in _software_application(page)["offers"]:
-            assert offer["url"].startswith("https://depthsight.diverseinc.net/register")
+            assert offer["url"].startswith("https://depthsight.diverseinc.net"), (
+                f"the indexed {offer['name']} offer points off-site: "
+                f"{offer['url']!r}"
+            )
 
     def test_no_offer_description_quotes_a_number_the_tier_does_not_grant(
         self, page, plans_by_name
@@ -887,7 +1061,7 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
                 )
 
     def test_no_card_quotes_a_number_that_is_not_a_quota_of_that_tier(
-        self, cards, plans_by_name
+        self, cards, plans_by_name, raw_plans
     ):
         """A number next to a quota word must be one of THIS tier's numbers.
 
@@ -898,10 +1072,13 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
         for card in cards:
             plan = plans_by_name.get(card["name"])
             assert plan is not None
+            raw = raw_plans[plan["key"]]
 
             own = set()
-            for entitlement in plan["entitlements"]:
-                own.update(re.findall(r"\d+", entitlement["label"]))
+            for label in _expected_included_labels(plan, raw) | _expected_excluded_labels(
+                plan, raw
+            ):
+                own.update(re.findall(r"\d+", label))
 
             quoted = _quota_numbers(" ".join(card["included"] + card["not_included"]))
             for number in quoted:
