@@ -352,6 +352,13 @@ class RiskManager:
         # are judged independently, so a breach in one never closes the
         # other's gate.
         self._paper_is_trading_allowed = True
+        # Has the PAPER wallet's balance been read in THIS process? Until it
+        # has, the paper limits cannot be judged at all: the balance is
+        # UNKNOWN, not zero. Evaluating them against an unknown balance
+        # closes the paper gate for the wrong reason, and since the
+        # controller consults the paper gate BEFORE the balance is refreshed,
+        # that would stop paper trading until the next restart.
+        self._paper_balance_known = False
         # Why the PAPER gate is off, when it is off for a reason other than
         # the emergency stop. The live equivalent is `_global_gate_disable_reason`.
         self._paper_global_gate_disable_reason: Optional[str] = None
@@ -1086,11 +1093,19 @@ class RiskManager:
                 #
                 # The paper executor is the real balance source for those
                 # accounts; it was being passed in and then ignored.
-                source = self.executor if self.executor is not None else self.paper_executor
+                #
+                # The source follows the SANDBOX: the live sandbox's balance
+                # comes from the live executor and the paper sandbox's from
+                # the paper executor. With the default mode this is exactly
+                # the old rule -- a keyless paper account has no live
+                # executor, so its mode is "paper" and the paper executor is
+                # its account.
+                source = self.executor if mode == "live" else self.paper_executor
                 if source is None:
                     logger.error(
-                        f"{log_prefix} No live executor and no paper_executor available "
-                        f"for user_id={self.user_id}; cannot fetch balance."
+                        f"{log_prefix} No {'live' if mode == 'live' else 'paper'} "
+                        f"executor available for user_id={self.user_id}; cannot "
+                        f"fetch balance."
                     )
                     return False
 
@@ -1145,6 +1160,16 @@ class RiskManager:
                             f"{log_prefix} Balance updated: Previous=${stats.current_balance:.2f}, New=${current_total_usdt:.2f} (Free: {free_bal:.2f}, Locked: {locked_bal:.2f})"
                         )
                         stats.current_balance = current_total_usdt
+                        if mode == "paper":
+                            # The paper sandbox's own opening balance: the
+                            # first balance observed for the day IS the
+                            # paper wallet's opening balance (upstream
+                            # anchors it the same way, upstream
+                            # `bot_module/risk_manager.py:1698`).
+                            self._paper_balance_known = True
+                            self._anchor_paper_start_of_day_base(
+                                current_total_usdt
+                            )
                     else:
                         logger.debug(
                             f"{log_prefix} Balance unchanged: ${stats.current_balance:.2f}"
@@ -2653,6 +2678,17 @@ class RiskManager:
         stats = self.paper_stats
         max_dd, max_daily_loss, max_consec = self._mode_thresholds("paper")
 
+        if not getattr(self, "_paper_balance_known", False):
+            # The PAPER wallet's balance has not been read in this process
+            # yet. It is UNKNOWN, not zero, and the limits cannot be judged
+            # against an unknown number -- so they are NOT judged, and the
+            # gate is left exactly as it is. Judging them here would close
+            # the paper gate for the wrong reason ("balance $0.00 < min"),
+            # and the controller consults that gate before the balance is
+            # refreshed, which would stop paper trading until the next
+            # restart.
+            return
+
         # The persisted guard state carries both sandboxes, so an unknown or
         # lost state is unknown for the paper counters too. Fail CLOSED.
         if getattr(self, "_guard_state_unverified", False):
@@ -2783,6 +2819,7 @@ class RiskManager:
                 # It must never be written into `self.stats`, which is the
                 # LIVE account's balance.
                 self.paper_stats.current_balance = current_balance_val
+                self._paper_balance_known = True
                 self._check_and_reset_paper_daily_stats()
                 self._anchor_paper_start_of_day_base(current_balance_val)
                 self._check_risk_limits(mode="paper")
