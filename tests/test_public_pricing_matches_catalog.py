@@ -101,6 +101,7 @@ class _PricingCardParser(HTMLParser):
         self._buf: list[str] = []
         self._list_mode: str | None = None
         self._li_buf: list[str] = []
+        self._cta_label: list[str] | None = None
 
     def handle_starttag(self, tag, attrs):
         attributes = dict(attrs)
@@ -138,6 +139,7 @@ class _PricingCardParser(HTMLParser):
             self._li_buf = []
         elif tag == "a" and "btn" in classes and self._card["cta"] is None:
             self._card["cta"] = attributes.get("href")
+            self._cta_label = []
 
     def handle_endtag(self, tag):
         if self._card is None:
@@ -164,6 +166,11 @@ class _PricingCardParser(HTMLParser):
             self._li_buf = []
             return
 
+        if tag == "a" and self._card["cta"] is not None and self._cta_label is not None:
+            self._card["cta_label"] = _norm(self._cta_label)
+            self._cta_label = None
+            return
+
         if tag == "ul":
             self._list_mode = None
 
@@ -172,6 +179,8 @@ class _PricingCardParser(HTMLParser):
             self._buf.append(data)
         elif self._list_mode is not None:
             self._li_buf.append(data)
+        elif self._cta_label is not None:
+            self._cta_label.append(data)
 
 
 def _price_of(card: dict) -> float:
@@ -874,6 +883,44 @@ class TestTheLiveTradingAndPurchaseClaims:
         )
         assert "new accounts start on the free plan" in lowered, (
             "the page must say that a new account starts on the Free tier"
+        )
+
+    def test_the_card_buttons_say_what_the_product_pricing_page_says(
+        self, cards, page
+    ):
+        """The static page and the React pricing page are both public.
+
+        frontend/src/lib/pricing.ts builds the React pricing cards, so the two
+        public pricing surfaces must use the same label on the same target:
+        "Start free" for the free tier and "Choose <plan>" for a paid one.
+
+        The label matters: "Sign up for Standard" reads as "enrolling in
+        Standard", which registration cannot do (api/crud.py:1078-1089).
+        """
+        for card in cards:
+            expected = (
+                "Start free"
+                if card["key"] == FREE_PLAN_KEY
+                else f"Choose {card['name']}"
+            )
+            assert card.get("cta_label") == expected, (
+                f"the {card['name']} card button says "
+                f"{card.get('cta_label')!r}; the product pricing page says "
+                f"{expected!r}"
+            )
+
+    def test_the_react_pricing_component_uses_these_labels(self):
+        source = (
+            REPO_ROOT / "frontend" / "src" / "lib" / "pricing.ts"
+        ).read_text(encoding="utf-8")
+
+        assert 'cta = "Start free"' in source, (
+            "the React pricing component changed its free-tier label; the "
+            "static page and the React page must match"
+        )
+        assert "cta = `Choose ${plan.name}`" in source, (
+            "the React pricing component changed its paid-tier label; the "
+            "static page and the React page must match"
         )
 
     def test_a_paid_offer_is_not_indexed_at_a_signup_that_cannot_grant_it(
