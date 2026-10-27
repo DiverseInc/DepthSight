@@ -107,9 +107,13 @@ HERMES_PROMPT_LIMIT = 30000
 # guard, not a CLI limit.
 OLLAMA_PROMPT_LIMIT = 12000
 
-# DSH's prompt travels on STDIN, so there is no command-line cap. This is a
-# model-context guard.
-DSH_PROMPT_LIMIT = 80000
+# DSH's prompt travels on STDIN, so there is no command-line cap. MEASURED
+# 2026-10-27 (measure_dsh_limit.py): the model still saw the TAIL of a
+# 240,000-character inline diff -- three probes (80,000 / 160,000 / 240,000)
+# each put a token in the tail only and asked the model to repeat it, and it
+# repeated it every time. 240,000 characters is therefore the measured-safe
+# budget; beyond it the diff would be cut, and a cut diff is NO VERDICT.
+DSH_PROMPT_LIMIT = 240000
 
 # What survives from the 2026-10-19 hermes incident is the RULE, not the
 # number: a reviewer that never received the change must never be recorded
