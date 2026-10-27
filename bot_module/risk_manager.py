@@ -588,6 +588,32 @@ class RiskManager:
             return self._paper_global_gate_disable_reason
         return self._global_gate_disable_reason
 
+    def published_account_snapshot(self) -> Dict[str, Any]:
+        """The account-level numbers the controller publishes.
+
+        A controller with NO api key is a PAPER-ONLY controller: there is no
+        live account behind it, so the numbers it publishes are the PAPER
+        sandbox's -- the paper wallet's balance, the paper day's PnL, the
+        paper loss streak and the PAPER gate. A controller WITH an api key
+        publishes the LIVE sandbox's.
+
+        The API reads the paper portfolio from exactly those paper-only
+        published keys (the key suffix is the api_key_id, and a paper-only
+        controller has none) and the live portfolio from the live ones, so
+        the published numbers must be the numbers of the sandbox the
+        controller actually trades. Publishing the LIVE sandbox's numbers
+        for a paper-only controller would report a $0.00 balance and a
+        zero loss streak while the paper gate was actually blocked.
+        """
+        mode = "paper" if self.api_key_id is None else "live"
+        stats = self._mode_stats(mode)
+        return {
+            "current_balance": stats.current_balance,
+            "today_pnl": stats.today_pnl,
+            "consecutive_losses": stats.consecutive_losses,
+            "is_trading_allowed": self._is_mode_trading_allowed(mode),
+        }
+
     def apply_user_settings(self, user_settings: Dict[str, Any]) -> None:
         """Applies fresh user settings in-place without recreating RiskManager."""
         settings = ensure_dict(user_settings)

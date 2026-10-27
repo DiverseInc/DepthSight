@@ -4903,7 +4903,39 @@ class TradingController:
 
         # 3. Collecting PORTFOLIO data
         # Getting balance from RiskManager
-        wallet_balance = self.rm.stats.current_balance  # Wallet balance (without PnL)
+        #
+        # WHICH SANDBOX IS PUBLISHED. A controller with NO api key is a
+        # PAPER-ONLY controller -- there is no live account behind it -- so
+        # the numbers it publishes are the PAPER sandbox's. A controller
+        # WITH an api key publishes the LIVE sandbox's. The API reads the
+        # paper portfolio from exactly the paper-only published keys (the
+        # key suffix is the api_key_id, and a paper-only controller has
+        # none) and the live portfolio from the live ones, so the published
+        # numbers have to be the numbers of the sandbox the controller
+        # actually trades.
+        _snapshot = None
+        _snapshot_getter = getattr(self.rm, "published_account_snapshot", None)
+        if callable(_snapshot_getter):
+            try:
+                _candidate = _snapshot_getter()
+                if isinstance(_candidate, dict) and isinstance(
+                    _candidate.get("current_balance"), (int, float)
+                ):
+                    _snapshot = _candidate
+            except Exception:
+                _snapshot = None
+        if _snapshot is None:
+            # A mocked RiskManager (its attribute is truthy while its
+            # callable child returns a Mock, which cannot be rounded).
+            _snapshot = {
+                "current_balance": self.rm.stats.current_balance,
+                "today_pnl": self.rm.stats.today_pnl,
+                "consecutive_losses": self.rm.stats.consecutive_losses,
+                "is_trading_allowed": bool(
+                    getattr(self.rm, "_is_trading_allowed", True)
+                ),
+            }
+        wallet_balance = _snapshot["current_balance"]  # Wallet balance (without PnL)
         equity = wallet_balance + total_unrealized_pnl  # Equity (including PnL)
 
         # The live emergency-stop latch, published so the API can report it.
@@ -4926,7 +4958,7 @@ class TradingController:
         # Read defensively -- `self.rm` is a real RiskManager in production but
         # a mock in some tests, and a Mock's attribute is truthy while its
         # callable child returns a Mock, which json.dumps cannot serialize.
-        _gate_open = bool(getattr(self.rm, "_is_trading_allowed", True))
+        _gate_open = bool(_snapshot["is_trading_allowed"])
         _reason_getter = getattr(self.rm, "get_trading_disabled_reason", None)
         _disabled_reason = None
         if not _gate_open and callable(_reason_getter):
@@ -4938,8 +4970,8 @@ class TradingController:
             "total_wallet_balance": round(wallet_balance, 2),
             "total_unrealized_pnl": round(total_unrealized_pnl, 2),
             "total_equity": round(equity, 2),
-            "today_pnl": round(self.rm.stats.today_pnl, 2),
-            "consecutive_losses": self.rm.stats.consecutive_losses,
+            "today_pnl": round(_snapshot["today_pnl"], 2),
+            "consecutive_losses": _snapshot["consecutive_losses"],
             "is_trading_allowed": _gate_open,
             "trading_disabled_reason": _disabled_reason,
             **self._emergency_stop_state_for_publish(),
