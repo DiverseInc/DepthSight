@@ -1,12 +1,15 @@
 import logging
+from typing import Any, Dict
 
 import redis.asyncio as redis
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .. import crud, schemas
+from .. import crud, models, schemas
 from ..database import get_db
+from ..demo_seed import not_demo_accounts
 from ..og_image_generator import generate_og_image
 from ..plans import build_plan_catalog
 from ..redis_client import get_redis_client
@@ -191,3 +194,212 @@ async def render_shared_backtest(
     except Exception as e:
         logger.error("Error rendering shared page for bot: %s", e, exc_info=True)
         raise HTTPException(status_code=404, detail="Report not found")
+
+
+# --- Public screener feed ---
+
+# The two metrics a published result can be ranked by. These are the same
+# categories the in-app leaderboard uses, so the public feed and the
+# authenticated leaderboard can never disagree about a number.
+PUBLIC_RESULT_CATEGORIES = ("sharpe_ratio", "net_pnl_percent")
+PUBLIC_RESULT_PERIODS = ("weekly", "monthly", "all_time")
+
+
+def _public_strategy_name(run, shared_backtest) -> str:
+    """The strategy name exactly as the PUBLIC share page shows it.
+
+    Mirrors `get_shared_backtest_data`: an owner who did not publish their
+    strategy name gets "Private Strategy", never the real one.
+    """
+    if not shared_backtest.is_strategy_name_public:
+        return "Private Strategy"
+
+    run_params = run.parameters_json or {}
+    if not isinstance(run_params, dict):
+        return run.strategy_name
+    strategy_config = run_params.get("config")
+    if not isinstance(strategy_config, dict):
+        strategy_config = None
+    return (
+        run_params.get("name")
+        or run_params.get("strategy_display_name")
+        or (strategy_config or {}).get("name")
+        or run.strategy_name
+    )
+
+
+def _public_result_metrics(run) -> Dict[str, Any]:
+    """The published backtest KPIs -- the same ones the public share page shows.
+
+    A metric the backtest never recorded stays None, so the page can print
+    "not reported" instead of a 0.00 the run never produced.
+    """
+    kpis = run.kpi_results_json or {}
+    if not isinstance(kpis, dict):
+        kpis = {}
+
+    total_pnl = kpis.get("total_pnl")
+    initial_balance = run.initial_balance
+    net_pnl_percent = None
+    if (
+        isinstance(total_pnl, (int, float))
+        and not isinstance(total_pnl, bool)
+        and isinstance(initial_balance, (int, float))
+        and not isinstance(initial_balance, bool)
+        and initial_balance
+    ):
+        net_pnl_percent = (total_pnl / initial_balance) * 100
+
+    trades = kpis.get("trades")
+    if trades is None:
+        trades = kpis.get("total_trades")
+
+    return {
+        "sharpeRatio": kpis.get("sharpe_ratio"),
+        "netPnlPercent": net_pnl_percent,
+        "netPnl": total_pnl,
+        "winRate": kpis.get("win_rate"),
+        "maxDrawdown": kpis.get("max_drawdown"),
+        "trades": trades,
+    }
+
+
+@public_router.get(
+    "/api/v1/public/published-results",
+    response_model=schemas.ApiResponseData[schemas.PublicPublishedResults],
+)
+async def get_public_published_results(
+    category: str = Query(
+        "sharpe_ratio",
+        json_schema_extra={"enum": list(PUBLIC_RESULT_CATEGORIES)},
+    ),
+    period: str = Query(
+        "all_time",
+        json_schema_extra={"enum": list(PUBLIC_RESULT_PERIODS)},
+    ),
+    limit: int = Query(25, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+):
+    """Public feed of the backtest results users published for comparison.
+
+    WHAT THIS IS
+    ------------
+    The public screener page (a no-login page) needs to show a visitor
+    something real rather than a promise. The only backtest results this
+    platform publishes on purpose are the ones a user ticked "publish to
+    leaderboard" for AND whose public link is still switched on. Those are
+    listed here, without the owner's identity.
+
+    WHAT THIS IS NOT
+    ----------------
+    It is not a window onto anybody's account. The payload carries no user
+    id, no username, no e-mail, no balance, no equity, no XP, no positions
+    and no API keys -- only the backtest metrics that are already public on
+    the owner's own report page (/s/{slug}). A backtest that was never
+    published, or whose public link the owner has switched off, is not
+    listed at all, and a seeded demo account is excluded by the same rule
+    the public counters already use.
+
+    The published `rank` is the position in the list this endpoint returns,
+    NOT the stored leaderboard rank: the stored one counts every entry ever
+    written, including the seeded demo accounts, so it describes a list the
+    visitor cannot see.
+    """
+    if category not in PUBLIC_RESULT_CATEGORIES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="category must be one of: " + ", ".join(PUBLIC_RESULT_CATEGORIES),
+        )
+    if period not in PUBLIC_RESULT_PERIODS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="period must be one of: " + ", ".join(PUBLIC_RESULT_PERIODS),
+        )
+
+    leaderboard_period = models.LeaderboardPeriod(period)
+
+    def _joined_select():
+        """The one joined query both the list and its count are built from, so
+        the two can never describe different sets."""
+        return (
+            select(
+                models.LeaderboardEntry,
+                models.BacktestRun,
+                models.SharedBacktest,
+            )
+            .join(
+                models.BacktestRun,
+                models.LeaderboardEntry.backtest_run_id == models.BacktestRun.id,
+            )
+            .join(
+                models.SharedBacktest,
+                models.LeaderboardEntry.shared_backtest_slug
+                == models.SharedBacktest.public_slug,
+            )
+            .join(models.User, models.LeaderboardEntry.user_id == models.User.id)
+        )
+
+    filters = (
+        models.LeaderboardEntry.period == leaderboard_period,
+        models.LeaderboardEntry.category == category,
+        # The owner must still have the public link switched on.
+        models.SharedBacktest.is_active.is_(True),
+        # Never advertise a run that did not finish.
+        models.BacktestRun.status == "COMPLETED",
+        # A seeded demo account is not a customer: its fabricated results must
+        # never be advertised to a prospect.
+        not_demo_accounts(models.User),
+    )
+
+    # How many published results this ranking covers, over the SAME filters.
+    total = (
+        await db.execute(
+            _joined_select()
+            .with_only_columns(func.count(models.LeaderboardEntry.id))
+            .where(*filters)
+        )
+    ).scalar_one()
+
+    rows = (
+        await db.execute(
+            _joined_select()
+            .where(*filters)
+            .order_by(
+                desc(models.LeaderboardEntry.score),
+                # A deterministic tie-break: two equal scores must not swap
+                # places between two calls, or a visitor's card would change
+                # position on every page load. The public slug is unique.
+                models.SharedBacktest.public_slug,
+            )
+            .limit(limit)
+        )
+    ).all()
+
+    # The published rank is the position in THIS list, not the stored global
+    # rank: the stored one counts every entry ever written, including the
+    # seeded demo accounts, so it describes a list the visitor cannot see.
+    results = [
+        schemas.PublicPublishedResult(
+            slug=shared_backtest.public_slug,
+            strategy_name=_public_strategy_name(run, shared_backtest),
+            symbol=run.symbol,
+            period={"start": run.start_date, "end": run.end_date},
+            category=entry.category,
+            score=entry.score,
+            rank=position,
+            metrics=_public_result_metrics(run),
+            has_published_backtest=True,
+        )
+        for position, (entry, run, shared_backtest) in enumerate(rows, start=1)
+    ]
+
+    return {
+        "data": {
+            "category": category,
+            "period": period,
+            "basis": "backtest",
+            "total": total,
+            "results": results,
+        }
+    }
+

@@ -60,6 +60,7 @@ import NotFound from "./pages/NotFound";
 import OptimizationViewerPage from "./pages/OptimizationViewerPage";
 import PortfolioBacktestViewer from "./pages/PortfolioBacktestViewer";
 import Positions from "./pages/Positions";
+import PublicScreener from "./pages/PublicScreener";
 import RegisterPage from "./pages/Register";
 import Research from "./pages/Research";
 import ResetPasswordPage from "./pages/ResetPassword";
@@ -128,6 +129,15 @@ function App() {
 													<Route path="/welcome" element={<LandingPage />} />
 													<Route path="/login" element={<LoginPage />} />
 													<Route path="/register" element={<RegisterPage />} />
+													{/*
+													 * The public screener. It is deliberately inside
+													 * PublicLayout and OUTSIDE ProtectedRoute: a
+													 * prospect must be able to reach it without an
+													 * account. It is served at a stable path so the
+													 * reserved `screener.depthsight.pro` hostname can
+													 * be pointed at it later with a host change only.
+													 */}
+													<Route path="/screener" element={<PublicScreener />} />
 													<Route
 														path="/r/:refCode"
 														element={<ReferralRedirect />}
