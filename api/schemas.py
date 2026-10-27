@@ -959,6 +959,11 @@ class PublicPublishedResult(BaseModel):
     published. Everything else it does carry is already public on the
     owner's own report page (/s/{slug}).
 
+    `rank` is the POSITION IN THE LIST THIS PAYLOAD RETURNS, not the stored
+    leaderboard rank: the stored one counts every entry ever written,
+    including the seeded demo accounts, so it describes a list the visitor
+    cannot see.
+
     A metric the backtest never recorded stays None rather than 0, so the
     page can say "not reported" instead of printing a number that was never
     produced.
@@ -981,12 +986,15 @@ class PublicPublishedResults(BaseModel):
     """The public screener feed of published backtest results.
 
     `basis` states what the numbers are ("backtest"), `period` states the
-    window they cover and `category` states the metric they are ranked by.
+    window the RANKING covers and `category` states the metric the results are
+    ranked by. `total` is how many published results that ranking covers,
+    counted over exactly the same filters as the list itself.
     """
 
     category: str
     period: str
     basis: str
+    total: int
     results: List[PublicPublishedResult]
 
     model_config = ConfigDict(populate_by_name=True, alias_generator=to_camel)

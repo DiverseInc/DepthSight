@@ -54,6 +54,8 @@ const published = {
 	category: "sharpe_ratio",
 	period: "all_time",
 	basis: "backtest",
+	// The number of published results the ranking covers.
+	total: 2,
 	results: [
 		{
 			slug: "abc123def456",
@@ -75,6 +77,27 @@ const published = {
 				winRate: null,
 				maxDrawdown: 8,
 				trades: 40,
+			},
+			hasPublishedBacktest: true,
+		},
+		{
+			slug: "zzz999yyy888",
+			strategyName: "Private Strategy",
+			symbol: "ETHUSDT",
+			period: {
+				start: "2025-11-01T00:00:00",
+				end: "2025-12-31T00:00:00",
+			},
+			category: "sharpe_ratio",
+			score: 0.9,
+			rank: 2,
+			metrics: {
+				sharpeRatio: 0.9,
+				netPnlPercent: -4.5,
+				netPnl: -450,
+				winRate: 48.2,
+				maxDrawdown: 11.1,
+				trades: 22,
 			},
 			hasPublishedBacktest: true,
 		},
@@ -177,10 +200,30 @@ describe("the public screener page", () => {
 	});
 
 	it("says what the numbers are and over which period they were measured", () => {
-		expect(html).toContain("Ranked by Sharpe ratio over all time");
+		expect(html).toContain("Ranked by Sharpe ratio");
 		expect(html).toContain("backtests, not live trading");
 		expect(html).toContain("01 Jan 2026");
 		expect(html).toContain("31 Mar 2026");
+	});
+
+	// --- The two honesty nits dsh raised on PR #41 -----------------------
+
+	it("labels the ranking window as the ranking, not as the run's own window", () => {
+		// The leaderboard window ("all time") describes the window the RANKING
+		// covers. It must never be printed as if it described one backtest.
+		expect(html).toContain("Ranking window: all time");
+		expect(html).not.toContain("31 Mar 2026 (all time)");
+		expect(html).not.toContain("31 Dec 2025 (all time)");
+	});
+
+	it("labels each card with the window that run actually covered", () => {
+		expect(html).toContain("Backtest window: 01 Jan 2026 - 31 Mar 2026");
+		expect(html).toContain("Backtest window: 01 Nov 2025 - 31 Dec 2025");
+	});
+
+	it("shows a position that agrees with the list the visitor is looking at", () => {
+		expect(html).toContain("Position 1 of 2 among published results");
+		expect(html).toContain("Position 2 of 2 among published results");
 	});
 
 	it("never renders a metric that was not measured as a zero", () => {

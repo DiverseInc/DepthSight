@@ -4,7 +4,7 @@ from typing import Any, Dict
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import crud, models, schemas
@@ -299,6 +299,11 @@ async def get_public_published_results(
     published, or whose public link the owner has switched off, is not
     listed at all, and a seeded demo account is excluded by the same rule
     the public counters already use.
+
+    The published `rank` is the position in the list this endpoint returns,
+    NOT the stored leaderboard rank: the stored one counts every entry ever
+    written, including the seeded demo accounts, so it describes a list the
+    visitor cannot see.
     """
     if category not in PUBLIC_RESULT_CATEGORIES:
         raise HTTPException(
@@ -313,38 +318,66 @@ async def get_public_published_results(
 
     leaderboard_period = models.LeaderboardPeriod(period)
 
-    stmt = (
-        select(
-            models.LeaderboardEntry,
-            models.BacktestRun,
-            models.SharedBacktest,
+    def _joined_select():
+        """The one joined query both the list and its count are built from, so
+        the two can never describe different sets."""
+        return (
+            select(
+                models.LeaderboardEntry,
+                models.BacktestRun,
+                models.SharedBacktest,
+            )
+            .join(
+                models.BacktestRun,
+                models.LeaderboardEntry.backtest_run_id == models.BacktestRun.id,
+            )
+            .join(
+                models.SharedBacktest,
+                models.LeaderboardEntry.shared_backtest_slug
+                == models.SharedBacktest.public_slug,
+            )
+            .join(models.User, models.LeaderboardEntry.user_id == models.User.id)
         )
-        .join(
-            models.BacktestRun,
-            models.LeaderboardEntry.backtest_run_id == models.BacktestRun.id,
-        )
-        .join(
-            models.SharedBacktest,
-            models.LeaderboardEntry.shared_backtest_slug
-            == models.SharedBacktest.public_slug,
-        )
-        .join(models.User, models.LeaderboardEntry.user_id == models.User.id)
-        .where(
-            models.LeaderboardEntry.period == leaderboard_period,
-            models.LeaderboardEntry.category == category,
-            # The owner must still have the public link switched on.
-            models.SharedBacktest.is_active.is_(True),
-            # Never advertise a run that did not finish.
-            models.BacktestRun.status == "COMPLETED",
-        )
+
+    filters = (
+        models.LeaderboardEntry.period == leaderboard_period,
+        models.LeaderboardEntry.category == category,
+        # The owner must still have the public link switched on.
+        models.SharedBacktest.is_active.is_(True),
+        # Never advertise a run that did not finish.
+        models.BacktestRun.status == "COMPLETED",
         # A seeded demo account is not a customer: its fabricated results must
         # never be advertised to a prospect.
-        .where(not_demo_accounts(models.User))
-        .order_by(desc(models.LeaderboardEntry.score))
-        .limit(limit)
+        not_demo_accounts(models.User),
     )
-    rows = (await db.execute(stmt)).all()
 
+    # How many published results this ranking covers, over the SAME filters.
+    total = (
+        await db.execute(
+            _joined_select()
+            .with_only_columns(func.count(models.LeaderboardEntry.id))
+            .where(*filters)
+        )
+    ).scalar_one()
+
+    rows = (
+        await db.execute(
+            _joined_select()
+            .where(*filters)
+            .order_by(
+                desc(models.LeaderboardEntry.score),
+                # A deterministic tie-break: two equal scores must not swap
+                # places between two calls, or a visitor's card would change
+                # position on every page load. The public slug is unique.
+                models.SharedBacktest.public_slug,
+            )
+            .limit(limit)
+        )
+    ).all()
+
+    # The published rank is the position in THIS list, not the stored global
+    # rank: the stored one counts every entry ever written, including the
+    # seeded demo accounts, so it describes a list the visitor cannot see.
     results = [
         schemas.PublicPublishedResult(
             slug=shared_backtest.public_slug,
@@ -353,11 +386,11 @@ async def get_public_published_results(
             period={"start": run.start_date, "end": run.end_date},
             category=entry.category,
             score=entry.score,
-            rank=entry.rank,
+            rank=position,
             metrics=_public_result_metrics(run),
             has_published_backtest=True,
         )
-        for entry, run, shared_backtest in rows
+        for position, (entry, run, shared_backtest) in enumerate(rows, start=1)
     ]
 
     return {
@@ -365,6 +398,7 @@ async def get_public_published_results(
             "category": category,
             "period": period,
             "basis": "backtest",
+            "total": total,
             "results": results,
         }
     }

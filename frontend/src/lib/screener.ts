@@ -41,9 +41,11 @@ export interface PublicPublishedResult {
 	slug: string;
 	strategyName: string;
 	symbol: string;
+	/** The window THIS run covered. */
 	period: { start: string; end: string };
 	category: string;
 	score: number;
+	/** The position in the published list the visitor is shown. */
 	rank: number;
 	metrics: PublicPublishedMetrics;
 	hasPublishedBacktest: boolean;
@@ -51,8 +53,15 @@ export interface PublicPublishedResult {
 
 export interface PublicPublishedResults {
 	category: string;
+	/**
+	 * The window the RANKING covers. It is NOT the window any individual
+	 * backtest ran over -- each result carries its own `period.start` /
+	 * `period.end`, which is the window that run actually covered.
+	 */
 	period: string;
 	basis: string;
+	/** How many published results the ranking covers. */
+	total: number;
 	results: PublicPublishedResult[];
 }
 

@@ -111,8 +111,10 @@ const PublicScreener = () => {
 	};
 
 	const results = published?.results ?? [];
-	const periodLabel = PERIOD_LABELS[published?.period ?? "all_time"] ?? "all time";
+	// The window the RANKING covers -- never the window a single run covered.
+	const rankingWindow = PERIOD_LABELS[published?.period ?? "all_time"] ?? "all time";
 	const categoryLabel = RESULT_CATEGORY_LABELS[category];
+	const publishedTotal = published?.total ?? results.length;
 
 	return (
 		<div className="min-h-screen bg-background">
@@ -441,10 +443,16 @@ const PublicScreener = () => {
 					) : (
 						<>
 							<p className="mt-4 text-center text-xs text-muted-foreground">
-								Ranked by {categoryLabel} over {periodLabel}. Every figure
-								below is a backtest measurement; a metric the run never produced
-								reads &quot;{NOT_REPORTED}&quot;.
+								Ranked by {categoryLabel}. Ranking window: {rankingWindow}. Every
+								figure on each card is a backtest measurement; a metric the run
+								never produced reads &quot;{NOT_REPORTED}&quot;.
 							</p>
+							{publishedTotal > results.length && (
+								<p className="mt-1 text-center text-xs text-muted-foreground">
+									Showing the top {results.length} of {publishedTotal} published
+									results.
+								</p>
+							)}
 							<div className="mt-8 grid grid-cols-1 gap-6 md:grid-cols-2">
 								{results.map((result) => (
 									<Card key={`${result.slug}-${result.category}`}>
@@ -456,12 +464,16 @@ const PublicScreener = () => {
 												<Badge variant="outline">{result.symbol}</Badge>
 											</div>
 											<CardDescription>
-												{formatDate(result.period.start)} -{" "}
-												{formatDate(result.period.end)} ({periodLabel})
+												Backtest window: {formatDate(result.period.start)} -{" "}
+												{formatDate(result.period.end)}
 											</CardDescription>
 										</CardHeader>
 										<CardContent>
-											<dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-3">
+											<p className="text-xs text-muted-foreground">
+												Position {result.rank} of {publishedTotal} among published
+												results
+											</p>
+											<dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-2 text-sm sm:grid-cols-3">
 												<div>
 													<dt className="text-xs text-muted-foreground">
 														Sharpe ratio

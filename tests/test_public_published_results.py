@@ -60,6 +60,7 @@ async def _make_published_result(
     category="sharpe_ratio",
     period=models.LeaderboardPeriod.ALL_TIME,
     score=1.5,
+    stored_rank=1,
 ):
     """Publish one backtest for public comparison, the way the app does it."""
     task_id = f"task-{uuid.uuid4().hex[:8]}"
@@ -108,7 +109,7 @@ async def _make_published_result(
             period=period,
             category=category,
             score=score,
-            rank=1,
+            rank=stored_rank,
             meta_data={"symbol": symbol},
         )
     )
@@ -362,6 +363,115 @@ class TestPublishedResultsAreHonest:
     async def test_an_unknown_category_is_refused(self, db_session, test_client):
         response = await test_client.get(f"{ENDPOINT}?category=not_a_metric")
         assert response.status_code == 400, response.text
+
+
+class TestThePublishedRankMatchesTheListAVisitorIsShown:
+    """The stored leaderboard rank is a GLOBAL rank: it is computed over every
+    entry ever written, including the seeded demo accounts, and it is not
+    refreshed in step with this endpoint's filters. A rank published next to a
+    filtered list therefore describes a list the visitor cannot see, and a
+    visitor comparing it with the cards in front of them sees a number that
+    does not mean what the label says.
+
+    The published rank must be the position in the list the endpoint returns.
+    """
+
+    async def test_the_rank_is_the_position_in_the_returned_list(
+        self, db_session, test_client
+    ):
+        user = _make_user(db_session, "rank-user", "rank@realcustomer.com")
+        await db_session.flush()
+        # The stored ranks are deliberately the WRONG global ranks.
+        await _make_published_result(
+            db_session, user, strategy_name="Second", score=2.0, stored_rank=42
+        )
+        await _make_published_result(
+            db_session, user, strategy_name="First", score=3.0, stored_rank=41
+        )
+        await _make_published_result(
+            db_session, user, strategy_name="Third", score=1.0, stored_rank=43
+        )
+        await db_session.commit()
+
+        response = await test_client.get(ENDPOINT)
+        results = response.json()["data"]["results"]
+
+        assert [r["strategyName"] for r in results] == ["First", "Second", "Third"]
+        assert [r["rank"] for r in results] == [1, 2, 3]
+
+    async def test_a_demo_account_cannot_shift_the_published_rank(
+        self, db_session, test_client
+    ):
+        """The demo account has the best score and the stored rank 1. It is not
+        published, so it must not push the first visible card off position 1."""
+        demo = _make_user(db_session, "alex_trader", "alex@example.com")
+        await db_session.flush()
+        await _make_published_result(
+            db_session, demo, strategy_name="DemoBest", score=99.0, stored_rank=1
+        )
+        user = _make_user(db_session, "rank-user-2", "rank2@realcustomer.com")
+        await db_session.flush()
+        await _make_published_result(
+            db_session, user, strategy_name="RealBest", score=3.0, stored_rank=7
+        )
+        await db_session.commit()
+
+        response = await test_client.get(ENDPOINT)
+        results = response.json()["data"]["results"]
+
+        assert [r["strategyName"] for r in results] == ["RealBest"]
+        assert results[0]["rank"] == 1
+
+    async def test_the_rank_is_stable_between_two_calls(
+        self, db_session, test_client
+    ):
+        """Two results with the SAME score must still get distinct, stable
+        positions: a tie broken arbitrarily would make a visitor's card change
+        place between two page loads."""
+        user = _make_user(db_session, "tie-user", "tie@realcustomer.com")
+        await db_session.flush()
+        await _make_published_result(
+            db_session, user, strategy_name="TieA", score=2.0, stored_rank=9
+        )
+        await _make_published_result(
+            db_session, user, strategy_name="TieB", score=2.0, stored_rank=8
+        )
+        await db_session.commit()
+
+        first = (await test_client.get(ENDPOINT)).json()["data"]["results"]
+        second = (await test_client.get(ENDPOINT)).json()["data"]["results"]
+
+        assert [r["rank"] for r in first] == [1, 2]
+        assert [(r["slug"], r["rank"]) for r in first] == [
+            (r["slug"], r["rank"]) for r in second
+        ]
+
+    async def test_the_feed_says_how_many_results_the_ranking_covers(
+        self, db_session, test_client
+    ):
+        """The count is over the SAME filtered set, so a visitor can see
+        whether the list they are looking at is the whole ranking."""
+        user = _make_user(db_session, "total-user", "total@realcustomer.com")
+        await db_session.flush()
+        for index in range(3):
+            await _make_published_result(
+                db_session,
+                user,
+                strategy_name=f"Result{index}",
+                score=float(3 - index),
+                stored_rank=50 + index,
+            )
+        demo = _make_user(db_session, "alex_trader", "alex@example.com")
+        await db_session.flush()
+        await _make_published_result(
+            db_session, demo, strategy_name="DemoOne", score=100.0, stored_rank=1
+        )
+        await db_session.commit()
+
+        data = (await test_client.get(ENDPOINT)).json()["data"]
+
+        assert data["total"] == 3
+        assert len(data["results"]) == 3
 
 
 class TestThePublishedSchemaAdvertisesTheAllowedValues:
