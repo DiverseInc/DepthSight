@@ -8928,13 +8928,10 @@ class TradingController:
                     logger.warning(f"{log_prefix} Placeholder position lost. Aborting.")
                     return
 
-                # A start-up fail-closed latch (Redis was unreachable when this
-                # controller came up) is an infrastructure fault, not an
-                # operator decision. Release it as soon as Redis can be read
-                # again and no emergency stop is recorded -- no restart and no
-                # operator action required. An operator's kill switch is NOT
-                # affected: _maybe_release_unverified_emergency_stop() refuses
-                # to touch it.
+                # The start-up fail-closed latch (Redis was unreachable when
+                # this controller came up) is released below, once the
+                # signal's trading mode is known -- the release and the gate
+                # check are both mode-aware.
             # 2. CONFIGURATION SEARCH AND ML-FLAG CHECK
             running_instance_config = None
             instance_user_id = None
@@ -8991,6 +8988,14 @@ class TradingController:
             # placeholder still protects the symbol meanwhile: a second
             # signal for the same symbol is rejected by the
             # "active position already exists" check above.
+            #
+            # A start-up fail-closed latch (Redis was unreachable when this
+            # controller came up) is an infrastructure fault, not an
+            # operator decision. Release it as soon as Redis can be read
+            # again and no emergency stop is recorded -- no restart and no
+            # operator action required. An operator's kill switch is NOT
+            # affected: _maybe_release_unverified_emergency_stop() refuses
+            # to touch it.
             await self._maybe_release_unverified_emergency_stop()
 
             if not await self.rm.is_symbol_trading_allowed(
