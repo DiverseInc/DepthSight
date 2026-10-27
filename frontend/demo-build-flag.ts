@@ -1,7 +1,7 @@
-// tools/demo-build-flag.ts
+// frontend/demo-build-flag.ts
 //
-// WHY THIS FILE LIVES OUTSIDE frontend/
-// --------------------------------------
+// WHY THIS FILE LIVES OUTSIDE src/
+// ---------------------------------
 // The seeded demo account's username and password used to live in
 // src/pages/Login.tsx as module-level constants. The demo panel was already
 // gated behind `isDemoCredentialsEnabled()`, so the panel was not RENDERED
@@ -9,18 +9,29 @@
 // shipped JavaScript. Anyone who opened devtools on the public login page
 // could read the demo password without clicking anything.
 //
-// They live here instead. This file is imported ONLY by frontend/vite.config.ts
-// and frontend/vitest.config.ts -- it is not reachable from the application
-// entry point, so the bundler never sees it. The credentials reach the app as
-// a BUILD-TIME `define`, which Vite substitutes with the literal `null` unless
-// the build explicitly asks for the demo helper. A production bundle therefore
-// does not contain the strings AT ALL, rather than containing them behind a
+// They live here instead. This file is imported ONLY by vite.config.ts and
+// vitest.config.ts -- it is not reachable from the application entry point,
+// so the bundler never sees it. The credentials reach the app as a BUILD-TIME
+// `define`, which Vite substitutes with the literal `null` unless the build
+// explicitly asks for the demo helper. A production bundle therefore does
+// not contain the strings AT ALL, rather than containing them behind a
 // runtime `if`.
 //
-// It is ALSO outside frontend/ on purpose: docker-compose.yml bind-mounts the
-// whole frontend/ directory read-only at /srv/frontend for Caddy, so a file
-// kept there would sit in the directory the web server serves from. Out here,
-// the plaintext is not in the served tree at all.
+// It stays INSIDE frontend/ on purpose, for two reasons:
+//
+//   * docker-compose.yml builds the frontend image with `context: ./frontend`
+//     (the frontend service, line 260). A module outside that directory is
+//     not in the build, so `docker compose build frontend` would fail on an
+//     import it cannot resolve -- while the bundle test, which builds in the
+//     checkout, would still pass. tests/test_production_bundle_excludes_demo_credentials.py
+//     now pins that every import of the Vite config stays inside the build
+//     context.
+//   * the demo account is a PUBLISHED login (docs/quick-start.html:125 and
+//     the signup email, api/routes/auth.py:61-63), not a secret.
+//
+// Caddy serves only frontend/welcome.html and three exact og-image
+// filenames out of the mounted frontend/ directory, so nothing else in here
+// is reachable over HTTP; tests/test_caddy_public_routes.py pins that too.
 
 /** The environment variable that opts a build into showing the demo helper. */
 export const DEMO_ENV_FLAG = "VITE_SHOW_DEMO";

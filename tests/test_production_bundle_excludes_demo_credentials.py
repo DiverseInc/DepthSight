@@ -44,6 +44,7 @@ To run the full check:
 """
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -237,6 +238,41 @@ class TestTheDemoCredentialsAreNotShipped:
                     "compiles the seeded demo credentials into the production "
                     "bundle."
                 )
+
+
+class TestTheBuildContextStillContainsWhatTheConfigImports:
+    """The production image is built with `context: ./frontend`.
+
+    docker-compose.yml builds the frontend image from the frontend directory
+    alone, so a module OUTSIDE frontend/ is not in the build: the image build
+    would fail on an import it cannot resolve. The bundle test above builds
+    in the checkout, where the whole repository is present, so it CANNOT see
+    that class of break -- this test does.
+    """
+
+    @pytest.mark.parametrize("config_name", ["vite.config.ts", "vitest.config.ts"])
+    def test_every_import_of_the_config_stays_inside_the_build_context(
+        self, config_name
+    ):
+        source = (FRONTEND / config_name).read_text(encoding="utf-8")
+
+        for match in re.finditer(r'from\s+"(\.[^"]+)"', source):
+            relative = match.group(1)
+            resolved = (FRONTEND / relative).resolve()
+            context_root = FRONTEND.resolve()
+
+            assert str(resolved).startswith(str(context_root)), (
+                f"{config_name} imports {relative!r}, which is outside the "
+                "frontend build context (docker-compose.yml builds the "
+                "frontend image with `context: ./frontend`), so "
+                "`docker compose build frontend` would fail"
+            )
+
+            target = resolved if resolved.suffix else resolved.with_suffix(".ts")
+            assert target.exists(), (
+                f"{config_name} imports {relative!r}, which does not exist at "
+                f"{target}"
+            )
 
 
 class TestTheBundleCheckIsNotVacuous:
