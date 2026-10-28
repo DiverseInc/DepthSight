@@ -28,7 +28,7 @@ export default defineConfig(({ mode }) => {
 			include: [
 				"@radix-ui/react-slider",
 				"react-joyride",
-				"@tanstack/react-resizable-panels",
+				"react-resizable-panels",
 			],
 		},
 		server: {
