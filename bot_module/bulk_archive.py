@@ -328,6 +328,24 @@ def _add_month(month_start: datetime) -> datetime:
     return month_start.replace(month=month_start.month + 1)
 
 
+# Binance's WEEKLY klines open on Monday and its MONTHLY ones open on the
+# first of the month, so the calendar bucket a bar belongs to depends on the
+# interval.  For every interval up to one day it is the calendar day the bar
+# opens in.
+def _bucket_bounds(day: datetime, interval: str) -> Tuple[datetime, datetime]:
+    """The half-open calendar bucket ``day`` belongs to for ``interval``."""
+    if interval == "1M":
+        start = day.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start, _add_month(start)
+    if interval == "1w":
+        start = (day - timedelta(days=day.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return start, start + timedelta(days=7)
+    start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
+
+
 def _iter_months(start_dt: datetime, end_dt: datetime) -> Iterator[datetime]:
     """Yields the first instant of every calendar month the window touches."""
     month = start_dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -344,6 +362,42 @@ def _is_missing_day_a_hole(day: datetime, now: datetime) -> bool:
     lag.  A day that ended well before that lag window must have a file.
     """
     return (day + timedelta(days=1)) <= (now - _PUBLICATION_LAG)
+
+
+def _is_missing_bucket_a_hole(
+    bucket_start: datetime,
+    bucket_end: datetime,
+    first_bar: datetime,
+    last_bar: datetime,
+    now: datetime,
+) -> bool:
+    """True when a calendar bucket that holds NO data is a genuine HOLE.
+
+    ``bucket_start``/``bucket_end`` are the half-open bounds of the bucket:
+    a calendar day for every interval up to a day, a week for "1w" and a
+    month for "1M".  The rules are the ones the absent-DAILY-file path
+    already uses, applied to the whole bucket:
+
+    * the bucket is inside the publication lag -> the trailing edge of a
+      window that runs to "now" legitimately has no data yet;
+    * the bucket is entirely before the first observed bar -> the symbol was
+      not listed yet (or was delisted and relisted); there is no hole, the
+      history simply starts later;
+    * the bucket is entirely after the last observed bar -> delisted, or the
+      trailing publication lag; there is no hole;
+    * otherwise -> the symbol traded on both sides of the bucket, so the
+      data should have existed.  If it did not, the archive has a hole in it
+      and the load must fail rather than ship a gapped frame.
+    """
+    if not _is_missing_day_a_hole(bucket_start, now):
+        return False
+    if bucket_end <= first_bar:
+        # Entirely before the first observed bar: not listed yet.
+        return False
+    if bucket_start > last_bar:
+        # Entirely after the last observed bar: delisted / trailing edge.
+        return False
+    return True
 
 
 def _is_absent_day_a_hole(
@@ -363,16 +417,13 @@ def _is_absent_day_a_hole(
     * in between -> the symbol traded on both sides of the day, so the file
       should have existed.  If it did not, the month has a hole in it and
       the load must fail rather than ship a gapped frame.
+
+    A day missing from INSIDE a monthly archive is judged by exactly the
+    same rule -- see ``_is_missing_bucket_a_hole``.
     """
-    if not _is_missing_day_a_hole(day, now):
-        return False
-    if day + timedelta(days=1) <= first_bar:
-        # Entirely before the first observed bar: not listed yet.
-        return False
-    if day > last_bar:
-        # Entirely after the last observed bar: delisted / trailing edge.
-        return False
-    return True
+    return _is_missing_bucket_a_hole(
+        day, day + timedelta(days=1), first_bar, last_bar, now
+    )
 
 
 def _load_monthly_archive(
@@ -430,6 +481,41 @@ def _load_daily_archives(
     return frames, absent_days
 
 
+def _missing_buckets_in_month(
+    frame: pd.DataFrame,
+    interval: str,
+    month_start: datetime,
+    next_month: datetime,
+    window_start: datetime,
+    window_end: datetime,
+) -> List[Tuple[datetime, datetime]]:
+    """The calendar buckets this month SHOULD hold but does NOT.
+
+    A MONTHLY archive can be incomplete in exactly the way a daily file can
+    be absent: Binance can publish a monthly archive that is missing whole
+    days of its own month.  Nothing in the daily path would notice -- the
+    monthly archive is used as it is -- so the missing days are found HERE
+    and refused the same way an absent daily file is refused.
+
+    Only the buckets the WINDOW touches are looked at, and only a bucket
+    that holds no bar at all counts: a day inside the traded range with no
+    bar in it is the same defect as an absent daily file.
+    """
+    present = set()
+    for stamp in frame.index:
+        present.add(_bucket_bounds(stamp.to_pydatetime(), interval)[0])
+
+    missing: List[Tuple[datetime, datetime]] = []
+    day = month_start
+    while day < next_month:
+        if day <= window_end and (day + timedelta(days=1)) > window_start:
+            bounds = _bucket_bounds(day, interval)
+            if bounds[0] not in present:
+                missing.append(bounds)
+        day += timedelta(days=1)
+    return missing
+
+
 # ==============================================================================
 # Public entry point
 # ==============================================================================
@@ -459,6 +545,12 @@ def fetch_klines_from_bulk_archive(
     being returned -- a backtest that silently trades a hole produces a P&L
     that looks valid and is not, and a wrong number is worse than no number.
 
+    A PUBLISHED MONTHLY ARCHIVE IS HELD TO THE SAME RULE.  Binance can
+    publish a monthly archive that is missing whole days of its own month,
+    and no absent daily file would ever report that: the monthly archive is
+    used as it is.  A calendar bucket the window touches that holds no bar at
+    all is therefore a hole too, and the load fails the same way.
+
     A day before the first observed bar is NOT a hole: the symbol was not
     listed yet, and the window simply carries the shorter history the
     archive holds.  A day after the last observed bar is not a hole either
@@ -481,6 +573,7 @@ def fetch_klines_from_bulk_archive(
     now = datetime.now(timezone.utc)
     frames: List[pd.DataFrame] = []
     absent_days: List[datetime] = []
+    missing_month_buckets: List[Tuple[datetime, datetime]] = []
     months = 0
 
     for month_start in _iter_months(start_dt, end_dt):
@@ -490,6 +583,16 @@ def fetch_klines_from_bulk_archive(
         monthly = _load_monthly_archive(symbol, interval, market_type, month_start)
         if monthly is not None:
             frames.append(monthly)
+            # A PUBLISHED monthly archive can be missing whole days of its
+            # own month.  The daily path catches an absent daily FILE;
+            # nothing would catch a day missing from INSIDE the monthly
+            # archive, so the missing days are collected here and refused
+            # the same way below.
+            missing_month_buckets.extend(
+                _missing_buckets_in_month(
+                    monthly, interval, month_start, next_month, start_dt, end_dt
+                )
+            )
             continue
 
         # The monthly archive is not published: fall back to the daily files
@@ -518,17 +621,27 @@ def fetch_klines_from_bulk_archive(
         )
         return _empty_result()
 
-    # Judge the absent days against the bars that were actually loaded: only
-    # a day the symbol demonstrably traded through can be a hole.
+    # Judge the missing data against the bars that were actually loaded:
+    # only a day the symbol demonstrably traded through can be a hole.
+    # The buckets are the calendar days the DAILY path found absent and the
+    # calendar buckets the MONTHLY path found empty.
     first_bar = result.index[0]
     last_bar = result.index[-1]
+    missing_buckets: List[Tuple[datetime, datetime]] = [
+        (day, day + timedelta(days=1)) for day in absent_days
+    ]
+    missing_buckets.extend(missing_month_buckets)
     holes = [
-        day
-        for day in absent_days
-        if _is_absent_day_a_hole(day, first_bar, last_bar, now)
+        bucket
+        for bucket in missing_buckets
+        if _is_missing_bucket_a_hole(
+            bucket[0], bucket[1], first_bar, last_bar, now
+        )
     ]
     if holes:
-        hole_text = ", ".join(day.strftime("%Y-%m-%d") for day in holes[:5])
+        hole_text = ", ".join(
+            bucket[0].strftime("%Y-%m-%d") for bucket in holes[:5]
+        )
         if len(holes) > 5:
             hole_text += f", ... (+{len(holes) - 5} more)"
         raise BulkArchiveCoverageError(
@@ -542,6 +655,7 @@ def fetch_klines_from_bulk_archive(
     logger.info(
         f"Bulk archive coverage: symbol={symbol} timeframe={timeframe} "
         f"months={months} days_absent={len(absent_days)} "
+        f"month_buckets_missing={len(missing_month_buckets)} "
         f"trailing_days_absent={len(trailing_absent)} "
         f"first_bar={first_bar.isoformat()} last_bar={last_bar.isoformat()} "
         f"rows={len(result)} "

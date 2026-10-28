@@ -205,6 +205,46 @@ def _month_starts(start_dt, end_dt):
     return months
 
 
+def _epoch_day(moment):
+    """The epoch day number of ``moment`` (UTC)."""
+    return int(moment.timestamp()) // 86400
+
+
+def _truncate_monthly_archive(payload, drop_days):
+    """A REAL monthly archive with whole days removed.
+
+    The committed fixture is a real Binance month (744 hourly bars, all 31
+    days of January 2024).  Dropping the hours of one interior day from it
+    produces exactly the defect the monthly path has to catch: a PUBLISHED
+    archive that is missing days of its own month.  Returns the new payload
+    and the number of bars that were removed.
+    """
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        name = archive.namelist()[0]
+        text = archive.read(name).decode("utf-8-sig")
+
+    lines = text.splitlines()
+    header = None
+    if lines and lines[0].startswith("open_time"):
+        header = lines[0]
+        lines = lines[1:]
+
+    kept = []
+    dropped = 0
+    for line in lines:
+        stamp = int(line.split(",")[0])
+        if stamp > 10**14:  # some archives are in microseconds
+            stamp //= 1000
+        if stamp // 86_400_000 in drop_days:  # the epoch day of the bar
+            dropped += 1
+            continue
+        kept.append(line)
+
+    assert dropped, "the fixture did not contain the day(s) that were dropped"
+    body = ([header] if header else []) + kept
+    return _make_zip("\n".join(body) + "\n", Path(name).name), dropped
+
+
 class _FrozenDatetime(datetime):
     """A datetime whose ``now()`` is pinned, so "the past" is deterministic."""
 
@@ -368,8 +408,11 @@ async def test_archive_output_matches_rest_api_output_without_header(
 @pytest.mark.asyncio
 async def test_two_month_window_concatenates_in_time_order(archive_server):
     """Both months are pulled and concatenated in order, without duplicates."""
-    jan_rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 24, 60)
-    feb_rows = _make_rows(datetime(2024, 2, 1, tzinfo=timezone.utc), 24, 60)
+    # COMPLETE months: a monthly archive that is missing days of its own
+    # month is a hole and is refused (see
+    # test_a_truncated_monthly_archive_is_refused_instead_of_returning_a_gap).
+    jan_rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 24 * 31, 60)
+    feb_rows = _make_rows(datetime(2024, 2, 1, tzinfo=timezone.utc), 24 * 29, 60)
     archive_server.add(
         _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
         _make_zip(_rows_to_csv(jan_rows), "BTCUSDT-1h-2024-01.csv"),
@@ -385,11 +428,11 @@ async def test_two_month_window_concatenates_in_time_order(archive_server):
         "BTCUSDT", "1h", start, end, FUTURES
     )
 
-    assert len(frame) == 48
+    assert len(frame) == 24 * 31 + 24 * 29
     assert frame.index.is_monotonic_increasing
     assert not frame.index.duplicated().any()
     assert frame.index[0] == pd.Timestamp("2024-01-01T00:00:00Z")
-    assert frame.index[-1] == pd.Timestamp("2024-02-01T23:00:00Z")
+    assert frame.index[-1] == pd.Timestamp("2024-02-29T23:00:00Z")
     assert len(archive_server.monthly_urls()) == 2
 
 
@@ -1308,3 +1351,92 @@ async def test_real_spot_archive_values_differ_from_futures(archive_server):
     assert futures.iloc[0]["number_of_trades"] == 88278
     assert spot.iloc[0]["open"] != futures.iloc[0]["open"]
     assert spot.iloc[0]["number_of_trades"] != futures.iloc[0]["number_of_trades"]
+
+
+# ==============================================================================
+# R5: a MONTHLY archive can be incomplete too
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_monthly_archive_is_refused_instead_of_returning_a_gap(
+    archive_server, monkeypatch
+):
+    """A PUBLISHED monthly archive that misses days of its own month is a HOLE.
+
+    The daily path catches an absent daily FILE.  Nothing caught a day
+    missing from INSIDE a monthly archive: the frame was handed back with
+    the gap in it, and the backtest traded it as if it were complete -- a
+    P&L that looks valid and is not.  A wrong number is worse than no
+    number, so the load must fail.
+    """
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    # A REAL Binance January with the 19th removed from it.
+    truncated, dropped = _truncate_monthly_archive(
+        _fixture("BTCUSDT-1h-2024-01-futures-um.zip"),
+        drop_days={_epoch_day(datetime(2024, 1, 19, tzinfo=timezone.utc))},
+    )
+    assert dropped == 24, "the 19th should hold 24 hourly bars"
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        truncated,
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    # The archive refuses to return a gapped frame.
+    with pytest.raises(bulk_archive.BulkArchiveCoverageError):
+        bulk_archive.fetch_klines_from_bulk_archive(
+            "BTCUSDT", "1h", start, end, FUTURES
+        )
+
+    # And the loader reports "no data", not a frame with a hole in it.
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_a_monthly_archive_that_stops_early_is_not_a_hole(
+    archive_server, monkeypatch
+):
+    """The symbol was delisted on the 10th: the days AFTER it are not a hole.
+
+    The same rule the daily path uses: a day before the first observed bar
+    is "not listed yet" and a day after the last observed bar is "delisted",
+    and neither is a hole.  This is the boundary the monthly check must not
+    cross.
+    """
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    truncated, _ = _truncate_monthly_archive(
+        _fixture("BTCUSDT-1h-2024-01-futures-um.zip"),
+        drop_days={
+            _epoch_day(datetime(2024, 1, day, tzinfo=timezone.utc))
+            for day in range(11, 32)
+        },
+    )
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        truncated,
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
+
+    # The shorter history is served: there is no hole, only a delisting.
+    assert frame is not None
+    assert len(frame) == 24 * 10
+    assert frame.index[-1] == pd.Timestamp("2024-01-10T23:00:00Z")
+
+
