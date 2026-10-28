@@ -11,6 +11,7 @@ NO NETWORK IS USED HERE.  The archives are built locally as real ``.zip``
 files containing a real CSV, and the HTTP fetch is stubbed.
 """
 
+import calendar
 import io
 import logging
 import time
@@ -1572,6 +1573,265 @@ async def test_the_two_paths_report_no_data_as_the_contract_says(
         market_type=FUTURES,
     )
     assert archive_result is None
+
+
+# ==============================================================================
+# R8: the LEADING EDGE of the window is measured and reported
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_a_leading_month_with_no_archive_is_reported_as_a_coverage_gap(
+    archive_server, monkeypatch, caplog
+):
+    """The leading month was NEVER published: the frame starts later.
+
+    This is the case a reviewer found: a window asked for from January
+    came back starting in February, with nothing but an INFO line to say
+    so.  The load must still SUCCEED -- the symbol may simply have been
+    listed later, and failing here would fire a false alarm for every
+    newly-listed symbol -- but the gap must be REPORTED, at WARNING level
+    with the exact numbers, and be visible to the caller.
+    """
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    # January has NO monthly archive and NO daily files at all.
+    # February has its monthly archive.
+    feb_rows = _make_rows(datetime(2024, 2, 1, tzinfo=timezone.utc), 24 * 29, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 2),
+        _make_zip(_rows_to_csv(feb_rows), "BTCUSDT-1h-2024-02.csv"),
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 2, 29, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    with caplog.at_level(logging.WARNING, logger="bot_module.bulk_archive"):
+        frame = bulk_archive.fetch_klines_from_bulk_archive(
+            "BTCUSDT", "1h", start, end, FUTURES
+        )
+
+    # The load still succeeds, and the frame holds what the archive has.
+    assert frame is not None
+    assert not frame.empty
+    assert frame.index[0] == pd.Timestamp("2024-02-01T00:00:00Z")
+
+    # REPORTED, at WARNING level, with the exact numbers.
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and record.name == "bot_module.bulk_archive"
+    ]
+    assert any("coverage gap" in message for message in warnings), warnings
+    assert any(
+        "requested_start=2024-01-01T00:00:00+00:00" in message for message in warnings
+    ), warnings
+    assert any(
+        "first_bar=2024-02-01T00:00:00+00:00" in message for message in warnings
+    ), warnings
+    assert any("gap_days=31" in message for message in warnings), warnings
+
+    # And MACHINE-READABLE, so a caller that must not trade a shorter
+    # window than it asked for can refuse it.
+    gap = bulk_archive.coverage_gap(frame)
+    assert gap is not None, "the gap must be visible to the caller"
+    assert gap["requested_start"] == "2024-01-01T00:00:00+00:00"
+    assert gap["first_bar"] == "2024-02-01T00:00:00+00:00"
+    assert gap["gap_days"] == 31
+    assert gap["leading_month"] == "2024-01"
+    assert gap["leading_month_published"] is False
+    assert "reason" in gap
+
+
+@pytest.mark.asyncio
+async def test_a_symbol_listed_later_with_a_published_monthly_is_not_a_gap(
+    archive_server, monkeypatch, caplog
+):
+    """The leading month's monthly archive WAS published: NOT a gap.
+
+    The symbol was listed on the 15th and Binance published the January
+    archive holding exactly that history.  The frame starts on the 15th,
+    which is correct and normal, so it must NOT be reported as a coverage
+    gap.  This is the distinction the loader used to throw away.
+    """
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    # January, published, starting on the 15th: the symbol listed then.
+    rows = _make_rows(datetime(2024, 1, 15, tzinfo=timezone.utc), 24 * 17, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        _make_zip(_rows_to_csv(rows), "BTCUSDT-1h-2024-01.csv"),
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    with caplog.at_level(logging.WARNING, logger="bot_module.bulk_archive"):
+        frame = bulk_archive.fetch_klines_from_bulk_archive(
+            "BTCUSDT", "1h", start, end, FUTURES
+        )
+
+    assert frame is not None
+    assert frame.index[0] == pd.Timestamp("2024-01-15T00:00:00Z")
+    assert bulk_archive.coverage_gap(frame) is None
+
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and record.name == "bot_module.bulk_archive"
+    ]
+    assert not any("coverage gap" in message for message in warnings), warnings
+
+
+@pytest.mark.asyncio
+async def test_the_coverage_gap_reaches_the_caller_through_download_klines(
+    archive_server, monkeypatch, tmp_path
+):
+    """The gap must survive the loader's OWN operations.
+
+    ``pandas.concat`` DROPS the ``attrs`` when the frames it merges do not
+    all carry the same ones, and the local cache carries none, so the
+    loader puts the gap back on the frame it hands to the caller.  The
+    local cache below is what makes the loader take the ``concat`` path.
+    """
+    monkeypatch.setattr(config, "LOCAL_DATA_STORAGE_PATH", str(tmp_path))
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    # A local cache file that holds no rows: the loader still merges it.
+    cache_dir = tmp_path / "binance" / "futures" / "BTCUSDT"
+    cache_dir.mkdir(parents=True)
+    empty_cache = pd.DataFrame(
+        {
+            "open": pd.Series(dtype="float64"),
+            "high": pd.Series(dtype="float64"),
+            "low": pd.Series(dtype="float64"),
+            "close": pd.Series(dtype="float64"),
+            "volume": pd.Series(dtype="float64"),
+        },
+        index=pd.DatetimeIndex([], tz="UTC", name="open_time"),
+    )
+    empty_cache.to_parquet(cache_dir / "kline_1h.parquet")
+
+    feb_rows = _make_rows(datetime(2024, 2, 1, tzinfo=timezone.utc), 24 * 29, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 2),
+        _make_zip(_rows_to_csv(feb_rows), "BTCUSDT-1h-2024-02.csv"),
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 2, 29, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+
+    assert result is not None
+    assert not result.empty
+    gap = bulk_archive.coverage_gap(result)
+    assert gap is not None, "the gap must survive the loader's own operations"
+    assert gap["requested_start"] == "2024-01-01T00:00:00+00:00"
+    assert gap["first_bar"] == "2024-02-01T00:00:00+00:00"
+    assert gap["gap_days"] == 31
+
+
+@pytest.mark.asyncio
+async def test_the_declared_production_window_has_no_leading_gap(archive_server):
+    """BTCUSDT 2024-01-01..2025-12-31 daily: every monthly archive exists.
+
+    This is the window the branch was written for.  All 24 of its monthly
+    archives are published, so the leading edge is PROVEN and the frame
+    covers the window it was asked for -- with no coverage gap reported.
+    """
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2025, 12, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    for month in _month_starts(start, end):
+        days = calendar.monthrange(month.year, month.month)[1]
+        rows = _make_rows(month, days, 1440)
+        archive_server.add(
+            _monthly_url("BTCUSDT", "1d", FUTURES, month.year, month.month),
+            _make_zip(
+                _rows_to_csv(rows),
+                f"BTCUSDT-1d-{month.year:04d}-{month.month:02d}.csv",
+            ),
+        )
+
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1d", start, end, FUTURES
+    )
+
+    # 2024 is a leap year: 366 + 365 = 731 daily bars.
+    assert len(frame) == 731
+    assert frame.index[0] == pd.Timestamp("2024-01-01T00:00:00Z")
+    assert frame.index[-1] == pd.Timestamp("2025-12-31T00:00:00Z")
+    assert frame.index.is_monotonic_increasing
+    assert not frame.index.duplicated().any()
+    # Every month's monthly archive was published, so there is no gap.
+    assert bulk_archive.coverage_gap(frame) is None
+
+
+@pytest.mark.asyncio
+async def test_a_leading_month_covered_by_the_daily_files_is_not_a_gap(
+    archive_server, monkeypatch
+):
+    """The leading month has no MONTHLY archive but its DAILIES cover it.
+
+    The monthly archive is only missing because Binance had not published
+    it yet; the daily files of the same month hold the window.  The frame
+    starts exactly where the window starts, so there is no gap to report.
+    """
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    for day in (1, 2, 3):
+        rows = _make_rows(datetime(2024, 1, day, tzinfo=timezone.utc), 24, 60)
+        archive_server.add(
+            _daily_url("BTCUSDT", "1h", FUTURES, 2024, 1, day),
+            _make_zip(_rows_to_csv(rows), f"BTCUSDT-1h-2024-01-{day:02d}.csv"),
+        )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 3, 23, tzinfo=timezone.utc)
+
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
+
+    assert frame is not None
+    assert frame.index[0] == pd.Timestamp("2024-01-01T00:00:00Z")
+    assert bulk_archive.coverage_gap(frame) is None
+
+
+@pytest.mark.asyncio
+async def test_a_window_that_starts_inside_a_bar_is_not_a_gap(archive_server):
+    """A start time in the MIDDLE of a bar is not a coverage gap.
+
+    The REST path answers the first bar whose open is at or after the
+    requested start, so a window that starts at 13:30 comes back with the
+    14:00 bar.  That is the REST behaviour, not a missing bar, and it
+    must not be reported as one.
+    """
+    rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 24 * 31, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        _make_zip(_rows_to_csv(rows), "BTCUSDT-1h-2024-01.csv"),
+    )
+
+    start = datetime(2024, 1, 1, 13, 30, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
+
+    assert frame is not None
+    assert frame.index[0] == pd.Timestamp("2024-01-01T14:00:00Z")
+    assert bulk_archive.coverage_gap(frame) is None
 
 
 # ==============================================================================

@@ -55,7 +55,7 @@ import logging
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
-from typing import Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 import backoff
 import pandas as pd
@@ -105,6 +105,21 @@ _MICROSECOND_THRESHOLD = 10**14
 # that runs up to "now" legitimately has no file yet.  A missing daily file is
 # only a genuine HOLE once it is older than this lag.
 _PUBLICATION_LAG = timedelta(days=2)
+
+# The key under which the loader records a LEADING-EDGE COVERAGE GAP on the
+# frame's ``attrs``.  The frame may cover a SHORTER period than the one that
+# was asked for -- the archive holds only what Binance published -- so a
+# caller that must not trade a shorter window than it requested needs to be
+# able to SEE that it happened.  The value is a dict; see
+# ``_leading_coverage_gap`` for its keys.
+#
+# ``DataFrame.attrs`` is used because it does not change the frame's shape,
+# its columns or its values: the existing callers keep indexing the frame
+# exactly as they do today.  The loader carries the key across its own
+# operations explicitly (see ``data_loader.download_klines``), because
+# ``pandas.concat`` DROPS the attrs when the frames it merges do not all
+# carry the same ones.
+COVERAGE_GAP_ATTR = "bulk_archive_coverage_gap"
 
 # Binance's kline intervals are a COUNT and a UNIT.  The unit is CASE
 # SENSITIVE: "m" is minutes and "M" is months, and the archive keeps that
@@ -546,20 +561,147 @@ def _is_absent_day_a_hole(
     )
 
 
+# ==============================================================================
+# The leading edge of the window
+# ==============================================================================
+
+
+def _previous_bar_open(first_bar: datetime, interval: str) -> datetime:
+    """The bar-open IMMEDIATELY BEFORE ``first_bar`` on the interval's grid.
+
+    The grid is the one the ARCHIVE itself uses, so the answer is right
+    whatever phase Binance aligns its bars to: a spot daily bar opens at
+    00:00 UTC+08:00, not at midnight UTC.  For a calendar-month interval
+    the previous bar is the first of the previous month.
+    """
+    count, unit = _parse_interval(interval)
+    if unit == "M":
+        month_start = first_bar.replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        return _add_month(month_start, -count)
+    return first_bar - _interval_duration(interval)
+
+
+def _leading_coverage_gap(
+    requested_start: datetime,
+    first_bar: datetime,
+    interval: str,
+    leading_month_published: Optional[bool],
+    leading_month: Optional[datetime],
+) -> Optional[Dict[str, Any]]:
+    """The COVERAGE GAP at the leading edge of the window, or ``None``.
+
+    A frame may cover a SHORTER period than the one that was asked for.
+    That is normal and legitimate in one case: the symbol was listed
+    later, and the archive holds only the history that exists.  It is
+    DANGEROUS in another: the archives for the leading month were never
+    published, so the archive cannot prove that the symbol simply did not
+    trade then -- it might be that the data for that month is missing
+    altogether, and the frame would silently start later than the window.
+
+    The two are told apart by ``leading_month_published``:
+
+    * the leading month's monthly archive WAS published -> Binance's own
+      answer for that month, so the frame starts where the symbol started
+      and there is NO gap;
+    * it was NOT published -> the coverage of the leading edge is
+      UNKNOWN, and the gap is reported.
+
+    The gap itself is measured on the archive's own bar grid: the bar
+    that would come immediately before ``first_bar`` decides it.  If that
+    bar would fall inside the requested window, it should have been
+    returned and was not -- that is the gap.  If it would fall OUTSIDE
+    the window, the frame starts exactly where the REST path would have
+    started it, and there is nothing to report.
+    """
+    if leading_month_published is not False:
+        # The leading month was published: the archive holds Binance's own
+        # answer for it, so a shorter history is a LISTING, not a gap.
+        return None
+
+    previous_bar = _previous_bar_open(first_bar, interval)
+    if previous_bar < requested_start:
+        # The bar before the first one falls outside the requested window,
+        # so the frame starts exactly where the REST path starts it.
+        return None
+
+    gap = first_bar - requested_start
+    return {
+        "requested_start": requested_start.isoformat(),
+        "first_bar": first_bar.isoformat(),
+        "gap_days": gap.days,
+        "leading_month": (
+            leading_month.strftime("%Y-%m") if leading_month is not None else None
+        ),
+        "leading_month_published": False,
+        "reason": (
+            "the leading month's monthly archive is not published, so the "
+            "archive cannot prove that the symbol was not listed yet; the "
+            "frame starts later than the requested window"
+        ),
+    }
+
+
+def coverage_gap(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+    """The leading-edge coverage gap recorded on ``frame``, if there is one.
+
+    ``None`` means "no leading-edge coverage gap was detected".  The
+    returned dict carries the requested start, the first bar the archive
+    could supply, the size of the gap in days and why it was reported.
+    """
+    if frame is None:
+        return None
+    gap = frame.attrs.get(COVERAGE_GAP_ATTR)
+    if isinstance(gap, dict):
+        return dict(gap)
+    return None
+
+
+class _MonthlyArchive(NamedTuple):
+    """The outcome of ONE monthly archive request.
+
+    The two outcomes are kept apart on purpose, because they mean
+    different things:
+
+    * ``published is False`` -- Binance has NOT published that monthly
+      archive (HTTP 404).  Nothing is known about that month: the symbol
+      may never have traded then, or the archive may simply be missing.
+      The two are indistinguishable from here, which is exactly why a
+      window that STARTS in such a month cannot prove it covers the
+      window it was asked for.
+    * ``published is True`` -- Binance HAS published that monthly
+      archive.  Then the archive is Binance's own answer for that month:
+      either it holds bars, and they start wherever the symbol started
+      trading, or it is empty, and the symbol did not trade that month.
+      Either way the month is accounted for and there is no gap.
+    """
+
+    frame: Optional[pd.DataFrame]
+    published: bool
+
+
 def _load_monthly_archive(
     symbol: str, interval: str, market_type: str, month_start: datetime
-) -> Optional[pd.DataFrame]:
-    """Fetches one monthly archive.  ``None`` when it is not published."""
+) -> _MonthlyArchive:
+    """Fetches one monthly archive.
+
+    ``published`` tells the caller whether Binance published that month at
+    all; ``frame`` holds its candles (``None`` when it holds none).
+    """
     url = _monthly_url(symbol, interval, market_type, month_start)
     payload = fetch_archive_bytes(url)
     if payload is None:
-        return None
+        # NOT PUBLISHED: this month is simply unknown.
+        return _MonthlyArchive(None, False)
     frame = parse_archive_candles(payload)
     if frame.empty:
+        # PUBLISHED but empty: Binance says the symbol did not trade that
+        # month.  That is an answer, not a hole.
         logger.warning(f"Bulk archive: monthly archive is empty {url}")
-        return None
+        return _MonthlyArchive(None, True)
     logger.info(f"Bulk archive: loaded monthly archive {url}")
-    return frame
+    return _MonthlyArchive(frame, True)
 
 
 def _load_daily_archives(
@@ -693,6 +835,34 @@ def fetch_klines_from_bulk_archive(
     also returns the still-forming one), and the trailing edge of a window
     that runs to "now" is short by the publication lag.
 
+    THE FRAME MAY COVER A SHORTER PERIOD THAN THE ONE REQUESTED.  The
+    archive holds what Binance published, and Binance publishes nothing
+    for a symbol that did not trade, so a window that starts before the
+    symbol was listed comes back starting later.  That is normal, and the
+    load does not fail for it -- but it must never happen UNSEEN, because a
+    backtest asked for 2024-01-01..2025-12-31 that silently receives a
+    frame starting 2024-02-01 reports the KPIs of the shorter window as if
+    they were the requested ones.
+
+    So the loader MEASURES the leading edge and REPORTS it:
+
+    * when the leading month's monthly archive WAS published, the frame
+      starts wherever the symbol started trading and there is no gap --
+      nothing is reported;
+    * when it was NOT published, the coverage of the leading edge is
+      UNKNOWN (the archives for that month cannot prove that the symbol
+      did not trade then), and the gap is reported at WARNING level with
+      the numbers, and recorded on the frame.
+
+    THE CALLER CAN SEE IT.  The gap is recorded on the frame's ``attrs``
+    under the key ``COVERAGE_GAP_ATTR`` ("bulk_archive_coverage_gap"), as
+    a dict with ``requested_start``, ``first_bar``, ``gap_days``,
+    ``leading_month``, ``leading_month_published`` and ``reason``.  The
+    ``attrs`` do not change the frame's shape, its columns or its values,
+    so every existing caller keeps using the frame exactly as it does
+    today.  Read it with ``bulk_archive.coverage_gap(frame)``, which
+    returns ``None`` when there is no gap.
+
     Returns a DataFrame shaped exactly like the REST path's output, or an
     empty DataFrame when Binance has no archive for the window at all.
     """
@@ -725,14 +895,22 @@ def _fetch_klines_from_bulk_archive(
     absent_days: List[datetime] = []
     missing_month_buckets: List[Tuple[datetime, datetime]] = []
     months = 0
+    leading_month: Optional[datetime] = None
+    leading_month_published: Optional[bool] = None
 
     for month_start in _iter_months(start_dt, end_dt):
         next_month = _add_month(month_start)
         months += 1
 
         monthly = _load_monthly_archive(symbol, interval, market_type, month_start)
-        if monthly is not None:
-            frames.append(monthly)
+        if leading_month is None:
+            # The month the window STARTS in decides whether the leading
+            # edge of the frame can be trusted: Binance published that
+            # month or it did not.
+            leading_month = month_start
+            leading_month_published = monthly.published
+        if monthly.frame is not None:
+            frames.append(monthly.frame)
             # A PUBLISHED monthly archive can be missing whole days of its
             # own month.  The daily path catches an absent daily FILE;
             # nothing would catch a day missing from INSIDE the monthly
@@ -740,7 +918,7 @@ def _fetch_klines_from_bulk_archive(
             # the same way below.
             missing_month_buckets.extend(
                 _missing_buckets_in_month(
-                    monthly, interval, month_start, next_month, start_dt, end_dt
+                    monthly.frame, interval, month_start, next_month, start_dt, end_dt
                 )
             )
             continue
@@ -797,6 +975,30 @@ def _fetch_klines_from_bulk_archive(
             f"archive ({hole_text}). Refusing to return a gapped frame."
         )
 
+    # THE LEADING EDGE.  A hole inside the traded range fails the load, but a
+    # window that simply starts LATER than it was asked to cannot: the
+    # symbol may simply have been listed later, and that is not a fault.
+    # What must never happen is that it happens UNSEEN, so the gap is
+    # measured here, reported at WARNING level with the numbers, and
+    # recorded on the frame so a caller can refuse to trade it.
+    gap = _leading_coverage_gap(
+        start_dt,
+        first_bar.to_pydatetime(),
+        interval,
+        leading_month_published,
+        leading_month,
+    )
+    if gap is not None:
+        logger.warning(
+            f"Bulk archive coverage gap: symbol={symbol} timeframe={timeframe} "
+            f"requested_start={gap['requested_start']} "
+            f"first_bar={gap['first_bar']} gap_days={gap['gap_days']} "
+            f"leading_month={gap['leading_month']} "
+            f"leading_month_published=False -- {gap['reason']}. "
+            f"The frame does not cover the requested start."
+        )
+        result.attrs[COVERAGE_GAP_ATTR] = gap
+
     trailing_absent = [day for day in absent_days if day > last_bar]
     logger.info(
         f"Bulk archive coverage: symbol={symbol} timeframe={timeframe} "
@@ -805,6 +1007,7 @@ def _fetch_klines_from_bulk_archive(
         f"trailing_days_absent={len(trailing_absent)} "
         f"first_bar={first_bar.isoformat()} last_bar={last_bar.isoformat()} "
         f"rows={len(result)} "
-        f"window={start_dt.isoformat()}..{end_dt.isoformat()}"
+        f"window={start_dt.isoformat()}..{end_dt.isoformat()} "
+        f"leading_coverage_gap={'yes' if gap is not None else 'no'}"
     )
     return result

@@ -10,7 +10,11 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 
 from . import config
-from .bulk_archive import BulkArchiveCoverageError, fetch_klines_from_bulk_archive
+from .bulk_archive import (
+    COVERAGE_GAP_ATTR,
+    BulkArchiveCoverageError,
+    fetch_klines_from_bulk_archive,
+)
 from .utils import (
     add_relative_volume,
     calculate_scalper_natr,
@@ -294,18 +298,14 @@ def _download_klines_from_api_with_archive_fallback(
             f"({timeframe}): {coverage_error}",
             exc_info=True,
         )
-        logger.info(
-            f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0"
-        )
+        logger.info(f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0")
         return None
     except Exception as archive_error:
         logger.error(
             f"Bulk archive klines failed for {symbol} ({timeframe}): {archive_error}",
             exc_info=True,
         )
-        logger.info(
-            f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0"
-        )
+        logger.info(f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0")
         return None
 
 
@@ -440,6 +440,27 @@ async def download_klines(
     """
     (ASYNCHRONOUS) Hybrid klines loader.
     All blocking operations (file reading, HTTP requests) are executed in separate threads.
+
+    THE FRAME MAY COVER A SHORTER PERIOD THAN THE ONE REQUESTED.  When
+    the REST API is geo-blocked (HTTP 451) the loader falls back to
+    Binance's bulk archives, and the archives hold only what Binance
+    published.  A symbol that was listed later than the requested window
+    therefore comes back starting later.  That is NOT a failure -- but it
+    must never be silent, so the loader measures the leading edge and
+    reports it.
+
+    A caller that must not trade a shorter window than it asked for can
+    see the gap on the returned frame: it is recorded in the frame's
+    ``attrs`` under the key ``COVERAGE_GAP_ATTR``
+    ("bulk_archive_coverage_gap"), as a dict with ``requested_start``,
+    ``first_bar``, ``gap_days``, ``leading_month``,
+    ``leading_month_published`` and ``reason``.  Read it with
+    ``bulk_archive.coverage_gap(frame)``, which returns ``None`` when
+    there is no gap.  The ``attrs`` do not change the frame's shape, its
+    columns or its values, so the existing callers are unaffected.
+
+    The gap is reported at WARNING level in the log as well, with the
+    exact numbers.
     """
     try:
         if isinstance(start_dt, str):
@@ -531,6 +552,16 @@ async def download_klines(
             )
             return None
 
+        # The leading-edge coverage gap the archive recorded on its frame.
+        # It is captured HERE because the operations below do not all carry
+        # it over: ``pandas.concat`` DROPS the ``attrs`` when the frames it
+        # merges do not all have the same ones, and the local cache (read
+        # from parquet) has none.  It is put back on the frame that is
+        # returned, so the caller can always see it.
+        coverage_gap = (
+            df_api.attrs.get(COVERAGE_GAP_ATTR) if df_api is not None else None
+        )
+
         df_final = pd.concat([df_local, df_api]) if df_local is not None else df_api
         if df_final.empty:
             return df_final
@@ -547,6 +578,9 @@ async def download_klines(
             return df_processed
 
         df_processed = await loop.run_in_executor(None, _process_indicators, df_final)
+
+        if coverage_gap is not None:
+            df_processed.attrs[COVERAGE_GAP_ATTR] = coverage_gap
 
         logger.info(f"Loaded/merged and processed {len(df_final)} candles.")
         return df_processed
