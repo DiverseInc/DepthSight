@@ -1023,11 +1023,17 @@ async def test_an_empty_daily_file_is_not_a_hole(archive_server, monkeypatch):
 async def test_archive_with_no_candles_yields_none_not_an_empty_frame(
     archive_server, monkeypatch
 ):
-    """REST 451 + an archive with nothing => None, so the hard stops fire."""
+    """REST 451 + an archive with nothing => None, so the hard stops fire.
+
+    The window is in the FUTURE: there is no coverage hole to raise, so the
+    archive simply has no candles.  That must still surface as None, not as
+    an empty frame -- an empty frame is "loaded, but empty", and the callers
+    treat the two differently.
+    """
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
 
-    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    start = datetime.now(timezone.utc) + timedelta(days=30)
+    end = start + timedelta(days=1)
 
     result = await data_loader.download_klines(
         symbol="BTCUSDT",
@@ -1038,6 +1044,33 @@ async def test_archive_with_no_candles_yields_none_not_an_empty_frame(
     )
 
     assert result is None, "an empty frame is not 'no data loaded'"
+
+
+@pytest.mark.asyncio
+async def test_archive_coverage_failure_also_yields_none(
+    archive_server, monkeypatch
+):
+    """REST 451 + an archive that cannot cover the window => None."""
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+
+    start = datetime(2024, 1, 15, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 20, 12, tzinfo=timezone.utc)
+    for day in (15, 16, 17, 18, 20):
+        rows = _make_rows(datetime(2024, 1, day, tzinfo=timezone.utc), 24, 60)
+        archive_server.add(
+            _daily_url("BTCUSDT", "1h", FUTURES, 2024, 1, day),
+            _make_zip(_rows_to_csv(rows), f"BTCUSDT-1h-2024-01-{day:02d}.csv"),
+        )
+
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+
+    assert result is None
 
 
 # ==============================================================================
