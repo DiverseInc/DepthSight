@@ -112,9 +112,9 @@ class FakeArchiveServer:
         self.requested = []
 
     def add(self, url, payload):
-        assert payload[:4] == b"PK\x03\x04", (
-            "the served payload must be a real ZIP, not an error page"
-        )
+        assert (
+            payload[:4] == b"PK\x03\x04"
+        ), "the served payload must be a real ZIP, not an error page"
         self.files[url] = payload
         return self
 
@@ -335,9 +335,7 @@ async def test_rest_api_still_wins_when_it_works(archive_server, monkeypatch):
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
     rows = _make_rows(start, 24, 60)
-    monkeypatch.setattr(
-        data_loader, "_make_api_request", _working_rest_api(rows)
-    )
+    monkeypatch.setattr(data_loader, "_make_api_request", _working_rest_api(rows))
 
     result = await data_loader.download_klines(
         symbol="BTCUSDT",
@@ -370,9 +368,7 @@ async def test_archive_output_matches_rest_api_output(archive_server, monkeypatc
     )
 
     # What the REST path produces.
-    monkeypatch.setattr(
-        data_loader, "_make_api_request", _working_rest_api(rows)
-    )
+    monkeypatch.setattr(data_loader, "_make_api_request", _working_rest_api(rows))
     rest_frame = data_loader._download_klines_from_api(
         "BTCUSDT", "1h", start, end, FUTURES
     )
@@ -399,9 +395,9 @@ async def test_archive_output_matches_rest_api_output(archive_server, monkeypatc
         "volume",
         "number_of_trades",
     ]
-    assert archive_frame["number_of_trades"].dtype == rest_frame[
-        "number_of_trades"
-    ].dtype
+    assert (
+        archive_frame["number_of_trades"].dtype == rest_frame["number_of_trades"].dtype
+    )
     assert archive_frame["close"].dtype == rest_frame["close"].dtype
 
 
@@ -419,9 +415,7 @@ async def test_archive_output_matches_rest_api_output_without_header(
         _make_zip(_rows_to_csv(rows, header=False), "BTCUSDT-1h-2024-01.csv"),
     )
 
-    monkeypatch.setattr(
-        data_loader, "_make_api_request", _working_rest_api(rows)
-    )
+    monkeypatch.setattr(data_loader, "_make_api_request", _working_rest_api(rows))
     rest_frame = data_loader._download_klines_from_api(
         "BTCUSDT", "1h", start, end, FUTURES
     )
@@ -469,19 +463,19 @@ async def test_two_month_window_concatenates_in_time_order(archive_server):
 
 
 @pytest.mark.asyncio
-async def test_mid_month_window_uses_the_monthly_archive_and_is_clipped(
-    archive_server
-):
+async def test_mid_month_window_uses_the_monthly_archive_and_is_clipped(archive_server):
     """A window that ends mid-month costs ONE monthly request, clipped to it."""
     jan_rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 24 * 31, 60)
     feb_rows = _make_rows(datetime(2024, 2, 1, tzinfo=timezone.utc), 24 * 29, 60)
     mar_rows = _make_rows(datetime(2024, 3, 1, tzinfo=timezone.utc), 24 * 31, 60)
-    for year, month, rows in ((2024, 1, jan_rows), (2024, 2, feb_rows), (2024, 3, mar_rows)):
+    for year, month, rows in (
+        (2024, 1, jan_rows),
+        (2024, 2, feb_rows),
+        (2024, 3, mar_rows),
+    ):
         archive_server.add(
             _monthly_url("BTCUSDT", "1h", FUTURES, year, month),
-            _make_zip(
-                _rows_to_csv(rows), f"BTCUSDT-1h-{year:04d}-{month:02d}.csv"
-            ),
+            _make_zip(_rows_to_csv(rows), f"BTCUSDT-1h-{year:04d}-{month:02d}.csv"),
         )
 
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
@@ -504,7 +498,7 @@ async def test_mid_month_window_uses_the_monthly_archive_and_is_clipped(
 
 @pytest.mark.asyncio
 async def test_daily_archives_are_used_when_the_monthly_is_not_published(
-    archive_server
+    archive_server,
 ):
     """The monthly archive not being published yet is what selects the dailies."""
     for day in range(15, 21):
@@ -622,9 +616,7 @@ async def test_missing_future_day_within_publication_lag_still_succeeds(
         if day + timedelta(days=3) <= now:
             rows = _make_rows(day, 24, 60)
             archive_server.add(
-                _daily_url(
-                    "BTCUSDT", "1h", FUTURES, day.year, day.month, day.day
-                ),
+                _daily_url("BTCUSDT", "1h", FUTURES, day.year, day.month, day.day),
                 _make_zip(
                     _rows_to_csv(rows),
                     f"BTCUSDT-1h-{day.year:04d}-{day.month:02d}-{day.day:02d}.csv",
@@ -705,9 +697,7 @@ async def test_missing_archive_yields_empty_result_without_raising(
 
 
 @pytest.mark.asyncio
-async def test_non_451_api_error_keeps_todays_behaviour(
-    archive_server, monkeypatch
-):
+async def test_non_451_api_error_keeps_todays_behaviour(archive_server, monkeypatch):
     """Only a location block switches source; other API errors behave as before."""
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
@@ -835,9 +825,7 @@ async def test_every_required_timeframe_loads_from_the_archive(
     rows = _make_rows(start, candles_in_month, INTERVAL_MINUTES[interval])
     archive_server.add(
         _monthly_url("BTCUSDT", interval, FUTURES, 2024, 1),
-        _make_zip(
-            _rows_to_csv(rows), f"BTCUSDT-{interval}-2024-01.csv"
-        ),
+        _make_zip(_rows_to_csv(rows), f"BTCUSDT-{interval}-2024-01.csv"),
     )
 
     result = await data_loader.download_klines(
@@ -870,16 +858,12 @@ async def test_complete_month_yields_hours_in_month_rows(
 ):
     """A complete month yields exactly hours-in-month candles, not a constant."""
     start = datetime(year, month, 1, tzinfo=timezone.utc)
-    end = (
-        datetime(year, month, days_in_month, 23, 59, 59, 999999, tzinfo=timezone.utc)
-    )
+    end = datetime(year, month, days_in_month, 23, 59, 59, 999999, tzinfo=timezone.utc)
     expected = days_in_month * 24
     rows = _make_rows(start, expected, 60)
     archive_server.add(
         _monthly_url("BTCUSDT", "1h", FUTURES, year, month),
-        _make_zip(
-            _rows_to_csv(rows), f"BTCUSDT-1h-{year:04d}-{month:02d}.csv"
-        ),
+        _make_zip(_rows_to_csv(rows), f"BTCUSDT-1h-{year:04d}-{month:02d}.csv"),
     )
 
     frame = bulk_archive.fetch_klines_from_bulk_archive(
@@ -899,9 +883,7 @@ async def test_complete_month_yields_hours_in_month_rows(
 
 
 @pytest.mark.asyncio
-async def test_load_source_is_recorded_in_the_log(
-    archive_server, monkeypatch, caplog
-):
+async def test_load_source_is_recorded_in_the_log(archive_server, monkeypatch, caplog):
     """The log records WHICH source produced the candles."""
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
@@ -931,9 +913,7 @@ async def test_rest_source_is_recorded_in_the_log(archive_server, monkeypatch, c
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
     rows = _make_rows(start, 24, 60)
-    monkeypatch.setattr(
-        data_loader, "_make_api_request", _working_rest_api(rows)
-    )
+    monkeypatch.setattr(data_loader, "_make_api_request", _working_rest_api(rows))
 
     with caplog.at_level(logging.INFO, logger="bot_module.data_loader"):
         await data_loader.download_klines(
@@ -969,9 +949,7 @@ async def test_spot_archive_without_header_and_microsecond_timestamps(
         _make_zip(_rows_to_csv(micro_rows, header=False), "BTCUSDT-1h-2025-01.csv"),
     )
 
-    monkeypatch.setattr(
-        data_loader, "_make_api_request", _working_rest_api(rows)
-    )
+    monkeypatch.setattr(data_loader, "_make_api_request", _working_rest_api(rows))
     rest_frame = data_loader._download_klines_from_api(
         "BTCUSDT", "1h", start, end, SPOT
     )
@@ -1122,9 +1100,7 @@ async def test_archive_with_no_candles_yields_none_not_an_empty_frame(
 
 
 @pytest.mark.asyncio
-async def test_archive_coverage_failure_also_yields_none(
-    archive_server, monkeypatch
-):
+async def test_archive_coverage_failure_also_yields_none(archive_server, monkeypatch):
     """REST 451 + an archive that cannot cover the window => None."""
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
 
@@ -1249,6 +1225,7 @@ async def test_a_transport_failure_is_not_treated_as_a_location_block(
     so serving it in place of the fault could quietly shorten a backtest
     window.  The fault must be re-raised instead.
     """
+
     def _timeout(*args, **kwargs):
         raise requests.exceptions.ReadTimeout("read timed out")
 
@@ -1262,7 +1239,8 @@ async def test_a_transport_failure_is_not_treated_as_a_location_block(
 
     with pytest.raises(requests.exceptions.ReadTimeout):
         data_loader._download_klines_from_api_with_archive_fallback(
-            "BTCUSDT", "1h",
+            "BTCUSDT",
+            "1h",
             datetime(2024, 1, 1, tzinfo=timezone.utc),
             datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
             FUTURES,
@@ -1273,7 +1251,7 @@ async def test_a_transport_failure_is_not_treated_as_a_location_block(
 async def test_a_market_type_containing_spot_does_not_get_spot_candles(
     archive_server, monkeypatch
 ):
-    """"spot_usdtm" must resolve to the FUTURES archive, like the REST path."""
+    """ "spot_usdtm" must resolve to the FUTURES archive, like the REST path."""
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
 
     rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 24, 60)
@@ -1283,7 +1261,8 @@ async def test_a_market_type_containing_spot_does_not_get_spot_candles(
     )
 
     frame = bulk_archive.fetch_klines_from_bulk_archive(
-        "BTCUSDT", "1h",
+        "BTCUSDT",
+        "1h",
         datetime(2024, 1, 1, tzinfo=timezone.utc),
         datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
         "spot_usdtm",
@@ -1341,7 +1320,8 @@ async def test_real_futures_archive_values_are_pinned(archive_server):
 
     # The single month on its own is exactly the 744 hours of January.
     january = bulk_archive.fetch_klines_from_bulk_archive(
-        "BTCUSDT", "1h",
+        "BTCUSDT",
+        "1h",
         datetime(2024, 1, 1, tzinfo=timezone.utc),
         datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
         FUTURES,
@@ -1592,3 +1572,82 @@ async def test_the_two_paths_report_no_data_as_the_contract_says(
         market_type=FUTURES,
     )
     assert archive_result is None
+
+
+# ==============================================================================
+# R9: the calendar bucket size comes from the INTERVAL
+# ==============================================================================
+
+
+def test_a_multi_day_interval_does_not_demand_a_bar_on_every_calendar_day():
+    """A "3d" interval gets three-day buckets, not one per calendar day.
+
+    Before, every interval that was not "1M" or "1w" fell through to a
+    single calendar day, so a multi-day interval demanded a bar on EVERY
+    calendar day and reported holes that were not holes.
+    """
+    day = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end_of_january = datetime(2024, 2, 1, tzinfo=timezone.utc)
+    one_day_buckets = set()
+    three_day_buckets = set()
+    while day < end_of_january:
+        one_day_buckets.add(bulk_archive._bucket_bounds(day, "1d")[0])
+        three_day_buckets.add(bulk_archive._bucket_bounds(day, "3d")[0])
+        day += timedelta(days=1)
+
+    # 31 calendar days, but only 11 three-day buckets.
+    assert len(one_day_buckets) == 31
+    assert len(three_day_buckets) == 11
+
+    # And every three-day bucket is three days long.
+    start, end = bulk_archive._bucket_bounds(
+        datetime(2024, 1, 5, tzinfo=timezone.utc), "3d"
+    )
+    assert end - start == timedelta(days=3)
+
+
+def test_the_product_intervals_keep_the_calendar_day_bucket():
+    """No supported timeframe changes behaviour."""
+    day = datetime(2024, 1, 15, 13, 30, tzinfo=timezone.utc)
+
+    for interval in ("1m", "5m", "15m", "1h", "4h", "1d"):
+        start, end = bulk_archive._bucket_bounds(day, interval)
+        assert start == datetime(2024, 1, 15, tzinfo=timezone.utc), interval
+        assert end == datetime(2024, 1, 16, tzinfo=timezone.utc), interval
+
+    # "1w" is a Monday-anchored week and "1M" is the calendar month.
+    start, end = bulk_archive._bucket_bounds(day, "1w")
+    assert start == datetime(2024, 1, 15, tzinfo=timezone.utc)  # a Monday
+    assert end == datetime(2024, 1, 22, tzinfo=timezone.utc)
+    start, end = bulk_archive._bucket_bounds(day, "1M")
+    assert start == datetime(2024, 1, 1, tzinfo=timezone.utc)
+    assert end == datetime(2024, 2, 1, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_a_multi_day_interval_loads_without_a_false_coverage_error(
+    archive_server,
+):
+    """A "3d" interval must not be reported as full of holes.
+
+    One bar every three days IS a complete month for a three-day
+    interval.  With the calendar-day bucket it looked like thirty missing
+    days and the load failed for no reason at all.
+    """
+    rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 11, 3 * 24 * 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "3d", FUTURES, 2024, 1),
+        _make_zip(_rows_to_csv(rows), "BTCUSDT-3d-2024-01.csv"),
+    )
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, tzinfo=timezone.utc)
+
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "3d", start, end, FUTURES
+    )
+
+    assert frame is not None
+    assert len(frame) == 11
+    assert frame.index[0] == pd.Timestamp("2024-01-01T00:00:00Z")
+    assert frame.index[-1] == pd.Timestamp("2024-01-31T00:00:00Z")

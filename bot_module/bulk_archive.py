@@ -55,7 +55,7 @@ import logging
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 import backoff
 import pandas as pd
@@ -105,6 +105,11 @@ _MICROSECOND_THRESHOLD = 10**14
 # that runs up to "now" legitimately has no file yet.  A missing daily file is
 # only a genuine HOLE once it is older than this lag.
 _PUBLICATION_LAG = timedelta(days=2)
+
+# Binance's kline intervals are a COUNT and a UNIT.  The unit is CASE
+# SENSITIVE: "m" is minutes and "M" is months, and the archive keeps that
+# distinction.
+_INTERVAL_UNITS = ("s", "m", "h", "d", "w", "M")
 
 
 class BulkArchiveCoverageError(RuntimeError):
@@ -206,9 +211,7 @@ def _monthly_url(
     )
 
 
-def _daily_url(
-    symbol: str, interval: str, market_type: str, day: datetime
-) -> str:
+def _daily_url(symbol: str, interval: str, market_type: str, day: datetime) -> str:
     """URL of the DAILY archive for one calendar day.
 
     The file name shape differs from the monthly one: ``...-1h-2024-01-15.zip``
@@ -343,9 +346,7 @@ def _parse_archive_csv(text: str) -> pd.DataFrame:
 
     # "count" is Binance's name for the loader's "number_of_trades".
     frame["number_of_trades"] = pd.to_numeric(frame["count"], errors="coerce")
-    frame[RESULT_COLUMNS] = frame[RESULT_COLUMNS].apply(
-        pd.to_numeric, errors="coerce"
-    )
+    frame[RESULT_COLUMNS] = frame[RESULT_COLUMNS].apply(pd.to_numeric, errors="coerce")
     frame = frame[~frame.index.duplicated(keep="first")]
     return frame[RESULT_COLUMNS]
 
@@ -355,9 +356,7 @@ def parse_archive_candles(zip_bytes: bytes) -> pd.DataFrame:
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
         members = [name for name in archive.namelist() if name.lower().endswith(".csv")]
         if not members:
-            members = [
-                name for name in archive.namelist() if not name.endswith("/")
-            ]
+            members = [name for name in archive.namelist() if not name.endswith("/")]
         if not members:
             raise ValueError("Bulk archive contains no CSV member.")
         with archive.open(members[0]) as handle:
@@ -376,10 +375,57 @@ def _as_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _add_month(month_start: datetime) -> datetime:
-    if month_start.month == 12:
-        return month_start.replace(year=month_start.year + 1, month=1)
-    return month_start.replace(month=month_start.month + 1)
+def _add_month(month_start: datetime, count: int = 1) -> datetime:
+    if count == 0:
+        return month_start
+    total = month_start.year * 12 + (month_start.month - 1) + count
+    return month_start.replace(year=total // 12, month=total % 12 + 1)
+
+
+def _parse_interval(interval: str) -> Tuple[int, str]:
+    """Splits a kline interval into its COUNT and its UNIT.
+
+    "3d" -> (3, "d"), "1M" -> (1, "M"), "15m" -> (15, "m").  An interval
+    that does not parse falls back to (1, ""), which every caller below
+    treats as "one bar a day" -- the behaviour every supported timeframe
+    had before the bucket size was derived from the interval.
+    """
+    text = (interval or "").strip()
+    if len(text) < 2:
+        return 1, ""
+    unit = text[-1]
+    if unit not in _INTERVAL_UNITS:
+        return 1, ""
+    try:
+        count = int(text[:-1])
+    except ValueError:
+        return 1, ""
+    if count <= 0:
+        return 1, ""
+    return count, unit
+
+
+def _interval_duration(interval: str) -> timedelta:
+    """The nominal duration of ONE bar of ``interval``.
+
+    A calendar month has no fixed length, so "1M" uses the SHORTEST
+    month (28 days): that is the smallest duration a monthly bar can
+    cover, and using it keeps the leading-edge rule conservative.
+    """
+    count, unit = _parse_interval(interval)
+    if unit == "M":
+        return timedelta(days=28)
+    if unit == "w":
+        return timedelta(days=7 * count)
+    if unit == "d":
+        return timedelta(days=count)
+    if unit == "h":
+        return timedelta(hours=count)
+    if unit == "m":
+        return timedelta(minutes=count)
+    if unit == "s":
+        return timedelta(seconds=count)
+    return timedelta(days=1)
 
 
 # Binance's WEEKLY klines open on Monday and its MONTHLY ones open on the
@@ -387,15 +433,35 @@ def _add_month(month_start: datetime) -> datetime:
 # interval.  For every interval up to one day it is the calendar day the bar
 # opens in.
 def _bucket_bounds(day: datetime, interval: str) -> Tuple[datetime, datetime]:
-    """The half-open calendar bucket ``day`` belongs to for ``interval``."""
-    if interval == "1M":
+    """The half-open calendar bucket ``day`` belongs to for ``interval``.
+
+    The bucket size is DERIVED FROM THE INTERVAL, not from a list of
+    hard-coded strings: a "3d" interval gets three-day buckets, "1w" gets
+    seven-day buckets and "1M" gets the calendar month.  Before, every
+    interval that was not "1M" or "1w" fell through to a single calendar
+    day, so a multi-day interval demanded a bar on EVERY calendar day and
+    reported holes that were not holes.
+
+    Every interval the product uses today (1m, 5m, 15m, 1h, 4h, 1d) keeps
+    the calendar day it had before, so no supported timeframe changes.
+    """
+    count, unit = _parse_interval(interval)
+    if unit == "M":
         start = day.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        return start, _add_month(start)
-    if interval == "1w":
+        return start, _add_month(start, count)
+    if unit == "w":
         start = (day - timedelta(days=day.weekday())).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        return start, start + timedelta(days=7)
+        return start, start + timedelta(days=7 * count)
+    if unit == "d" and count > 1:
+        # A multi-day grid, aligned to the UNIX epoch so the buckets tile
+        # the calendar without gaps or overlaps.
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        epoch_day = (day - epoch).days
+        start_day = epoch_day - (epoch_day % count)
+        start = epoch + timedelta(days=start_day)
+        return start, start + timedelta(days=count)
     start = day.replace(hour=0, minute=0, second=0, microsecond=0)
     return start, start + timedelta(days=1)
 
@@ -560,11 +626,15 @@ def _missing_buckets_in_month(
         present.add(_bucket_bounds(stamp.to_pydatetime(), interval)[0])
 
     missing: List[Tuple[datetime, datetime]] = []
+    seen: set = set()
     day = month_start
     while day < next_month:
         if day <= window_end and (day + timedelta(days=1)) > window_start:
             bounds = _bucket_bounds(day, interval)
-            if bounds[0] not in present:
+            # A multi-day bucket is visited once per day it covers, so the
+            # same bucket is only reported once.
+            if bounds[0] not in present and bounds[0] not in seen:
+                seen.add(bounds[0])
                 missing.append(bounds)
         day += timedelta(days=1)
     return missing
@@ -714,19 +784,15 @@ def _fetch_klines_from_bulk_archive(
     holes = [
         bucket
         for bucket in missing_buckets
-        if _is_missing_bucket_a_hole(
-            bucket[0], bucket[1], first_bar, last_bar, now
-        )
+        if _is_missing_bucket_a_hole(bucket[0], bucket[1], first_bar, last_bar, now)
     ]
     if holes:
-        hole_text = ", ".join(
-            bucket[0].strftime("%Y-%m-%d") for bucket in holes[:5]
-        )
+        hole_text = ", ".join(bucket[0].strftime("%Y-%m-%d") for bucket in holes[:5])
         if len(holes) > 5:
             hole_text += f", ... (+{len(holes) - 5} more)"
         raise BulkArchiveCoverageError(
             f"Bulk archive cannot cover {symbol} ({timeframe}): "
-            f"{len(holes)} day(s) inside the traded range "
+            f"{len(holes)} bucket(s) inside the traded range "
             f"{first_bar.isoformat()}..{last_bar.isoformat()} have no published "
             f"archive ({hole_text}). Refusing to return a gapped frame."
         )
