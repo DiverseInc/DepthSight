@@ -1614,15 +1614,16 @@ class RiskManager:
         `mode` says which sandbox the funding belongs to. A PAPER funding
         charge must land in the PAPER counters: it is simulated money, and
         the LIVE daily-loss gate is what stands between the account and
-        real money.
+        real money. The paper executor -- the only caller -- therefore says
+        `mode="paper"` explicitly, because the money it charges was debited
+        from the PAPER wallet whether or not the account also has a live
+        executor.
 
-        With no explicit mode, the sandbox follows the ACCOUNT, exactly as
+        With no explicit mode the sandbox follows the ACCOUNT, exactly as
         `update_balance()` does: a keyless PAPER account has no live
         executor, so the paper executor IS its account and its funding
         belongs to the paper sandbox -- which is also the sandbox the
-        controller publishes for it. An account WITH a live executor has a
-        live wallet whose day PnL the live gate measures; its funding is
-        booked there.
+        controller publishes for it.
 
         Returns True when the funding IS in today's PnL. The caller needs
         that distinction: the close subtracts the funding that was ALREADY
