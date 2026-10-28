@@ -1297,7 +1297,7 @@ class RiskManager:
                         self._check_and_reset_paper_daily_stats()
                     else:
                         self._check_and_reset_daily_stats()
-                    self._check_risk_limits(mode=mode)
+                    self._check_risk_limits_for_mode(mode)
                     return True
                 else:
                     logger.warning(
@@ -1667,7 +1667,7 @@ class RiskManager:
         # a failure would reach the caller as "not applied", and the close
         # would then report the same funding a second time.
         try:
-            self._check_risk_limits(mode=mode)
+            self._check_risk_limits_for_mode(mode)
         except Exception as exc:
             logger.error(
                 f"[RiskManager:Funding] The limit check failed after the "
@@ -1716,7 +1716,7 @@ class RiskManager:
         logger.info(
             f"Global PnL Updated: PnL={pnl:.2f}, GlobalTodayPnL={stats.today_pnl:.2f}, GlobalConsecLosses={stats.consecutive_losses} (mode: {mode})"
         )
-        self._check_risk_limits(mode=mode)
+        self._check_risk_limits_for_mode(mode)
 
         # Persist the guard state NOW, not on the controller's next periodic
         # tick: the streak is what closes the gate, so a process that dies
@@ -2524,6 +2524,25 @@ class RiskManager:
         if stamp:
             return stamp == self._current_utc_day_str()
         return True
+
+    def _check_risk_limits_for_mode(self, mode: str) -> None:
+        """Evaluate the limits of ONE sandbox, without changing the LIVE call.
+
+        `_check_risk_limits()` gained the `mode` argument with the paper/live
+        split, but the LIVE branch is still exactly the code that was there
+        before, and it is still called with NO argument. That is deliberate:
+        `_check_risk_limits()`'s default mode IS "live", so the call is
+        behaviourally identical, and a caller that overrides the method with
+        the old zero-argument signature (a test double, a subclass) keeps
+        working. Passing `mode="live"` to such an override raises TypeError,
+        and because the limit check is wrapped in a broad `except`, that
+        failure is swallowed and reported as "the balance could not be
+        fetched" -- which is how a limit check silently stops running.
+        """
+        if self._normalize_mode(mode) == "paper":
+            self._check_risk_limits(mode="paper")
+        else:
+            self._check_risk_limits()
 
     def _check_risk_limits(self, mode: str = "live"):  # Global limits
         """Evaluate the global risk limits for ONE sandbox.
