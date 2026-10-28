@@ -2067,6 +2067,11 @@ class RiskManager:
 
         Returns None only if the gate has never refused anything since this
         RiskManager was created.
+
+        The reason is the ACCOUNT's reason, whichever sandbox that account
+        trades: a keyless PAPER account's gate is the PAPER gate (see
+        `published_account_snapshot()`), and the paths that close it publish
+        their reason here too.
         """
         return getattr(self, "_trading_disabled_reason", None)
 
