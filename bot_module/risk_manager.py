@@ -4208,24 +4208,73 @@ class RiskManager:
         if isinstance(paper_payload, dict):
             paper_day_str = str(paper_payload.get("day_str") or "")
             if paper_day_str == current_day_str:
+                raw_paper_consecutive_losses = paper_payload.get("consecutive_losses")
+                raw_paper_today_pnl = paper_payload.get("today_pnl")
                 try:
-                    paper_consecutive_losses = int(
-                        paper_payload.get("consecutive_losses") or 0
-                    )
+                    paper_consecutive_losses = int(raw_paper_consecutive_losses or 0)
                 except (TypeError, ValueError):
-                    paper_consecutive_losses = 0
+                    paper_consecutive_losses = None
                 try:
-                    paper_today_pnl = float(paper_payload.get("today_pnl") or 0.0)
+                    paper_today_pnl = float(raw_paper_today_pnl or 0.0)
                 except (TypeError, ValueError):
-                    paper_today_pnl = 0.0
+                    paper_today_pnl = None
                 try:
                     paper_start_of_day_balance = float(
                         paper_payload.get("start_of_day_balance") or 0.0
                     )
                 except (TypeError, ValueError):
                     paper_start_of_day_balance = 0.0
-                self.paper_stats.consecutive_losses = max(0, paper_consecutive_losses)
-                self.paper_stats.today_pnl = paper_today_pnl
+
+                # A PERSISTED VALUE THAT CANNOT BE READ IS NOT A ZERO.
+                #
+                # The LIVE path above already decided what a corrupt persisted
+                # value means, and it decided it in the CONSERVATIVE
+                # direction: the streak keeps the higher of the persisted and
+                # the in-memory value, and a day's PnL that cannot be read
+                # must not become "no loss today". The PAPER path must not
+                # decide it differently -- a corrupt payload that silently
+                # restores as zero DISCARDS the in-memory streak and the day's
+                # PnL, and a streak-triggered paper block is LOST with it.
+                # That is the defect class this whole change exists to kill:
+                # the guard state says one thing and the money says another.
+                #
+                # So an unreadable value leaves the in-memory value IN FORCE,
+                # and it is logged at CRITICAL: an unreadable persisted paper
+                # state is an OPERATIONAL event, not a debug line.
+                if paper_consecutive_losses is None:
+                    logger.critical(
+                        "[RiskGuard] The persisted PAPER loss streak could NOT be "
+                        "read (%r, UTC day %s). The in-memory PAPER streak (%d) "
+                        "stays IN FORCE, so a streak-triggered paper block is "
+                        "not lost.",
+                        raw_paper_consecutive_losses,
+                        current_day_str,
+                        int(self.paper_stats.consecutive_losses or 0),
+                    )
+                else:
+                    # The streak only ever grows within a UTC day (it is reset
+                    # by a win or by the daily rollover), so the higher of the
+                    # persisted and the in-memory value is the conservative --
+                    # and, after a failed restore, the more likely correct --
+                    # one. Exactly the rule the LIVE path uses.
+                    self.paper_stats.consecutive_losses = max(
+                        0,
+                        paper_consecutive_losses,
+                        int(self.paper_stats.consecutive_losses or 0),
+                    )
+
+                if paper_today_pnl is None:
+                    logger.critical(
+                        "[RiskGuard] The persisted PAPER day's PnL could NOT be "
+                        "read (%r, UTC day %s). The in-memory PAPER day's PnL "
+                        "(%.2f) stays IN FORCE: discarding it would measure "
+                        "nothing at all and open the gate wider.",
+                        raw_paper_today_pnl,
+                        current_day_str,
+                        float(self.paper_stats.today_pnl or 0.0),
+                    )
+                else:
+                    self.paper_stats.today_pnl = paper_today_pnl
                 if paper_start_of_day_balance > 1e-9:
                     self.paper_stats.start_of_day_balance = paper_start_of_day_balance
                     self.paper_stats.start_of_day_day_str = str(
