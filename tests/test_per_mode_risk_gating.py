@@ -183,9 +183,7 @@ async def _book_closed_trade(rm, symbol, pnl, mode):
     missing keyword argument.
     """
     try:
-        await rm.update_trade_result(
-            symbol, pnl, exit_reason="STOP_LOSS", mode=mode
-        )
+        await rm.update_trade_result(symbol, pnl, exit_reason="STOP_LOSS", mode=mode)
     except TypeError as exc:
         if "mode" not in str(exc):
             raise
@@ -226,12 +224,12 @@ async def test_a_paper_loss_does_not_close_the_live_gate(redis_store):
         "a PAPER loss closed the LIVE gate: real-money trading was blocked "
         "by a simulated loss"
     )
-    assert rm.stats.today_pnl == pytest.approx(0.0), (
-        "the PAPER loss was added to the LIVE day's PnL"
-    )
-    assert rm.stats.consecutive_losses == 0, (
-        "the PAPER loss was added to the LIVE loss streak"
-    )
+    assert rm.stats.today_pnl == pytest.approx(
+        0.0
+    ), "the PAPER loss was added to the LIVE day's PnL"
+    assert (
+        rm.stats.consecutive_losses == 0
+    ), "the PAPER loss was added to the LIVE loss streak"
 
     # ...and the loss was booked into the PAPER sandbox, where it belongs.
     assert rm.paper_stats.today_pnl == pytest.approx(A_LOSS_THAT_BREACHES_EVERY_LIMIT)
@@ -256,9 +254,9 @@ async def test_the_live_gate_still_refuses_a_live_symbol_after_a_paper_loss(
     await _book_closed_trade(
         rm, "BTCUSDT", A_LOSS_THAT_BREACHES_EVERY_LIMIT, mode="live"
     )
-    assert rm._is_trading_allowed is False, (
-        "a LIVE loss that breaches the live limits must close the LIVE gate"
-    )
+    assert (
+        rm._is_trading_allowed is False
+    ), "a LIVE loss that breaches the live limits must close the LIVE gate"
     assert rm.stats.today_pnl == pytest.approx(A_LOSS_THAT_BREACHES_EVERY_LIMIT)
 
 
@@ -285,9 +283,9 @@ async def test_a_live_loss_still_closes_the_live_gate(redis_store):
         "has been weakened"
     )
     assert rm.stats.consecutive_losses == 1
-    assert rm.paper_stats.today_pnl == pytest.approx(0.0), (
-        "a LIVE loss was booked into the PAPER sandbox"
-    )
+    assert rm.paper_stats.today_pnl == pytest.approx(
+        0.0
+    ), "a LIVE loss was booked into the PAPER sandbox"
 
 
 async def test_the_live_consecutive_loss_still_closes_the_live_gate(redis_store):
@@ -298,9 +296,9 @@ async def test_the_live_consecutive_loss_still_closes_the_live_gate(redis_store)
         await _book_closed_trade(rm, "BTCUSDT", -1.0, mode="live")
 
     assert rm.stats.consecutive_losses == MAX_CONSECUTIVE_LOSSES
-    assert rm._is_trading_allowed is False, (
-        "the live consecutive-loss limit no longer closes the live gate"
-    )
+    assert (
+        rm._is_trading_allowed is False
+    ), "the live consecutive-loss limit no longer closes the live gate"
 
 
 async def test_a_live_loss_does_not_close_the_paper_gate(redis_store):
@@ -330,12 +328,12 @@ async def test_a_paper_loss_closes_the_paper_gate(redis_store):
         rm, "BTCUSDT", A_LOSS_THAT_BREACHES_EVERY_LIMIT, mode="paper"
     )
 
-    assert rm._paper_is_trading_allowed is False, (
-        "the paper sandbox's own daily-loss limit is no longer enforced"
-    )
-    assert rm._is_trading_allowed is True, (
-        "the paper gate's closure must not have closed the LIVE gate"
-    )
+    assert (
+        rm._paper_is_trading_allowed is False
+    ), "the paper sandbox's own daily-loss limit is no longer enforced"
+    assert (
+        rm._is_trading_allowed is True
+    ), "the paper gate's closure must not have closed the LIVE gate"
 
 
 # ---------------------------------------------------------------------------
@@ -403,8 +401,7 @@ async def test_a_keyless_paper_accounts_funding_lands_in_the_paper_sandbox(
     assert applied is True
     assert rm.paper_stats.today_pnl == pytest.approx(-25.0)
     assert rm.stats.today_pnl == pytest.approx(0.0), (
-        "the paper wallet's funding charge was booked against the LIVE "
-        "day's PnL"
+        "the paper wallet's funding charge was booked against the LIVE " "day's PnL"
     )
 
 
@@ -478,9 +475,9 @@ async def test_the_emergency_stop_closes_both_gates(redis_store):
 
     rm.trigger_emergency_stop("operator pulled the plug")
 
-    assert rm._is_trading_allowed is False, (
-        "the operator's kill switch did not close the LIVE gate"
-    )
+    assert (
+        rm._is_trading_allowed is False
+    ), "the operator's kill switch did not close the LIVE gate"
     assert rm._paper_is_trading_allowed is False, (
         "the operator's kill switch did not close the PAPER gate: the "
         "emergency stop is an ACCOUNT-level control, not a per-sandbox limit"
