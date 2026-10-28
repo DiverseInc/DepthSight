@@ -846,6 +846,59 @@ class TestTheLiveTradingAndPurchaseClaims:
             "this test"
         )
 
+    def test_the_pricing_line_does_not_promise_an_engine_a_tier_cannot_use(
+        self, page
+    ):
+        """The prose line above the cards is read by every tier at once.
+
+        "All plans include the backtester" tells a Free reader that every
+        engine is theirs, while Free's run_kline_backtest_per_day is 0 and
+        every Precision run is answered with a 429. The line has to name the
+        engine the way the cards do.
+        """
+        start = page.index('<section id="pricing"')
+        end = page.index('<section id="waitlist"')
+        section = page[start:end].lower()
+
+        assert "the backtester" not in section, (
+            "the pricing line promises 'the backtester' to every plan; a "
+            "Free reader would expect every engine, and the Precision "
+            "engine is not available to them"
+        )
+        assert "the fast backtester" in section, (
+            "the pricing line must name the engine every plan gets"
+        )
+
+    def test_the_pricing_line_does_not_promise_a_pro_tool_to_every_plan(
+        self, page, plans_by_name, raw_plans
+    ):
+        """The Discovery Hub's tools are Professional-only.
+
+        run_optimization_per_month, run_genetic_search_per_month and
+        train_model_per_month are 0 for Free and Standard, so a line that
+        says every plan includes them is false for two of the three tiers.
+        """
+        start = page.index('<section id="pricing"')
+        end = page.index('<section id="waitlist"')
+        section = page[start:end].lower()
+
+        for label, key in (
+            ("optimization runs", "run_optimization_per_month"),
+            ("genetic searches", "run_genetic_search_per_month"),
+            ("model trainings", "train_model_per_month"),
+        ):
+            pro_only = all(
+                (raw_plans[p["key"]].get("quotas", {}) or {}).get(key, 0) == 0
+                for p in plans_by_name.values()
+                if p["key"] != "pro"
+            )
+            if not pro_only:
+                continue
+            assert f"every plan includes {label}" not in section, (
+                f"the pricing line offers {label!r} to every plan, but only "
+                "Professional gets them"
+            )
+
     def test_an_indexed_live_trading_claim_names_the_tiers_it_is_about(
         self, page
     ):

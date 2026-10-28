@@ -18,6 +18,7 @@ og:image tag pointed at an HTML page rather than a PNG, and the affiliate
 click counter in public.py was never reached.
 """
 
+import os
 import re
 from pathlib import Path
 
@@ -25,6 +26,12 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CADDY_CONFIG = REPO_ROOT / "caddy.config"
+
+# Directories under frontend/ that are NOT part of the repository: they are
+# gitignored (.gitignore:20-22), regenerated or downloaded, and hold third
+# party code -- frontend/node_modules alone is ~39k files. Walking them made
+# this test take minutes and asserted nothing about OUR source.
+NOT_REPOSITORY_DIRS = frozenset({"node_modules", "dist", "__pycache__"})
 
 
 @pytest.fixture(scope="module")
@@ -137,9 +144,10 @@ class TestTheServedDirectoryHoldsNothingElse:
         can only ever return that one file;
       * the @ogimage handler matches three exact filenames.
 
-    The demo credentials used to live in frontend/demo-build-flag.ts; they
-    now live in tools/demo-build-flag.ts, outside the mounted directory
-    entirely.
+    The demo credentials live in frontend/demo-build-flag.ts, and they have
+    to: docker-compose.yml builds the frontend image with `context:
+    ./frontend`, so a module outside that directory is not in the build. What
+    the assertions below guarantee is that no handler can serve them.
     """
 
     def test_the_welcome_handler_can_only_serve_welcome_html(self, config):
@@ -162,27 +170,49 @@ class TestTheServedDirectoryHoldsNothingElse:
             )
 
     def test_the_demo_credentials_are_not_in_the_served_directory(self):
-        """The plaintext demo login must not sit in the shipped tree.
+        """The plaintext demo login must sit in ONE known place, nowhere else.
 
         frontend/ is bind-mounted read-only at /srv/frontend for Caddy, so
         anything with the demo login in it is one handler change away from
-        being published. Test files are exempt: they are never bundled and
-        never served -- frontend/src/__tests__/loginDemoCredentials.test.tsx
-        asserts the opposite and has to name the strings to do it.
+        being published.
+
+        It cannot live outside frontend/, though: docker-compose.yml builds
+        the frontend image with `context: ./frontend`, so a module outside
+        that directory is not in the build and the image build fails on an
+        import it cannot resolve. So the credentials stay in
+        frontend/demo-build-flag.ts -- a file no handler can serve, because
+        the @welcome handler rewrites every request to /welcome.html and
+        @ogimage matches three exact filenames (both pinned above).
+
+        This test therefore pins that the flag file is the ONLY place in the
+        served tree that holds them.
         """
+        flag_file = REPO_ROOT / "frontend" / "demo-build-flag.ts"
+        assert flag_file.is_file(), (
+            "frontend/demo-build-flag.ts must exist: the frontend image is "
+            "built with `context: ./frontend`, so the credentials have to be "
+            "inside that directory to reach the build"
+        )
+
         served = REPO_ROOT / "frontend"
-        for path in served.rglob("*"):
-            if not path.is_file():
-                continue
-            if "__tests__" in path.parts:
-                continue
-            if path.suffix.lower() not in {".ts", ".tsx", ".js", ".json", ".html", ".txt", ".md"}:
-                continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            assert "alex_trader" not in text, (
-                f"{path.relative_to(REPO_ROOT)} holds the demo username and "
-                "sits in the directory Caddy serves from"
-            )
+        for root, dirnames, filenames in os.walk(served):
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if name not in NOT_REPOSITORY_DIRS and name != "__tests__"
+            ]
+            for filename in filenames:
+                path = Path(root) / filename
+                if path == flag_file:
+                    continue
+                if path.suffix.lower() not in {".ts", ".tsx", ".js", ".json", ".html", ".txt", ".md"}:
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")
+                assert "alex_trader" not in text, (
+                    f"{path.relative_to(REPO_ROOT)} holds the demo username and "
+                    "sits in the directory Caddy serves from; the only file that "
+                    "may hold it is frontend/demo-build-flag.ts"
+                )
 
 
 class TestTheCatchAllStillRunsLast:
