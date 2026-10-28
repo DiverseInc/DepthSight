@@ -389,10 +389,17 @@ async def _finalize(controller, reason: str, exit_price: float = 0.0):
 
 def _pin_day(rm):
     """Pin the day so the UTC rollover cannot fire and be mistaken for the
-    effect under test."""
-    rm.stats.last_known_day_str = _utc_day_str()
-    rm.stats.current_balance = 1000.0
-    rm.stats.start_of_day_balance = 1000.0
+    effect under test.
+
+    BOTH sandboxes are pinned. The trades in this file are PAPER trades, so
+    they are booked into the PAPER sandbox (`rm.paper_stats`) -- pinning only
+    the live one would let the PAPER day rollover fire and reset the paper
+    day's PnL to zero in the middle of the test.
+    """
+    for stats in (rm.stats, rm.paper_stats):
+        stats.last_known_day_str = _utc_day_str()
+        stats.current_balance = 1000.0
+        stats.start_of_day_balance = 1000.0
 
 
 # --- 1. THE ROUND TRIP: the gate's numerator is the wallet's day PnL ---------
@@ -461,18 +468,29 @@ async def test_the_risk_manager_today_pnl_is_the_wallet_and_the_db_after_an_entr
         f"{wallet_total:.8f}"
     )
 
-    assert rm.stats.today_pnl == pytest.approx(wallet_total), (
-        f"the risk manager was told {rm.stats.today_pnl:.8f} but the wallet "
-        f"moved {wallet_total:.8f}. The gap is "
-        f"{wallet_total - rm.stats.today_pnl:.8f}, which is the entry "
+    assert rm.paper_stats.today_pnl == pytest.approx(wallet_total), (
+        f"the risk manager was told {rm.paper_stats.today_pnl:.8f} but the "
+        f"wallet moved {wallet_total:.8f}. The gap is "
+        f"{wallet_total - rm.paper_stats.today_pnl:.8f}, which is the entry "
         f"commission ({entry_commission:.8f}) that was charged to the wallet "
         "and never booked. A daily-loss gate with a short numerator reads LOW "
         "and under-trips."
     )
 
-    assert rm.stats.today_pnl == pytest.approx(db_total), (
+    assert rm.paper_stats.today_pnl == pytest.approx(db_total), (
         "the risk manager must be told the same number the API reports to the "
         "user"
+    )
+
+    # ...and the LIVE sandbox must not have heard a word about it. This trade
+    # was on SIMULATED money: booking it against the live day's PnL is the
+    # defect this branch exists to fix (a paper loss closing the live gate).
+    assert rm.stats.today_pnl == pytest.approx(0.0), (
+        f"the PAPER loss was added to the LIVE day's PnL "
+        f"({rm.stats.today_pnl:.8f})"
+    )
+    assert rm.stats.consecutive_losses == 0, (
+        "the PAPER loss was added to the LIVE loss streak"
     )
 
 
@@ -680,16 +698,20 @@ async def test_the_risk_manager_fails_closed_when_there_is_no_wallet(monkeypatch
         "the risk manager's balance read created a paper wallet -- a read must "
         "never create money"
     )
-    assert rm.stats.start_of_day_balance == 0.0, (
+    assert rm.paper_stats.start_of_day_balance == 0.0, (
         "with no wallet there is no balance, so there is no opening balance: "
-        f"got ${rm.stats.start_of_day_balance:.2f}. A $10,000 base is a "
+        f"got ${rm.paper_stats.start_of_day_balance:.2f}. A $10,000 base is a "
         "13.2x disarm of the daily-loss gate."
     )
-    assert rm.stats.start_of_day_day_str != _utc_day_str(), (
+    assert rm.paper_stats.start_of_day_day_str != _utc_day_str(), (
         "an opening balance that does not exist must not be stamped with "
         "today's day, or it would read as known"
     )
-    assert rm._is_trading_allowed is False, (
+    assert rm.stats.start_of_day_balance == 0.0, (
+        "the LIVE sandbox must not have adopted an opening balance either: "
+        f"got ${rm.stats.start_of_day_balance:.2f}"
+    )
+    assert rm._paper_is_trading_allowed is False, (
         "an account with no wallet has no money to lose and no known opening "
         "balance, so the gate must fail closed"
     )
@@ -939,25 +961,39 @@ async def test_the_funding_charge_reaches_the_risk_manager_exactly_once(money):
         "movement for that position, or the close reports a number the "
         "account never earned."
     )
-    assert rm.stats.today_pnl == pytest.approx(charged), (
-        f"the risk manager was told {rm.stats.today_pnl:.8f} but the wallet "
-        f"moved {charged:.8f} of funding. The gate's numerator is the "
+    assert rm.paper_stats.today_pnl == pytest.approx(charged), (
+        f"the risk manager was told {rm.paper_stats.today_pnl:.8f} but the "
+        f"wallet moved {charged:.8f} of funding. The gate's numerator is the "
         "wallet's day PnL, so a funding charge that never reaches it is "
         "invisible to the daily-loss guard."
     )
-    assert rm.stats.consecutive_losses == 0, (
+    assert rm.paper_stats.consecutive_losses == 0, (
         "a funding payment is a CARRY COST, not a losing trade: the "
         "consecutive-loss streak counts losing CLOSES, and counting funding "
         "against it could falsely trip the max-consecutive-losses guard"
+    )
+    # The funding was debited from the PAPER wallet, so it is simulated money
+    # and it must not have reached the LIVE sandbox's counters.
+    assert rm.stats.today_pnl == pytest.approx(0.0), (
+        f"the PAPER wallet's funding charge was booked against the LIVE day's "
+        f"PnL ({rm.stats.today_pnl:.8f})"
+    )
+    assert rm.stats.consecutive_losses == 0, (
+        "the PAPER funding was added to the LIVE loss streak"
     )
 
     # The close must not count the funding a second time.
     await _finalize(controller, "STOP_LOSS")
 
-    assert rm.stats.today_pnl == pytest.approx(_wallet_total(money)), (
-        f"the risk manager was told {rm.stats.today_pnl:.8f} but the wallet "
-        f"moved {_wallet_total(money):.8f} in total. The funding was already "
-        "reported when it was charged, so the close must not report it again."
+    assert rm.paper_stats.today_pnl == pytest.approx(_wallet_total(money)), (
+        f"the risk manager was told {rm.paper_stats.today_pnl:.8f} but the "
+        f"wallet moved {_wallet_total(money):.8f} in total. The funding was "
+        "already reported when it was charged, so the close must not report "
+        "it again."
+    )
+    assert rm.stats.today_pnl == pytest.approx(0.0), (
+        f"the PAPER close was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl:.8f})"
     )
 
 
@@ -985,7 +1021,10 @@ async def test_a_funding_charge_the_risk_manager_refused_is_reported_by_the_clos
         float(f.get("commission") or 0.0) for f in entry_result.get("fills", [])
     )
 
-    async def _refuse(symbol, funding_pnl):
+    async def _refuse(symbol, funding_pnl, mode=None):
+        # The signature matches `RiskManager.apply_funding_pnl()` so the
+        # refusal is DELIBERATE: the risk manager is unavailable, not
+        # confused by an unexpected keyword.
         raise RuntimeError("the risk manager is unavailable")
 
     monkeypatch.setattr(rm, "apply_funding_pnl", _refuse)
@@ -1014,9 +1053,13 @@ async def test_a_funding_charge_the_risk_manager_refused_is_reported_by_the_clos
         "counted as reported: the close has to report it, and subtracting it "
         "there would take it out of the risk manager's PnL entirely"
     )
-    assert rm.stats.today_pnl == pytest.approx(0.0), (
+    assert rm.paper_stats.today_pnl == pytest.approx(0.0), (
         "the risk manager refused the funding, so its day PnL must not "
-        f"contain it, got {rm.stats.today_pnl:.8f}"
+        f"contain it, got {rm.paper_stats.today_pnl:.8f}"
+    )
+    assert rm.stats.today_pnl == pytest.approx(0.0), (
+        f"the LIVE day's PnL must not contain the refused funding either, "
+        f"got {rm.stats.today_pnl:.8f}"
     )
     assert float(position.pnl or 0.0) == pytest.approx(
         -entry_commission + charged
@@ -1029,10 +1072,14 @@ async def test_a_funding_charge_the_risk_manager_refused_is_reported_by_the_clos
     # funding: the wallet moved it, so the risk manager hears about it once.
     await _finalize(controller, "STOP_LOSS")
 
-    assert rm.stats.today_pnl == pytest.approx(_wallet_total(money)), (
-        f"the risk manager was told {rm.stats.today_pnl:.8f} but the wallet "
-        f"moved {_wallet_total(money):.8f} in total. The funding the risk "
-        "manager refused must be reported by the close, exactly once."
+    assert rm.paper_stats.today_pnl == pytest.approx(_wallet_total(money)), (
+        f"the risk manager was told {rm.paper_stats.today_pnl:.8f} but the "
+        f"wallet moved {_wallet_total(money):.8f} in total. The funding the "
+        "risk manager refused must be reported by the close, exactly once."
+    )
+    assert rm.stats.today_pnl == pytest.approx(0.0), (
+        f"the PAPER close was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl:.8f})"
     )
 
 
@@ -1058,7 +1105,10 @@ async def test_the_recompute_close_carries_a_funding_the_risk_manager_refused(
         float(f.get("commission") or 0.0) for f in entry_result.get("fills", [])
     )
 
-    async def _refuse(symbol, funding_pnl):
+    async def _refuse(symbol, funding_pnl, mode=None):
+        # The signature matches `RiskManager.apply_funding_pnl()` so the
+        # refusal is DELIBERATE: the risk manager is unavailable, not
+        # confused by an unexpected keyword.
         raise RuntimeError("the risk manager is unavailable")
 
     monkeypatch.setattr(rm, "apply_funding_pnl", _refuse)
@@ -1083,11 +1133,15 @@ async def test_the_recompute_close_carries_a_funding_the_risk_manager_refused(
     # The rebuilt net result: (exit - entry) * qty, minus the commission that
     # was actually paid, PLUS the funding the position paid.
     expected = (EXIT_PRICE - ENTRY_PRICE) * QTY - entry_commission + charged
-    assert rm.stats.today_pnl == pytest.approx(expected), (
-        f"the risk manager was told {rm.stats.today_pnl:.8f} but the close's "
-        f"net result is {expected:.8f}: "
+    assert rm.paper_stats.today_pnl == pytest.approx(expected), (
+        f"the risk manager was told {rm.paper_stats.today_pnl:.8f} but the "
+        f"close's net result is {expected:.8f}: "
         f"({EXIT_PRICE} - {ENTRY_PRICE}) * {QTY} - {entry_commission:.8f} "
         f"(commission) + {charged:.8f} (funding). The funding was erased by "
         "the rebuild, so the loss the wallet paid is invisible to the "
         "daily-loss gate."
+    )
+    assert rm.stats.today_pnl == pytest.approx(0.0), (
+        f"the PAPER close was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl:.8f})"
     )
