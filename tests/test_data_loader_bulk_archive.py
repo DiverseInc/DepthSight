@@ -1911,3 +1911,60 @@ async def test_a_multi_day_interval_loads_without_a_false_coverage_error(
     assert len(frame) == 11
     assert frame.index[0] == pd.Timestamp("2024-01-01T00:00:00Z")
     assert frame.index[-1] == pd.Timestamp("2024-01-31T00:00:00Z")
+
+
+# ==============================================================================
+# R10: a geo-block is not retried
+# ==============================================================================
+
+
+class _StatusResponse:
+    """A response that answers with a given HTTP status."""
+
+    def __init__(self, status_code):
+        self.status_code = status_code
+        self.reason = "stubbed"
+
+    def raise_for_status(self):
+        raise requests.exceptions.HTTPError(
+            f"{self.status_code} Client Error", response=self
+        )
+
+
+class _CountingSession:
+    """Counts the requests a session makes."""
+
+    def __init__(self, status_code):
+        self.status_code = status_code
+        self.calls = 0
+
+    def get(self, url, params=None, timeout=None):
+        self.calls += 1
+        return _StatusResponse(self.status_code)
+
+
+def test_a_451_is_not_retried_but_another_status_still_is(monkeypatch):
+    """A geo-block is deterministic: retrying it cannot succeed.
+
+    MEASURED before this change: a blocked load made FIVE requests to
+    the same blocked host (5.75s measured, 15s worst case with the
+    jitter) before the bulk-archive fallback was even tried.  HTTP 451 is
+    Binance's deterministic answer to a request from a blocked address, so
+    those four extra attempts were wasted time.  EVERY other status keeps
+    the retry behaviour it has always had.
+    """
+    blocked = _CountingSession(451)
+    monkeypatch.setattr(data_loader, "http_session", blocked)
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        _REAL_MAKE_API_REQUEST("klines", {"symbol": "BTCUSDT"}, market_type=FUTURES)
+
+    assert blocked.calls == 1, "a 451 must not be retried"
+
+    failing = _CountingSession(500)
+    monkeypatch.setattr(data_loader, "http_session", failing)
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        _REAL_MAKE_API_REQUEST("klines", {"symbol": "BTCUSDT"}, market_type=FUTURES)
+
+    assert failing.calls == 5, "every other status keeps its five tries"

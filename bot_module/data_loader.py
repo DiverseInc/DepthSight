@@ -104,17 +104,58 @@ def get_local_path(
     )
 
 
+def _is_binance_location_block(error: Exception) -> bool:
+    """True when the REST endpoint refused us because of where we are.
+
+    Binance answers HTTP 451 ("Service unavailable from a restricted
+    location according to 'b. Eligibility' ...") from geo/IP-blocked
+    networks.  That is the signature this repository already records for the
+    production servers: ``market_data_service.py:155-157`` ("Binance is
+    geo-blocked from many Elestio server IPs (HTTP 451)") and
+    ``bot_runner.py:612`` ("a fresh Binance consumer that 451s on REST
+    history").
+
+    ONLY HTTP 451 counts.  Every other failure -- a 4xx/5xx answer, a bad
+    request, a bug, a DNS/TLS failure, a timeout, an exhausted retry -- keeps
+    the behaviour it has today and is re-raised unchanged.  A genuine fault
+    must never be masked by silently serving archive data instead: the
+    archive holds only closed bars and its trailing edge is short by the
+    publication lag, so serving it in place of a fault could quietly shorten
+    a backtest window and change the number it reports.
+    """
+    if isinstance(error, requests.exceptions.HTTPError):
+        response = getattr(error, "response", None)
+        return response is not None and response.status_code == 451
+    return False
+
+
 @backoff.on_exception(
     backoff.expo,
     requests.exceptions.RequestException,
     max_tries=5,
     max_time=60,
     logger=logger,
+    giveup=_is_binance_location_block,
 )
 def _make_api_request(
     endpoint: str, params: Optional[Dict[str, Any]] = None, market_type: str = "spot"
 ) -> List[Any]:
-    """Performs a request to the Binance API with consideration of the environment (mainnet/testnet)."""
+    """Performs a request to the Binance API with consideration of the environment (mainnet/testnet).
+
+    A GEO-BLOCK IS NOT RETRIED.  ``giveup=_is_binance_location_block`` stops
+    the retry loop the moment the answer is HTTP 451, and nothing else:
+    every other failure keeps the five tries and the 60 second budget it
+    has always had.
+
+    The reason is measured, not assumed: before this change a blocked load
+    made FIVE requests to the same blocked host (the retry loop measured
+    5.75s on this machine, with a jittered worst case of 15s and a 60s
+    ceiling) before the bulk-archive fallback was even tried.  HTTP 451 is
+    Binance's deterministic answer to a request from a blocked address --
+    the same request from the same address gets the same answer a second
+    later -- so those four extra attempts could not succeed and only
+    delayed the fallback that does work.
+    """
     if config.ACTIVE_TRADING_ENVIRONMENT == "testnet":
         base_url = (
             config.BINANCE_SPOT_TESTNET_API_URL_FOR_LOADER
@@ -177,31 +218,6 @@ def _download_klines_from_api(
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
     df = df[~df.index.duplicated(keep="first")]
     return df[["open", "high", "low", "close", "volume", "number_of_trades"]]
-
-
-def _is_binance_location_block(error: Exception) -> bool:
-    """True when the REST endpoint refused us because of where we are.
-
-    Binance answers HTTP 451 ("Service unavailable from a restricted
-    location according to 'b. Eligibility' ...") from geo/IP-blocked
-    networks.  That is the signature this repository already records for the
-    production servers: ``market_data_service.py:155-157`` ("Binance is
-    geo-blocked from many Elestio server IPs (HTTP 451)") and
-    ``bot_runner.py:612`` ("a fresh Binance consumer that 451s on REST
-    history").
-
-    ONLY HTTP 451 counts.  Every other failure -- a 4xx/5xx answer, a bad
-    request, a bug, a DNS/TLS failure, a timeout, an exhausted retry -- keeps
-    the behaviour it has today and is re-raised unchanged.  A genuine fault
-    must never be masked by silently serving archive data instead: the
-    archive holds only closed bars and its trailing edge is short by the
-    publication lag, so serving it in place of a fault could quietly shorten
-    a backtest window and change the number it reports.
-    """
-    if isinstance(error, requests.exceptions.HTTPError):
-        response = getattr(error, "response", None)
-        return response is not None and response.status_code == 451
-    return False
 
 
 def _download_klines_from_api_with_archive_fallback(
