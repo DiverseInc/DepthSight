@@ -232,6 +232,26 @@ BINANCE_FUTURES_COINM_DATA_API_URL_FOR_LOADER = "https://dapi.binance.com/dapi/v
 # unchanged.
 BINANCE_BULK_ARCHIVE_DATA_URL = "https://data.binance.vision/data"
 
+# The TOTAL time ONE bulk-archive fallback load may spend, across every
+# request it makes: the monthly archives plus the daily files of the
+# trailing month.  Without a cap, an unreachable archive host costs one
+# request timeout per file and the trailing month alone can need 31 of them
+# -- MINUTES of stall before the loader gives up.  The cap makes the
+# failure predictable and bounded: the fallback gives up, the load fails
+# loudly, and nothing partial is ever served.
+#
+# 120s covers a legitimate long window (a year of months plus a trailing
+# month is ~43 requests) even on a slow link, while bounding an unreachable
+# host to about two minutes instead of half an hour.
+BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS = 120.0
+
+# The cap on ONE archive request.  It is the same value the REST path uses
+# for its own requests (data_loader.py), and it is further bounded by the
+# total budget above: a request never gets more time than the load has
+# left, and a request that cannot finish inside the remaining budget is
+# not started at all.
+BULK_ARCHIVE_REQUEST_TIMEOUT_SECONDS = 30.0
+
 # These are already defined above, but we ensure they exist for clarity in DataLoader context
 # BINANCE_SPOT_TESTNET_API_URL_FOR_LOADER = "https://testnet.binance.vision/api/v3"
 # BINANCE_FUTURES_TESTNET_API_URL_FOR_LOADER = "https://testnet.binancefuture.com/fapi/v1"

@@ -13,6 +13,7 @@ files containing a real CSV, and the HTTP fetch is stubbed.
 
 import io
 import logging
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -243,6 +244,37 @@ def _truncate_monthly_archive(payload, drop_days):
     assert dropped, "the fixture did not contain the day(s) that were dropped"
     body = ([header] if header else []) + kept
     return _make_zip("\n".join(body) + "\n", Path(name).name), dropped
+
+
+class _FakeArchiveResponse:
+    """A 200 answer carrying a real archive payload."""
+
+    def __init__(self, content):
+        self.status_code = 200
+        self.content = content
+
+    def raise_for_status(self):
+        return None
+
+
+class _NeverAnswersSession:
+    """A transport that never answers, the way an unreachable host behaves.
+
+    ``served`` holds the URLs that answer immediately with a real archive;
+    every other URL runs into the request's timeout, exactly like a host
+    that has gone away.
+    """
+
+    def __init__(self, served=None):
+        self.served = served or {}
+        self.requests = []
+
+    def get(self, url, params=None, timeout=None):
+        self.requests.append(url)
+        if url in self.served:
+            return _FakeArchiveResponse(self.served[url])
+        time.sleep(timeout)
+        raise requests.exceptions.ReadTimeout("the archive host never answered")
 
 
 class _FrozenDatetime(datetime):
@@ -1438,6 +1470,79 @@ async def test_a_monthly_archive_that_stops_early_is_not_a_hole(
     assert frame is not None
     assert len(frame) == 24 * 10
     assert frame.index[-1] == pd.Timestamp("2024-01-10T23:00:00Z")
+
+
+# ==============================================================================
+# R6: the fallback fails FAST, and never serves what it collected on the way
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_an_unreachable_archive_fails_fast_instead_of_stalling(monkeypatch):
+    """One unreachable host must not cost the loader MINUTES.
+
+    A single archive request can burn a whole request timeout, and the
+    trailing month of a window can need 31 daily files, so without a
+    deadline the fallback stalls for minutes before it gives up.  With the
+    deadline the whole load gives up inside its budget -- and it gives up
+    LOUDLY: None, not a half-filled frame.
+    """
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+    monkeypatch.setattr(config, "BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS", 0.5)
+
+    session = _NeverAnswersSession()
+    monkeypatch.setattr(bulk_archive, "http_session", session)
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    began = time.monotonic()
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+    elapsed = time.monotonic() - began
+
+    # It failed LOUDLY: None, not a frame with a hole in it.
+    assert result is None
+    # And it failed FAST: the whole budget, not one timeout per file.
+    assert elapsed < 10, f"the fallback took {elapsed:.1f}s"
+    assert len(session.requests) <= 3, session.requests
+
+
+@pytest.mark.asyncio
+async def test_the_deadline_never_serves_the_candles_it_collected_first(monkeypatch):
+    """January loaded and February hung: the load must FAIL, not serve January.
+
+    Running out of time is a failure, not a reason to hand back the part
+    that happened to arrive: a half-covered window is a wrong number.
+    """
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+    monkeypatch.setattr(config, "BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS", 1.0)
+
+    january_url = _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1)
+    session = _NeverAnswersSession(
+        served={january_url: _fixture("BTCUSDT-1h-2024-01-futures-um.zip")}
+    )
+    monkeypatch.setattr(bulk_archive, "http_session", session)
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 2, 29, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+
+    # January's candles WERE collected, and none of them are served.
+    assert january_url in session.requests
+    assert result is None
 
 
 # ==============================================================================

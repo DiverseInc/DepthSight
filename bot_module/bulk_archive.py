@@ -49,8 +49,10 @@ The 12 archive columns are POSITIONALLY identical to the loader's
 so the mapping is strictly by position.
 """
 
+import contextvars
 import io
 import logging
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -114,6 +116,31 @@ class BulkArchiveCoverageError(RuntimeError):
     would look valid while trading a hole.  A wrong number is worse than no
     number, so the load fails instead.
     """
+
+
+class BulkArchiveDeadlineExceeded(RuntimeError):
+    """The fallback ran out of time before it could cover the window.
+
+    One archive request can burn a whole request timeout, and the trailing
+    month of a window can need 31 daily files, so an unreachable archive
+    host would otherwise stall the loader for MINUTES.  The fallback
+    therefore carries a DEADLINE for the whole load (see ``_DEADLINE``) and
+    this is raised when it is spent.  The load fails loudly: it never
+    serves the candles it happened to collect before the deadline.
+    """
+
+
+# The deadline of the CURRENT fallback load, as an absolute
+# ``time.monotonic()`` value.  ``None`` means "no deadline", and the request
+# is then bounded only by the per-request timeout.
+#
+# It lives in a ContextVar rather than in a module global because the loader
+# runs these loads in a THREAD POOL: two loads must never share one
+# deadline.  A ContextVar is per thread, and the value is reset when the
+# load ends, so a pooled thread never carries a deadline into the next load.
+_DEADLINE: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "bulk_archive_deadline", default=None
+)
 
 # Binance's REST API accepts a couple of aliases the archive folders do not
 # use.  The interval is never lower-cased: "1m" is one minute and "1M" is one
@@ -202,6 +229,28 @@ def _daily_url(
 # ==============================================================================
 
 
+def _request_timeout() -> float:
+    """The timeout for the NEXT archive request, bounded by the deadline.
+
+    Raises :class:`BulkArchiveDeadlineExceeded` when the load has no time
+    left, so a request is never started that cannot finish inside the
+    remaining budget.
+    """
+    deadline = _DEADLINE.get()
+    if deadline is None:
+        return float(config.BULK_ARCHIVE_REQUEST_TIMEOUT_SECONDS)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BulkArchiveDeadlineExceeded(
+            "The bulk archive fallback ran out of time after "
+            f"{float(config.BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS):.0f}s."
+        )
+    return max(
+        0.1,
+        min(float(config.BULK_ARCHIVE_REQUEST_TIMEOUT_SECONDS), remaining),
+    )
+
+
 @backoff.on_exception(
     backoff.expo,
     requests.exceptions.RequestException,
@@ -216,8 +265,13 @@ def fetch_archive_bytes(url: str) -> Optional[bytes]:
     which is the normal case for a symbol/period that does not exist.  Any
     other failure raises and is retried by ``backoff`` exactly like the REST
     loader does.
+
+    The request's timeout is bounded by the DEADLINE of the running load
+    (see ``_DEADLINE``): a request that cannot finish inside the remaining
+    budget is not started, and a load that is out of time raises
+    :class:`BulkArchiveDeadlineExceeded`, which ``backoff`` does not retry.
     """
-    response = http_session.get(url, timeout=60)
+    response = http_session.get(url, timeout=_request_timeout())
     if response.status_code == 404:
         logger.debug(f"Bulk archive not published: {url}")
         return None
@@ -556,6 +610,14 @@ def fetch_klines_from_bulk_archive(
     archive holds.  A day after the last observed bar is not a hole either
     (delisted, or the trailing publication lag).
 
+    THE WHOLE FALLBACK RUNS UNDER A DEADLINE.  One archive request can burn
+    a whole request timeout and the trailing month of a window can need 31
+    daily files, so an unreachable archive host would stall the loader for
+    MINUTES.  The load therefore gets a fixed budget
+    (``config.BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS``); when it is spent the
+    load fails loudly with :class:`BulkArchiveDeadlineExceeded` and NOTHING
+    is served -- never the candles collected before the deadline.
+
     KNOWN DIFFERENCES FROM THE REST PATH, both inherent to the source and
     reported in the log line below: the archive holds only CLOSED bars (REST
     also returns the still-forming one), and the trailing edge of a window
@@ -564,6 +626,24 @@ def fetch_klines_from_bulk_archive(
     Returns a DataFrame shaped exactly like the REST path's output, or an
     empty DataFrame when Binance has no archive for the window at all.
     """
+    deadline = time.monotonic() + float(config.BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS)
+    token = _DEADLINE.set(deadline)
+    try:
+        return _fetch_klines_from_bulk_archive(
+            symbol, timeframe, start_dt, end_dt, market_type
+        )
+    finally:
+        _DEADLINE.reset(token)
+
+
+def _fetch_klines_from_bulk_archive(
+    symbol: str,
+    timeframe: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    market_type: str,
+) -> Optional[pd.DataFrame]:
+    """The body of ``fetch_klines_from_bulk_archive``, under its deadline."""
     start_dt = _as_utc(start_dt)
     end_dt = _as_utc(end_dt)
     if start_dt > end_dt:
