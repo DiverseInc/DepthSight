@@ -206,6 +206,72 @@ def _json_ld_blocks(page: str) -> list:
     return blocks
 
 
+# --------------------------------------------------------------------------
+# Which tier does a promise to trade live apply to?
+# --------------------------------------------------------------------------
+# The venues the platform routes to. Same list as ALL_VENUES.
+LIVE_VENUES = ("OKX", "Binance", "Bybit", "Bitget", "Gate.io", "BingX")
+
+# A promise that the reader can go live or trade live. "live-tradeable" in
+# the tagline is NOT one of these: that names the product, it does not
+# promise a set of venues.
+LIVE_PROMISE_RE = re.compile(
+    r"go live|live trading|trade live|live account|live-trading", re.I
+)
+
+# A count of the venues: "six exchanges", "6 venues", "any of the six".
+VENUE_COUNT_RE = re.compile(
+    r"\b(?:six|6)\s+(?:exchanges|venues)\b"
+    r"|\b(?:exchanges|venues)\b[^.]{0,24}\b(?:six|6)\b"
+    r"|\b(?:the|all|any\s+of\s+the)\s+six\b",
+    re.I,
+)
+
+# A tier word. "risk-free" is not one, so it is neutralised first.
+TIER_SCOPE_RE = re.compile(r"\bpaid\b|\bfree\b", re.I)
+
+
+def _copy_units(html: str) -> list:
+    """The page's copy, one unit per element that carries a sentence.
+
+    A unit is a block element's own text (a paragraph, a bullet, a tag, a
+    heading, a link) or a meta tag's content. The unit -- not the page --
+    is what carries the tier qualifier, so the unit is what is checked.
+    """
+    units = []
+    for match in re.finditer(
+        r"<(?P<tag>p|h1|h2|h3|h4|li|span|a|option|title)\b[^>]*>"
+        r"(?P<body>.*?)</(?P=tag)\s*>",
+        html,
+        flags=re.S | re.I,
+    ):
+        body = " ".join(re.sub(r"<[^>]+>", " ", match.group("body")).split())
+        if body:
+            units.append(body)
+    for match in re.finditer(r'<meta\b[^>]*\bcontent="([^"]*)"', html, flags=re.I):
+        units.append(match.group(1))
+    return units
+
+
+def _json_ld_strings(page: str) -> list:
+    """Every string in the JSON-LD blocks -- the copy the indexers read."""
+
+    def walk(node, into):
+        if isinstance(node, dict):
+            for value in node.values():
+                walk(value, into)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, into)
+        elif isinstance(node, str):
+            into.append(node)
+
+    strings = []
+    for block in _json_ld_blocks(page):
+        walk(block, strings)
+    return strings
+
+
 # A price with an optional decimal part, so "$30.50" cannot be silently
 # truncated to 30 and compared equal to a $30 plan.
 _PRICE_RE = re.compile(r"\$(\d+(?:\.\d+)?)")
@@ -915,6 +981,52 @@ class TestTheLiveTradingAndPurchaseClaims:
                 f"the indexed feature {feature!r} claims live trading without "
                 "saying which tiers get it: the Free tier gets Bybit only"
             )
+
+    def test_every_live_trading_promise_names_the_tier_it_is_about(self, page):
+        """A promise to trade live must say which tier gets it.
+
+        Free trades live on Bybit ONLY: api/routes/strategies.py:541-549
+        answers 403 for every other venue ("Trading on your plan is only
+        allowed using Bybit API keys."), and bot_runner.py:139-142 filters
+        a free user's keys to Bybit. A paid plan may trade on all six.
+
+        So any copy that offers live trading on a set of venues must name
+        the tier -- INSIDE THE SAME UNIT of copy, because a page that
+        scopes the promise in one paragraph and unscopes it in the next is
+        the defect this pins. The page's own meta description already
+        scoped it ("go live on Bybit for Free, or on any of six exchanges
+        on a paid plan"); the hero, the JSON-LD Organization node and the
+        tech card did not, and the page contradicted itself.
+
+        The pricing cards are scoped by the tier they belong to and are
+        covered by the per-card equality tests, so they are not checked
+        here.
+        """
+        units = _copy_units(_prose(page)) + _json_ld_strings(page)
+
+        seen = 0
+        for unit in units:
+            text = unit.replace("risk-free", "riskfree").replace("risk free", "riskfree")
+            named = [venue for venue in LIVE_VENUES if venue in text]
+
+            offers_a_venue_set = len(named) >= 2 or (
+                LIVE_PROMISE_RE.search(text) and VENUE_COUNT_RE.search(text)
+            )
+            if not offers_a_venue_set:
+                continue
+            seen += 1
+
+            assert TIER_SCOPE_RE.search(text), (
+                f"the page promises live trading on "
+                f"{sorted(named) or 'several venues'} without saying which tier "
+                "gets it: Free trades live on Bybit only "
+                "(api/routes/strategies.py:541-549)"
+            )
+
+        assert seen, (
+            "no live-trading promise was found on the page; re-measure this "
+            "test"
+        )
 
     def test_the_page_promises_no_self_serve_upgrade(self, page):
         """There is no self-serve upgrade in the deployment.
