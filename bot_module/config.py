@@ -296,9 +296,7 @@ REDIS_STATE_KEY_POSITIONS = os.environ.get(
 # REDIS_STATE_KEY_PORTFOLIO: that key is the PUBLISHED view of the account
 # and PR #25 fixed the API's reading of it, so its shape must not change.
 # This key is written and read only by the bot.
-REDIS_STATE_KEY_RISK = os.environ.get(
-    "REDIS_STATE_KEY_RISK", "depthsight:state:risk"
-)
+REDIS_STATE_KEY_RISK = os.environ.get("REDIS_STATE_KEY_RISK", "depthsight:state:risk")
 
 # Market-data specific Redis (separate instance for fan-out).
 MARKET_REDIS_HOST = os.environ.get("MARKET_REDIS_HOST", REDIS_HOST)
@@ -877,9 +875,7 @@ ML_CONFIRMATION_ENABLED = os.environ.get(
 ).strip().lower() in ("1", "true", "yes", "on")
 # Path to the model for confirmation (can be the same as ML_OFFLINE_TRAINED_MODEL_PATH)
 ML_CONFIRMATION_MODEL_PATH = Path(
-    os.environ.get(
-        "ML_CONFIRMATION_MODEL_PATH", "data/offline_trained_model.joblib"
-    )
+    os.environ.get("ML_CONFIRMATION_MODEL_PATH", "data/offline_trained_model.joblib")
 )
 # FIX 2026-10-07: what to do when a strategy asks for ML confirmation but the
 # model cannot run -- no model file, a failed load, or unavailable components.
