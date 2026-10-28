@@ -4564,6 +4564,49 @@ class TradingController:
             "emergency_stop_source": emergency_stop_source,
         }
 
+    def _published_account_state(self) -> Dict[str, Any]:
+        """The risk state of the sandbox THIS controller trades, as published.
+
+        A controller with NO api key is a PAPER-ONLY controller -- there is no
+        live account behind it -- so the numbers it publishes are the PAPER
+        sandbox's. A controller WITH an api key publishes the LIVE sandbox's.
+        The API reads the paper portfolio from exactly the paper-only
+        published keys (the key suffix is the api_key_id, and a paper-only
+        controller has none) and the live portfolio from the live ones, so the
+        published numbers have to be the numbers of the sandbox the controller
+        actually trades.
+
+        The RiskManager owns the choice, so the two can never drift: it
+        publishes the sandbox it was built for.
+
+        Read defensively: `self.rm` is a real RiskManager in production but a
+        mock in some tests, and a Mock's attribute is truthy while its
+        callable child returns a Mock, which cannot be rounded.
+        """
+        snapshot = None
+        snapshot_getter = getattr(self.rm, "published_account_snapshot", None)
+        if callable(snapshot_getter):
+            try:
+                candidate = snapshot_getter()
+                if isinstance(candidate, dict) and isinstance(
+                    candidate.get("current_balance"), (int, float)
+                ):
+                    snapshot = candidate
+            except Exception:
+                snapshot = None
+        if snapshot is None:
+            # A mocked RiskManager (its attribute is truthy while its
+            # callable child returns a Mock, which cannot be rounded).
+            snapshot = {
+                "current_balance": self.rm.stats.current_balance,
+                "today_pnl": self.rm.stats.today_pnl,
+                "consecutive_losses": self.rm.stats.consecutive_losses,
+                "is_trading_allowed": bool(
+                    getattr(self.rm, "_is_trading_allowed", True)
+                ),
+            }
+        return snapshot
+
     async def _fetch_strategy_pnl_aggregates(
         self, config_ids: List[str]
     ) -> Optional[Dict[Tuple[str, str], Dict[str, Any]]]:
@@ -4904,37 +4947,16 @@ class TradingController:
         # 3. Collecting PORTFOLIO data
         # Getting balance from RiskManager
         #
-        # WHICH SANDBOX IS PUBLISHED. A controller with NO api key is a
-        # PAPER-ONLY controller -- there is no live account behind it -- so
-        # the numbers it publishes are the PAPER sandbox's. A controller
-        # WITH an api key publishes the LIVE sandbox's. The API reads the
-        # paper portfolio from exactly the paper-only published keys (the
-        # key suffix is the api_key_id, and a paper-only controller has
-        # none) and the live portfolio from the live ones, so the published
-        # numbers have to be the numbers of the sandbox the controller
-        # actually trades.
-        _snapshot = None
-        _snapshot_getter = getattr(self.rm, "published_account_snapshot", None)
-        if callable(_snapshot_getter):
-            try:
-                _candidate = _snapshot_getter()
-                if isinstance(_candidate, dict) and isinstance(
-                    _candidate.get("current_balance"), (int, float)
-                ):
-                    _snapshot = _candidate
-            except Exception:
-                _snapshot = None
-        if _snapshot is None:
-            # A mocked RiskManager (its attribute is truthy while its
-            # callable child returns a Mock, which cannot be rounded).
-            _snapshot = {
-                "current_balance": self.rm.stats.current_balance,
-                "today_pnl": self.rm.stats.today_pnl,
-                "consecutive_losses": self.rm.stats.consecutive_losses,
-                "is_trading_allowed": bool(
-                    getattr(self.rm, "_is_trading_allowed", True)
-                ),
-            }
+        # WHICH SANDBOX IS PUBLISHED, and the numbers that go with it, are
+        # decided by `_published_account_state()` -- the RiskManager owns that
+        # choice, so the two cannot drift.
+        #
+        # ONE read: the walrus binds the snapshot in the same statement that
+        # uses it, so the published numbers and the published gate cannot come
+        # from two different reads of a moving account.
+        _gate_open = bool(
+            (_snapshot := self._published_account_state())["is_trading_allowed"]
+        )
         wallet_balance = _snapshot["current_balance"]  # Wallet balance (without PnL)
         equity = wallet_balance + total_unrealized_pnl  # Equity (including PnL)
 
@@ -4958,7 +4980,6 @@ class TradingController:
         # Read defensively -- `self.rm` is a real RiskManager in production but
         # a mock in some tests, and a Mock's attribute is truthy while its
         # callable child returns a Mock, which json.dumps cannot serialize.
-        _gate_open = bool(_snapshot["is_trading_allowed"])
         _reason_getter = getattr(self.rm, "get_trading_disabled_reason", None)
         _disabled_reason = None
         if not _gate_open and callable(_reason_getter):
