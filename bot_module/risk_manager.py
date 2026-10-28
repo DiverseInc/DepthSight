@@ -1977,6 +1977,16 @@ class RiskManager:
         self._emergency_stop_reason = reason
         self._emergency_stop_operator_initiated = bool(operator_initiated)
         self._is_trading_allowed = False
+        # THE KILL SWITCH IS AN ACCOUNT-LEVEL CONTROL, NOT A PER-SANDBOX
+        # LIMIT, so it closes BOTH gates.
+        #
+        # It has to: a controller with no api key is a PAPER-ONLY controller
+        # and publishes the PAPER gate, so leaving the paper gate open would
+        # report "trading allowed" on the dashboard while the operator's stop
+        # was engaged -- and the paper strategies would keep running. The
+        # live path is the same: `is_symbol_trading_allowed()` checks the
+        # latch before the mode's gate, for every mode.
+        self._paper_is_trading_allowed = False
         self._trading_disabled_reason = f"EMERGENCY STOP active ({reason})"
         logger.critical(f"EMERGENCY STOP engaged: {reason}")
 
@@ -2004,12 +2014,22 @@ class RiskManager:
         # still in force"). This keeps the operator path consistent for the
         # state this change introduced, and leaves its documented behaviour
         # for everything else untouched.
-        if (
+        guard_state_holds_the_gate = (
             self._guard_state_restored
             or self._guard_state_unverified
             or getattr(self, "_guard_state_lost", False)
-        ):
+        )
+        if guard_state_holds_the_gate:
             self._check_risk_limits()
+            # THE PAPER GATE IS RELEASED ON THE SAME CONDITION, AND IN THE
+            # SAME WAY: re-judged against the paper counters, which close it
+            # again if a paper limit really is in force, and which fail CLOSED
+            # if the guard state is unknown for the paper counters too.
+            self._check_risk_limits(mode="paper")
+        else:
+            # The kill switch is account-level, so it closed the PAPER gate as
+            # well; the operator's clear releases it.
+            self._paper_is_trading_allowed = True
         logger.warning("EMERGENCY STOP cleared. New entries re-enabled.")
 
     def release_unverified_emergency_stop(self) -> bool:
@@ -2833,7 +2853,16 @@ class RiskManager:
             self._paper_global_gate_disable_reason = disable_reason
         else:
             self._paper_global_gate_disable_reason = None
-            if not self._paper_is_trading_allowed:
+            if self._emergency_stop_active:
+                # The latch owns the gate while it is engaged; it is released
+                # only by clear_emergency_stop() or by the start-up self-heal.
+                # This mirrors the LIVE branch above exactly: without it, the
+                # balance update on a new UTC day would re-open the PAPER gate
+                # while the operator's kill switch was still pulled, and
+                # `published_account_snapshot()` would then publish "trading
+                # allowed" during an emergency stop.
+                pass
+            elif not self._paper_is_trading_allowed:
                 logger.info(
                     "Paper risk limits are now within acceptable range. "
                     "Re-enabling paper trading."
