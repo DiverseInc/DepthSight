@@ -1094,6 +1094,13 @@ def test_archive_market_path_uses_the_rest_path_comparison():
     assert bulk_archive._archive_market_path("spot_perp") == "futures/um"
 
 
+# The suite's autouse fixture replaces ``data_loader._make_api_request`` with a
+# stub so that no test can make a real network call (tests/conftest.py:738).
+# This test needs the REAL one, so the original is captured here at import
+# time: module import happens during collection, before any fixture runs.
+_REAL_MAKE_API_REQUEST = data_loader._make_api_request
+
+
 def test_archive_venue_matches_the_rest_host_for_every_market_type(monkeypatch):
     """The archive must be a FALLBACK for the REST path, never a second venue.
 
@@ -1140,7 +1147,11 @@ def test_archive_venue_matches_the_rest_host_for_every_market_type(monkeypatch):
         "",
     ):
         captured.clear()
-        data_loader._make_api_request("klines", {}, market_type=market_type)
+        _REAL_MAKE_API_REQUEST("klines", {}, market_type=market_type)
+        assert captured, (
+            "the real _make_api_request did not issue a request; the suite's "
+            "stub was captured instead of the original"
+        )
         rest_host = captured[0]
 
         rest_uses_spot = rest_host.startswith(spot_host)
