@@ -39,6 +39,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from bot_module.runtime_dependencies import DependencyProxy
 
 
@@ -411,3 +413,145 @@ def test_a_second_out_of_band_change_is_also_preserved():
         "destroyed the second one. The proxy must re-baseline on what the "
         "target holds now, every time it patches an abandoned name."
     )
+
+
+def test_an_out_of_band_change_between_two_patches_survives_the_undo():
+    """A change made on the target BETWEEN two patches must survive the undo.
+
+    The proxy wrote `DIRECT_PATCH`; somebody then changed the same name on
+    the target WITHOUT going through the proxy; the proxy then wrote `STUB2`.
+    The snapshot the proxy kept still described the value from BEFORE the
+    out-of-band change - the proxy had no way to notice it, because nothing
+    had been undone in between - so the undo after the second patch wrote
+    that stale original over the out-of-band value, destroying a change the
+    proxy never made.
+
+    So a patch of a name whose value on the target is no longer the one the
+    proxy put there must re-baseline on what the target holds NOW.
+    """
+
+    target = _Target()
+    target.get_paper_wallet = "ORIGINAL"  # type: ignore[attr-defined]
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    out_of_band = "OUT_OF_BAND"
+
+    proxy.get_paper_wallet = "DIRECT_PATCH"  # type: ignore[attr-defined]
+    assert target.get_paper_wallet == "DIRECT_PATCH"  # type: ignore[attr-defined]
+
+    target.get_paper_wallet = out_of_band  # type: ignore[attr-defined]
+
+    proxy.get_paper_wallet = "STUB2"  # type: ignore[attr-defined]
+    assert target.get_paper_wallet == "STUB2"  # type: ignore[attr-defined]
+
+    del proxy.get_paper_wallet  # type: ignore[attr-defined]
+
+    assert target.get_paper_wallet == "OUT_OF_BAND", (  # type: ignore[attr-defined]
+        "the undo wrote the proxy's stale snapshot over the change that was "
+        "made on the target directly. The proxy's snapshot no longer "
+        "described reality and had to be re-baselined on what the target "
+        "holds now."
+    )
+    assert target.get_paper_wallet != "ORIGINAL"  # type: ignore[attr-defined]
+    assert target.get_paper_wallet is out_of_band  # type: ignore[attr-defined]
+
+
+def test_a_name_the_module_gained_out_of_band_is_not_deleted_by_the_undo():
+    """An out-of-band name must survive the undo; it is not the proxy's to delete.
+
+    The proxy created the name - the module did not have it - so the proxy's
+    snapshot says "there was nothing there to restore". If the module then
+    gains the name out of band, the snapshot no longer describes reality,
+    and the undo must not delete the module's attribute: that would take it
+    out of the module for good, which is exactly what this proxy exists to
+    prevent.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    proxy.brand_new = "STUB1"  # type: ignore[attr-defined]
+    assert target.brand_new == "STUB1"  # type: ignore[attr-defined]
+
+    target.brand_new = "REAL"  # type: ignore[attr-defined]
+
+    proxy.brand_new = "STUB2"  # type: ignore[attr-defined]
+    assert target.brand_new == "STUB2"  # type: ignore[attr-defined]
+
+    del proxy.brand_new  # type: ignore[attr-defined]
+
+    assert hasattr(target, "brand_new"), (
+        "the undo deleted a name the module gained out of band. The proxy's "
+        "snapshot said 'the module never had this name', but that snapshot "
+        "no longer described reality."
+    )
+    assert target.brand_new == "REAL"  # type: ignore[attr-defined]
+
+
+def test_the_pytest_9_2_undo_path_keeps_the_real_function():
+    """`pytest.MonkeyPatch` must not take the module's own function away.
+
+    pytest 9.2 records the value it has to put back from `target.__dict__`,
+    and a proxied attribute is VIRTUAL - it is produced by
+    `DependencyProxy.__getattr__`, so it is not an entry in the proxy's
+    `__dict__` - so the undo goes through `delattr(proxy, name)`. That has to
+    put the module's own function back, not delete it.
+    """
+
+    from api import crud as crud_module
+    from bot_module.runtime_dependencies import crud
+
+    original = crud_module.get_user_by_email
+
+    async def _fake(db, email):  # type: ignore[no-untyped-def]
+        return None
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(crud, "get_user_by_email", _fake)
+        assert crud.get_user_by_email is _fake
+        assert crud_module.get_user_by_email is _fake
+    finally:
+        mp.undo()
+
+    assert hasattr(crud_module, "get_user_by_email"), (
+        "the undo deleted the function from the proxied module; every later "
+        "test in the session would fail on it"
+    )
+    assert crud_module.get_user_by_email is original
+
+
+def test_two_patches_of_one_name_undone_together_keep_the_real_function():
+    """Two patches of one name, undone together, leave the original in place.
+
+    pytest's `MonkeyPatch` records the same (target, name) twice here, and
+    undoes both at once. Neither undo may take the module's real attribute
+    away, and the module has to end up with its own function again.
+    """
+
+    from api import crud as crud_module
+    from bot_module.runtime_dependencies import crud
+
+    original = crud_module.get_user_by_username
+
+    async def _first(db, username):  # type: ignore[no-untyped-def]
+        return None
+
+    async def _second(db, username):  # type: ignore[no-untyped-def]
+        return None
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(crud, "get_user_by_username", _first)
+        mp.setattr(crud, "get_user_by_username", _second)
+        assert crud.get_user_by_username is _second
+    finally:
+        mp.undo()
+
+    assert hasattr(crud_module, "get_user_by_username"), (
+        "the undo deleted the function from the proxied module; every later "
+        "test in the session would fail on it"
+    )
+    assert crud_module.get_user_by_username is original

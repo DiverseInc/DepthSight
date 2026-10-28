@@ -51,12 +51,22 @@ class DependencyProxy:
             return
         # Remember what the proxied object had, so that removing the override
         # puts the original back instead of deleting it (see __delattr__).
-        if self._written.get(name) is _ABANDONED:
-            # This name was abandoned: the proxied object was changed out of
-            # band, so the snapshot kept for it describes a value that is no
-            # longer there. Re-baseline on what the target holds NOW.
+        written = self._written.get(name, _MISSING)
+        if written is _MISSING:
+            # First write of this name: the baseline is what the proxied
+            # object holds NOW.
             self._restore[name] = getattr(self._target, name, _MISSING)
-        elif name not in self._restore:
+        elif getattr(self._target, name, _MISSING) is not written:
+            # The proxied object no longer holds what this proxy wrote, so it
+            # was changed out of band. The snapshot kept for this name
+            # describes a value that is no longer there, so re-baseline on
+            # what the object holds NOW - otherwise the next undo would put a
+            # stale original over the out-of-band value, or delete a name the
+            # object gained in the meantime.
+            #
+            # An abandoned name lands here as well: `_ABANDONED` is never the
+            # value the object holds, so patching an abandoned name
+            # re-baselines the same way.
             self._restore[name] = getattr(self._target, name, _MISSING)
         setattr(self._target, name, value)
         self._written[name] = value
