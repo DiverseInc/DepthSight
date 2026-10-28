@@ -229,6 +229,15 @@ def _download_klines_from_api_with_archive_fallback(
       existing hard stops still fire.  It never returns an empty frame in
       place of a failure: an empty frame is not the same thing as "no data
       loaded", and several callers treat them differently.
+
+    THE TWO PATHS REPORT "NO DATA" DIFFERENTLY, AND BOTH ARE CORRECT.  The
+    REST path is only reached when it ANSWERED, so "no klines in this
+    window" is a successful load of an empty window and it stays an empty
+    frame.  The archive path is only reached after the REST path was
+    BLOCKED (HTTP 451), so an archive with nothing in it means the load
+    produced no candles at all, and it is ``None`` -- the failure the
+    callers' hard stops exist for.  Neither path ever serves a frame with
+    a hole in it.
     """
     try:
         frame = _download_klines_from_api(

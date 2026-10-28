@@ -1440,3 +1440,50 @@ async def test_a_monthly_archive_that_stops_early_is_not_a_hole(
     assert frame.index[-1] == pd.Timestamp("2024-01-10T23:00:00Z")
 
 
+# ==============================================================================
+# R7: what "no data" means on each path
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_the_two_paths_report_no_data_as_the_contract_says(
+    archive_server, monkeypatch
+):
+    """``None`` means "no data loaded"; an empty frame means "loaded, but empty".
+
+    The two paths report "no data" differently because they are different
+    situations, and both are correct:
+
+    * the REST path ANSWERED and had no klines for the window -> the load
+      succeeded and the window is simply empty -> an empty frame;
+    * the archive path is only reached after the REST path was BLOCKED
+      (HTTP 451).  An archive with nothing in it means the load produced no
+      candles at all -> ``None``, so the hard stops fire.
+
+    Neither path ever hands back a frame with a hole in it.
+    """
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    # The REST path answered, and it had no klines for the window.
+    monkeypatch.setattr(data_loader, "_make_api_request", lambda *a, **k: [])
+    rest_result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+    assert rest_result is not None
+    assert rest_result.empty
+
+    # The REST path was blocked and the archive had nothing either.
+    monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+    archive_result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+    assert archive_result is None
