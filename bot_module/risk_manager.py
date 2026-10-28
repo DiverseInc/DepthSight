@@ -904,6 +904,14 @@ class RiskManager:
                 "paper balance could not be fetched at start-up — "
                 "paper trading disabled"
             )
+            # The operator-facing reason too. The LIVE start-up path publishes
+            # its equivalent (`_trading_disabled_reason =
+            # _global_gate_disable_reason`), and before the paper/live split
+            # this same branch served BOTH kinds of account, so a keyless
+            # paper account used to get a reason. Without this line the gate
+            # would be closed with no explanation at all, because the live
+            # sandbox of a keyless account is never consulted.
+            self._trading_disabled_reason = self._paper_global_gate_disable_reason
             return
         self._check_and_reset_paper_daily_stats()
         self._anchor_paper_start_of_day_base(self.paper_stats.current_balance)
