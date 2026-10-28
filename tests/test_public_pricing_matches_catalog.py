@@ -1246,6 +1246,30 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
                 "Trade-only. Never Withdraw.' (AGENTS.md:71)"
             )
 
+    def test_the_key_rule_is_stated_as_guidance_not_as_a_guarantee(self, page):
+        """The platform cannot enforce the key permissions; the trader can.
+
+        api/routes/api_keys.py:44-66 stores whatever key the user submits and
+        never inspects its permissions, so the page may NOT imply that the
+        product guarantees trade-only keys -- it only tells the trader what
+        to create. The product's own rule is "API keys are Trade-only. Never
+        Withdraw." (AGENTS.md:71), so the rule may be stated, but as
+        something the READER does.
+
+        The bare label "trade-only keys" is what reads as a platform
+        property, so it may not stand alone as one.
+        """
+        lowered = page.lower()
+        assert "configure your exchange keys with trade permissions only" in lowered, (
+            "the page must tell the trader to create trade-only keys; the "
+            "product cannot do it for them"
+        )
+        assert ">trade-only keys<" not in lowered, (
+            "the page still labels the keys as a platform property ('trade-"
+            "only keys'); the trader brings them, so the label must say who "
+            "creates them"
+        )
+
     def test_portfolio_backtesting_follows_the_permission_not_the_quota(
         self, cards, plans_by_name, raw_plans
     ):
