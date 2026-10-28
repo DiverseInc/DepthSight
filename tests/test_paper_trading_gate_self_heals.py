@@ -30,6 +30,20 @@ signal path cannot heal it either.
 
 These tests drive the real RiskManager methods. They assert OUTCOMES, not the
 shape of the fix.
+
+2026-10-28: THE PAPER SANDBOX NOW OWNS THE PAPER ACCOUNT'S NUMBERS
+--------------------------------------------------------------------
+The live and the paper sandboxes are separate (`self.stats` and
+`self.paper_stats`), so a keyless PAPER account's balance, day's PnL and
+gate now live in the PAPER sandbox (`self.paper_stats` and
+`_paper_is_trading_allowed`), not in the shared live ones. The account in
+these tests is keyless -- it has no live executor -- so the paper sandbox IS
+its sandbox.
+
+The assertions below were updated accordingly. The INTENT of each one --
+"the paper account's balance was fetched" and "trading becomes allowed" --
+is unchanged; only the sandbox that holds the number, and the sandbox whose
+gate is consulted, moved.
 """
 import asyncio
 import datetime
@@ -40,7 +54,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bot_module.risk_manager import RiskManager  # noqa: E402
+from bot_module.risk_manager import RiskManager, TradeStats  # noqa: E402
 
 
 class _PaperExecutor:
@@ -74,6 +88,17 @@ def _make_rm(paper_executor, *, balance_threshold=5.0, trading_allowed=False):
     rm.daily_max_loss_threshold = 0.99
     rm.max_drawdown_threshold = 0.99
     rm.max_consecutive_losses = 5
+    # The PAPER sandbox. For an account with no live account behind it, this
+    # IS the account's sandbox: its balance, its PnL and its gate.
+    rm.paper_stats = TradeStats()
+    rm.paper_daily_max_loss_threshold = 0.99
+    rm.paper_max_drawdown_threshold = 0.99
+    rm.paper_max_consecutive_losses = 5
+    rm._paper_is_trading_allowed = trading_allowed
+    rm._paper_global_gate_disable_reason = None
+    rm._paper_last_disable_reason = None
+    rm._paper_balance_known = False
+    rm._global_gate_disable_reason = None
     rm.telegram_notifier = None
     rm.loop_from_controller = None
     # db_session=None makes is_symbol_trading_allowed SKIP the blacklist
@@ -100,9 +125,9 @@ def test_a_latched_paper_account_cannot_trade():
     never the thing rejecting the signal.
     """
     rm = _make_rm(_PaperExecutor(2645.55))
-    rm._is_trading_allowed = False
+    rm._paper_is_trading_allowed = False
 
-    allowed = asyncio.run(rm.is_symbol_trading_allowed("BTCUSDT"))
+    allowed = asyncio.run(rm.is_symbol_trading_allowed("BTCUSDT", mode="paper"))
 
     assert allowed is False, (
         "with the global flag off and no db_session (so no blacklist lookup), "
@@ -132,6 +157,10 @@ def test_reinitializing_with_the_latch_engaged_does_not_open_the_gate():
     assert rm._is_trading_allowed is False, (
         "initialize_balance() reset the day and re-enabled the published flag "
         "while the emergency stop was engaged"
+    )
+    assert rm._paper_is_trading_allowed is False, (
+        "initialize_balance() re-enabled the PAPER gate while the emergency "
+        "stop was engaged"
     )
     assert asyncio.run(rm.is_symbol_trading_allowed("BTCUSDT")) is False
 
@@ -196,15 +225,15 @@ def test_recovered_paper_balance_reopens_the_trading_gate():
     ok = asyncio.run(rm.update_balance())
 
     assert ok is True, "the balance fetch itself must succeed for this test to mean anything"
-    assert rm.stats.current_balance == pytest.approx(2645.55)
-    assert rm._is_trading_allowed is True, (
+    assert rm.paper_stats.current_balance == pytest.approx(2645.55)
+    assert rm._paper_is_trading_allowed is True, (
         "trading stayed disabled after the balance fetch recovered: "
         "update_balance() succeeds but nothing re-validates the global gate on "
         "the paper path, so one transient startup failure latches trading off "
         "for the whole life of the bot process"
     )
 
-    allowed = asyncio.run(rm.is_symbol_trading_allowed("BTCUSDT"))
+    allowed = asyncio.run(rm.is_symbol_trading_allowed("BTCUSDT", mode="paper"))
     assert allowed is True, "the gate must actually reopen, not just the flag flip"
 
 
@@ -221,11 +250,11 @@ def test_a_genuine_risk_breach_is_not_reopened_by_a_successful_fetch():
     ok = asyncio.run(rm.update_balance())
 
     assert ok is True
-    assert rm._is_trading_allowed is False, (
+    assert rm._paper_is_trading_allowed is False, (
         "balance $3.00 is below min_balance_threshold $5.00 -- a successful "
         "read must not paper over a real risk breach"
     )
-    allowed = asyncio.run(rm.is_symbol_trading_allowed("BTCUSDT"))
+    allowed = asyncio.run(rm.is_symbol_trading_allowed("BTCUSDT", mode="paper"))
     assert allowed is False
 
 
@@ -236,7 +265,7 @@ def test_a_failed_fetch_does_not_open_the_gate():
     ok = asyncio.run(rm.update_balance())
 
     assert ok is False, "a raising executor must report failure"
-    assert rm._is_trading_allowed is False, (
+    assert rm._paper_is_trading_allowed is False, (
         "a failed balance read must never open the trading gate"
     )
 
@@ -261,13 +290,13 @@ def test_emergency_stop_survives_a_successful_balance_refresh():
 
     assert ok is True
     assert rm.is_emergency_stop_active() is True
-    allowed = asyncio.run(rm.is_symbol_trading_allowed("BTCUSDT"))
+    allowed = asyncio.run(rm.is_symbol_trading_allowed("BTCUSDT", mode="paper"))
     assert allowed is False, (
         "an engaged emergency stop must survive a healthy balance refresh"
     )
-    assert rm._is_trading_allowed is False, (
-        "the published flag desynced from the latch: _check_risk_limits() "
-        "re-enabled _is_trading_allowed while the emergency stop was still "
+    assert rm._paper_is_trading_allowed is False, (
+        "the published flag desynced from the latch: _check_paper_risk_limits() "
+        "re-enabled _paper_is_trading_allowed while the emergency stop was still "
         "engaged, so GET /api/v1/portfolio would report is_trading_allowed=true "
         "during a kill switch"
     )
