@@ -239,6 +239,54 @@ class TestTheDemoCredentialsAreNotShipped:
                     "bundle."
                 )
 
+    def test_a_local_env_override_cannot_reach_the_production_build(self):
+        """A developer's local env file must not reach the production build.
+
+        frontend/Dockerfile.prod does `COPY . .`, so whatever the
+        .dockerignore does not exclude is copied into the image and read by
+        vite at build time. In a production build vite reads `.env`,
+        `.env.production`, `.env.local` and `.env.production.local`; of those
+        only `.env.production` is tracked, and the check above only inspects
+        `.env.production`. So a local file that sets VITE_SHOW_DEMO would
+        compile the seeded demo credentials into the production bundle -- the
+        exact thing this file exists to prevent.
+        """
+        dockerignore = FRONTEND / ".dockerignore"
+        assert dockerignore.is_file(), "frontend/.dockerignore is missing"
+
+        patterns = {
+            line.strip()
+            for line in _read(dockerignore).splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        }
+
+        for required in (".env", ".env.local", ".env.*.local"):
+            assert required in patterns, (
+                f"frontend/.dockerignore must exclude {required!r}. "
+                "frontend/Dockerfile.prod does `COPY . .`, so a developer's "
+                "local env file would be copied into the image and read by "
+                "vite at build time -- it could set VITE_SHOW_DEMO and compile "
+                "the seeded demo credentials into the production bundle. "
+                f"Patterns present: {sorted(patterns)}"
+            )
+
+        # frontend/.env.production IS needed by the build: it holds the public
+        # VITE_* values. A blanket exclusion would break the image build, so
+        # the patterns must stay narrow.
+        assert ".env.production" not in patterns, (
+            "frontend/.dockerignore excludes frontend/.env.production, which "
+            "the build needs (it holds the public VITE_* values). Exclude the "
+            "LOCAL files only: .env, .env.local and .env.*.local."
+        )
+
+        # A local file that exists right now must not be one the build reads.
+        for local in (FRONTEND / ".env", FRONTEND / ".env.local"):
+            if local.is_file():
+                assert ".env" in patterns, (
+                    f"{local.relative_to(REPO_ROOT)} exists and the build "
+                    "context would copy it into the image."
+                )
+
 
 class TestTheBuildContextStillContainsWhatTheConfigImports:
     """The production image is built with `context: ./frontend`.
