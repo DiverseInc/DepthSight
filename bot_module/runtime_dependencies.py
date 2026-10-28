@@ -13,9 +13,16 @@ class DependencyProxy:
         # What the proxied object had for a name before this proxy wrote to it.
         # Used to put the original back instead of deleting it.
         self._restore: dict[str, Any] = {}
+        # What this proxy last wrote to the proxied object for a name. Used to
+        # tell "the target still holds what we put there" (ours to revert)
+        # from "the target was changed out of band since" (not ours to revert).
+        self._written: dict[str, Any] = {}
 
     def configure(self, target: Any) -> None:
         self._target = target
+        # A snapshot of the previous target means nothing for the new one.
+        self._restore.clear()
+        self._written.clear()
 
     def __bool__(self) -> bool:
         return self._target is not None or bool(self._overrides)
@@ -42,6 +49,7 @@ class DependencyProxy:
         if name not in self._restore:
             self._restore[name] = getattr(self._target, name, _MISSING)
         setattr(self._target, name, value)
+        self._written[name] = value
 
     def __delattr__(self, name: str) -> None:
         if name in self._overrides:
@@ -50,13 +58,24 @@ class DependencyProxy:
         if self._target is None:
             raise AttributeError(name)
         saved = self._restore.get(name, _MISSING)
-        if saved is not _MISSING:
-            # Restore the value the proxied object had before this proxy
-            # overwrote it. Deleting it instead would take the attribute out
-            # of the proxied module for good.
-            setattr(self._target, name, saved)
+        written = self._written.get(name, _MISSING)
+        if (
+            written is not _MISSING
+            and getattr(self._target, name, _MISSING) is not written
+        ):
+            # The proxied object no longer holds what this proxy put there: it
+            # was changed out of band, and that change is not this proxy's to
+            # revert. Leave it alone rather than clobbering it.
             return
-        delattr(self._target, name)
+        if saved is _MISSING:
+            # The proxied object never had this name - the proxy created it,
+            # so removing the override removes it again.
+            delattr(self._target, name)
+            return
+        # Put the original back. Deleting it instead would take the attribute
+        # out of the proxied module for good.
+        setattr(self._target, name, saved)
+        self._written[name] = saved
 
 
 class CallableDependency:

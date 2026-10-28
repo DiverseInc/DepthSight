@@ -26,6 +26,13 @@ The proxy has to PUT THE ORIGINAL BACK, not delete it. These tests pin that
 contract, and the second one pins the other half of it: the proxy must still
 forward to the LIVE target, so that a patch applied to the module directly is
 visible through the proxy.
+
+The undo has one more rule, and it is the one that makes "an undo must never
+destroy something it did not create" true: the proxy only reverts what it
+put there. If the proxied object was changed out of band since the proxy's
+write, that change is not the proxy's to revert, so the undo leaves it
+alone. And a snapshot of a previous target is meaningless once `configure()`
+swaps the target, so it is dropped then.
 """
 
 from __future__ import annotations
@@ -43,8 +50,23 @@ class _Target:
     "still there by accident".
     """
 
-    def __init__(self) -> None:
-        self.existing = "original"
+    def __init__(self, value: Any = "original") -> None:
+        self.existing = value
+
+
+class _Value:
+    """A distinct, identifiable value.
+
+    The proxy compares what it wrote by identity, so the tests need values
+    that are objects in their own right - two equal strings can be the same
+    object, two `_Value`s never are.
+    """
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+
+    def __repr__(self) -> str:
+        return f"_Value({self.label!r})"
 
 
 def test_deleting_an_override_puts_the_original_back():
@@ -165,3 +187,119 @@ def test_the_configured_target_is_still_the_one_that_is_used():
 
     value: Any = proxy.existing
     assert value == "original"
+
+
+def test_undo_does_not_clobber_a_change_made_out_of_band():
+    """A change made directly on the target is not the proxy's to revert.
+
+    The proxy wrote `patched`; somebody then changed the same name on the
+    target WITHOUT going through the proxy. Undoing the proxy's write must
+    leave that later change alone - the proxy did not make it, so it must
+    not destroy it.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    patched = _Value("patched")
+    changed_elsewhere = _Value("changed-elsewhere")
+
+    proxy.existing = patched  # type: ignore[assignment]
+    assert target.existing is patched
+
+    target.existing = changed_elsewhere  # out of band, bypassing the proxy
+
+    del proxy.existing  # type: ignore[attr-defined]
+
+    assert target.existing is changed_elsewhere, (
+        "the undo clobbered a change that was made on the target directly, "
+        "outside the proxy - that change is not the proxy's to revert"
+    )
+
+
+def test_two_undos_of_the_same_name_leave_the_original_in_place():
+    """Two patches of one name, undone twice, must not delete the attribute.
+
+    pytest's monkeypatch can record the same (target, name) twice, so the
+    undo of the second patch must not be able to remove the target's real
+    attribute - the module has to end with its ORIGINAL attribute, and that
+    attribute has to still exist.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    original = target.existing
+    first = _Value("first")
+    second = _Value("second")
+
+    proxy.existing = first  # type: ignore[assignment]
+    proxy.existing = second  # type: ignore[assignment]
+    assert target.existing is second
+
+    del proxy.existing  # type: ignore[attr-defined]
+    del proxy.existing  # type: ignore[attr-defined]
+
+    assert hasattr(target, "existing"), (
+        "the second undo deleted the attribute from the proxied object "
+        "instead of leaving it restored"
+    )
+    assert target.existing == original
+
+
+def test_two_explicit_undos_of_a_real_attribute_leave_it_in_place(monkeypatch):
+    """The real `api.crud` attribute must survive two undos of the same name.
+
+    This is the CI shape: pytest's monkeypatch records the same
+    (target, name) twice and undoes it twice, and the second undo must not
+    be able to take the module's real attribute away.
+    """
+
+    from api import crud as crud_module
+    from bot_module.runtime_dependencies import crud
+
+    original = crud_module.get_paper_wallet
+
+    async def _fake(db, user_id):  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(crud, "get_paper_wallet", _fake)
+    monkeypatch.undo()
+
+    # A second undo for the same name must not remove the real attribute.
+    delattr(crud, "get_paper_wallet")
+
+    assert hasattr(crud_module, "get_paper_wallet"), (
+        "the second undo deleted the attribute from the proxied module; "
+        "every later test in the session would fail on it"
+    )
+    assert crud_module.get_paper_wallet is original
+
+
+def test_configure_clears_what_the_proxy_remembered():
+    """A new target must not inherit the previous target's snapshot.
+
+    `configure()` swaps the proxied object, so what the proxy remembers
+    about the old one is meaningless and must not be applied to the new one.
+    """
+
+    first = _Target("first-original")
+    second = _Target("second-original")
+
+    proxy = DependencyProxy("t")
+    proxy.configure(first)
+
+    proxy.existing = "patched"  # type: ignore[assignment]
+    assert first.existing == "patched"
+
+    proxy.configure(second)
+
+    proxy.existing = "second-patched"  # type: ignore[assignment]
+    del proxy.existing  # type: ignore[attr-defined]
+
+    assert (
+        second.existing == "second-original"
+    ), "the undo restored the PREVIOUS target's snapshot onto the new target"
+    assert first.existing == "patched", "the undo touched the previous target"
