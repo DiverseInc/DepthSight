@@ -496,12 +496,26 @@ async def download_klines(
             # The remote source failed. Before the bulk-archive fallback this
             # branch read ``if df_api is None and (df_local is None or
             # df_local.empty)``, so a PARTIAL local cache was shipped on its
-            # own when the API failed -- and the backtest then ran on a
+            # own whenever the API helper RETURNED None while the local
+            # cache was not empty: pandas' ``concat`` SKIPS a None element
+            # (``pd.concat([df_local, None])`` returns df_local's rows), so
+            # the merge silently succeeded and the truncated window was
+            # handed back as if it were the requested one.
+            #
+            # That only ever happened when the helper returned None rather
+            # than raising: an exception propagated out of this function and
+            # failed the load loudly instead.  The backtest then ran on a
             # window shorter than the one that was asked for, reporting the
             # KPIs of that shorter window as if they were the requested ones.
             # A truncated window is a wrong number, so this now fails the
             # WHOLE load instead: callers distinguish "no data loaded" (None)
             # from "loaded, but empty", and only None fails the hard stops.
+            #
+            # The REST path's own "no klines in this window" answer is a
+            # DIFFERENT thing and is deliberately left alone: it is an EMPTY
+            # frame (see ``_download_klines_from_api``), so the source
+            # answered, and the merge below keeps the local cache, which is
+            # the history that exists for the window.
             logger.error(
                 f"Klines unavailable for {symbol} ({timeframe}): no data from "
                 "the REST API or the bulk archive."
