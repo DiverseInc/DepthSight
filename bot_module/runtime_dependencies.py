@@ -1,11 +1,18 @@
 from typing import Any, Callable, Optional
 
+# Sentinel for "the proxied object has no such attribute". Distinct from None,
+# which is a legitimate attribute value.
+_MISSING = object()
+
 
 class DependencyProxy:
     def __init__(self, name: str):
         self._name = name
         self._target: Optional[Any] = None
         self._overrides: dict[str, Any] = {}
+        # What the proxied object had for a name before this proxy wrote to it.
+        # Used to put the original back instead of deleting it.
+        self._restore: dict[str, Any] = {}
 
     def configure(self, target: Any) -> None:
         self._target = target
@@ -30,6 +37,10 @@ class DependencyProxy:
         if self._target is None:
             self._overrides[name] = value
             return
+        # Remember what the proxied object had, so that removing the override
+        # puts the original back instead of deleting it (see __delattr__).
+        if name not in self._restore:
+            self._restore[name] = getattr(self._target, name, _MISSING)
         setattr(self._target, name, value)
 
     def __delattr__(self, name: str) -> None:
@@ -38,6 +49,13 @@ class DependencyProxy:
             return
         if self._target is None:
             raise AttributeError(name)
+        saved = self._restore.get(name, _MISSING)
+        if saved is not _MISSING:
+            # Restore the value the proxied object had before this proxy
+            # overwrote it. Deleting it instead would take the attribute out
+            # of the proxied module for good.
+            setattr(self._target, name, saved)
+            return
         delattr(self._target, name)
 
 
