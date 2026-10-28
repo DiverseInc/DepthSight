@@ -362,6 +362,12 @@ class RiskManager:
         # Why the PAPER gate is off, when it is off for a reason other than
         # the emergency stop. The live equivalent is `_global_gate_disable_reason`.
         self._paper_global_gate_disable_reason: Optional[str] = None
+        # The reason the PAPER gate was LAST closed, kept separately from
+        # `_paper_global_gate_disable_reason` (which is CLEARED as soon as the
+        # paper limits are back within range). Initialised here because it is
+        # written on more than one path and must never be read off an
+        # attribute that does not exist yet.
+        self._paper_last_disable_reason: Optional[str] = None
         # Latching emergency stop. Deliberately separate from
         # _is_trading_allowed, which both the daily-stat reset and
         # _check_risk_limits() legitimately flip back to True on their own.
