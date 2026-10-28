@@ -447,3 +447,62 @@ async def test_a_payload_written_before_this_change_is_still_restored(
     # which is correct, not a reset.
     assert rm.paper_stats.consecutive_losses == 0
     assert rm.paper_stats.today_pnl == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# 4. THE OPERATOR'S KILL SWITCH IS ACCOUNT-LEVEL: it closes BOTH gates
+# ---------------------------------------------------------------------------
+
+
+async def test_the_emergency_stop_closes_both_gates(redis_store):
+    """The kill switch is NOT a per-sandbox limit.
+
+    The two gates are independent for the RISK LIMITS -- that is the whole
+    point of this file -- but the emergency stop is an operator and account
+    level control. `is_symbol_trading_allowed()` checks the latch before the
+    mode's gate, for every mode, so a paper signal is refused during an
+    emergency stop.
+
+    The PUBLISHED gate must agree with that. A controller with no api key is a
+    PAPER-ONLY controller and publishes the PAPER gate, so a kill switch that
+    left the paper gate open would report "trading allowed" on the dashboard
+    while the operator's stop was engaged -- and the paper strategies would
+    keep running.
+    """
+    rm = await _start_dual_mode_account(redis_store)
+    await rm.update_balance(mode="paper")
+    assert rm._paper_is_trading_allowed is True, (
+        "the account must start with the PAPER gate OPEN, or this test would "
+        "pass for the wrong reason"
+    )
+
+    rm.trigger_emergency_stop("operator pulled the plug")
+
+    assert rm._is_trading_allowed is False, (
+        "the operator's kill switch did not close the LIVE gate"
+    )
+    assert rm._paper_is_trading_allowed is False, (
+        "the operator's kill switch did not close the PAPER gate: the "
+        "emergency stop is an ACCOUNT-level control, not a per-sandbox limit"
+    )
+
+
+async def test_the_emergency_stop_holds_the_paper_gate_across_a_refresh(
+    redis_store,
+):
+    """The latch owns the PAPER gate until it is released.
+
+    The day rollover resets the paper counters, so `_check_paper_risk_limits()`
+    finds every limit within range -- and without the latch guard it would
+    re-open the PAPER gate while the operator's kill switch was still pulled.
+    """
+    rm = await _start_dual_mode_account(redis_store)
+    await rm.update_balance(mode="paper")
+    rm.trigger_emergency_stop("operator pulled the plug")
+
+    await rm.update_balance(mode="paper")
+
+    assert rm._paper_is_trading_allowed is False, (
+        "the balance refresh re-opened the PAPER gate while the operator's "
+        "kill switch was still engaged"
+    )
