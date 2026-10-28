@@ -136,17 +136,26 @@ _INTERVAL_ALIASES = {
 def _archive_market_path(market_type: str) -> str:
     """Maps a loader ``market_type`` onto the archive's folder layout.
 
-    The comparison is EXACTLY the one the REST path uses to choose its host
-    (``market_type == "spot"`` in ``data_loader._make_api_request``).  A
-    substring test would be a silent venue swap: a market type that merely
-    CONTAINS "spot" would get spot candles from the archive while the REST
-    path had queried the futures host.
+    This MUST mirror ``data_loader._make_api_request`` exactly, because the
+    archive is a FALLBACK for that REST path: for one request the two must
+    answer with the same venue.
+
+    The REST path sends ``market_type == "spot"`` to the spot host and EVERY
+    other market type -- including ``futures_coinm`` -- to the USDT-M
+    futures host (``data_loader._make_api_request``).  So the archive maps
+    exactly one value to spot and EVERY other value to futures/um.
+
+    Two things must never happen here:
+
+    * a market type that merely CONTAINS "spot" must not get spot candles,
+      because the REST path would have queried the futures host;
+    * a COIN-M market type must not get COIN-M candles, because the REST
+      path never asked Binance for COIN-M candles.  Serving them would swap
+      the venue under the caller and change the numbers it gets back.
     """
     mt = (market_type or "").strip()
     if mt == "spot":
         return "spot"
-    if mt in ("futures_coinm", "futures_cm", "coinm"):
-        return "futures/cm"
     return "futures/um"
 
 

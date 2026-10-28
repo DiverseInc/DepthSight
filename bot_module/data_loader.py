@@ -180,20 +180,24 @@ def _is_binance_location_block(error: Exception) -> bool:
 
     Binance answers HTTP 451 ("Service unavailable from a restricted
     location according to 'b. Eligibility' ...") from geo/IP-blocked
-    networks -- the signature documented in market_data_service.py.  A
-    transport-level failure (DNS/TLS/timeout) counts too: the REST host could
-    not be reached at all, while the archive lives on a different host.
+    networks.  That is the signature this repository already records for the
+    production servers: ``market_data_service.py:155-157`` ("Binance is
+    geo-blocked from many Elestio server IPs (HTTP 451)") and
+    ``bot_runner.py:612`` ("a fresh Binance consumer that 451s on REST
+    history").
 
-    Every OTHER failure (a 4xx/5xx answer, a bad request, a bug) keeps the
-    behaviour it has today, so a genuine API fault is never masked by
-    silently serving archive data instead.
+    ONLY HTTP 451 counts.  Every other failure -- a 4xx/5xx answer, a bad
+    request, a bug, a DNS/TLS failure, a timeout, an exhausted retry -- keeps
+    the behaviour it has today and is re-raised unchanged.  A genuine fault
+    must never be masked by silently serving archive data instead: the
+    archive holds only closed bars and its trailing edge is short by the
+    publication lag, so serving it in place of a fault could quietly shorten
+    a backtest window and change the number it reports.
     """
     if isinstance(error, requests.exceptions.HTTPError):
         response = getattr(error, "response", None)
         return response is not None and response.status_code == 451
-    return isinstance(
-        error, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
-    )
+    return False
 
 
 def _download_klines_from_api_with_archive_fallback(
@@ -210,8 +214,10 @@ def _download_klines_from_api_with_archive_fallback(
 
     The REST path itself is untouched: it is still tried first and it is still
     what wins whenever it answers. The archive is a strictly additive third
-    source, used only when the REST path fails with a location block or a
-    transport error.
+    source, used ONLY when the REST path fails with a location block (HTTP
+    451). Every other failure -- a 4xx/5xx, a bad request, a timeout, an
+    exhausted retry, a bug -- is re-raised unchanged, so a genuine fault is
+    never masked by quietly serving archive data instead.
 
     Two rules keep the venue honest and the failure honest:
 
@@ -488,9 +494,13 @@ async def download_klines(
 
         if df_api is None:
             # The remote source failed. Before the bulk-archive fallback this
-            # was the only way the load could end, and it failed the WHOLE
-            # load -- a partial local cache was never shipped on its own.
-            # Keep that contract: callers distinguish "no data loaded" (None)
+            # branch read ``if df_api is None and (df_local is None or
+            # df_local.empty)``, so a PARTIAL local cache was shipped on its
+            # own when the API failed -- and the backtest then ran on a
+            # window shorter than the one that was asked for, reporting the
+            # KPIs of that shorter window as if they were the requested ones.
+            # A truncated window is a wrong number, so this now fails the
+            # WHOLE load instead: callers distinguish "no data loaded" (None)
             # from "loaded, but empty", and only None fails the hard stops.
             logger.error(
                 f"Klines unavailable for {symbol} ({timeframe}): no data from "

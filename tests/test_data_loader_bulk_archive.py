@@ -1082,11 +1082,105 @@ def test_archive_market_path_uses_the_rest_path_comparison():
     """Exactly the comparison the REST path uses (market_type == "spot")."""
     assert bulk_archive._archive_market_path("spot") == "spot"
     assert bulk_archive._archive_market_path("futures_usdtm") == "futures/um"
-    assert bulk_archive._archive_market_path("futures_coinm") == "futures/cm"
+    # The REST path sends EVERY non-spot market type to the USDT-M host, so
+    # the archive must answer a COIN-M request with USDT-M candles.  Serving
+    # COIN-M candles here would swap the venue under the caller.
+    assert bulk_archive._archive_market_path("futures_coinm") == "futures/um"
+    assert bulk_archive._archive_market_path("futures_cm") == "futures/um"
+    assert bulk_archive._archive_market_path("coinm") == "futures/um"
     # A market type that merely CONTAINS "spot" must NOT get spot candles:
     # the REST path would have queried the futures host.
     assert bulk_archive._archive_market_path("spot_usdtm") == "futures/um"
     assert bulk_archive._archive_market_path("spot_perp") == "futures/um"
+
+
+def test_archive_venue_matches_the_rest_host_for_every_market_type(monkeypatch):
+    """The archive must be a FALLBACK for the REST path, never a second venue.
+
+    ``data_loader._make_api_request`` sends ``market_type == "spot"`` to the
+    spot host and EVERY other market type -- including the COIN-M ones -- to
+    the USDT-M futures host.  If the archive folder disagrees for even one
+    market type, a fallback would answer that request with a DIFFERENT
+    market's candles and change the numbers the backtest reports.
+
+    This test reads the REST path's OWN choice, so the two cannot drift apart
+    again the way a hand-written pair of lists would.
+    """
+    captured = []
+
+    class _FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    class _FakeSession:
+        def get(self, url, params=None, timeout=None):
+            captured.append(url)
+            return _FakeResponse()
+
+    monkeypatch.setattr(data_loader, "http_session", _FakeSession())
+
+    if config.ACTIVE_TRADING_ENVIRONMENT == "testnet":
+        spot_host = config.BINANCE_SPOT_TESTNET_API_URL_FOR_LOADER
+    else:
+        spot_host = config.BINANCE_SPOT_DATA_API_URL_FOR_LOADER
+
+    for market_type in (
+        "spot",
+        "futures_usdtm",
+        "futures_coinm",
+        "futures_cm",
+        "coinm",
+        "spot_usdtm",
+        "spot_perp",
+        "",
+    ):
+        captured.clear()
+        data_loader._make_api_request("klines", {}, market_type=market_type)
+        rest_host = captured[0]
+
+        rest_uses_spot = rest_host.startswith(spot_host)
+        archive_folder = bulk_archive._archive_market_path(market_type)
+
+        if rest_uses_spot:
+            assert archive_folder == "spot", market_type
+        else:
+            assert archive_folder == "futures/um", market_type
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_is_not_treated_as_a_location_block(
+    archive_server, monkeypatch
+):
+    """A timeout/DNS failure must NOT silently become archive data.
+
+    Only HTTP 451 is a location block.  A transport failure is a genuine
+    fault, and the archive's trailing edge is short by the publication lag --
+    so serving it in place of the fault could quietly shorten a backtest
+    window.  The fault must be re-raised instead.
+    """
+    def _timeout(*args, **kwargs):
+        raise requests.exceptions.ReadTimeout("read timed out")
+
+    monkeypatch.setattr(data_loader, "_make_api_request", _timeout)
+
+    rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 24, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        _make_zip(_rows_to_csv(rows), "BTCUSDT-1h-2024-01.csv"),
+    )
+
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        data_loader._download_klines_from_api_with_archive_fallback(
+            "BTCUSDT", "1h",
+            datetime(2024, 1, 1, tzinfo=timezone.utc),
+            datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc),
+            FUTURES,
+        )
 
 
 @pytest.mark.asyncio
