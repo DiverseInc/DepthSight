@@ -303,3 +303,111 @@ def test_configure_clears_what_the_proxy_remembered():
         second.existing == "second-original"
     ), "the undo restored the PREVIOUS target's snapshot onto the new target"
     assert first.existing == "patched", "the undo touched the previous target"
+
+
+def test_a_later_undo_does_not_clobber_an_out_of_band_change():
+    """An out-of-band change must survive a LATER undo of the same name.
+
+    The first undo already refuses to revert a change made directly on the
+    target. But the snapshot the proxy kept for that name still described the
+    value that was there BEFORE the out-of-band change, so a later patch of
+    the same name reused that stale snapshot, and the undo after it wrote the
+    stale original over the out-of-band value - destroying a change the proxy
+    never made.
+
+    So once the proxy sees that the target was changed out of band, it must
+    re-baseline on what the target holds NOW and stop claiming the name.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    original = target.existing
+    patched = _Value("patched")
+    changed_elsewhere = _Value("changed-elsewhere")
+    patched_again = _Value("patched-again")
+
+    proxy.existing = patched  # type: ignore[assignment]
+    assert target.existing is patched
+
+    target.existing = changed_elsewhere  # out of band, bypassing the proxy
+
+    del proxy.existing  # type: ignore[attr-defined]
+    assert target.existing is changed_elsewhere, (
+        "the first undo clobbered a change made on the target directly"
+    )
+
+    proxy.existing = patched_again  # type: ignore[assignment]
+    assert target.existing is patched_again
+
+    del proxy.existing  # type: ignore[attr-defined]
+
+    assert target.existing is changed_elsewhere, (
+        "the second undo wrote the proxy's stale pre-out-of-band snapshot over "
+        "the change that was made on the target directly. The proxy's "
+        "original snapshot no longer described reality and had to be "
+        "re-baselined when the out-of-band change was first seen."
+    )
+    assert target.existing is not original
+
+
+def test_undoing_an_abandoned_name_again_changes_nothing():
+    """Once the proxy has abandoned a name, undoing it again is inert.
+
+    Abandoning means the value on the target is not the proxy's to touch. A
+    second undo must therefore neither raise nor change the target.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    patched = _Value("patched")
+    changed_elsewhere = _Value("changed-elsewhere")
+
+    proxy.existing = patched  # type: ignore[assignment]
+    target.existing = changed_elsewhere  # out of band, bypassing the proxy
+
+    del proxy.existing  # type: ignore[attr-defined]
+    del proxy.existing  # type: ignore[attr-defined]  # must not raise
+
+    assert target.existing is changed_elsewhere, (
+        "a repeated undo of an abandoned name changed the value on the target"
+    )
+
+
+def test_a_second_out_of_band_change_is_also_preserved():
+    """A second out-of-band change must survive too.
+
+    After the first out-of-band change the proxy re-baselines on what the
+    target holds then. If the target is changed out of band AGAIN before the
+    next patch, the proxy must re-baseline again - otherwise it would put back
+    the value from the FIRST out-of-band change and destroy the second one.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    patched = _Value("patched")
+    changed_once = _Value("changed-once")
+    changed_twice = _Value("changed-twice")
+    patched_again = _Value("patched-again")
+
+    proxy.existing = patched  # type: ignore[assignment]
+
+    target.existing = changed_once  # out of band, bypassing the proxy
+    del proxy.existing  # type: ignore[attr-defined]
+    assert target.existing is changed_once
+
+    target.existing = changed_twice  # out of band again, bypassing the proxy
+
+    proxy.existing = patched_again  # type: ignore[assignment]
+    del proxy.existing  # type: ignore[attr-defined]
+
+    assert target.existing is changed_twice, (
+        "the undo put back the value from the FIRST out-of-band change and "
+        "destroyed the second one. The proxy must re-baseline on what the "
+        "target holds now, every time it patches an abandoned name."
+    )

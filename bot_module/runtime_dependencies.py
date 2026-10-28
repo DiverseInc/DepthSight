@@ -4,6 +4,11 @@ from typing import Any, Callable, Optional
 # which is a legitimate attribute value.
 _MISSING = object()
 
+# Sentinel for "this proxy no longer owns this name". It is set when the
+# proxied object was changed out of band, so the proxy's snapshot for that
+# name no longer describes reality and must not be applied again.
+_ABANDONED = object()
+
 
 class DependencyProxy:
     def __init__(self, name: str):
@@ -46,7 +51,12 @@ class DependencyProxy:
             return
         # Remember what the proxied object had, so that removing the override
         # puts the original back instead of deleting it (see __delattr__).
-        if name not in self._restore:
+        if self._written.get(name) is _ABANDONED:
+            # This name was abandoned: the proxied object was changed out of
+            # band, so the snapshot kept for it describes a value that is no
+            # longer there. Re-baseline on what the target holds NOW.
+            self._restore[name] = getattr(self._target, name, _MISSING)
+        elif name not in self._restore:
             self._restore[name] = getattr(self._target, name, _MISSING)
         setattr(self._target, name, value)
         self._written[name] = value
@@ -66,6 +76,19 @@ class DependencyProxy:
             # The proxied object no longer holds what this proxy put there: it
             # was changed out of band, and that change is not this proxy's to
             # revert. Leave it alone rather than clobbering it.
+            #
+            # The name is ABANDONED: the snapshot kept for it describes a
+            # value that is no longer there, so it must never be applied
+            # again. The next patch of this name re-baselines on what the
+            # target holds now (see __setattr__), so the out-of-band value
+            # can never be overwritten by a stale original - which is exactly
+            # what this guard exists to prevent.
+            #
+            # An abandoned name is caught here too: `_ABANDONED` is never the
+            # value the target holds, so a repeated undo lands here, re-baselines
+            # on the same value and changes nothing.
+            self._restore[name] = getattr(self._target, name, _MISSING)
+            self._written[name] = _ABANDONED
             return
         if saved is _MISSING:
             # The proxied object never had this name - the proxy created it,
