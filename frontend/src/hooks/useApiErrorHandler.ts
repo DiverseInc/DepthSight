@@ -46,7 +46,7 @@ export const useApiErrorHandler = (error: unknown, context?: string) => {
 				title: "Access Denied",
 				description:
 					detail ||
-					"This feature requires a higher plan. Please upgrade your account.",
+					"This feature requires a higher plan. Contact us and we will set it up for you.",
 			});
 			return;
 		}

@@ -303,7 +303,7 @@ export const ConfigAndLaunchPanel = memo(
 					variant: "destructive",
 					title: "Pro Feature",
 					description:
-						"Precision Engine (Kline) is available for Pro users only. Please upgrade to unlock institutional-grade testing.",
+						"Precision Engine (Kline) is available for Pro users only. Contact us and we will set up the Pro plan for you.",
 				});
 				return;
 			}

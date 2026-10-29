@@ -114,6 +114,9 @@ GUARDED_COMPONENTS = (
     "frontend/src/components/AppSidebar.tsx",
     "frontend/src/components/UserNav.tsx",
     "frontend/src/pages/CommunityHub.tsx",
+    "frontend/src/components/strategy-editor/ComponentPalette.tsx",
+    "frontend/src/components/strategy-editor/ConfigAndLaunchPanel.tsx",
+    "frontend/src/hooks/useApiErrorHandler.ts",
 )
 
 # The knowledge-base index.

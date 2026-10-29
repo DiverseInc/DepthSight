@@ -84,7 +84,7 @@ export const DraggablePaletteItem: React.FC<DraggablePaletteItemProps> = ({
 		toast({
 			title: "Pro Feature Locked",
 			description:
-				"This institutional-grade block requires a Pro subscription. Upgrade to unleash its power.",
+				"This institutional-grade block requires a Pro plan. Contact us and we will set it up for you.",
 			variant: "default",
 		});
 	};
@@ -131,7 +131,7 @@ export const DraggablePaletteItem: React.FC<DraggablePaletteItemProps> = ({
 			{isLocked && (
 				<div className="absolute inset-0 bg-background/40 backdrop-blur-[1px] flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity z-20">
 					<div className="bg-violet-600 text-white text-[10px] px-2 py-1 rounded shadow-lg font-bold">
-						UPGRADE TO PRO
+						PRO PLAN ONLY
 					</div>
 				</div>
 			)}
