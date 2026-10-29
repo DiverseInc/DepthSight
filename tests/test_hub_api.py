@@ -698,6 +698,21 @@ async def test_admin_signature_highlighting(
     # not carry a name -- the account does.
     admin = await create_hub_user(db_session, "hub_admin", role="admin")
 
+    # The shared key posts as the LOWEST-id administrator, so this test must
+    # own the only administrator account in the database. Pinning that
+    # precondition turns a future fixture that adds another admin into a
+    # clear failure here instead of a confusing name mismatch.
+    admins = (
+        (
+            await db_session.execute(
+                select(models.User).filter(models.User.role == "admin")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert [a.username for a in admins] == [admin.username]
+
     # 1. Create a topic as admin
     topic_payload = {
         "topic_type": "discussion",
