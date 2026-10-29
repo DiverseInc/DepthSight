@@ -14,6 +14,11 @@
 // HONEST: a metric the backtest never recorded has to read "Not reported",
 // never 0.00, and a template with no published performance has to say so
 // rather than imply a result.
+//
+// The published feed is NOT a winners-only list. A result that lost money is
+// published and ranked exactly like one that made it, so every helper here
+// has to render a NEGATIVE number correctly: the sign, the magnitude and the
+// unit all have to survive.
 
 export interface PublicStrategyTemplate {
 	id: string;
@@ -44,7 +49,14 @@ export interface PublicPublishedResult {
 	/** The window THIS run covered. */
 	period: { start: string; end: string };
 	category: string;
-	score: number;
+	/**
+	 * The run's OWN number for the category the feed is ranked by.
+	 *
+	 * It is null when the run never measured that metric -- the feed still
+	 * lists the result, and the page says "Not reported" rather than
+	 * printing a number the backtest never produced.
+	 */
+	score: number | null;
 	/** The position in the published list the visitor is shown. */
 	rank: number;
 	metrics: PublicPublishedMetrics;
