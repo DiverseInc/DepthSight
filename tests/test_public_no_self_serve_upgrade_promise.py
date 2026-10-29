@@ -414,6 +414,16 @@ def _ts_copy_units(source: str) -> list:
     return units
 
 
+def _surface_name(path: Path) -> str:
+    """The surface's repo-relative path, always with forward slashes.
+
+    A guard whose failure message reads "frontend\\src\\..." on Windows and
+    "frontend/src/..." on Linux is a guard whose message is not the same
+    message twice.
+    """
+    return path.relative_to(REPO_ROOT).as_posix()
+
+
 def _guarded_surfaces() -> dict:
     """Every customer-visible surface that can carry this promise."""
     surfaces: dict[str, list] = {}
@@ -421,16 +431,16 @@ def _guarded_surfaces() -> dict:
     for path in REGISTER_LOCALES:
         units = _json_strings(json.loads(path.read_text(encoding="utf-8")))
         # The one string the owning branch is replacing is not policed here.
-        surfaces[str(path.relative_to(REPO_ROOT))] = [
+        surfaces[_surface_name(path)] = [
             unit for unit in units if unit != LEGACY_EN_REGISTER_COPY
         ]
 
     for path in KB_ARTICLES:
-        surfaces[str(path.relative_to(REPO_ROOT))] = _markdown_units(
+        surfaces[_surface_name(path)] = _markdown_units(
             path.read_text(encoding="utf-8")
         )
 
-    surfaces[str(KB_INDEX.relative_to(REPO_ROOT))] = _ts_copy_units(
+    surfaces[_surface_name(KB_INDEX)] = _ts_copy_units(
         KB_INDEX.read_text(encoding="utf-8")
     )
 
@@ -638,6 +648,22 @@ class TestTheBillingArticleAgreesWithTheCatalog:
                 f"the KB index still tags the billing article {tag!r}, which "
                 "advertises a payment method the product does not have"
             )
+
+    def test_the_support_category_the_copy_points_at_really_exists(self):
+        """The copy sends the customer to a support ticket.
+
+        If the category it names does not exist, the copy points at nothing,
+        so the category is pinned here.
+        """
+        support = json.loads(
+            (LOCALES_DIR / "en" / "support.json").read_text(encoding="utf-8")
+        )
+        assert support["form"]["category_billing"] == "Billing / Plans"
+
+        russian = json.loads(
+            (LOCALES_DIR / "ru" / "support.json").read_text(encoding="utf-8")
+        )
+        assert russian["form"]["category_billing"] == "Оплата / Тарифы"
 
 
 class TestTheRegisterCopy:
