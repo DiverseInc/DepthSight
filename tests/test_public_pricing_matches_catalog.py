@@ -191,9 +191,9 @@ def _price_of(card: dict) -> float:
     than being truncated to 30 and passing.
     """
     match = _PRICE_RE.search(card["price_text"] or "")
-    assert match, (
-        f"pricing card {card.get('name')!r} has no $ price: {card['price_text']!r}"
-    )
+    assert (
+        match
+    ), f"pricing card {card.get('name')!r} has no $ price: {card['price_text']!r}"
     return float(match.group(1))
 
 
@@ -461,9 +461,7 @@ def _expected_included_labels(plan: dict, raw_plan: dict) -> set:
                 labels.add(f"{allowance} fast backtests per day")
 
     if _has_bybit_live_exception(raw_plan):
-        labels.add(
-            BYBIT_LIVE_LABEL.format(n=_bybit_live_allowance(raw_plan))
-        )
+        labels.add(BYBIT_LIVE_LABEL.format(n=_bybit_live_allowance(raw_plan)))
 
     if _allows_every_venue(raw_plan):
         # The catalog's label names three of the six venues
@@ -549,8 +547,8 @@ class TestTheCatalogIsTheSourceOfTruth:
         for plan in catalog["plans"]:
             raw = config["plans"][plan["key"]]
             assert plan["name"] == raw["name"]
-            expected = raw.get("billing", {}).get(mode, {}).get(
-                "price_usd", raw["price_usd"]
+            expected = (
+                raw.get("billing", {}).get(mode, {}).get("price_usd", raw["price_usd"])
             )
             assert plan["price_usd"] == expected
 
@@ -593,17 +591,17 @@ class TestThePageSellsExactlyTheCatalog:
         free = [c for c in cards if c["name"] == plans_by_name["Free"]["name"]]
         assert free, "the page does not advertise the Free tier"
         assert _price_of(free[0]) == 0
-        assert "forever" in (free[0]["price_text"] or "").lower(), (
-            "the Free tier is priced at $0 and must not be billed per month"
-        )
+        assert (
+            "forever" in (free[0]["price_text"] or "").lower()
+        ), "the Free tier is priced at $0 and must not be billed per month"
 
     def test_a_paid_tier_is_advertised_per_month(self, cards, plans_by_name):
         for card in cards:
             if card["name"] == plans_by_name["Free"]["name"]:
                 continue
-            assert "month" in (card["price_text"] or "").lower(), (
-                f"the paid tier {card['name']!r} must state its billing period"
-            )
+            assert (
+                "month" in (card["price_text"] or "").lower()
+            ), f"the paid tier {card['name']!r} must state its billing period"
 
     def test_the_page_contains_no_price_the_catalog_does_not_sell(self, page, catalog):
         allowed = {float(plan["price_usd"]) for plan in catalog["plans"]}
@@ -617,9 +615,9 @@ class TestThePageSellsExactlyTheCatalog:
         for card in cards:
             plan = plans_by_name.get(card["name"])
             assert plan is not None
-            assert card["description"] == plan["description"], (
-                f"the {card['name']} blurb does not match the catalog description"
-            )
+            assert (
+                card["description"] == plan["description"]
+            ), f"the {card['name']} blurb does not match the catalog description"
 
 
 # --------------------------------------------------------------------------
@@ -819,7 +817,9 @@ class TestTheLiveTradingAndPurchaseClaims:
             "exception; re-measure this test"
         )
 
-    def test_a_tier_that_may_trade_everywhere_says_so(self, cards, plans_by_name, raw_plans):
+    def test_a_tier_that_may_trade_everywhere_says_so(
+        self, cards, plans_by_name, raw_plans
+    ):
         """A paid tier may trade on every venue the platform has.
 
         api/routes/strategies.py:538-554 restricts a tier to Bybit ONLY when
@@ -846,8 +846,7 @@ class TestTheLiveTradingAndPurchaseClaims:
             )
 
         assert seen, (
-            "no tier has the allow_real_trading permission; re-measure this "
-            "test"
+            "no tier has the allow_real_trading permission; re-measure this " "test"
         )
 
     def test_the_page_advertises_no_feature_that_does_not_exist(self, page):
@@ -908,13 +907,10 @@ class TestTheLiveTradingAndPurchaseClaims:
             )
 
         assert seen, (
-            "no tier lacks the save_strategy_config permission; re-measure "
-            "this test"
+            "no tier lacks the save_strategy_config permission; re-measure " "this test"
         )
 
-    def test_the_pricing_line_does_not_promise_an_engine_a_tier_cannot_use(
-        self, page
-    ):
+    def test_the_pricing_line_does_not_promise_an_engine_a_tier_cannot_use(self, page):
         """The prose line above the cards is read by every tier at once.
 
         "All plans include the backtester" tells a Free reader that every
@@ -931,9 +927,9 @@ class TestTheLiveTradingAndPurchaseClaims:
             "Free reader would expect every engine, and the Precision "
             "engine is not available to them"
         )
-        assert "the fast backtester" in section, (
-            "the pricing line must name the engine every plan gets"
-        )
+        assert (
+            "the fast backtester" in section
+        ), "the pricing line must name the engine every plan gets"
 
     def test_the_pricing_line_does_not_promise_a_pro_tool_to_every_plan(
         self, page, plans_by_name, raw_plans
@@ -965,9 +961,7 @@ class TestTheLiveTradingAndPurchaseClaims:
                 "Professional gets them"
             )
 
-    def test_an_indexed_live_trading_claim_names_the_tiers_it_is_about(
-        self, page
-    ):
+    def test_an_indexed_live_trading_claim_names_the_tiers_it_is_about(self, page):
         """The featureList is indexed, so its claims are tiered too.
 
         The Free tier gets live trading on Bybit only, so an unscoped
@@ -1006,7 +1000,9 @@ class TestTheLiveTradingAndPurchaseClaims:
 
         seen = 0
         for unit in units:
-            text = unit.replace("risk-free", "riskfree").replace("risk free", "riskfree")
+            text = unit.replace("risk-free", "riskfree").replace(
+                "risk free", "riskfree"
+            )
             named = [venue for venue in LIVE_VENUES if venue in text]
 
             offers_a_venue_set = len(named) >= 2 or (
@@ -1024,8 +1020,7 @@ class TestTheLiveTradingAndPurchaseClaims:
             )
 
         assert seen, (
-            "no live-trading promise was found on the page; re-measure this "
-            "test"
+            "no live-trading promise was found on the page; re-measure this " "test"
         )
 
     def test_the_page_promises_no_self_serve_upgrade(self, page):
@@ -1046,13 +1041,11 @@ class TestTheLiveTradingAndPurchaseClaims:
             "the page promises an upgrade path that the deployment does not "
             "provide: the payment provider is opt-in and is not running"
         )
-        assert "new accounts start on the free plan" in lowered, (
-            "the page must say that a new account starts on the Free tier"
-        )
+        assert (
+            "new accounts start on the free plan" in lowered
+        ), "the page must say that a new account starts on the Free tier"
 
-    def test_the_card_buttons_say_what_the_product_pricing_page_says(
-        self, cards, page
-    ):
+    def test_the_card_buttons_say_what_the_product_pricing_page_says(self, cards, page):
         """The static page and the React pricing page are both public.
 
         frontend/src/lib/pricing.ts builds the React pricing cards, so the two
@@ -1075,9 +1068,9 @@ class TestTheLiveTradingAndPurchaseClaims:
             )
 
     def test_the_react_pricing_component_uses_these_labels(self):
-        source = (
-            REPO_ROOT / "frontend" / "src" / "lib" / "pricing.ts"
-        ).read_text(encoding="utf-8")
+        source = (REPO_ROOT / "frontend" / "src" / "lib" / "pricing.ts").read_text(
+            encoding="utf-8"
+        )
 
         assert 'cta = "Start free"' in source, (
             "the React pricing component changed its free-tier label; the "
@@ -1104,7 +1097,9 @@ class TestTheLiveTradingAndPurchaseClaims:
             assert plan is not None
 
             if plan["key"] == FREE_PLAN_KEY:
-                assert offer["url"].startswith(
+                assert offer[
+                    "url"
+                ].startswith(
                     "https://depthsight.diverseinc.net/register"
                 ), "the Free offer is indexed at the signup, where a free account really can be created"
                 continue
@@ -1138,9 +1133,7 @@ class TestAProspectCanActuallySignUp:
                 f"must point at {expected!r} so the prospect can start"
             )
 
-    def test_the_plan_keys_used_by_the_page_are_real_catalog_keys(
-        self, cards, catalog
-    ):
+    def test_the_plan_keys_used_by_the_page_are_real_catalog_keys(self, cards, catalog):
         real = {plan["key"] for plan in catalog["plans"]}
         for card in cards:
             key = card.get("key")
@@ -1161,12 +1154,12 @@ class TestAProspectCanActuallySignUp:
             )
 
     def test_the_primary_calls_to_action_point_at_registration(self, page):
-        assert 'class="nav-cta" href="/register"' in page, (
-            "the nav call to action must offer registration, not a waitlist"
-        )
-        assert 'class="btn btn-primary" href="/register"' in page, (
-            "the hero call to action must offer registration, not a waitlist"
-        )
+        assert (
+            'class="nav-cta" href="/register"' in page
+        ), "the nav call to action must offer registration, not a waitlist"
+        assert (
+            'class="btn btn-primary" href="/register"' in page
+        ), "the hero call to action must offer registration, not a waitlist"
 
     def test_the_page_does_not_only_offer_the_waitlist(self, page):
         assert 'href="#waitlist"' not in page, (
@@ -1181,9 +1174,9 @@ class TestAProspectCanActuallySignUp:
 class TestTheJsonLdOffers:
     def test_the_offers_are_the_catalog_tiers(self, page, plans_by_name):
         offers = _software_application(page)["offers"]
-        assert {offer["name"] for offer in offers} == set(plans_by_name), (
-            "the indexed offers must be exactly the tiers the catalog sells"
-        )
+        assert {offer["name"] for offer in offers} == set(
+            plans_by_name
+        ), "the indexed offers must be exactly the tiers the catalog sells"
 
     def test_every_offer_price_equals_the_catalog_price(self, page, plans_by_name):
         for offer in _software_application(page)["offers"]:
@@ -1302,8 +1295,7 @@ class TestTheJsonLdOffers:
 class TestThePagePromisesOnlyWhatTheProductDoes:
     def test_the_page_promises_no_credit(self, page):
         assert "$20" not in page, (
-            "no credit is granted by the backend, so the page must not "
-            "promise one"
+            "no credit is granted by the backend, so the page must not " "promise one"
         )
 
     def test_the_page_does_not_describe_a_test_mode_checkout(self, page):
@@ -1314,9 +1306,9 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
         assert "test mode" not in page.lower()
 
     def test_the_page_does_not_promise_an_annual_prepay(self, page):
-        assert "Annual prepay" not in page, (
-            "the catalog sells monthly billing; there is no annual prepay"
-        )
+        assert (
+            "Annual prepay" not in page
+        ), "the catalog sells monthly billing; there is no annual prepay"
 
     def test_the_page_promises_no_trial(self, page):
         """The backend grants a trial of ZERO days, so there is no trial."""
@@ -1458,9 +1450,9 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
             raw = raw_plans[plan["key"]]
 
             own = set()
-            for label in _expected_included_labels(plan, raw) | _expected_excluded_labels(
+            for label in _expected_included_labels(
                 plan, raw
-            ):
+            ) | _expected_excluded_labels(plan, raw):
                 own.update(re.findall(r"\d+", label))
 
             quoted = _quota_numbers(" ".join(card["included"] + card["not_included"]))
@@ -1491,9 +1483,9 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
                 f"the page still advertises {phrase!r}; the backend sells no "
                 "team tier, no seats and no RBAC"
             )
-        assert not re.search(r"\bTeam\b", page), (
-            "the page still advertises a 'Team' tier; the catalog has none"
-        )
+        assert not re.search(
+            r"\bTeam\b", page
+        ), "the page still advertises a 'Team' tier; the catalog has none"
 
     def test_the_page_prose_claims_no_quota_that_only_one_tier_gets(
         self, page, catalog
@@ -1516,9 +1508,7 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
                 "the catalog grants that quota to no tier"
             )
 
-    def test_the_page_uses_unlimited_only_where_the_catalog_does(
-        self, page, catalog
-    ):
+    def test_the_page_uses_unlimited_only_where_the_catalog_does(self, page, catalog):
         """'Unlimited' is an entitlement, not an adjective."""
         unlimited = {
             entitlement["label"]

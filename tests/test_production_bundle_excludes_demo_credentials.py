@@ -339,8 +339,7 @@ class TestTheBundleCheckIsNotVacuous:
         assert not found, (
             "a production build without VITE_SHOW_DEMO contains the seeded "
             "demo credentials. A visitor can read them out of the public "
-            "JavaScript without clicking anything. Files: "
-            + ", ".join(files)
+            "JavaScript without clicking anything. Files: " + ", ".join(files)
         )
 
     def test_a_build_with_the_demo_flag_ships_them_so_the_check_can_fail(
