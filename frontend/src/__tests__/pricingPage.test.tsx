@@ -164,9 +164,13 @@ describe("the rendered pricing page (FIX 1)", () => {
 		expect(card).toContain("PRO blocks (Tape, Book, Open Interest)");
 	});
 
-	it("shows the lifetime prices that used to be hidden", () => {
-		expect(standardCard()).toContain("$99");
-		expect(professionalCard()).toContain("$299");
+	it("does NOT advertise a one-off price the backend does not sell", () => {
+		// Same truth, asserted on the RENDERED page: the catalog's lifetime
+		// block is enabled, but the active billing_mode is "monthly", so the
+		// checkout would charge $30 / $100 -- not $99 / $299.
+		expect(standardCard()).not.toContain("$99");
+		expect(professionalCard()).not.toContain("$299");
+		expect(html).not.toContain("lifetime access");
 	});
 
 	it("keeps the free tier accurate", () => {

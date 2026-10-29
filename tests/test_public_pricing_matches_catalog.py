@@ -1965,6 +1965,51 @@ class TestTheIndexedFeatureListNamesItsTiers:
         assert seen, "no indexed feature was inspected; re-measure this test"
 
 
+class TestTheOneOffLifetimePrice:
+    """A one-off price may only be advertised while it is actually sold.
+
+    THE DEFECT THIS PINS
+    --------------------
+    The catalog exposes BOTH the lifetime block (enabled, price_usd) and
+    the active billing_mode. In this deployment billing_mode is "monthly":
+    api/routes/payments.py only creates a lifetime offer when the billing
+    mode is "lifetime", so the one-off price is CONFIGURED but NOT SOLD.
+
+    frontend/src/lib/pricing.ts used to gate the one-off price on
+    `lifetime.enabled` alone, so the React pricing section rendered
+    "or $99 once -- lifetime access" for a price the backend would never
+    charge -- a price the catalog does not sell. The rendered-output
+    proof lives in frontend/src/__tests__/publicPricingCopy.test.tsx; this
+    test pins the source so the gate cannot be removed silently.
+    """
+
+    @pytest.fixture(scope="class")
+    def helper(self) -> str:
+        return PRICING_HELPER.read_text(encoding="utf-8")
+
+    def test_the_active_billing_mode_decides_whether_a_one_off_price_is_shown(self, helper):
+        parts = helper.split("export const lifetimePriceFor", 1)
+        assert len(parts) == 2, "lifetimePriceFor is no longer in pricing.ts"
+        fn = parts[1].split("};", 1)[0]
+        assert "billing_mode" in fn, (
+            "the one-off price must be gated on the plan's active "
+            "billing_mode -- the catalog carries the lifetime block even "
+            "while the deployment bills monthly"
+        )
+        assert '"lifetime"' in fn, (
+            "the gate must compare the plan's billing_mode against "
+            '"lifetime"'
+        )
+
+    def test_the_configured_one_off_price_is_not_what_this_deployment_sells(self):
+        text = PLANS_CONFIG.read_text(encoding="utf-8")
+        assert "mode: monthly" in text, (
+            "this deployment bills monthly, so the configured one-off "
+            "price is not sold -- if the billing mode changed, the gate in "
+            "pricing.ts and this test must both be revisited"
+        )
+
+
 class TestTheRegisterPageCopy:
     """The register page's selected-plan copy is a public promise.
 

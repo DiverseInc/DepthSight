@@ -97,7 +97,7 @@ vi.mock("react-router-dom", () => ({
 }));
 
 import { Pricing } from "@/components/marketing/Pricing";
-import { buildSignupNote } from "@/lib/pricing";
+import { buildSignupNote, lifetimePriceFor } from "@/lib/pricing";
 
 const html = renderToStaticMarkup(<Pricing />);
 const note = buildSignupNote(catalog);
@@ -123,7 +123,7 @@ describe("the public pricing copy", () => {
 		// There is no self-serve upgrade to promise, so the copy has to
 		// say what actually happens instead.
 		expect(note).toMatch(/we will set up|activate the paid tier/i);
-		expect(registerCopy).toMatch(/we activate the paid tier for you/i);
+		expect(registerCopy).toMatch(/contact us and we will set it up for you/i);
 	});
 
 	it("keeps naming the plan the visitor selected", () => {
@@ -136,5 +136,30 @@ describe("the public pricing copy", () => {
 
 	it("keeps the free tier's promise that no card is needed", () => {
 		expect(html).toContain("No credit card to start");
+	});
+});
+
+describe("the one-off lifetime price", () => {
+	// The catalog exposes BOTH the lifetime block (enabled, price_usd) and
+	// the active billing_mode. This deployment bills MONTHLY, so the
+	// one-off price is configured but NOT sold. The live catalog proves
+	// it: /api/v1/public/plans returns, for the standard plan,
+	// "billing_mode": "monthly" together with
+	// "lifetime": { "enabled": true, "price_usd": 99 }.
+	const standard = catalog.plans[1];
+	const withLifetimeOffer = {
+		...standard,
+		billing: { lifetime: { enabled: true, price_usd: 99, slot_limit: 75 } },
+	};
+
+	it("does NOT advertise a one-off price while the deployment bills monthly", () => {
+		expect(standard.billing_mode).toBe("monthly");
+		expect(lifetimePriceFor(withLifetimeOffer)).toBeNull();
+	});
+
+	it("advertises the one-off price when the deployment actually sells one", () => {
+		expect(
+			lifetimePriceFor({ ...withLifetimeOffer, billing_mode: "lifetime" as const }),
+		).toBe("$99");
 	});
 });

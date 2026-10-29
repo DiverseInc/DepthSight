@@ -1,7 +1,7 @@
 {
 	"cardTitle": "Create an account",
 	"cardDescription": "Enter your details below to create your account.",
-	"selectedPlan": "You selected the {{plan}} plan. New accounts start on the plan they are entitled to — we activate the paid tier for you after you sign up.",
+	"selectedPlan": "You selected the {{plan}} plan. New accounts start on the plan they are entitled to — to activate a paid tier, contact us and we will set it up for you.",
 	"usernameLabel": "Username",
 	"usernamePlaceholder": "Your username",
 	"emailLabel": "Email",
