@@ -28,6 +28,39 @@ def ensure_hub_router_registered():
         app._depthsight_hub_router_mounted = True
 
 
+def make_hub_user(username: str, role: str = "user") -> models.User:
+    """
+    Build a hub account that can sign in.
+
+    The hub derives a poster's display name from the AUTHENTICATED account,
+    so a test that posts has to present a real account. get_current_user
+    rejects inactive accounts, hence is_active=True.
+    """
+    return models.User(
+        username=username,
+        email=f"{username}@example.com",
+        hashed_password="fakehashpassword",
+        role=role,
+        plan="pro",
+        is_active=True,
+        xp=0,
+        level=1,
+    )
+
+
+async def create_hub_user(
+    db_session: AsyncSession, username: str, role: str = "user"
+) -> models.User:
+    """
+    Persist a hub account and hand back the refreshed row.
+    """
+    user = make_hub_user(username, role)
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+    return user
+
+
 async def test_get_hub_strategies(test_client: AsyncClient):
     """
     Test retrieving strategy templates from the Hub.
@@ -107,11 +140,19 @@ async def test_post_hub_feedback(test_client: AsyncClient, db_session: AsyncSess
 
 
 async def test_create_and_get_hub_topics(
-    test_client: AsyncClient, db_session: AsyncSession
+    test_client: AsyncClient,
+    db_session: AsyncSession,
+    authenticated_client_factory,
 ):
     """
     Test creating both strategy and discussion topics, and then retrieving them.
+
+    The topics are published by a signed-in account, and the author name that
+    comes back is DERIVED from that account: the name supplied in the request
+    body ("QuantTrader" / "BullishJohn") is ignored and must not be stored.
     """
+    poster = await create_hub_user(db_session, "quant_trader")
+
     strategy_payload = {
         "topic_type": "strategy",
         "title": "EMA Cross Strategy",
@@ -130,23 +171,29 @@ async def test_create_and_get_hub_topics(
         "equity_curve": [[1767225600000, 10000], [1767312000000, 10156]],
         "strategy_json": {"strategy_name": "EmaCross", "symbol": "BTCUSDT"},
     }
-    response = await test_client.post("/api/v1/hub/topics", json=strategy_payload)
-    assert response.status_code == 201
-    strategy_data = response.json()
-    assert strategy_data["title"] == "EMA Cross Strategy"
-    assert strategy_data["author_name"] == "QuantTrader"
-    assert strategy_data["kpis"]["total_pnl"] == 15.6
+    auth_client = await authenticated_client_factory(poster)
+    async with auth_client:
+        response = await auth_client.post("/api/v1/hub/topics", json=strategy_payload)
+        assert response.status_code == 201
+        strategy_data = response.json()
+        assert strategy_data["title"] == "EMA Cross Strategy"
+        # The author name is the signed-in account's, not the one in the body.
+        assert strategy_data["author_name"] == "quant_trader"
+        assert strategy_data["author_name"] != "QuantTrader"
+        assert strategy_data["kpis"]["total_pnl"] == 15.6
 
-    discussion_payload = {
-        "topic_type": "discussion",
-        "title": "Market Sentiment Thread",
-        "description": "What do you think about the current market direction?",
-        "author_name": "BullishJohn",
-    }
-    response = await test_client.post("/api/v1/hub/topics", json=discussion_payload)
-    assert response.status_code == 201
-    discussion_data = response.json()
-    assert discussion_data["title"] == "Market Sentiment Thread"
+        discussion_payload = {
+            "topic_type": "discussion",
+            "title": "Market Sentiment Thread",
+            "description": "What do you think about the current market direction?",
+            "author_name": "BullishJohn",
+        }
+        response = await auth_client.post("/api/v1/hub/topics", json=discussion_payload)
+        assert response.status_code == 201
+        discussion_data = response.json()
+        assert discussion_data["title"] == "Market Sentiment Thread"
+        assert discussion_data["author_name"] == "quant_trader"
+        assert discussion_data["author_name"] != "BullishJohn"
 
     # Fetch strategy topics
     response = await test_client.get("/api/v1/hub/topics?type=strategy")
@@ -161,21 +208,38 @@ async def test_create_and_get_hub_topics(
     assert any(t["id"] == discussion_data["id"] for t in topics)
 
 
-async def test_like_hub_topic(test_client: AsyncClient, db_session: AsyncSession):
+async def test_like_hub_topic(
+    test_client: AsyncClient,
+    db_session: AsyncSession,
+    authenticated_client_factory,
+):
     """
     Test liking a topic increases its likes_count.
+
+    The topic is published by a signed-in account, so the displayed author name
+    is the account's own ("liker"), not the name sent in the request body.
     """
+    poster = await create_hub_user(db_session, "liker")
+
     topic_payload = {
         "topic_type": "discussion",
         "title": "Like Test",
         "description": "Testing upvote counts.",
         "author_name": "Tester",
     }
-    response = await test_client.post("/api/v1/hub/topics", json=topic_payload)
-    topic_id = response.json()["id"]
+    auth_client = await authenticated_client_factory(poster)
+    async with auth_client:
+        response = await auth_client.post("/api/v1/hub/topics", json=topic_payload)
+        assert response.status_code == 201
+        topic_data = response.json()
+        topic_id = topic_data["id"]
 
-    # Initial like count is 0
-    assert response.json()["likes_count"] == 0
+        # The author name is derived from the account, not taken from the body.
+        assert topic_data["author_name"] == "liker"
+        assert topic_data["author_name"] != "Tester"
+
+        # Initial like count is 0
+        assert topic_data["likes_count"] == 0
 
     # Like the topic
     response = await test_client.post(f"/api/v1/hub/topics/{topic_id}/like")
@@ -189,29 +253,45 @@ async def test_like_hub_topic(test_client: AsyncClient, db_session: AsyncSession
 
 
 async def test_create_and_get_comments(
-    test_client: AsyncClient, db_session: AsyncSession
+    test_client: AsyncClient,
+    db_session: AsyncSession,
+    authenticated_client_factory,
 ):
     """
     Test creating comments for a topic and fetching the comment thread.
+
+    Both the topic and the comment are posted by a signed-in account, and the
+    stored author name is that account's own name -- not the name sent in the
+    request body.
     """
+    poster = await create_hub_user(db_session, "commenter")
+
     topic_payload = {
         "topic_type": "discussion",
         "title": "Comment Thread Test",
         "description": "Testing comments retrieval.",
         "author_name": "CommentTester",
     }
-    response = await test_client.post("/api/v1/hub/topics", json=topic_payload)
-    topic_id = response.json()["id"]
+    auth_client = await authenticated_client_factory(poster)
+    async with auth_client:
+        response = await auth_client.post("/api/v1/hub/topics", json=topic_payload)
+        assert response.status_code == 201
+        topic_data = response.json()
+        topic_id = topic_data["id"]
+        assert topic_data["author_name"] == "commenter"
+        assert topic_data["author_name"] != "CommentTester"
 
-    comment_payload = {"author_name": "ReplyUser", "text": "This is a great idea!"}
-    response = await test_client.post(
-        f"/api/v1/hub/topics/{topic_id}/comments", json=comment_payload
-    )
-    assert response.status_code == 201
-    comment_data = response.json()
-    assert comment_data["author_name"] == "ReplyUser"
-    assert comment_data["text"] == "This is a great idea!"
-    assert comment_data["topic_id"] == topic_id
+        comment_payload = {"author_name": "ReplyUser", "text": "This is a great idea!"}
+        response = await auth_client.post(
+            f"/api/v1/hub/topics/{topic_id}/comments", json=comment_payload
+        )
+        assert response.status_code == 201
+        comment_data = response.json()
+        # The comment's author name is derived from the account too.
+        assert comment_data["author_name"] == "commenter"
+        assert comment_data["author_name"] != "ReplyUser"
+        assert comment_data["text"] == "This is a great idea!"
+        assert comment_data["topic_id"] == topic_id
 
     # Retrieve comment thread
     response = await test_client.get(f"/api/v1/hub/topics/{topic_id}/comments")
@@ -229,75 +309,87 @@ async def test_create_and_get_comments(
 
 
 async def test_delete_hub_topic(
-    test_client: AsyncClient, db_session: AsyncSession, monkeypatch
+    test_client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch,
+    authenticated_client_factory,
 ):
     """
     Test creating a topic, verifying delete_token behaves correctly,
     and deleting the topic as owner and as admin.
+
+    The topic is created by a signed-in account, so the stored author name is
+    that account's own ("deleter"), not the name sent in the request body.
     """
-    # 1. Create a topic
-    payload = {
-        "topic_type": "discussion",
-        "title": "To Be Deleted",
-        "description": "This topic will be deleted.",
-        "author_name": "Ghost",
-    }
-    response = await test_client.post("/api/v1/hub/topics", json=payload)
-    assert response.status_code == 201
-    creation_data = response.json()
-    assert "delete_token" in creation_data
-    delete_token = creation_data["delete_token"]
-    topic_id = creation_data["id"]
+    poster = await create_hub_user(db_session, "deleter")
 
-    # 2. Get topics list and verify delete_token is NOT leaked
-    response = await test_client.get("/api/v1/hub/topics?type=discussion")
-    assert response.status_code == 200
-    topics = response.json()
-    matched = next(t for t in topics if t["id"] == topic_id)
-    assert "delete_token" not in matched
+    auth_client = await authenticated_client_factory(poster)
+    async with auth_client:
+        # 1. Create a topic
+        payload = {
+            "topic_type": "discussion",
+            "title": "To Be Deleted",
+            "description": "This topic will be deleted.",
+            "author_name": "Ghost",
+        }
+        response = await auth_client.post("/api/v1/hub/topics", json=payload)
+        assert response.status_code == 201
+        creation_data = response.json()
+        assert "delete_token" in creation_data
+        assert creation_data["author_name"] == "deleter"
+        assert creation_data["author_name"] != "Ghost"
+        delete_token = creation_data["delete_token"]
+        topic_id = creation_data["id"]
 
-    # 3. Attempt deletion without token
-    response = await test_client.delete(f"/api/v1/hub/topics/{topic_id}")
-    assert response.status_code == 403
+        # 2. Get topics list and verify delete_token is NOT leaked
+        response = await test_client.get("/api/v1/hub/topics?type=discussion")
+        assert response.status_code == 200
+        topics = response.json()
+        matched = next(t for t in topics if t["id"] == topic_id)
+        assert "delete_token" not in matched
 
-    # 4. Attempt deletion with wrong token
-    response = await test_client.delete(
-        f"/api/v1/hub/topics/{topic_id}?delete_token=wrong-token"
-    )
-    assert response.status_code == 403
+        # 3. Attempt deletion without token
+        response = await test_client.delete(f"/api/v1/hub/topics/{topic_id}")
+        assert response.status_code == 403
 
-    # 5. Delete with correct token
-    response = await test_client.delete(
-        f"/api/v1/hub/topics/{topic_id}?delete_token={delete_token}"
-    )
-    assert response.status_code == 204
+        # 4. Attempt deletion with wrong token
+        response = await test_client.delete(
+            f"/api/v1/hub/topics/{topic_id}?delete_token=wrong-token"
+        )
+        assert response.status_code == 403
 
-    # Verify topic is gone
-    response = await test_client.get("/api/v1/hub/topics?type=discussion")
-    topics = response.json()
-    assert not any(t["id"] == topic_id for t in topics)
+        # 5. Delete with correct token
+        response = await test_client.delete(
+            f"/api/v1/hub/topics/{topic_id}?delete_token={delete_token}"
+        )
+        assert response.status_code == 204
 
-    # 6. Test Admin deletion using monkeypatched HUB_ADMIN_API_KEY
-    from api import hub_router
+        # Verify topic is gone
+        response = await test_client.get("/api/v1/hub/topics?type=discussion")
+        topics = response.json()
+        assert not any(t["id"] == topic_id for t in topics)
 
-    monkeypatch.setattr(hub_router, "HUB_ADMIN_API_KEY", "super-secret-admin-key")
+        # 6. Test Admin deletion using monkeypatched HUB_ADMIN_API_KEY
+        from api import hub_router
 
-    # Create another topic
-    response = await test_client.post("/api/v1/hub/topics", json=payload)
-    assert response.status_code == 201
-    topic_id_2 = response.json()["id"]
+        monkeypatch.setattr(hub_router, "HUB_ADMIN_API_KEY", "super-secret-admin-key")
 
-    # Delete using admin key via header
-    headers = {"Authorization": "Bearer super-secret-admin-key"}
-    response = await test_client.delete(
-        f"/api/v1/hub/topics/{topic_id_2}", headers=headers
-    )
-    assert response.status_code == 204
+        # Create another topic
+        response = await auth_client.post("/api/v1/hub/topics", json=payload)
+        assert response.status_code == 201
+        topic_id_2 = response.json()["id"]
 
-    # Verify it is gone
-    response = await test_client.get("/api/v1/hub/topics?type=discussion")
-    topics = response.json()
-    assert not any(t["id"] == topic_id_2 for t in topics)
+        # Delete using admin key via header
+        headers = {"Authorization": "Bearer super-secret-admin-key"}
+        response = await test_client.delete(
+            f"/api/v1/hub/topics/{topic_id_2}", headers=headers
+        )
+        assert response.status_code == 204
+
+        # Verify it is gone
+        response = await test_client.get("/api/v1/hub/topics?type=discussion")
+        topics = response.json()
+        assert not any(t["id"] == topic_id_2 for t in topics)
 
 
 async def test_admin_manage_presets_and_news(
@@ -525,11 +617,18 @@ async def test_hub_node_lifecycle(test_client: AsyncClient, db_session: AsyncSes
 
 
 async def test_hub_news_interactions(
-    test_client: AsyncClient, db_session: AsyncSession
+    test_client: AsyncClient,
+    db_session: AsyncSession,
+    authenticated_client_factory,
 ):
     """
     Test liking and commenting on a news item.
+
+    The comment is posted by a signed-in account, so the stored author name is
+    that account's own ("news_commenter"), not the name sent in the body.
     """
+    commenter = await create_hub_user(db_session, "news_commenter")
+
     # 1. Fetch news to get a valid news id
     response = await test_client.get("/api/v1/hub/news")
     assert response.status_code == 200
@@ -552,11 +651,15 @@ async def test_hub_news_interactions(
         "author_name": "NewsCommenter",
         "text": "This is a great update!",
     }
-    comment_res = await test_client.post(
-        f"/api/v1/hub/news/{news_id}/comments", json=comment_payload
-    )
+    auth_client = await authenticated_client_factory(commenter)
+    async with auth_client:
+        comment_res = await auth_client.post(
+            f"/api/v1/hub/news/{news_id}/comments", json=comment_payload
+        )
     assert comment_res.status_code == 201
-    assert comment_res.json()["author_name"] == "NewsCommenter"
+    # The author name is derived from the account, not taken from the body.
+    assert comment_res.json()["author_name"] == "news_commenter"
+    assert comment_res.json()["author_name"] != "NewsCommenter"
     assert comment_res.json()["text"] == "This is a great update!"
     assert comment_res.json()["news_id"] == news_id
 
@@ -582,11 +685,18 @@ async def test_admin_signature_highlighting(
     Test that when a comment or topic is posted by the admin (passing Authorization header),
     the username is cryptographically signed, and when retrieved, the signature is validated,
     stripped, and the response is marked with is_admin: True.
+
+    The shared admin key still authorises the post, but the name it posts under
+    is DERIVED from the administrator's ACCOUNT -- never from the request body.
     """
     from api import hub_router
 
     monkeypatch.setattr(hub_router, "HUB_ADMIN_API_KEY", "super-secret-admin-key")
     headers = {"Authorization": "Bearer super-secret-admin-key"}
+
+    # The administrator account the shared key posts as. The key alone does
+    # not carry a name -- the account does.
+    admin = await create_hub_user(db_session, "hub_admin", role="admin")
 
     # 1. Create a topic as admin
     topic_payload = {
@@ -600,7 +710,9 @@ async def test_admin_signature_highlighting(
     )
     assert response.status_code == 201
     topic_data = response.json()
-    assert topic_data["author_name"] == "AdminUser"
+    # The author name is the admin account's, not the one in the body.
+    assert topic_data["author_name"] == admin.username
+    assert topic_data["author_name"] != "AdminUser"
     assert topic_data["is_admin"] is True
     topic_id = topic_data["id"]
 
@@ -613,13 +725,14 @@ async def test_admin_signature_highlighting(
     # author_name should have [a:<sig>] suffix
     assert topic_in_db.author_name != "AdminUser"
     assert "[a:" in topic_in_db.author_name
+    assert topic_in_db.author_name.startswith(f"{admin.username}[a:")
 
     # 2. Get topics list and verify clean name + is_admin: True
     response = await test_client.get("/api/v1/hub/topics?type=discussion")
     assert response.status_code == 200
     topics = response.json()
     matched = next(t for t in topics if t["id"] == topic_id)
-    assert matched["author_name"] == "AdminUser"
+    assert matched["author_name"] == admin.username
     assert matched["is_admin"] is True
 
     # 3. Post a comment as admin
@@ -629,7 +742,8 @@ async def test_admin_signature_highlighting(
     )
     assert response.status_code == 201
     comment_data = response.json()
-    assert comment_data["author_name"] == "AdminUser"
+    assert comment_data["author_name"] == admin.username
+    assert comment_data["author_name"] != "AdminUser"
     assert comment_data["is_admin"] is True
     comment_id = comment_data["id"]
 
@@ -639,11 +753,12 @@ async def test_admin_signature_highlighting(
     )
     comment_in_db = result.scalars().first()
     assert "[a:" in comment_in_db.author_name
+    assert comment_in_db.author_name.startswith(f"{admin.username}[a:")
 
     # 4. Get comments list and verify clean name + is_admin: True
     response = await test_client.get(f"/api/v1/hub/topics/{topic_id}/comments")
     assert response.status_code == 200
     comments = response.json()
     matched_c = next(c for c in comments if c["id"] == comment_id)
-    assert matched_c["author_name"] == "AdminUser"
+    assert matched_c["author_name"] == admin.username
     assert matched_c["is_admin"] is True
