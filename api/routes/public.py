@@ -1,11 +1,13 @@
 import logging
-from typing import Any, Dict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from sqlalchemy import desc, func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from .. import crud, models, schemas
 from ..database import get_db
@@ -32,7 +34,6 @@ async def get_public_plans():
     that differs from the tier the backend actually grants.
     """
     return build_plan_catalog()
-
 
 
 @public_router.get(
@@ -198,11 +199,53 @@ async def render_shared_backtest(
 
 # --- Public screener feed ---
 
-# The two metrics a published result can be ranked by. These are the same
-# categories the in-app leaderboard uses, so the public feed and the
-# authenticated leaderboard can never disagree about a number.
+# The two metrics a published result can be RANKED BY. They are the same two
+# categories the in-app leaderboard uses, so a visitor and a player are
+# looking at the same numbers -- but they are NOT the same list. The
+# leaderboard is a competition with its own entry rules; this feed is a list
+# of what people published.
 PUBLIC_RESULT_CATEGORIES = ("sharpe_ratio", "net_pnl_percent")
 PUBLIC_RESULT_PERIODS = ("weekly", "monthly", "all_time")
+
+# What "weekly" and "monthly" cover: the window in which the result was
+# PUBLISHED. A leaderboard entry belongs to the week it was scored in; a
+# published result belongs to the moment its owner made it public.
+PUBLIC_RESULT_PERIOD_WINDOWS = {
+    "weekly": timedelta(days=7),
+    "monthly": timedelta(days=30),
+}
+
+
+def _run_kpis(run) -> Dict[str, Any]:
+    """The run's own KPI block, read defensively."""
+    kpis = run.kpi_results_json or {}
+    if not isinstance(kpis, dict):
+        return {}
+    return kpis
+
+
+def _as_float(value: Any) -> Optional[float]:
+    """A KPI value as a number, or None when the run never measured it.
+
+    `bool` is excluded on purpose: `isinstance(True, int)` is True in
+    Python, and a boolean KPI is a broken KPI, not a number.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _net_pnl_percent(run) -> Optional[float]:
+    """The run's own net return, as a percentage of its own starting balance.
+
+    ONE implementation, used both for the number the card shows and for the
+    number the list is sorted by, so the two can never disagree.
+    """
+    total_pnl = _as_float(_run_kpis(run).get("total_pnl"))
+    initial_balance = _as_float(run.initial_balance)
+    if total_pnl is None or not initial_balance:
+        return None
+    return (total_pnl / initial_balance) * 100
 
 
 def _public_strategy_name(run, shared_backtest) -> str:
@@ -234,34 +277,80 @@ def _public_result_metrics(run) -> Dict[str, Any]:
     A metric the backtest never recorded stays None, so the page can print
     "not reported" instead of a 0.00 the run never produced.
     """
-    kpis = run.kpi_results_json or {}
-    if not isinstance(kpis, dict):
-        kpis = {}
+    kpis = _run_kpis(run)
 
     total_pnl = kpis.get("total_pnl")
-    initial_balance = run.initial_balance
-    net_pnl_percent = None
-    if (
-        isinstance(total_pnl, (int, float))
-        and not isinstance(total_pnl, bool)
-        and isinstance(initial_balance, (int, float))
-        and not isinstance(initial_balance, bool)
-        and initial_balance
-    ):
-        net_pnl_percent = (total_pnl / initial_balance) * 100
 
     trades = kpis.get("trades")
     if trades is None:
         trades = kpis.get("total_trades")
 
     return {
-        "sharpeRatio": kpis.get("sharpe_ratio"),
-        "netPnlPercent": net_pnl_percent,
+        "sharpeRatio": _as_float(kpis.get("sharpe_ratio")),
+        "netPnlPercent": _net_pnl_percent(run),
         "netPnl": total_pnl,
         "winRate": kpis.get("win_rate"),
         "maxDrawdown": kpis.get("max_drawdown"),
         "trades": trades,
     }
+
+
+def _public_result_score(run, category: str) -> Optional[float]:
+    """The score a published result is RANKED BY.
+
+    It comes from the RUN'S OWN KPIs -- never from the leaderboard. The
+    leaderboard's anti-buy-and-hold rule decides who may COMPETE; it has
+    nothing to say about what a visitor may READ. So a result that lost
+    money is ranked here exactly like one that made it, by the number the
+    run itself produced.
+
+    A run that never measured the metric has no score. It is still listed
+    (the visitor can see it, and its other metrics are real), but it sorts
+    after every result that did measure it -- it cannot claim to be better
+    than a measured number.
+    """
+    if category == "sharpe_ratio":
+        return _as_float(_run_kpis(run).get("sharpe_ratio"))
+    if category == "net_pnl_percent":
+        return _net_pnl_percent(run)
+    return None
+
+
+def _public_result_sort_key(shared_backtest, run, category: str):
+    """The key the published feed is sorted by.
+
+    1. The run's own score for the category, highest first.
+    2. A result that never measured the metric comes last.
+    3. Ties break on the PUBLIC strategy name, then on the public slug.
+
+    The tie-break exists so that two equal results never swap places
+    between two page loads: a visitor's card must not change position for
+    no reason. It uses the PUBLIC name on purpose -- an owner who kept
+    their strategy name private must not be identifiable from the position
+    their result happens to take.
+    """
+    score = _public_result_score(run, category)
+    return (
+        score is None,
+        -(score if score is not None else 0.0),
+        _public_strategy_name(run, shared_backtest),
+        shared_backtest.public_slug,
+    )
+
+
+def _published_at(shared_backtest) -> Optional[datetime]:
+    """When the result was published, in UTC.
+
+    The column is timezone-aware on PostgreSQL and naive-UTC on SQLite, so
+    it is normalised here rather than compared against a cutoff in two
+    different ways.
+    """
+    published_at = shared_backtest.created_at
+    if published_at is None:
+        return None
+    if published_at.tzinfo is None:
+        return published_at.replace(tzinfo=timezone.utc)
+    return published_at.astimezone(timezone.utc)
 
 
 @public_router.get(
@@ -285,10 +374,23 @@ async def get_public_published_results(
     WHAT THIS IS
     ------------
     The public screener page (a no-login page) needs to show a visitor
-    something real rather than a promise. The only backtest results this
-    platform publishes on purpose are the ones a user ticked "publish to
-    leaderboard" for AND whose public link is still switched on. Those are
-    listed here, without the owner's identity.
+    something real rather than a promise. It lists every backtest result a
+    user made public: the run finished, its public link is still switched
+    on, and the account is not a seeded demo account.
+
+    It is NOT the leaderboard, and it does not share its entry rules. The
+    leaderboard is a competition: only a strategy that traded at least 30
+    times AND beat buy and hold may enter it. That rule is deliberate and
+    it is left exactly as it is. This feed has a different job -- it shows
+    a visitor what people actually published -- so it lists a result that
+    LOST money exactly like one that made it, ranked by the number the run
+    itself produced. A feed that can only ever show winners is worth
+    nothing to a prospect deciding whether to trust the platform.
+
+    The ranking score is the run's own KPI for the requested category
+    (`sharpe_ratio` or `net_pnl_percent`) -- never a leaderboard score. A
+    result that never measured the metric is still listed, with that metric
+    left unset, and it sorts after every result that did measure it.
 
     WHAT THIS IS NOT
     ----------------
@@ -316,32 +418,38 @@ async def get_public_published_results(
             detail="period must be one of: " + ", ".join(PUBLIC_RESULT_PERIODS),
         )
 
-    leaderboard_period = models.LeaderboardPeriod(period)
-
-    def _joined_select():
-        """The one joined query both the list and its count are built from, so
-        the two can never describe different sets."""
-        return (
-            select(
-                models.LeaderboardEntry,
-                models.BacktestRun,
-                models.SharedBacktest,
-            )
-            .join(
-                models.BacktestRun,
-                models.LeaderboardEntry.backtest_run_id == models.BacktestRun.id,
-            )
-            .join(
-                models.SharedBacktest,
-                models.LeaderboardEntry.shared_backtest_slug
-                == models.SharedBacktest.public_slug,
-            )
-            .join(models.User, models.LeaderboardEntry.user_id == models.User.id)
+    # The one joined query the whole feed is built from. It reads the
+    # PUBLIC SHARE and the RUN it points at -- deliberately NOT the
+    # leaderboard entry, because a leaderboard entry only exists for a
+    # strategy that passed the leaderboard's own entry rules.
+    base = (
+        select(models.SharedBacktest, models.BacktestRun)
+        .join(
+            models.BacktestRun,
+            models.SharedBacktest.backtest_run_id == models.BacktestRun.id,
         )
+        .join(models.User, models.BacktestRun.user_id == models.User.id)
+        .options(
+            # Only the columns the feed actually publishes. An equity curve
+            # is thousands of points per run and the feed never shows one.
+            load_only(
+                models.SharedBacktest.public_slug,
+                models.SharedBacktest.is_strategy_name_public,
+                models.SharedBacktest.created_at,
+            ),
+            load_only(
+                models.BacktestRun.strategy_name,
+                models.BacktestRun.symbol,
+                models.BacktestRun.start_date,
+                models.BacktestRun.end_date,
+                models.BacktestRun.initial_balance,
+                models.BacktestRun.kpi_results_json,
+                models.BacktestRun.parameters_json,
+            ),
+        )
+    )
 
     filters = (
-        models.LeaderboardEntry.period == leaderboard_period,
-        models.LeaderboardEntry.category == category,
         # The owner must still have the public link switched on.
         models.SharedBacktest.is_active.is_(True),
         # Never advertise a run that did not finish.
@@ -351,46 +459,41 @@ async def get_public_published_results(
         not_demo_accounts(models.User),
     )
 
-    # How many published results this ranking covers, over the SAME filters.
-    total = (
-        await db.execute(
-            _joined_select()
-            .with_only_columns(func.count(models.LeaderboardEntry.id))
-            .where(*filters)
-        )
-    ).scalar_one()
+    rows = (await db.execute(base.where(*filters))).all()
 
-    rows = (
-        await db.execute(
-            _joined_select()
-            .where(*filters)
-            .order_by(
-                desc(models.LeaderboardEntry.score),
-                # A deterministic tie-break: two equal scores must not swap
-                # places between two calls, or a visitor's card would change
-                # position on every page load. The public slug is unique.
-                models.SharedBacktest.public_slug,
-            )
-            .limit(limit)
-        )
-    ).all()
+    # The ranking window. A result published outside it is not part of this
+    # ranking, so it is not counted and not listed.
+    window = PUBLIC_RESULT_PERIOD_WINDOWS.get(period)
+    if window is not None:
+        cutoff = datetime.now(timezone.utc) - window
+        rows = [
+            row
+            for row in rows
+            if _published_at(row[0]) is not None and _published_at(row[0]) >= cutoff
+        ]
 
-    # The published rank is the position in THIS list, not the stored global
-    # rank: the stored one counts every entry ever written, including the
-    # seeded demo accounts, so it describes a list the visitor cannot see.
+    # The list and its count are built from the SAME rows, so the count can
+    # never describe a different set than the list does.
+    ranked = sorted(
+        rows,
+        key=lambda row: _public_result_sort_key(row[0], row[1], category),
+    )
+    total = len(ranked)
+    page = ranked[:limit]
+
     results = [
         schemas.PublicPublishedResult(
             slug=shared_backtest.public_slug,
             strategy_name=_public_strategy_name(run, shared_backtest),
             symbol=run.symbol,
             period={"start": run.start_date, "end": run.end_date},
-            category=entry.category,
-            score=entry.score,
+            category=category,
+            score=_public_result_score(run, category),
             rank=position,
             metrics=_public_result_metrics(run),
             has_published_backtest=True,
         )
-        for position, (entry, run, shared_backtest) in enumerate(rows, start=1)
+        for position, (shared_backtest, run) in enumerate(page, start=1)
     ]
 
     return {
@@ -402,4 +505,3 @@ async def get_public_published_results(
             "results": results,
         }
     }
-
