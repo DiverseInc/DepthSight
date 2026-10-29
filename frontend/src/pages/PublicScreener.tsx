@@ -19,6 +19,9 @@
 //   * A template with no published performance says so.
 //   * Every published result states that it is a backtest and over which
 //     period it covers.
+//   * A result that LOST money is published and ranked like any other.
+//     The page must never hide a negative number, and must never
+//     describe the feed as a list of winners.
 
 import { useMemo, useState } from "react";
 import { format, parseISO } from "date-fns";
@@ -406,7 +409,9 @@ const PublicScreener = () => {
 						<p className="mt-3 text-muted-foreground">
 							These are backtest results that DepthSight users published for
 							public comparison. They are backtests, not live trading, and they
-							are not a promise of future results.
+							are not a promise of future results. A result that lost money is
+							published here exactly like one that made it: the list is ranked by
+							the metric you pick, not by whether the strategy was profitable.
 						</p>
 					</div>
 
@@ -437,8 +442,10 @@ const PublicScreener = () => {
 						</p>
 					) : results.length === 0 ? (
 						<p className="mt-10 text-center text-sm text-muted-foreground">
-							Nothing has been published for public comparison yet. We would rather
-							show you nothing than show you a number we cannot stand behind.
+							No results have been published for public comparison yet. A result
+							appears here once its owner shares a finished backtest publicly and
+							leaves its public link switched on -- and a result that lost money
+							is published just like one that made it.
 						</p>
 					) : (
 						<>
@@ -449,7 +456,7 @@ const PublicScreener = () => {
 							</p>
 							{publishedTotal > results.length && (
 								<p className="mt-1 text-center text-xs text-muted-foreground">
-									Showing the top {results.length} of {publishedTotal} published
+									Showing the first {results.length} of {publishedTotal} published
 									results.
 								</p>
 							)}
@@ -555,7 +562,8 @@ const PublicScreener = () => {
 									</li>
 									<li>
 										Backtest results users published for public comparison, with
-										the period they cover and the metric they are ranked by.
+										the period they cover and the metric they are ranked by --
+										including the results that lost money.
 									</li>
 									<li>
 										Platform counters, with the seeded demo accounts excluded.

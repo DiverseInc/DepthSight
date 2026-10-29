@@ -89,10 +89,10 @@ const published = {
 				end: "2025-12-31T00:00:00",
 			},
 			category: "sharpe_ratio",
-			score: 0.9,
+			score: -0.42,
 			rank: 2,
 			metrics: {
-				sharpeRatio: 0.9,
+				sharpeRatio: -0.42,
 				netPnlPercent: -4.5,
 				netPnl: -450,
 				winRate: 48.2,
@@ -103,6 +103,12 @@ const published = {
 		},
 	],
 };
+
+// The mock reads this at RENDER time, so a test can point the page at
+// a different feed (an empty one) and render it again. The reference
+// lives inside the hook, so it is read long after this module body has
+// finished running.
+let publishedResults = published;
 
 const stats = {
 	totalUsers: 12,
@@ -120,7 +126,7 @@ vi.mock("@/lib/api", () => {
 			isError: false,
 		}),
 		usePublicPublishedResults: () => ({
-			data: published,
+			data: publishedResults,
 			isLoading: false,
 			isError: false,
 		}),
@@ -246,6 +252,47 @@ describe("the public screener page", () => {
 		expect(html).not.toMatch(/trial/i);
 		expect(html).not.toMatch(/expires/i);
 		expect(html).not.toMatch(/hurry/i);
+	});
+
+	it("renders a result that lost money with its sign intact", () => {
+		// The second fixture result LOST money: a negative Sharpe ratio, a
+		// negative net return and a negative net P&L. Every one of them has
+		// to keep its minus sign -- a page that printed the bare magnitude
+		// would be showing a result the backtest never produced.
+		expect(html).toContain("-0.42"); // Sharpe ratio
+		expect(html).toContain("-4.5%"); // net return
+		expect(html).toContain("-$450.00"); // net P&L
+		// And the magnitude alone must never appear on its own.
+		expect(html).not.toMatch(/>0\.42</);
+		expect(html).not.toMatch(/>4\.5%</);
+		expect(html).not.toMatch(/>\$450\.00</);
+	});
+
+	it("does not describe the feed as a list of winners", () => {
+		// The feed is ranked by the metric the visitor picks, inside one
+		// category. It does NOT say a result beat anything, and it does
+		// NOT call any result the best one.
+		expect(html).toContain("A result that lost money is");
+		expect(html).not.toMatch(/\bbest\b/i);
+		expect(html).not.toMatch(/\bbeat\b/i);
+		expect(html).not.toMatch(/\boutperform/i);
+		// 'the top N' is a page of a longer ranking, not the best N.
+		expect(html).not.toContain("Showing the top");
+	});
+
+	it("tells the truth when the feed is empty", () => {
+		publishedResults = { ...published, total: 0, results: [] };
+		const emptyHtml = renderPage();
+		publishedResults = published;
+
+		expect(emptyHtml).toContain(
+			"No results have been published for public comparison yet",
+		);
+		// The old copy promised to withhold any number we could not stand
+		// behind. That is no longer true: a losing result IS published, so
+		// an empty feed means nothing is published, not that we are hiding
+		// something we cannot stand behind.
+		expect(emptyHtml).not.toContain("we cannot stand behind");
 	});
 
 	it("states plainly that it never shows account data", () => {
