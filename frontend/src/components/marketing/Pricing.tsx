@@ -24,10 +24,10 @@ export const Pricing = () => {
 			<div className="container max-w-screen-xl px-4">
 				<div className="mx-auto max-w-2xl text-center">
 					<h2 className="text-3xl font-bold tracking-tight sm:text-4xl">
-						Start free. Upgrade when you're ready.
+						Start free. Tell us which plan you want.
 					</h2>
 					<p className="mt-4 text-lg text-muted-foreground">
-						No credit card to start. Cancel any time.
+						No credit card to start. We activate the paid tier for you.
 					</p>
 				</div>
 
