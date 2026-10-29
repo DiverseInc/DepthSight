@@ -71,6 +71,24 @@ RISK_GUARD_STATE_LOST_REASON = (
     "traded before - treated as an unknown state, trading disabled"
 )
 
+# Why the gate is closed when the persisted guard state's SCOPE cannot be read.
+#
+# The state was READ, but the day stamp it carries cannot be: the field is
+# missing, null, or not a readable string. So it is NOT known whether the
+# payload holds today's numbers or yesterday's.
+#
+# "Unknown day" is NOT "another day". A previous day's numbers must not be
+# resurrected, and today's must not be assumed -- so the counters cannot be
+# shown to be within limits, and the state is treated as unknown exactly like
+# a lost one. Reading an unreadable stamp as "belongs to yesterday" would
+# discard the whole persisted state, restore the loss streak and the day's
+# PnL as ZEROS, and re-open a gate that was closed.
+RISK_GUARD_SCOPE_UNKNOWN_REASON = (
+    "the persisted trading-guard state's day stamp could not be read, so it is "
+    "not known whether it holds today's numbers or yesterday's - treated as an "
+    "unknown state, trading disabled"
+)
+
 
 @dataclass
 class TradeStats:
@@ -461,6 +479,30 @@ class RiskManager:
         # without this the latch would release on the very same start that set
         # it and never mean anything.
         self._guard_state_lost_day_str: str = ""
+        # True when the persisted guard state was READ but its SCOPE could not
+        # be: the day stamp it carries is missing, null or not a readable
+        # string, so it is not known whether the payload holds today's numbers
+        # or yesterday's.
+        #
+        # This is a THIRD kind of unknown state, and it is not the same as a
+        # lost one (the key is there) nor as an unreadable one (Redis was
+        # reachable). It is the same in its CONSEQUENCE: today's PnL and the
+        # loss streak cannot be shown to be within limits, so the gate fails
+        # CLOSED, the state is not re-persisted, and the latch clears at the
+        # UTC rollover -- the one moment the day's counters legitimately
+        # restart at zero by definition.
+        #
+        # It is deliberately NOT folded into `_guard_state_lost`: that latch
+        # means "the key VANISHED", and an operator reading "the persisted
+        # state is missing" for a payload that is sitting in Redis right now
+        # would be sent looking in the wrong place.
+        self._guard_state_scope_unknown: bool = False
+        # The UTC day the scope became unreadable on. The latch may only be
+        # released on a STRICTLY LATER day, for the same reason the lost
+        # state's latch is: a fresh process sees its first day-key change on
+        # its very first `_check_and_reset_daily_stats()`, so releasing on any
+        # day change would clear the latch on the same start that set it.
+        self._guard_state_scope_unknown_day_str: str = ""
         # Has this controller EVER traded? True / False / None (unknown).
         #
         # It decides whether the live balance may be installed as today's
@@ -1001,8 +1043,12 @@ class RiskManager:
             )
             # A LOST state is unknown in exactly the same way an unreadable
             # one is: the counters are not zero, they are UNKNOWN. They must
-            # not be re-baselined, and the gate must not be re-opened.
+            # not be re-baselined, and the gate must not be re-opened. A state
+            # whose SCOPE could not be read is unknown in the same way too.
             guard_state_lost = bool(getattr(self, "_guard_state_lost", False))
+            guard_state_scope_unknown = bool(
+                getattr(self, "_guard_state_scope_unknown", False)
+            )
 
             # The opening balance is re-derived on its OWN condition: it must
             # belong to the day we are initializing FOR. It is deliberately NOT
@@ -1069,6 +1115,7 @@ class RiskManager:
                 guard_state_unverifiable
                 or guard_state_restored_today
                 or guard_state_lost
+                or guard_state_scope_unknown
             ):
                 # The trading-guard state was restored from Redis on this very
                 # start, OR it could not be read at all. Re-baselining the
@@ -1596,6 +1643,38 @@ class RiskManager:
                         "today's PnL and loss streak are still unknown. "
                         "Trading stays DISABLED until the day rolls over."
                     )
+            # A state whose SCOPE could not be read heals at the UTC rollover
+            # too, and for the same reason: a new UTC day starts the day's PnL
+            # and the loss streak at zero by definition, so whatever the
+            # unreadable payload held belonged to the day that just ended. It
+            # cannot heal on a re-read, because re-reading finds the same
+            # unreadable stamp.
+            if getattr(self, "_guard_state_scope_unknown", False):
+                # Only a STRICTLY LATER day releases this latch, for the same
+                # reason as the lost-state latch above: a fresh process sees
+                # its first day-key change on the very same start that set it.
+                if getattr(self, "_guard_state_scope_unknown_day_str", "") and (
+                    current_day_str_utc > self._guard_state_scope_unknown_day_str
+                ):
+                    logger.critical(
+                        "[RiskGuard] The persisted trading-guard state's day stamp "
+                        f"could not be read on UTC day "
+                        f"{self._guard_state_scope_unknown_day_str}; the rollover "
+                        f"to {current_day_str_utc} resets the day's PnL and the "
+                        "loss streak to zero, so the account is no longer trading "
+                        "on unknown numbers. Trading is released for the new day."
+                    )
+                    self._guard_state_scope_unknown = False
+                    self._guard_state_scope_unknown_day_str = ""
+                else:
+                    logger.critical(
+                        "[RiskGuard] The persisted trading-guard state's day stamp "
+                        "could not be read and UTC day "
+                        f"{current_day_str_utc} is not past "
+                        f"{self._guard_state_scope_unknown_day_str or 'unknown'}, "
+                        "so today's PnL and loss streak are still unknown. "
+                        "Trading stays DISABLED until the day rolls over."
+                    )
             self.stats.today_pnl = 0.0
             self.stats.consecutive_losses = 0
             self.stats.current_trading_day_start_ts = current_start_ts_float
@@ -2045,6 +2124,7 @@ class RiskManager:
             self._guard_state_restored
             or self._guard_state_unverified
             or getattr(self, "_guard_state_lost", False)
+            or getattr(self, "_guard_state_scope_unknown", False)
         )
         if guard_state_holds_the_gate:
             self._check_risk_limits()
@@ -2617,6 +2697,25 @@ class RiskManager:
             # the same trigger -- this does not touch the live path.
             self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_STATE_LOST_REASON)
             return
+        if getattr(self, "_guard_state_scope_unknown", False):
+            # The guard state was READ but its SCOPE could not be: the day
+            # stamp it carries is missing, null or unreadable, so it is not
+            # known whether it holds today's numbers or yesterday's. Today's
+            # PnL and the loss streak cannot be shown to be within limits, so
+            # the gate stays closed. This heals itself at the UTC day rollover
+            # (see `_check_and_reset_daily_stats`), which is the one moment
+            # the day's counters restart at zero by definition.
+            self._is_trading_allowed = False
+            self._global_gate_disable_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+            if not getattr(self, "_emergency_stop_active", False):
+                self._trading_disabled_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+            # The persisted state carries the paper counters too, so its scope
+            # is unknown for the paper sandbox as well. The PAPER gate is
+            # closed on the same trigger -- this does not touch the live path.
+            self._close_paper_gate_for_unknown_guard_state(
+                RISK_GUARD_SCOPE_UNKNOWN_REASON
+            )
+            return
         should_be_allowed = True
         disable_reason = ""
         if self.stats.current_balance < self.min_balance_threshold:
@@ -2821,6 +2920,13 @@ class RiskManager:
             return
         if getattr(self, "_guard_state_lost", False):
             self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_STATE_LOST_REASON)
+            return
+        if getattr(self, "_guard_state_scope_unknown", False):
+            # The persisted state's SCOPE could not be read, so the paper
+            # counters are unknown exactly like the live ones. Fail CLOSED.
+            self._close_paper_gate_for_unknown_guard_state(
+                RISK_GUARD_SCOPE_UNKNOWN_REASON
+            )
             return
 
         should_be_allowed = True
@@ -3762,6 +3868,33 @@ class RiskManager:
                 )
                 return
 
+            if getattr(self, "_guard_state_scope_unknown", False):
+                # The persisted state was READ but its SCOPE could not be: the
+                # day stamp it carries is missing, null or unreadable, so it
+                # is not known whether it holds today's numbers or yesterday's.
+                # The in-memory counters are the zeros this process was born
+                # with, so writing them now would LAUNDER an unknown state
+                # into a payload -- and the next start-up would read that
+                # payload as "the streak really is empty" and OPEN the gate.
+                #
+                # This is the same hazard as the lost-state branch above, in
+                # its other form: that one cannot be re-read (there is nothing
+                # left to read), this one cannot be BELIEVED (what was read
+                # does not say which day it belongs to). Either way, nothing is
+                # persisted while the scope is unknown, and the next start-up
+                # detects it again and fails closed.
+                logger.critical(
+                    "[RiskGuard] NOT persisting the trading-guard state: its day "
+                    "stamp could not be read on UTC day "
+                    f"{self._guard_state_scope_unknown_day_str or 'unknown'}, so "
+                    "it is not known whether it holds today's numbers or "
+                    "yesterday's, and the in-memory counters are UNKNOWN, not "
+                    "zero. Writing them would make the next start-up read the "
+                    "loss as an empty streak and open the gate. The "
+                    "unknown-scope latch holds until the UTC day rolls over."
+                )
+                return
+
             if not self.redis_client:
                 logger.critical(
                     "[RiskGuard] No redis_client; the trading-guard state will "
@@ -3946,6 +4079,7 @@ class RiskManager:
         return bool(
             getattr(self, "_guard_state_unverified", False)
             or getattr(self, "_guard_state_lost", False)
+            or getattr(self, "_guard_state_scope_unknown", False)
         )
 
     def _mark_guard_state_lost(self) -> None:
@@ -3970,6 +4104,44 @@ class RiskManager:
         self._global_gate_disable_reason = RISK_GUARD_STATE_LOST_REASON
         if not self._emergency_stop_active:
             self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
+
+    def _mark_guard_state_scope_unknown(self) -> None:
+        """Latch the fail-closed state for a persisted state whose SCOPE is unknown.
+
+        The state was READ, but the day stamp it carries cannot be: the field
+        is missing, null, or not a readable string. So it is not known whether
+        the payload holds today's numbers or yesterday's.
+
+        "Unknown day" is NOT "another day". Yesterday's numbers must not be
+        resurrected, and today's must not be assumed, so the counters cannot be
+        shown to be within limits: the gate closes and stays closed, and the
+        state is not re-persisted (writing the in-memory counters would
+        LAUNDER an unknown state into a payload -- see `save_state`).
+
+        The latch is released at the UTC day rollover (see
+        `_check_and_reset_daily_stats`), which is the one moment the day's
+        counters restart at zero by definition -- but ONLY on a rollover to a
+        STRICTLY LATER day than the day the scope became unreadable, for the
+        same reason the lost state's latch is that strict.
+
+        This is the PAPER/LIVE-parity twin of `_mark_guard_state_lost`: both
+        sandboxes must fail closed on an unreadable scope, and they must do it
+        through the same mechanism, so the two cannot drift apart.
+        """
+        self._guard_state_scope_unknown = True
+        self._guard_state_scope_unknown_day_str = self._current_utc_day_str()
+        self._is_trading_allowed = False
+        self._global_gate_disable_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+        if not self._emergency_stop_active:
+            self._trading_disabled_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+        # The persisted guard state carries BOTH sandboxes, so an unreadable
+        # scope is a fact about the PAPER counters too (see
+        # `_close_paper_gate_for_unknown_guard_state`). The PAPER gate is
+        # closed here and not only through `_check_risk_limits`, because that
+        # path leaves the paper gate alone while the paper balance is not yet
+        # known -- and "the paper balance is not known yet" is not a reason to
+        # leave the paper gate open on an unknown state.
+        self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_SCOPE_UNKNOWN_REASON)
 
     async def _has_traded_before(self) -> Optional[bool]:
         """Has THIS controller ever successfully persisted a guard state?
@@ -4046,7 +4218,51 @@ class RiskManager:
         because it belongs to a previous UTC day.
         """
         current_day_str = self._current_utc_day_str()
-        persisted_day_str = str(payload.get("day_str") or "")
+        raw_day_str = payload.get("day_str")
+        persisted_day_str = str(raw_day_str) if raw_day_str is not None else ""
+        # "ANOTHER DAY" AND "UNKNOWN DAY" ARE DIFFERENT FACTS.
+        #
+        # A day stamp that reads as a PREVIOUS day means the payload holds
+        # yesterday's numbers: they must be discarded, because the daily
+        # rollover legitimately cleared the streak and the day's PnL.
+        #
+        # A day stamp that CANNOT BE READ -- missing, null, or not a readable
+        # string -- means something else entirely: it is NOT known whether the
+        # payload holds today's numbers or yesterday's. The `or ""` idiom
+        # below cannot tell the two apart (a missing field yields None, and
+        # `None or ""` is ""), so an unreadable stamp was silently read as
+        # "belongs to another day": the WHOLE persisted state was discarded,
+        # the counters restored as ZEROS, and a gate that was CLOSED re-opened
+        # -- at INFO level, so the operator never saw it happen. That is the
+        # same fail-open this whole change exists to kill: the guard state
+        # says one thing and the money says another.
+        #
+        # So an unreadable scope is an UNKNOWN state, and unknown must never
+        # be more permissive than known. The state is not applied at all (we
+        # cannot tell which day's numbers these are), the gate fails CLOSED,
+        # and the operator is told WHY at CRITICAL.
+        day_scope_is_readable = (
+            isinstance(raw_day_str, str) and raw_day_str.strip() != ""
+        )
+        if not day_scope_is_readable:
+            self._mark_guard_state_scope_unknown()
+            logger.critical(
+                "[RiskGuard] The persisted trading-guard state has an UNREADABLE "
+                "day stamp (present=%s, value=%r), so it is NOT known whether it "
+                "holds today's numbers or yesterday's. 'Unknown day' is NOT "
+                "'another day': discarding it would restore the loss streak and "
+                "the day's PnL as ZEROS and re-open a gate that was closed. "
+                "Today's PnL and the loss streak cannot be shown to be within "
+                "limits, so trading stays DISABLED (fail-closed) until the UTC "
+                "day rolls over.",
+                "day_str" in payload,
+                raw_day_str,
+            )
+            # Re-evaluate both gates against the unknown state, so neither is
+            # left open on the process-born zero counters.
+            self._check_risk_limits()
+            self._check_risk_limits(mode="paper")
+            return False
         if persisted_day_str != current_day_str:
             # The daily rollover resets the loss streak and the day's PnL at
             # the UTC day boundary. A previous day's numbers must not be
@@ -4259,8 +4475,59 @@ class RiskManager:
         # sandbox was never persisted before.
         paper_payload = payload.get("paper")
         if isinstance(paper_payload, dict):
-            paper_day_str = str(paper_payload.get("day_str") or "")
-            if paper_day_str == current_day_str:
+            raw_paper_day_str = paper_payload.get("day_str")
+            paper_day_str = (
+                str(raw_paper_day_str) if raw_paper_day_str is not None else ""
+            )
+            # THE PAPER TWIN OF THE LIVE SCOPE CHECK ABOVE.
+            #
+            # "Unknown day" is NOT "another day": a paper day stamp that
+            # cannot be read leaves it unknown whether the paper counters are
+            # today's or yesterday's. Discarding them silently restores the
+            # paper streak and the paper day's PnL as ZEROS and re-opens the
+            # PAPER gate on them -- at INFO level, so nobody sees it. The
+            # PAPER path must fail closed here exactly as the LIVE path does.
+            #
+            # ONE EXCEPTION, and it is a FACT rather than a corruption:
+            # `save_state` writes the PAPER day stamp as "" when the paper
+            # sandbox has never been persisted (`self.paper_stats
+            # .last_known_day_str or ""`), so an EMPTY paper day stamp on a
+            # section that carries NO state at all is the "the paper sandbox
+            # was never persisted" marker, and the paper counters really are
+            # zero. That is not an unknown scope and it must not be treated as
+            # one -- it would block every account that never paper-traded.
+            #
+            # Anything else -- a missing stamp, a null stamp, a stamp that is
+            # not a string, or an EMPTY stamp on a section that DOES carry
+            # state -- leaves the scope UNKNOWN.
+            paper_counters_are_zero = all(
+                not _read_persisted_number(paper_payload, name, cast)
+                for name, cast in (
+                    ("consecutive_losses", int),
+                    ("today_pnl", float),
+                    ("start_of_day_balance", float),
+                )
+            )
+            paper_scope_is_readable = isinstance(raw_paper_day_str, str) and (
+                raw_paper_day_str.strip() != "" or paper_counters_are_zero
+            )
+            if not paper_scope_is_readable:
+                self._mark_guard_state_scope_unknown()
+                logger.critical(
+                    "[RiskGuard] The persisted PAPER sandbox state has an "
+                    "UNREADABLE day stamp (present=%s, value=%r), so it is NOT "
+                    "known whether it holds today's numbers or yesterday's. "
+                    "'Unknown day' is NOT 'another day': discarding it would "
+                    "restore the paper loss streak and the paper day's PnL as "
+                    "ZEROS and re-open a gate that was closed. The PAPER "
+                    "counters cannot be shown to be within limits, so paper "
+                    "trading stays DISABLED (fail-closed) until the UTC day "
+                    "rolls over.",
+                    "day_str" in paper_payload,
+                    raw_paper_day_str,
+                )
+                self._check_risk_limits(mode="paper")
+            elif paper_day_str == current_day_str:
                 raw_paper_consecutive_losses = paper_payload.get("consecutive_losses")
                 raw_paper_today_pnl = paper_payload.get("today_pnl")
                 # A MISSING or NULL field is UNREADABLE, not a zero -- the same
@@ -4337,11 +4604,53 @@ class RiskManager:
                     )
                 else:
                     self.paper_stats.today_pnl = paper_today_pnl
-                if paper_start_of_day_balance > 1e-9:
+                # THE PAPER OPENING BALANCE MUST CARRY ITS OWN DAY, exactly
+                # like the LIVE one.
+                #
+                # `paper_payload.get("start_of_day_day_str") or current_day_str`
+                # reads an ABSENT stamp as "today" -- and a base with no day
+                # of its own is UNKNOWN, not today's. A base that may already
+                # contain today's PnL becomes the DENOMINATOR of today's loss
+                # ratio, and the ratio then reads LOW and UNDER-TRIPS: the
+                # denominator already contains the loss it is supposed to
+                # measure. The LIVE path refuses exactly this (it restores the
+                # base only when the payload says which day the base belongs
+                # to and that day is today), so the PAPER path must not
+                # decide it differently.
+                #
+                # So the persisted PAPER base is installed ONLY when its own
+                # day stamp says today. Otherwise it is refused AND the one in
+                # force is dropped, because neither can be shown to be today's
+                # opening balance: the PAPER opening balance is UNKNOWN, and
+                # the PAPER daily-loss gate fails CLOSED until the paper
+                # wallet's own balance establishes one.
+                persisted_paper_base_day_str = str(
+                    paper_payload.get("start_of_day_day_str") or ""
+                )
+                paper_base_is_from_today = (
+                    persisted_paper_base_day_str == current_day_str
+                    and paper_start_of_day_balance > 1e-9
+                )
+                if paper_base_is_from_today:
                     self.paper_stats.start_of_day_balance = paper_start_of_day_balance
-                    self.paper_stats.start_of_day_day_str = str(
-                        paper_payload.get("start_of_day_day_str") or current_day_str
+                    self.paper_stats.start_of_day_day_str = current_day_str
+                else:
+                    logger.critical(
+                        "[RiskGuard] NOT restoring the persisted PAPER start-of-day "
+                        "balance ($%.2f): it belongs to UTC day %r and today is %s. "
+                        "A base with no day stamp of its own is UNKNOWN, not "
+                        "today's: it may already contain today's PnL, and "
+                        "measuring the day's loss against a denominator that "
+                        "contains it reads LOW and under-trips. The PAPER opening "
+                        "balance stays UNKNOWN and the PAPER daily-loss gate "
+                        "fails CLOSED until the paper wallet's own balance "
+                        "establishes one.",
+                        paper_start_of_day_balance,
+                        persisted_paper_base_day_str or "UNKNOWN (no day stamp)",
+                        current_day_str,
                     )
+                    self.paper_stats.start_of_day_balance = 0.0
+                    self.paper_stats.start_of_day_day_str = ""
                 self.paper_stats.last_known_day_str = current_day_str
             else:
                 logger.info(
