@@ -596,11 +596,7 @@ class RiskManager:
         Upstream `risk_manager.py:356`-`:357`. The PAPER sandbox's counters
         live in `self.paper_stats`; the LIVE ones in `self.stats`.
         """
-        return (
-            self.paper_stats
-            if self._normalize_mode(mode) == "paper"
-            else self.stats
-        )
+        return self.paper_stats if self._normalize_mode(mode) == "paper" else self.stats
 
     def _mode_thresholds(self, mode: Optional[str]) -> Tuple[float, float, int]:
         """(max_drawdown, daily_max_loss, max_consecutive_losses) for the mode.
@@ -959,10 +955,7 @@ class RiskManager:
         # gate must not stay closed because of a failure that has since
         # healed. The limit check below closes it again if a limit really is
         # breached.
-        if (
-            not self._emergency_stop_active
-            and not self._guard_state_is_unknown()
-        ):
+        if not self._emergency_stop_active and not self._guard_state_is_unknown():
             self._paper_is_trading_allowed = True
             self._paper_global_gate_disable_reason = None
             self._paper_last_disable_reason = None
@@ -1258,9 +1251,7 @@ class RiskManager:
                             # anchors it the same way, upstream
                             # `bot_module/risk_manager.py:1698`).
                             self._paper_balance_known = True
-                            self._anchor_paper_start_of_day_base(
-                                current_total_usdt
-                            )
+                            self._anchor_paper_start_of_day_base(current_total_usdt)
                     else:
                         logger.debug(
                             f"{log_prefix} Balance unchanged: ${stats.current_balance:.2f}"
@@ -1450,9 +1441,7 @@ class RiskManager:
             self._account_history_resolved = True
         else:
             self._account_has_traded_before = await self._has_traded_before()
-            self._account_history_resolved = (
-                self._account_has_traded_before is not None
-            )
+            self._account_history_resolved = self._account_has_traded_before is not None
         logger.info(
             "[RiskGuard] History check for user_id=%s: has_traded_before=%s "
             "(None = unknown).",
@@ -1502,8 +1491,7 @@ class RiskManager:
             # a fact about the start of the day; it is never restated.
             return False
         logger.info(
-            "[RiskGuard] Capturing the opening balance $%.8f for UTC day %s "
-            "(%s).",
+            "[RiskGuard] Capturing the opening balance $%.8f for UTC day %s " "(%s).",
             self.stats.current_balance,
             day_str,
             "the account has never traded, so its balance cannot contain "
@@ -2138,9 +2126,7 @@ class RiskManager:
         """Record why the gate is refusing, for the log line and the API."""
         self._trading_disabled_reason = reason
 
-    async def is_symbol_trading_allowed(
-        self, symbol: str, mode: str = "live"
-    ) -> bool:
+    async def is_symbol_trading_allowed(self, symbol: str, mode: str = "live") -> bool:
         """
         Checks if trading is allowed for the given symbol.
         Includes checking the global flag and the user's blacklist.
@@ -2614,9 +2600,7 @@ class RiskManager:
             # The persisted state carries the paper counters too, so it is
             # unknown for the paper sandbox as well. The PAPER gate is closed
             # on the same trigger -- this does not touch the live path.
-            self._close_paper_gate_for_unknown_guard_state(
-                RISK_GUARD_UNVERIFIED_REASON
-            )
+            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_UNVERIFIED_REASON)
             return
         if getattr(self, "_guard_state_lost", False):
             # The guard state is GONE, not merely unreadable. Today's PnL and
@@ -2631,9 +2615,7 @@ class RiskManager:
             # The persisted state carries the paper counters too, so it is
             # lost for the paper sandbox as well. The PAPER gate is closed on
             # the same trigger -- this does not touch the live path.
-            self._close_paper_gate_for_unknown_guard_state(
-                RISK_GUARD_STATE_LOST_REASON
-            )
+            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_STATE_LOST_REASON)
             return
         should_be_allowed = True
         disable_reason = ""
@@ -2739,9 +2721,7 @@ class RiskManager:
         fail-closed behaviour this fork relies on.
         """
         if self._paper_is_trading_allowed:
-            logger.critical(
-                f"Paper trading disabled! Reason: {reason}"
-            )
+            logger.critical(f"Paper trading disabled! Reason: {reason}")
         self._paper_is_trading_allowed = False
         self._paper_global_gate_disable_reason = reason
 
@@ -2837,14 +2817,10 @@ class RiskManager:
         # The persisted guard state carries both sandboxes, so an unknown or
         # lost state is unknown for the paper counters too. Fail CLOSED.
         if getattr(self, "_guard_state_unverified", False):
-            self._close_paper_gate_for_unknown_guard_state(
-                RISK_GUARD_UNVERIFIED_REASON
-            )
+            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_UNVERIFIED_REASON)
             return
         if getattr(self, "_guard_state_lost", False):
-            self._close_paper_gate_for_unknown_guard_state(
-                RISK_GUARD_STATE_LOST_REASON
-            )
+            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_STATE_LOST_REASON)
             return
 
         should_be_allowed = True
@@ -3795,8 +3771,7 @@ class RiskManager:
 
             payload = {
                 "version": RISK_STATE_VERSION,
-                "day_str": self.stats.last_known_day_str
-                or self._current_utc_day_str(),
+                "day_str": self.stats.last_known_day_str or self._current_utc_day_str(),
                 "consecutive_losses": int(self.stats.consecutive_losses),
                 "today_pnl": float(self.stats.today_pnl),
                 "start_of_day_balance": float(self.stats.start_of_day_balance),
