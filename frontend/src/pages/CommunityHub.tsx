@@ -1558,8 +1558,22 @@ const CommunityHub = () => {
 			const headers: Record<string, string> = {
 				"Content-Type": "application/json",
 			};
-			if (adminKey) {
+			// The hub derives the displayed author name from the signed-in
+			// account, so the post has to carry that account's bearer token.
+			// The shared admin key is still sent when there is no session (it
+			// is how the hub is administered), but it never picks a name.
+			if (token) {
+				headers.Authorization = `Bearer ${token}`;
+			} else if (adminKey) {
 				headers.Authorization = `Bearer ${adminKey}`;
+			} else {
+				toast.error(
+					t(
+						"community:detailedView.signInToComment",
+						"Sign in to post a comment",
+					),
+				);
+				return;
 			}
 			const res = await fetch(
 				`${hubApiUrl}/topics/${selectedTopic.id}/comments`,
@@ -1573,6 +1587,14 @@ const CommunityHub = () => {
 				},
 			);
 
+			if (res.status === 401) {
+				throw new Error(
+					t(
+						"community:detailedView.signInToComment",
+						"Sign in to post a comment",
+					),
+				);
+			}
 			if (!res.ok) throw new Error();
 			const newComment = await res.json();
 
@@ -1600,9 +1622,14 @@ const CommunityHub = () => {
 			toast.success(
 				t("community:detailedView.commentSuccess", "Comment posted!"),
 			);
-		} catch {
+		} catch (error: unknown) {
+			const err = error as Error;
 			toast.error(
-				t("community:detailedView.commentFailed", "Failed to post comment"),
+				err.message ||
+					t(
+						"community:detailedView.commentFailed",
+						"Failed to post comment",
+					),
 			);
 		} finally {
 			setSubmittingComment(false);
@@ -1619,8 +1646,17 @@ const CommunityHub = () => {
 			const headers: Record<string, string> = {
 				"Content-Type": "application/json",
 			};
-			if (adminKey) {
+			// The hub derives the displayed author name from the signed-in
+			// account, so the post has to carry that account's bearer token.
+			// The shared admin key is still sent when there is no session (it
+			// is how the hub is administered), but it never picks a name.
+			if (token) {
+				headers.Authorization = `Bearer ${token}`;
+			} else if (adminKey) {
 				headers.Authorization = `Bearer ${adminKey}`;
+			} else {
+				toast.error("Sign in to post a comment");
+				return;
 			}
 			const res = await fetch(`${hubApiUrl}/news/${selectedNews.id}/comments`, {
 				method: "POST",
@@ -1631,6 +1667,9 @@ const CommunityHub = () => {
 				}),
 			});
 
+			if (res.status === 401) {
+				throw new Error("Sign in to post a comment");
+			}
 			if (!res.ok) throw new Error();
 			const newComment = await res.json();
 
@@ -1649,8 +1688,9 @@ const CommunityHub = () => {
 				),
 			);
 			toast.success("Comment posted!");
-		} catch {
-			toast.error("Failed to post comment");
+		} catch (error: unknown) {
+			const err = error as Error;
+			toast.error(err.message || "Failed to post comment");
 		} finally {
 			setSubmittingNewsComment(false);
 		}
@@ -1705,8 +1745,22 @@ const CommunityHub = () => {
 			const headers: Record<string, string> = {
 				"Content-Type": "application/json",
 			};
-			if (adminKey) {
+			// The hub derives the displayed author name from the signed-in
+			// account, so the post has to carry that account's bearer token.
+			// The shared admin key is still sent when there is no session (it
+			// is how the hub is administered), but it never picks a name.
+			if (token) {
+				headers.Authorization = `Bearer ${token}`;
+			} else if (adminKey) {
 				headers.Authorization = `Bearer ${adminKey}`;
+			} else {
+				toast.error(
+					t(
+						"community:createTopic.signInRequired",
+						"Sign in to publish a topic",
+					),
+				);
+				return;
 			}
 			const res = await fetch(`${hubApiUrl}/topics`, {
 				method: "POST",
@@ -1719,6 +1773,14 @@ const CommunityHub = () => {
 				}),
 			});
 
+			if (res.status === 401) {
+				throw new Error(
+					t(
+						"community:createTopic.signInRequired",
+						"Sign in to publish a topic",
+					),
+				);
+			}
 			if (!res.ok) throw new Error();
 
 			const newTopic = await res.json();
@@ -1741,8 +1803,12 @@ const CommunityHub = () => {
 			setNewTopicDesc("");
 			setIsCreateDialogOpen(false);
 			fetchDiscussions();
-		} catch {
-			toast.error(t("community:createTopic.failed", "Failed to publish topic"));
+		} catch (error: unknown) {
+			const err = error as Error;
+			toast.error(
+				err.message ||
+					t("community:createTopic.failed", "Failed to publish topic"),
+			);
 		} finally {
 			setPublishingTopic(false);
 		}
