@@ -13,16 +13,34 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
-import { demoDefine } from "./demo-build-flag";
+import {
+	DEMO_ENV_FLAG,
+	DEMO_PASSWORD_ENV,
+	DEMO_USERNAME_ENV,
+	demoDefine,
+	demoEnvDefine,
+	readEnvFiles,
+} from "./demo-build-flag";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// The demo opt-in comes from an ENV FILE, exactly as it does in the app
+// build -- never from `process.env`. See frontend/demo-build-flag.ts.
+const demoFlag = readEnvFiles(process.cwd(), "test")[DEMO_ENV_FLAG];
 
 export default defineConfig({
 	plugins: [react()],
 	// The same build-time define the app build uses, so the demo credentials
 	// are `null` in the test runner too unless the test build asks for them.
 	// Without this the `__DEMO_CREDENTIALS__` global would be undefined here.
-	define: demoDefine(process.env.VITE_SHOW_DEMO),
+	define: {
+		...demoDefine({
+			flag: demoFlag,
+			username: process.env[DEMO_USERNAME_ENV],
+			password: process.env[DEMO_PASSWORD_ENV],
+		}),
+		...demoEnvDefine(demoFlag),
+	},
 	resolve: {
 		alias: {
 			"@": path.resolve(__dirname, "./src"),
