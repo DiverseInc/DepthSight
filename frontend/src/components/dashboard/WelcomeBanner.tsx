@@ -135,7 +135,7 @@ export const WelcomeBanner = () => {
 					/>
 				</div>
 				<div className="mt-4 flex items-center gap-3 text-xs text-muted-foreground">
-					<span>On the free plan · upgrade anytime in Settings → Billing</span>
+					<span>On the free plan · contact us to activate a paid tier</span>
 					<Button asChild variant="link" size="sm" className="text-xs px-0">
 						<Link to="/hub">
 							See the full marketplace

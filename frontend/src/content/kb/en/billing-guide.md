@@ -1,31 +1,21 @@
-# Instructions: Plans and Subscription Billing
+# Plans and Subscription Billing
 
-DepthSight features a transparent pricing system and automated access activation through cryptocurrency payments. This guide outlines the available plans and the payment process.
+DepthSight has three plans — **Free**, **Standard** and **Professional** — and all three are billed monthly: $0, $30 and $100. There is no one-off lifetime purchase, no yearly plan and no self-service checkout in this deployment. To activate a paid tier, contact us and we set it up for you. Billing questions go through a Support ticket in the **Billing / Plans** category.
 
-## 1. Choosing a Plan
+## 1. The three plans
 
-The platform is divided into three access levels based on your trading needs:
+*   **Free** — $0. The visual strategy editor, the standard strategy blocks and basic vector backtests, plus paper trading.
+*   **Standard** — $30 per month. Live trading on OKX, Binance and Bybit, portfolio backtesting, up to 10 live trading strategies, and 1-year backtest history.
+*   **Professional** — $100 per month. Everything in Standard, plus unlimited backtests, the PRO blocks (Tape, Book, Open Interest), genetic strategy search and the ML Model Laboratory, with up to 30 live trading strategies.
 
-*   **Free**: Allows you to use the visual strategy editor and run basic vector backtests for free. This tier is ideal for learning and initial hypothesis testing without connecting exchange accounts.
-*   **Standard**: Designed for full-scale trading. Grants access to the Live engine, event-driven backtester, and basic risk management. Suited for traders using manual or straightforward automated systems.
-*   **Pro**: The ultimate level for professionals. Includes the AI Copilot assistant, genetic strategy search algorithms, and L2 order book microstructure analysis. Allows managing an unlimited number of bots.
+## 2. Asking for a paid tier
 
-## 2. Payment Process
+1.  Open **Support → Submit a Ticket**.
+2.  Choose the **Billing / Plans** category and tell us which tier you want (Standard or Professional) and which account it is for.
+3.  We quote the price, you confirm, and we set your account to that tier.
 
-To activate a subscription, follow these steps:
+A paid tier is set up by us, never by the customer, so there is no purchase button to click anywhere in the product.
 
-1.  Navigate to the **Billing** section in your profile settings.
-2.  Select your desired plan and subscription period (monthly or yearly).
-3.  Click the **Upgrade** or **Subscribe** button.
-4.  The system will redirect you to the secure **BitCart** payment gateway.
-5.  Choose your preferred cryptocurrency (USDT TRC-20, BTC, ETH) and transfer the specified amount to the generated address.
-6.  Once the transaction is sent, wait for 1-2 network confirmations.
+## 3. If your tier has not been set up yet
 
-## 3. Activation and Management
-
-*   **Automatic Activation**: Access to all features will open instantly once the payment gateway detects the transaction. You will receive a notification on the platform and via email.
-*   **Validity Period**: Subscriptions are valid for exactly 30 days (or 365 days for a yearly plan) from the moment of activation.
-*   **No Auto-Renewals**: We do not store card data and do not perform forced recurring charges. To extend your access, you will need to make a new payment at the end of the period.
-*   **Plan Upgrades**: If you decide to move from Standard to Pro mid-month, the system will offer to pay only the price difference based on the remaining days.
-
-If you encounter difficulties with a transaction or activation does not occur within 30 minutes, create a ticket in the **Support** section and attach a screenshot of the payment or the transaction Hash.
+Open a ticket under **Billing / Plans** with your account name, the tier you asked for and the date you paid. Nothing on your account changes on its own, so a ticket is the fastest way to get it moving.

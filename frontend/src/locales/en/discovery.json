@@ -3,7 +3,7 @@
 	"launchForm": {
 		"title": "Launch New Genetic Search",
 		"description": "Configure and start a new run to discover trading strategies.",
-		"proFeatureTooltip": "This is a Pro feature. Please upgrade your plan to use genetic search.",
+		"proFeatureTooltip": "This is a Pro feature. Contact us and we will set up the Pro tier for you.",
 		"runNameLabel": "Run Name",
 		"runNamePlaceholder": "e.g., My BTC Discovery",
 		"runNameHelp": "Choose a descriptive name to easily identify this search in history",

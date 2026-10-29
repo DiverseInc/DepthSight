@@ -81,9 +81,9 @@ export const kbArticles: Record<"ru" | "en", KBArticle[]> = {
 		{
 			id: "billing-guide",
 			title: "Тарифы и оплата",
-			description: "Описание планов и способов активации доступа",
+			description: "Что входит в каждый тариф и как получить платный",
 			category: "billing",
-			tags: ["billing", "plans", "crypto", "bitcart"],
+			tags: ["billing", "plans"],
 		},
 		{
 			id: "ai-copilot",
@@ -237,9 +237,9 @@ export const kbArticles: Record<"ru" | "en", KBArticle[]> = {
 		{
 			id: "billing-guide",
 			title: "Plans and Billing",
-			description: "Description of plans and payment methods",
+			description: "What each plan includes and how to get a paid tier",
 			category: "billing",
-			tags: ["billing", "plans", "crypto", "bitcart"],
+			tags: ["billing", "plans"],
 		},
 		{
 			id: "ai-copilot",
@@ -313,4 +313,3 @@ export const kbArticles: Record<"ru" | "en", KBArticle[]> = {
 		},
 	],
 };
-

@@ -2345,8 +2345,8 @@ const CommunityHub = () => {
 																>
 																	<Lock className="w-3.5 h-3.5" />
 																	{t(
-																		"community:verified.upgradeRequired",
-																		`Upgrade to ${strategy.tier_required ?? "Pro"}`,
+																		"community:verified.planRequired",
+																		`Requires the ${strategy.tier_required ?? "Pro"} tier`,
 																	)}
 																</Button>
 															)}

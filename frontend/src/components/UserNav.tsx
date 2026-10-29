@@ -132,7 +132,7 @@ export function UserNav() {
 										className="w-full flex items-center justify-center h-8 rounded-md bg-gradient-to-r from-amber-500 to-orange-600 hover:from-amber-600 focus:from-amber-600 hover:to-orange-700 focus:to-orange-700 text-white shadow-sm font-medium cursor-pointer"
 									>
 										<Crown className="mr-2 h-3.5 w-3.5" />
-										{t("common:upgradeToPro", "Upgrade to PRO")}
+										{t("common:requestProTier", "Request the Pro tier")}
 									</Link>
 								</DropdownMenuItem>
 							</div>

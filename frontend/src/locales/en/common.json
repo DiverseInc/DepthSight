@@ -41,14 +41,16 @@
 		"pageInfo": "Page {{page}} of {{totalPages}}"
 	},
 	"pricingModal": {
-		"title": "Choose Your Plan",
-		"description": "Select the plan that best fits your trading needs and upgrade your capabilities.",
-		"selectPlan": "Select Plan",
+		"title": "Plans",
+		"description": "See what each plan includes. To activate a paid tier, contact us and we set it up for you.",
+		"selectPlan": "Request this plan",
 		"currentPlan": "Current Plan",
-		"upgrading": "Redirecting...",
+		"upgrading": "Sending request...",
+		"requestTitle": "Request the {{plan}} plan",
+		"requestDescription": "Open a support ticket under Billing / Plans and tell us which plan you want. We set it up for you.",
 		"downgradeNotAvailable": "Unavailable",
 		"agreementNotice": {
-			"part1": "By making a purchase, you agree to our",
+			"part1": "By using DepthSight, you agree to our",
 			"part2": "and",
 			"blocksNote": "Strategy blocks are divided into Standard (available to all) and PRO (require Professional plan). PRO-blocks include advanced tape/order book analysis and dynamic position management."
 		}

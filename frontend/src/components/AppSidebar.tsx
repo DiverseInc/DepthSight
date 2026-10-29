@@ -336,7 +336,7 @@ export function AppSidebar() {
 									<TooltipContent side="right" className="flex flex-col gap-1">
 										<span>
 											{user.plan !== "pro"
-												? t("upgradePlan", "Upgrade plan")
+												? t("requestPlan", "Request a paid tier")
 												: t("currentPlan", { plan: user.plan })}
 										</span>
 										{daysLeft !== null && daysLeft >= 0 && (
