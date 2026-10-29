@@ -967,6 +967,10 @@ class PublicPublishedResult(BaseModel):
     A metric the backtest never recorded stays None rather than 0, so the
     page can say "not reported" instead of printing a number that was never
     produced.
+
+    `score` is the run's OWN number for the category the feed is ranked by.
+    It is None when the run never measured that metric -- never a fake 0.0,
+    and never a number borrowed from the leaderboard.
     """
 
     slug: str
@@ -974,7 +978,7 @@ class PublicPublishedResult(BaseModel):
     symbol: str
     period: SharedBacktestPeriod
     category: str
-    score: float
+    score: Optional[float] = None
     rank: int
     metrics: Dict[str, Any]
     has_published_backtest: bool = Field(True, alias="hasPublishedBacktest")
