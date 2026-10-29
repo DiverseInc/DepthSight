@@ -503,3 +503,173 @@ async def test_the_emergency_stop_holds_the_paper_gate_across_a_refresh(
         "the balance refresh re-opened the PAPER gate while the operator's "
         "kill switch was still engaged"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5. THE PERSISTED PAPER STATE: a CORRUPT payload must not lose a block
+# ---------------------------------------------------------------------------
+
+
+async def _paper_account_at_its_loss_limit(redis_store):
+    """A dual-mode account whose PAPER sandbox is at its loss-streak limit.
+
+    The PAPER gate is closed by the streak and the LIVE gate is still open:
+    the two gates are independent, which is the point of this branch.
+    """
+    rm = await _start_dual_mode_account(redis_store)
+    await rm.update_balance(mode="paper")
+    for _ in range(MAX_CONSECUTIVE_LOSSES):
+        await _book_closed_trade(rm, "BTCUSDT", -1.0, mode="paper")
+    assert rm.paper_stats.consecutive_losses == MAX_CONSECUTIVE_LOSSES
+    assert rm._paper_is_trading_allowed is False, (
+        "the PAPER gate must be CLOSED before the corrupt-payload tests below, "
+        "or they would pass for the wrong reason"
+    )
+    assert (
+        rm._is_trading_allowed is True
+    ), "the paper streak must not have closed the LIVE gate"
+    return rm
+
+
+def _write_the_persisted_paper_payload(redis_store, rm, **paper_fields):
+    """Overwrite fields of the persisted PAPER sub-payload.
+
+    This is how a CORRUPT payload is simulated: the value that reaches
+    Redis is not a number at all, so the restore has to decide what an
+    unreadable persisted value means.
+    """
+    key = _guard_key(rm)
+    payload = json.loads(redis_store[key])
+    payload["paper"].update(paper_fields)
+    redis_store[key] = json.dumps(payload)
+    return payload
+
+
+async def test_a_corrupt_persisted_paper_streak_does_not_lose_the_paper_block(
+    redis_store,
+):
+    """A corrupt persisted PAPER streak must NOT discard the in-memory streak.
+
+    The LIVE path already decided what a corrupt persisted streak means: the
+    streak keeps the conservative max(persisted, in-memory), because the
+    streak only ever grows within a UTC day. The PAPER path must not decide
+    it differently.
+
+    Before the fix, the corrupt value was restored as zero and the in-memory
+    streak was DISCARDED, so a streak-triggered paper block was LOST and the
+    paper gate re-opened -- the guard state said one thing and the money
+    said another.
+    """
+    rm = await _paper_account_at_its_loss_limit(redis_store)
+    streak_in_memory = rm.paper_stats.consecutive_losses
+
+    _write_the_persisted_paper_payload(
+        redis_store, rm, consecutive_losses="not-a-number"
+    )
+
+    restored = await rm.restore_state()
+
+    assert restored is True, "the persisted state must still have been read"
+    assert rm.paper_stats.consecutive_losses == streak_in_memory, (
+        "the corrupt persisted PAPER streak was restored as zero and the "
+        "in-memory streak was DISCARDED: a streak-triggered paper block is "
+        "LOST"
+    )
+    assert rm._paper_is_trading_allowed is False, (
+        "the paper block did not survive a corrupt persisted paper streak: "
+        "the PAPER gate re-opened"
+    )
+
+
+async def test_a_corrupt_persisted_paper_day_pnl_leaves_the_in_memory_value(
+    redis_store,
+):
+    """A corrupt persisted PAPER day's PnL must NOT become "no loss today".
+
+    Restoring it as 0.0 measures NO loss, so the daily-loss gate stops
+    measuring and the PAPER gate re-opens.
+    """
+    rm = await _paper_account_at_its_loss_limit(redis_store)
+    pnl_in_memory = rm.paper_stats.today_pnl
+    assert (
+        pnl_in_memory < 0.0
+    ), "the PAPER day's PnL must be a LOSS before this test means anything"
+
+    _write_the_persisted_paper_payload(redis_store, rm, today_pnl="not-a-number")
+
+    restored = await rm.restore_state()
+
+    assert restored is True
+    assert rm.paper_stats.today_pnl == pytest.approx(pnl_in_memory), (
+        "the corrupt persisted PAPER day's PnL was restored as 0.0: the "
+        "daily-loss gate would measure NO LOSS TODAY and the PAPER gate "
+        "would re-open"
+    )
+    assert (
+        rm._paper_is_trading_allowed is False
+    ), "the PAPER gate re-opened after a corrupt persisted paper day's PnL"
+
+
+async def test_a_valid_persisted_paper_streak_still_restores(redis_store):
+    """The fix must not break the RESTORE: a valid paper streak is restored.
+
+    This is the counterweight to the two tests above: refusing to restore a
+    corrupt value must not mean refusing to restore a GOOD one.
+    """
+    rm = _dual_mode_risk_manager(FakeRedis(redis_store))
+    await rm.update_balance(mode="paper")
+    redis_store[_guard_key(rm)] = json.dumps(
+        {
+            "version": 2,
+            "day_str": TODAY,
+            "consecutive_losses": 0,
+            "today_pnl": 0.0,
+            "start_of_day_balance": 1000.0,
+            "start_of_day_day_str": TODAY,
+            "paper": {
+                "day_str": TODAY,
+                "consecutive_losses": 5,
+                "today_pnl": -1000.0,
+                "start_of_day_balance": 5000.0,
+                "start_of_day_day_str": TODAY,
+            },
+        }
+    )
+
+    restored = await rm.restore_state()
+
+    assert restored is True, "the persisted state must have been read"
+    assert (
+        rm.paper_stats.consecutive_losses == 5
+    ), "the persisted PAPER loss streak was not restored"
+    assert rm.paper_stats.today_pnl == pytest.approx(-1000.0)
+    assert rm._paper_is_trading_allowed is False, (
+        "the restored PAPER streak breaches the paper limit, so the PAPER gate "
+        "must be closed"
+    )
+
+
+async def test_a_valid_persisted_paper_streak_cannot_lower_the_in_memory_streak(
+    redis_store,
+):
+    """The conservative rule, on a VALID persisted streak.
+
+    The streak only ever grows within a UTC day, so a persisted streak may
+    RAISE the in-memory streak but must never LOWER it. The LIVE path has
+    always worked that way; the PAPER path now does too.
+    """
+    rm = await _paper_account_at_its_loss_limit(redis_store)
+    streak_in_memory = rm.paper_stats.consecutive_losses
+
+    _write_the_persisted_paper_payload(redis_store, rm, consecutive_losses=1)
+
+    restored = await rm.restore_state()
+
+    assert restored is True
+    assert rm.paper_stats.consecutive_losses == streak_in_memory, (
+        "the persisted PAPER streak LOWERED the in-memory streak: the higher "
+        "of the two is the conservative -- and the more likely correct -- one"
+    )
+    assert (
+        rm._paper_is_trading_allowed is False
+    ), "the paper block did not survive a lower persisted paper streak"
