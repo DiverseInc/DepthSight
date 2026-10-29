@@ -1568,3 +1568,434 @@ class TestTheDockerServiceCount:
         assert "14 Docker services" not in page
         assert "14 services" not in page
         assert "14-service" not in page
+
+
+# --------------------------------------------------------------------------
+# EVERY public pricing surface
+# --------------------------------------------------------------------------
+# The static page is not the only public pricing surface. Three more are
+# public:
+#
+#   * frontend/src/components/marketing/Pricing.tsx -- the React pricing
+#     section, rendered by frontend/src/pages/LandingPage.tsx;
+#   * frontend/src/lib/pricing.ts -- the helper that builds the React cards
+#     and the sentence under them;
+#   * frontend/src/locales/en/register.json -- the copy the register page
+#     shows a visitor who arrived from a pricing call to action
+#     (frontend/welcome.html links to /register?plan=standard and
+#     /register?plan=pro, and /register is a public route).
+#
+# A defect in any of them is a defect a welcome.html-only guard cannot see,
+# and that is exactly how three false promises survived: "upgrade any time
+# from your account" (register.json), "You can upgrade to ... at any time
+# from your account" (pricing.ts) and "Cancel any time" (Pricing.tsx).
+REGISTER_JSON = REPO_ROOT / "frontend" / "src" / "locales" / "en" / "register.json"
+PRICING_COMPONENT = (
+    REPO_ROOT / "frontend" / "src" / "components" / "marketing" / "Pricing.tsx"
+)
+PRICING_HELPER = REPO_ROOT / "frontend" / "src" / "lib" / "pricing.ts"
+
+# A promise the product does not keep.
+#
+#   upgrade -- there is no SELF-SERVE upgrade. A paid tier is granted by
+#              the payment webhook (api/routes/payments.py) or by an
+#              operator, and the webhook needs a payment provider the
+#              default deployment does not run: docker-compose.yml has no
+#              Bitcart service, the provider arrives only through the
+#              opt-in docker-compose.bitcart.yml overlay (deploy.sh:135),
+#              and api/routes/payments.py:121-125 raises "Payment provider
+#              is not configured." without it.
+#   cancel  -- there is no subscription and no route that cancels one.
+SELF_SERVICE_UPGRADE_RE = re.compile(r"\bupgrad\w*", re.I)
+CANCELLATION_RE = re.compile(r"\bcancel\w*", re.I)
+
+# A string literal in a TS/TSX file. The template-literal branch keeps the
+# ${...} expressions, so a unit reads as the code that produces it.
+_TS_STRING_LITERAL_RE = re.compile(
+    r'"(?:[^"\\\n]|\\.)*"' r"|'(?:[^'\\\n]|\\.)*'" r"|`(?:[^`\\]|\\.)*`",
+    re.S,
+)
+
+# The characters that mean a JSX segment is CODE rather than copy.
+_TS_CODE_CHARS = set("{}<>=`|\\$")
+
+
+def _strip_ts_comments(source: str) -> str:
+    """Remove the comments, so a comment is never read as customer copy."""
+    without_block = re.sub(r"/\*.*?\*/", " ", source, flags=re.S)
+    return re.sub(r"(?m)(?<![:\w])//[^\n]*", " ", without_block)
+
+
+def _ts_copy_units(path: Path) -> list:
+    """The customer-visible copy of a TS/TSX file.
+
+    Two kinds of unit: the string literals, and the JSX text nodes. The
+    JSX text is the copy a visitor reads on the page, and it is NOT a
+    string literal -- a guard that only read the literals would miss
+    "Start free. Upgrade when you're ready." entirely.
+    """
+    source = _strip_ts_comments(path.read_text(encoding="utf-8"))
+    units = []
+
+    for match in _TS_STRING_LITERAL_RE.finditer(source):
+        value = " ".join(match.group(0)[1:-1].split())
+        if value:
+            units.append(value)
+
+    if path.suffix == ".tsx":
+        # The {...} expressions are dropped first, so a text node that
+        # wraps an expression is still read as one unit.
+        without_expressions = re.sub(r"\{[^{}]*\}", " ", source)
+        for match in re.finditer(r"(?<![=<>])>([^<>]+)<", without_expressions):
+            text = " ".join(match.group(1).split())
+            if not text or not re.search(r"[A-Za-z]", text):
+                continue
+            if any(char in _TS_CODE_CHARS for char in text):
+                continue
+            units.append(text)
+
+    return units
+
+
+def _json_copy_units(path: Path) -> list:
+    """Every string value in a locale file."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    units = []
+    for value in data.values():
+        if isinstance(value, str) and value.strip():
+            units.append(" ".join(value.split()))
+    return units
+
+
+def _public_pricing_surfaces() -> dict:
+    """Every public pricing surface, and the copy units it carries.
+
+    The static page contributes its visible markup AND its JSON-LD: the
+    JSON-LD is what a search engine indexes, so a promise that only
+    exists there is still a promise a prospect reads.
+    """
+    page = WELCOME_HTML.read_text(encoding="utf-8")
+    return {
+        "frontend/welcome.html (visible markup)": _copy_units(page),
+        "frontend/welcome.html (JSON-LD)": _json_ld_strings(page),
+        "frontend/src/components/marketing/Pricing.tsx": _ts_copy_units(
+            PRICING_COMPONENT
+        ),
+        "frontend/src/lib/pricing.ts": _ts_copy_units(PRICING_HELPER),
+        "frontend/src/locales/en/register.json": _json_copy_units(REGISTER_JSON),
+    }
+
+
+def _claim_units(html: str) -> list:
+    """The copy that makes a CLAIM, as opposed to a form control's labels.
+
+    `<option>Live trading</option>` in the contact form's "What interests
+    you most?" dropdown is a topic the visitor picks -- it is not a promise
+    about what a tier grants, so it needs no tier of its own. Every other
+    element in the markup is copy the visitor reads as a claim.
+
+    This is `_copy_units` without the <option> elements; the tag list is
+    otherwise identical, so nothing else is read differently.
+    """
+    units = []
+    for match in re.finditer(
+        r"<(?P<tag>p|h1|h2|h3|h4|li|span|a|title)\b[^>]*>"
+        r"(?P<body>.*?)</(?P=tag)\s*>",
+        html,
+        flags=re.S | re.I,
+    ):
+        body = " ".join(re.sub(r"<[^>]+>", " ", match.group("body")).split())
+        if body:
+            units.append(body)
+    return units
+
+
+def _known_quota_numbers(catalog: dict, raw_plans: dict) -> set:
+    """Every number the catalog grants, including the enforced exceptions.
+
+    The catalog's own labels are not the whole story: the Free tier's
+    Bybit-only live allowance ("Live trading on Bybit (up to 5 live trading
+    strategies)") is ENFORCED but not derived from a quota, so the numbers
+    come from the same expected-label computation the card tests use.
+    """
+    numbers = set()
+    for plan in catalog["plans"]:
+        raw = raw_plans[plan["key"]]
+        labels = _expected_included_labels(plan, raw) | _expected_excluded_labels(
+            plan, raw
+        )
+        for label in labels:
+            numbers.update(re.findall(r"\d+", label))
+    return numbers
+
+
+def _non_tiered_surfaces(page: str) -> dict:
+    """The copy that is NOT inside a per-tier card.
+
+    A pricing card is scoped by the card it sits in, so its bullets need
+    no tier of their own -- the card equality tests already pin them. The
+    JSON-LD offers are the same: each offer IS one tier.
+
+    Everything else is read by every tier at once, so anything it says
+    about a tier-gated capability has to name the tier.
+    """
+    return {
+        "frontend/welcome.html (prose)": _claim_units(_prose(page)),
+        "frontend/welcome.html (JSON-LD featureList)": _software_application(page).get(
+            "featureList", []
+        ),
+        "frontend/src/components/marketing/Pricing.tsx": _ts_copy_units(
+            PRICING_COMPONENT
+        ),
+        "frontend/src/lib/pricing.ts": _ts_copy_units(PRICING_HELPER),
+        "frontend/src/locales/en/register.json": _json_copy_units(REGISTER_JSON),
+    }
+
+
+def _capabilities(catalog: dict, raw_plans: dict) -> dict:
+    """The catalog's capabilities, and which tiers grant each one.
+
+    A capability is an entitlement CODE, not a label: the same capability
+    is rendered with a different label per tier ("20 backtests per day" for
+    Free, "50 backtests per day" for Standard, "Unlimited backtests" for
+    Professional), and those are ONE capability, not three. Reading the
+    gating off the labels would call "10 AI Assistant queries per day" a
+    Free-only capability, which it is not -- every tier gets the AI
+    assistant, just a different allowance.
+
+    The labels are kept because the copy a visitor reads IS a label, so a
+    piece of copy has to be matched against them.
+    """
+    granted: dict = {}
+    labels: dict = {}
+
+    for plan in catalog["plans"]:
+        for entitlement in plan["entitlements"]:
+            code = entitlement["code"]
+            labels.setdefault(code, set()).add(entitlement["label"])
+            if entitlement["included"]:
+                granted.setdefault(code, set()).add(plan["key"])
+
+    # `save_strategy_config` is enforced NOWHERE (POST
+    # /api/v1/strategies/config, api/routes/strategies.py:308-317, takes
+    # only `get_current_user`), so every tier really can save a strategy
+    # configuration. The catalog's exclusion list is wrong about that, and
+    # the cards already say so.
+    save_code = "permission_save_strategy_config"
+    if save_code in granted:
+        can_save = {key for key, raw in raw_plans.items() if _can_save_strategies(raw)}
+        if can_save:
+            granted[save_code] = can_save
+
+    return {
+        code: {"granted": keys, "labels": labels.get(code, set())}
+        for code, keys in granted.items()
+    }
+
+
+def _tier_gated_capabilities(capabilities: dict, every: set) -> dict:
+    """The capabilities that not every tier grants."""
+    return {
+        code: info
+        for code, info in capabilities.items()
+        if info["granted"] and info["granted"] != every
+    }
+
+
+def _named_plans(text: str, plans: list) -> set:
+    """The tiers a piece of copy names outright."""
+    named = set()
+    for plan in plans:
+        if re.search(rf"\b{re.escape(plan['name'])}\b", text, re.I):
+            named.add(plan["key"])
+    return named
+
+
+def _tier_groups(text: str, plans: list) -> set:
+    """The tiers a piece of copy names as a group ("paid plans", "Free")."""
+    groups = set()
+    if re.search(r"\bpaid\b", text, re.I):
+        groups |= {p["key"] for p in plans if p["key"] != FREE_PLAN_KEY}
+    if re.search(r"\bfree\b", text, re.I):
+        groups |= {p["key"] for p in plans if p["key"] == FREE_PLAN_KEY}
+    return groups
+
+
+def _scope_problem(text: str, gated: dict, plans: list) -> str | None:
+    """Why this copy overstates what the tiers grant -- or None.
+
+    A capability that only ONE tier grants must be attributed to that tier
+    BY NAME: "paid plans" would be wrong, because the other paid tier does
+    not grant it either. A capability several tiers grant may be attributed
+    to the group ("paid plans"), which is what the page already does for
+    live trading.
+    """
+    named = _named_plans(text, plans)
+    groups = _tier_groups(text, plans)
+    names = {plan["key"]: plan["name"] for plan in plans}
+    lowered = text.lower()
+
+    for code, info in gated.items():
+        matched = next(
+            (label for label in info["labels"] if label.lower() in lowered), None
+        )
+        if matched is None:
+            continue
+
+        keys = info["granted"]
+        if len(keys) == 1:
+            only = next(iter(keys))
+            if only not in named:
+                return (
+                    f"names {matched!r}, which only the {names[only]} tier "
+                    "grants, without saying so"
+                )
+        elif not keys <= (named | groups):
+            return (
+                f"names {matched!r}, which only "
+                f"{', '.join(sorted(names[k] for k in keys))} grant, "
+                "without saying so"
+            )
+    return None
+
+
+class TestEveryPublicPricingSurfaceTellsTheTruth:
+    """The static page is not the only public pricing surface.
+
+    The guard used to read frontend/welcome.html and nothing else, so a
+    false promise in the React pricing component, in the pricing helper
+    or on the register page passed every test.
+    """
+
+    @pytest.fixture(scope="class")
+    def surfaces(self):
+        return _public_pricing_surfaces()
+
+    def test_the_guard_inspected_every_public_pricing_surface(self, surfaces):
+        """The guard may not pass by inspecting nothing."""
+        assert surfaces, "no public pricing surface was found"
+        for name, units in surfaces.items():
+            assert units, (
+                f"nothing was inspected on {name}; the guard would pass " "vacuously"
+            )
+
+    def test_no_public_surface_promises_a_self_serve_upgrade(self, surfaces):
+        seen = 0
+        for name, units in surfaces.items():
+            for unit in units:
+                seen += 1
+                assert not SELF_SERVICE_UPGRADE_RE.search(unit), (
+                    f"{name} promises a self-serve upgrade: {unit!r}. There is "
+                    "none: the payment provider is opt-in "
+                    "(api/routes/payments.py:121-125) and the default "
+                    "deployment does not enable it (deploy.sh:135)"
+                )
+        assert seen, "the guard inspected nothing; re-measure this test"
+
+    def test_no_public_surface_promises_a_cancellation(self, surfaces):
+        seen = 0
+        for name, units in surfaces.items():
+            for unit in units:
+                seen += 1
+                assert not CANCELLATION_RE.search(unit), (
+                    f"{name} promises a cancellation: {unit!r}. There is no "
+                    "subscription and no route that cancels one"
+                )
+        assert seen, "the guard inspected nothing; re-measure this test"
+
+    def test_no_public_surface_invents_a_quota(self, surfaces, catalog, raw_plans):
+        known_numbers = _known_quota_numbers(catalog, raw_plans)
+
+        seen = 0
+        for name, units in surfaces.items():
+            for unit in units:
+                seen += 1
+                for number in _quota_numbers(unit):
+                    assert number in known_numbers, (
+                        f"{name} quotes {number} next to a quota word "
+                        f"({unit!r}), but the catalog grants that quota to no "
+                        "tier"
+                    )
+        assert seen, "the guard inspected nothing; re-measure this test"
+
+    def test_no_public_surface_overstates_what_a_tier_grants(self, catalog, raw_plans):
+        every = {plan["key"] for plan in catalog["plans"]}
+        gated = _tier_gated_capabilities(_capabilities(catalog, raw_plans), every)
+        assert gated, (
+            "no tier-gated capability was found in the catalog; re-measure " "this test"
+        )
+
+        page = WELCOME_HTML.read_text(encoding="utf-8")
+        seen = 0
+        for name, units in _non_tiered_surfaces(page).items():
+            for unit in units:
+                seen += 1
+                problem = _scope_problem(unit, gated, catalog["plans"])
+                assert problem is None, f"{name}: {unit!r} {problem}"
+        assert seen, "the guard inspected nothing; re-measure this test"
+
+
+class TestTheIndexedFeatureListNamesItsTiers:
+    """The JSON-LD featureList is what a search engine indexes.
+
+    The visible cards were scoped in an earlier round; this indexed copy
+    was missed. "Genetic strategy search" and "ML model laboratory" are
+    Professional-plan features, so an unscoped featureList still
+    overstated what a Free or Standard customer gets.
+    """
+
+    def test_every_indexed_feature_that_is_tier_gated_names_the_tier(
+        self, page, catalog, raw_plans
+    ):
+        features = _software_application(page).get("featureList", [])
+        assert features, "the JSON-LD has no featureList"
+
+        every = {plan["key"] for plan in catalog["plans"]}
+        gated = _tier_gated_capabilities(_capabilities(catalog, raw_plans), every)
+
+        seen = 0
+        for feature in features:
+            seen += 1
+            problem = _scope_problem(feature, gated, catalog["plans"])
+            assert problem is None, (
+                f"the indexed feature {feature!r} {problem}. The JSON-LD is "
+                "what a search engine reads, so an unscoped feature is a "
+                "promise a prospect reads."
+            )
+        assert seen, "no indexed feature was inspected; re-measure this test"
+
+
+class TestTheRegisterPageCopy:
+    """The register page's selected-plan copy is a public promise.
+
+    The branch's own call to action sends the visitor here:
+    frontend/welcome.html links to /register?plan=standard and
+    /register?plan=pro, and /register is a public route
+    (frontend/src/App.tsx:131).
+    """
+
+    @pytest.fixture(scope="class")
+    def copy(self) -> str:
+        return json.loads(REGISTER_JSON.read_text(encoding="utf-8"))["selectedPlan"]
+
+    def test_the_copy_still_names_the_plan_the_visitor_selected(self, copy):
+        assert (
+            "{{plan}}" in copy
+        ), "the register copy must still name the plan the visitor selected"
+
+    def test_the_copy_still_says_the_account_starts_on_the_entitled_plan(self, copy):
+        assert "start on the plan they are entitled to" in copy, (
+            "the register copy must say that a new account starts on the "
+            "tier it is entitled to"
+        )
+
+    def test_the_copy_says_a_paid_tier_is_set_up_for_the_customer(self, copy):
+        lowered = copy.lower()
+        assert "paid tier" in lowered, (
+            "the register copy must say what happens to the paid tier the "
+            "visitor asked for"
+        )
+        assert "activate" in lowered or "set up" in lowered, (
+            "the register copy must say that the paid tier is set up for the "
+            "customer -- there is no self-serve upgrade to promise"
+        )
