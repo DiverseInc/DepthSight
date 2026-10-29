@@ -6,7 +6,7 @@ import time
 import asyncio
 import json
 from datetime import timedelta, datetime, time as dt_time, timezone
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from collections import defaultdict, deque
@@ -133,6 +133,45 @@ def ensure_dict(obj) -> Dict[str, Any]:
         except Exception:
             return {}
     return {}
+
+
+def _read_persisted_number(
+    payload: Dict[str, Any], key: str, cast: Callable[[Any], Any]
+) -> Optional[Any]:
+    """Read a NUMBER out of a persisted payload, keeping "absent" apart from "zero".
+
+    Returns the cast value, or None when the value is UNREADABLE.
+
+    Three things make a persisted number UNREADABLE, and NONE of them is a
+    zero:
+
+    * the field is MISSING from the payload;
+    * the field is present but NULL;
+    * the field is present but is not a number.
+
+    The idiom this replaces -- ``payload.get(key) or 0`` -- cannot tell any of
+    them apart from a genuine zero: a missing field yields None, ``None or 0``
+    is 0, and a field that is present but null yields the same 0. So a partial
+    or corrupt payload restored as "no loss today" and "no loss streak" --
+    which DISCARDS the numbers the guard was blocking on and RE-OPENS a gate
+    that was closed. That is the fail-OPEN this helper exists to close.
+
+    A field that IS present and readable is returned EXACTLY as it is, so a
+    genuine zero (a streak of 0, a day's PnL of 0.0) is still restored as a
+    zero. "Absent" and "zero" are DIFFERENT facts and must never be confused:
+    one of them is an unknown, the other is a measurement.
+
+    `cast` is `int` for the loss streak and `float` for the day's PnL.
+    """
+    if key not in payload:
+        return None
+    raw = payload[key]
+    if raw is None:
+        return None
+    try:
+        return cast(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 class RiskManager:
@@ -4091,29 +4130,68 @@ class RiskManager:
             self._account_history_resolved = True
             return False
 
-        try:
-            consecutive_losses = int(payload.get("consecutive_losses") or 0)
-        except (TypeError, ValueError):
-            consecutive_losses = 0
-        try:
-            today_pnl = float(payload.get("today_pnl") or 0.0)
-        except (TypeError, ValueError):
-            today_pnl = 0.0
+        # A PERSISTED VALUE THAT IS MISSING, NULL OR NOT A NUMBER IS NOT A
+        # ZERO.
+        #
+        # `payload.get("today_pnl") or 0.0` cannot tell those apart from a
+        # genuine zero: a MISSING field yields None, `None or 0.0` is 0.0, and
+        # a field that is present but NULL yields the same 0.0. So a partial
+        # or corrupt payload restored as "no loss today" and "no loss streak"
+        # -- which DISCARDS the numbers the guard was blocking on and RE-OPENS
+        # a gate that was closed. The day's PnL is a REAL-MONEY control: read
+        # as 0.0 it measures no loss at all, so the daily-loss gate stops
+        # measuring and a previously blocked account is free to trade again.
+        #
+        # An unreadable value is UNKNOWN, and unknown must never be more
+        # permissive than known. So the in-memory value stays IN FORCE: the
+        # streak is never lowered, and the day's PnL is not overwritten. A
+        # value that IS readable is used exactly as it always was. See
+        # `_read_persisted_number`.
+        raw_consecutive_losses = payload.get("consecutive_losses")
+        raw_today_pnl = payload.get("today_pnl")
+        persisted_consecutive_losses = _read_persisted_number(
+            payload, "consecutive_losses", int
+        )
+        persisted_today_pnl = _read_persisted_number(payload, "today_pnl", float)
         try:
             start_of_day_balance = float(payload.get("start_of_day_balance") or 0.0)
         except (TypeError, ValueError):
             start_of_day_balance = 0.0
 
-        # The streak only ever grows within a UTC day (it is reset by a win
-        # or by the daily rollover), so the higher of the persisted and the
-        # in-memory value is the conservative -- and, after a failed restore,
-        # the more likely correct -- one.
-        self.stats.consecutive_losses = max(
-            0,
-            consecutive_losses,
-            int(self.stats.consecutive_losses or 0),
-        )
-        self.stats.today_pnl = today_pnl
+        if persisted_consecutive_losses is None:
+            logger.critical(
+                "[RiskGuard] The persisted LIVE loss streak could NOT be read "
+                "(present=%s, value=%r, UTC day %s). The in-memory LIVE streak "
+                "(%d) stays IN FORCE, so a streak-triggered block is not lost.",
+                "consecutive_losses" in payload,
+                raw_consecutive_losses,
+                current_day_str,
+                int(self.stats.consecutive_losses or 0),
+            )
+        else:
+            # The streak only ever grows within a UTC day (it is reset by a win
+            # or by the daily rollover), so the higher of the persisted and the
+            # in-memory value is the conservative -- and, after a failed restore,
+            # the more likely correct -- one.
+            self.stats.consecutive_losses = max(
+                0,
+                persisted_consecutive_losses,
+                int(self.stats.consecutive_losses or 0),
+            )
+
+        if persisted_today_pnl is None:
+            logger.critical(
+                "[RiskGuard] The persisted LIVE day's PnL could NOT be read "
+                "(present=%s, value=%r, UTC day %s). The in-memory LIVE day's "
+                "PnL (%.2f) stays IN FORCE: restoring it as 0.0 would measure "
+                "NO LOSS TODAY and open the daily-loss gate wider.",
+                "today_pnl" in payload,
+                raw_today_pnl,
+                current_day_str,
+                float(self.stats.today_pnl or 0.0),
+            )
+        else:
+            self.stats.today_pnl = persisted_today_pnl
 
         # THE BASE MUST CARRY ITS OWN DAY. `day_str` above describes the STREAK
         # and the day's PnL. It says nothing about which day
@@ -4210,14 +4288,16 @@ class RiskManager:
             if paper_day_str == current_day_str:
                 raw_paper_consecutive_losses = paper_payload.get("consecutive_losses")
                 raw_paper_today_pnl = paper_payload.get("today_pnl")
-                try:
-                    paper_consecutive_losses = int(raw_paper_consecutive_losses or 0)
-                except (TypeError, ValueError):
-                    paper_consecutive_losses = None
-                try:
-                    paper_today_pnl = float(raw_paper_today_pnl or 0.0)
-                except (TypeError, ValueError):
-                    paper_today_pnl = None
+                # A MISSING or NULL field is UNREADABLE, not a zero -- the same
+                # rule the LIVE path above uses, and for the same reason:
+                # `int(None or 0)` is 0, so a partial payload would silently
+                # restore as "no loss today" and "no loss streak".
+                paper_consecutive_losses = _read_persisted_number(
+                    paper_payload, "consecutive_losses", int
+                )
+                paper_today_pnl = _read_persisted_number(
+                    paper_payload, "today_pnl", float
+                )
                 try:
                     paper_start_of_day_balance = float(
                         paper_payload.get("start_of_day_balance") or 0.0
@@ -4238,15 +4318,21 @@ class RiskManager:
                 # That is the defect class this whole change exists to kill:
                 # the guard state says one thing and the money says another.
                 #
+                # A value that is MISSING or NULL is unreadable in exactly the
+                # same way a value that is not a number is: the payload does
+                # not say what the day's PnL or the streak was, so it cannot
+                # be read as "no loss today" either.
+                #
                 # So an unreadable value leaves the in-memory value IN FORCE,
                 # and it is logged at CRITICAL: an unreadable persisted paper
                 # state is an OPERATIONAL event, not a debug line.
                 if paper_consecutive_losses is None:
                     logger.critical(
                         "[RiskGuard] The persisted PAPER loss streak could NOT be "
-                        "read (%r, UTC day %s). The in-memory PAPER streak (%d) "
-                        "stays IN FORCE, so a streak-triggered paper block is "
-                        "not lost.",
+                        "read (present=%s, value=%r, UTC day %s). The in-memory "
+                        "PAPER streak (%d) stays IN FORCE, so a streak-triggered "
+                        "paper block is not lost.",
+                        "consecutive_losses" in paper_payload,
                         raw_paper_consecutive_losses,
                         current_day_str,
                         int(self.paper_stats.consecutive_losses or 0),
@@ -4266,9 +4352,10 @@ class RiskManager:
                 if paper_today_pnl is None:
                     logger.critical(
                         "[RiskGuard] The persisted PAPER day's PnL could NOT be "
-                        "read (%r, UTC day %s). The in-memory PAPER day's PnL "
-                        "(%.2f) stays IN FORCE: discarding it would measure "
-                        "nothing at all and open the gate wider.",
+                        "read (present=%s, value=%r, UTC day %s). The in-memory "
+                        "PAPER day's PnL (%.2f) stays IN FORCE: discarding it "
+                        "would measure nothing at all and open the gate wider.",
+                        "today_pnl" in paper_payload,
                         raw_paper_today_pnl,
                         current_day_str,
                         float(self.paper_stats.today_pnl or 0.0),
