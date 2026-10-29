@@ -33,6 +33,14 @@ put there. If the proxied object was changed out of band since the proxy's
 write, that change is not the proxy's to revert, so the undo leaves it
 alone. And a snapshot of a previous target is meaningless once `configure()`
 swaps the target, so it is dropped then.
+
+The rule the undo follows is OWNERSHIP. The proxy only ever reverts a name
+it wrote to the proxied object ITSELF, and it never removes a name it
+cannot prove it still owns: a name the proxy never wrote is left alone, an
+underscore name is the proxy's own and never reaches the proxied object at
+all, and a name the proxy CREATED is left in place when it is undone,
+because the proxied object may have taken that name over out of band and
+identity cannot tell that apart from "it still holds what we put there".
 """
 
 from __future__ import annotations
@@ -90,8 +98,22 @@ def test_deleting_an_override_puts_the_original_back():
     assert target.existing == "original"
 
 
-def test_deleting_an_override_of_a_name_the_target_never_had():
-    """A name the target does not have is still absent afterwards."""
+def test_deleting_an_override_of_a_name_the_target_never_had_leaves_it_in_place():
+    """A name the target did not have is LEFT IN PLACE after the undo.
+
+    2026-10-29 - DELIBERATE BEHAVIOUR CHANGE. This test used to assert
+    `not hasattr(target, "brand_new")`: the undo DELETED the name the proxy
+    had created. Deleting is not safe. The proxy created the name, but it
+    cannot prove the target still holds only what the proxy put there - the
+    target may have adopted the very same object out of band, and identity
+    cannot tell the two cases apart (see
+    `test_the_undo_does_not_delete_a_name_the_module_adopted_out_of_band`).
+    So the undo now leaves the attribute in place and records the name as
+    abandoned instead of deleting it.
+
+    The common case is unaffected: a name the target DID have is restored
+    with `setattr(target, name, saved)` and is never deleted.
+    """
 
     target = _Target()
     proxy = DependencyProxy("t")
@@ -102,7 +124,11 @@ def test_deleting_an_override_of_a_name_the_target_never_had():
 
     del proxy.brand_new  # type: ignore[attr-defined]
 
-    assert not hasattr(target, "brand_new")
+    assert hasattr(target, "brand_new"), (
+        "the undo deleted a name the proxy created. The proxy may only "
+        "revert what it put there, and it cannot prove it still owns it."
+    )
+    assert target.brand_new == 1  # type: ignore[attr-defined]
 
 
 def test_the_proxy_still_forwards_to_the_live_target():
@@ -336,9 +362,9 @@ def test_a_later_undo_does_not_clobber_an_out_of_band_change():
     target.existing = changed_elsewhere  # out of band, bypassing the proxy
 
     del proxy.existing  # type: ignore[attr-defined]
-    assert target.existing is changed_elsewhere, (
-        "the first undo clobbered a change made on the target directly"
-    )
+    assert (
+        target.existing is changed_elsewhere
+    ), "the first undo clobbered a change made on the target directly"
 
     proxy.existing = patched_again  # type: ignore[assignment]
     assert target.existing is patched_again
@@ -374,9 +400,9 @@ def test_undoing_an_abandoned_name_again_changes_nothing():
     del proxy.existing  # type: ignore[attr-defined]
     del proxy.existing  # type: ignore[attr-defined]  # must not raise
 
-    assert target.existing is changed_elsewhere, (
-        "a repeated undo of an abandoned name changed the value on the target"
-    )
+    assert (
+        target.existing is changed_elsewhere
+    ), "a repeated undo of an abandoned name changed the value on the target"
 
 
 def test_a_second_out_of_band_change_is_also_preserved():
@@ -555,3 +581,90 @@ def test_two_patches_of_one_name_undone_together_keep_the_real_function():
         "test in the session would fail on it"
     )
     assert crud_module.get_user_by_username is original
+
+
+def test_deleting_a_name_the_proxy_never_wrote_leaves_the_target_alone():
+    """An undo must not delete an attribute the proxy never wrote.
+
+    The proxy may only revert what it put there. This name was on the
+    target from the start and the proxy never touched it, so the undo has
+    nothing to do on the target at all - deleting it would take a real
+    attribute out of the proxied object for good.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    original = target.existing
+
+    del proxy.existing  # type: ignore[attr-defined]
+
+    assert hasattr(target, "existing"), (
+        "deleting a name the proxy never wrote took the attribute off the "
+        "proxied object; the proxy may only revert what it put there"
+    )
+    assert target.existing == original
+
+
+def test_deleting_an_underscore_name_leaves_the_target_alone():
+    """An underscore name belongs to the proxy, never to the target.
+
+    `__setattr__` keeps underscore names on the proxy and never writes them
+    to the proxied object, so `__delattr__` must not delete them from the
+    proxied object either. It removes them from the proxy - and only from
+    the proxy.
+    """
+
+    target = _Target()
+    target._real_private = "REAL"  # type: ignore[attr-defined]
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    # Underscore names are stored on the proxy; they never reach the target.
+    proxy._real_private = "patched"  # type: ignore[attr-defined]
+    assert target._real_private == "REAL"
+
+    del proxy._real_private  # type: ignore[attr-defined]
+
+    assert target._real_private == "REAL", (
+        "deleting an underscore name deleted the attribute from the proxied "
+        "object; underscore names are the proxy's own and never reach it"
+    )
+    assert (
+        "_real_private" not in proxy.__dict__
+    ), "the underscore name was not removed from the proxy it belongs to"
+
+
+def test_the_undo_does_not_delete_a_name_the_module_adopted_out_of_band():
+    """A name the module took over out of band must survive the undo.
+
+    The proxy created the name, so the proxy's snapshot says "there was
+    nothing there to restore". The module then adopts the very SAME object
+    the proxy put there, out of band. Identity cannot tell that apart from
+    "the module still holds exactly what the proxy wrote", so the undo must
+    not delete the module's attribute: the proxy cannot prove it still owns
+    that name.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    shared = _Value("shared")
+
+    # The proxy creates the name - the target did not have it.
+    proxy.brand_new = shared  # type: ignore[attr-defined]
+    assert target.brand_new is shared
+
+    # The module adopts the very same object, out of band.
+    target.brand_new = shared  # type: ignore[attr-defined]
+
+    del proxy.brand_new  # type: ignore[attr-defined]
+
+    assert hasattr(target, "brand_new"), (
+        "the undo deleted a name the module holds. The proxy created the "
+        "name, but it cannot prove the module still holds only what the "
+        "proxy put there, so it must not delete it."
+    )
+    assert target.brand_new is shared
