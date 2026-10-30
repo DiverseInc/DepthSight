@@ -25,7 +25,7 @@
 	"bonusesCard.pending": "pending",
 	"bonusesCard.pendingNote": "Pending bonuses will be activated when the referred user adds their first unique API key.",
 	"paymentStatus.success.title": "Payment received",
-	"paymentStatus.success.description": "Thank you — we set the paid tier up on your account and confirm by email.",
+	"paymentStatus.success.description": "Thank you — your payment went through. If your tier has not been set up yet, open a ticket under Billing / Plans and we will set it up for you.",
 	"paymentStatus.failed.title": "Payment Failed",
 	"paymentStatus.failed.description": "The payment did not go through, so nothing was charged. Open a support ticket under Billing / Plans and we will help.",
 	"paymentStatus.cancelled.title": "Payment Cancelled",

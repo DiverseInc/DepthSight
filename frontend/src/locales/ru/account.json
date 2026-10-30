@@ -25,7 +25,7 @@
 	"bonusesCard.pending": "ожидание",
 	"bonusesCard.pendingNote": "Бонусы в ожидании будут активированы, когда приглашенный пользователь добавит свой первый уникальный API ключ.",
 	"paymentStatus.success.title": "Платеж получен",
-	"paymentStatus.success.description": "Спасибо — мы настроим платный тариф на вашем аккаунте и подтвердим это по почте.",
+	"paymentStatus.success.description": "Спасибо — платеж прошел. Если тариф еще не настроен, откройте тикет в категории «Оплата / Тарифы», и мы настроим его для вас.",
 	"paymentStatus.failed.title": "Ошибка оплаты",
 	"paymentStatus.failed.description": "Платеж не прошел, списания не было. Откройте тикет в категории «Оплата / Тарифы», и мы поможем.",
 	"paymentStatus.cancelled.title": "Оплата отменена",

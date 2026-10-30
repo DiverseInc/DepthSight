@@ -153,11 +153,54 @@ AGREED_EN_REGISTER_COPY = (
     "it up for you."
 )
 
+# The payment-success toast. `api/routes/payments.py:298` and
+# `api/routes/webhooks.py:102` activate a tier with
+# `crud.update_user_plan`, which sets the plan and the expiry and flushes
+# (api/crud.py:313-322). Nothing on that path sends mail, so the toast may
+# not promise an email confirmation. It says the same thing the knowledge
+# base article says: if the tier has not been set up, open a ticket under
+# Billing / Plans.
+AGREED_EN_PAYMENT_SUCCESS_COPY = (
+    "Thank you \u2014 your payment went through. If your tier has not been "
+    "set up yet, open a ticket under Billing / Plans and we will set it up "
+    "for you."
+)
+
+AGREED_RU_PAYMENT_SUCCESS_COPY = (
+    "\u0421\u043f\u0430\u0441\u0438\u0431\u043e \u2014 \u043f\u043b\u0430\u0442\u0435\u0436 \u043f\u0440\u043e\u0448\u0435\u043b. "
+    "\u0415\u0441\u043b\u0438 \u0442\u0430\u0440\u0438\u0444 \u0435\u0449\u0435 \u043d\u0435 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043d, "
+    "\u043e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 \u0442\u0438\u043a\u0435\u0442 \u0432 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438 "
+    "\u00ab\u041e\u043f\u043b\u0430\u0442\u0430 / \u0422\u0430\u0440\u0438\u0444\u044b\u00bb, "
+    "\u0438 \u043c\u044b \u043d\u0430\u0441\u0442\u0440\u043e\u0438\u043c \u0435\u0433\u043e \u0434\u043b\u044f \u0432\u0430\u0441."
+)
+
 # The agreed Russian wording, landed here.
 AGREED_RU_REGISTER_COPY = (
     "Вы выбрали план {{plan}}. Новый аккаунт начинает с того плана, который "
     "ему положен — чтобы активировать платный тариф, напишите нам, и мы "
     "настроим его для вас."
+)
+
+
+# A promise that we will send the customer an email about their plan or
+# their payment. The backend HAS an email service (api/email_utils.py), but
+# nothing on the payment path calls it: api/routes/payments.py:298 and
+# api/routes/webhooks.py:102 activate a tier with crud.update_user_plan,
+# which sets the plan and the expiry and flushes (api/crud.py:313-322) and
+# sends no mail. The email service is called from api/routes/auth.py and
+# api/onboarding_emails.py -- the signup and onboarding flows, not billing.
+_PLAN_CONTEXT = (
+    r"(?:plans?|tiers?|subscriptions?|billing|paid|premium|payments?"
+    r"|\u0442\u0430\u0440\u0438\u0444\w*|\u043f\u043b\u0430\u043d\w*"
+    r"|\u043f\u043e\u0434\u043f\u0438\u0441\u043a\w*|\u043e\u043f\u043b\u0430\u0442\w*"
+    r"|\u043f\u0440\u0435\u043c\u0438\u0443\u043c\w*|\u043f\u043b\u0430\u0442\u0435\u0436\w*)"
+)
+_EMAIL_WORD = r"(?:e-?mails?|\u043f\u043e\u0447\u0442\w*)"
+
+EMAIL_PROMISE_RE = re.compile(
+    rf"\b{_PLAN_CONTEXT}\b[^.\n]{{0,60}}\b{_EMAIL_WORD}\b"
+    rf"|\b{_EMAIL_WORD}\b[^.\n]{{0,60}}\b{_PLAN_CONTEXT}\b",
+    re.I,
 )
 
 
@@ -328,6 +371,12 @@ FORBIDDEN = (
         re.compile(r"\bself[-\s]?serv\w*|\bсамостоятельн\w*", re.I),
         True,
         "offers a self-service checkout that is not deployed",
+    ),
+    (
+        "an email confirmation of the plan or the payment",
+        EMAIL_PROMISE_RE,
+        False,
+        "promises an email the payment path never sends",
     ),
 )
 
@@ -555,6 +604,14 @@ class TestNoSurfacePromisesASelfServeUpgrade:
             ("a yearly or annual plan", "a yearly plan at $99"),
             ("a one-off lifetime purchase", "or $299 once - lifetime access"),
             ("a self-service checkout", "a self-service checkout"),
+            (
+                "an email confirmation of the plan or the payment",
+                "we set the paid tier up on your account and confirm by email",
+            ),
+            (
+                "an email confirmation of the plan or the payment",
+                "мы настроим платный тариф на вашем аккаунте и подтвердим это по почте.",
+            ),
         )
         rules = {name: pattern for name, pattern, _, _ in FORBIDDEN}
         for promise, sample in samples:
@@ -744,4 +801,45 @@ class TestTheRegisterCopy:
             assert "upgrade" not in copies["en"].lower(), (
                 "the English register copy must not promise that the customer "
                 "can change their plan themselves"
+            )
+
+
+class TestThePaymentSuccessCopy:
+    """The payment toast may not promise an email the backend never sends."""
+
+    @pytest.fixture(scope="class")
+    def copies(self) -> dict:
+        return {
+            language: json.loads(
+                (LOCALES_DIR / language / "account.json").read_text(
+                    encoding="utf-8"
+                )
+            )["paymentStatus.success.description"]
+            for language in ("en", "ru")
+        }
+
+    def test_the_english_copy_is_the_agreed_wording(self, copies):
+        assert copies["en"] == AGREED_EN_PAYMENT_SUCCESS_COPY
+
+    def test_the_russian_copy_is_the_agreed_wording(self, copies):
+        assert copies["ru"] == AGREED_RU_PAYMENT_SUCCESS_COPY
+
+    def test_the_copy_promises_no_email(self, copies):
+        """The payment path sends no mail.
+
+        `crud.update_user_plan` (api/crud.py:313-322) sets the plan and the
+        expiry and flushes. The email service in api/email_utils.py is called
+        from the signup and onboarding flows, never from the payment path.
+        """
+        for language, copy in copies.items():
+            assert not EMAIL_PROMISE_RE.search(copy), (
+                f"the {language} payment-success copy promises an email: "
+                f"{copy!r}. The payment path does not send one."
+            )
+
+    def test_the_copy_points_at_the_support_ticket(self, copies):
+        for language, copy in copies.items():
+            assert "Billing / Plans" in copy or "\u041e\u043f\u043b\u0430\u0442\u0430 / \u0422\u0430\u0440\u0438\u0444\u044b" in copy, (
+                f"the {language} payment-success copy must point at the "
+                "support category that actually exists"
             )
