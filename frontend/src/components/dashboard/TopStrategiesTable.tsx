@@ -45,6 +45,11 @@ const getStatusBadgeVariant = (status: string) => {
 		// Red, not grey: it is broken, not merely idle.
 		case "cannot_trade":
 			return "bg-red-500 hover:bg-red-600";
+		// The screener feed this strategy depends on is not answering, so the
+		// strategy cannot do the thing it was started for. Amber: impaired by
+		// an outage, not structurally broken -- and never green.
+		case "degraded":
+			return "bg-yellow-500 hover:bg-yellow-600";
 		default:
 			return "bg-gray-500 hover:bg-gray-600";
 	}

@@ -475,6 +475,13 @@ SYMBOL_SOURCE_MODE = "MAIN_APP"  # Default is 'MAIN_APP'
 # to, none to match against. That is the worst failure mode for a product,
 # because it looks healthy.
 #
+# That "looks healthy" part is now closed. The refusal below is still a
+# CONFIGURATION test (bot_module/regime_feed.py), but the REACHABILITY of the
+# configured feed is measured separately and for real by
+# bot_module/main_app_feed.py: a bounded, cached probe of the configured
+# host. A dead feed is reported as status='degraded' with the reason, so the
+# failure is visible instead of inferred.
+#
 # Default is FALSE so a deployment without a screener refuses DYNAMIC loudly at
 # strategy-start instead of accepting it and never trading. Operators running
 # their own screener should set SYMBOL_SELECTION_ALLOW_DYNAMIC=true.
@@ -511,8 +518,60 @@ SYMBOL_SOURCE_JSON_FILE_PATH = "data/static_symbols.json"
 
 # Path to the file with filtered pairs (if a static list is used) - OLD, CAN BE KEPT OR REMOVED
 FILTERED_PAIRS_FILE = "data/filtered_pairs.json"
-# WebSocket URL of the main application that provides market data and the list of active pairs
-MAIN_APP_WS_URL = "wss://screener.depthsight.pro/ws/bot/"
+
+# WebSocket URL of the main application that provides market data and the list
+# of active pairs.
+#
+# THE DEFAULT VALUE IS RESERVED, NOT LIVE. MEASURED 2026-10-29 from this box:
+# `wss://screener.depthsight.pro/ws/bot/` answers HTTP 525 (Cloudflare: origin
+# unreachable) on BOTH a plain GET and a WebSocket upgrade handshake. The
+# hostname is reserved for a future DNS cutover; there is no service behind it
+# yet.
+#
+# The default is deliberately NOT changed to a guessed value:
+#   * The only other candidate host, depthsight.diverseinc.net, registers NO
+#     /ws/bot route at all -- HTTP 403 on a WebSocket upgrade handshake. Its
+#     /ws and /ws/main routes (api/websocket_server.py) both require a
+#     `token` query parameter, and the bot sends none.
+#   * The screener feed is empty BY DESIGN right now (every published
+#     backtest is FAILED), so a new feed would carry nothing anyway.
+# There is therefore no correct live URL to point at, and a guessed one would
+# only trade one dead feed for another while making the dead default look
+# deliberate.
+#
+# Instead the default is made EXPLICIT and the deployment is made honest about
+# it: bot_module/main_app_feed.py probes this host with a bounded, cached
+# reachability check; the bot says ONCE at startup that it is not answering;
+# and every strategy that depends on this feed is published as
+# status='degraded' with the reason instead of status='running'.
+#
+# Set MAIN_APP_WS_URL to point the deployment at a feed that actually answers.
+MAIN_APP_WS_URL = (
+    os.environ.get("MAIN_APP_WS_URL", "").strip()
+    or "wss://screener.depthsight.pro/ws/bot/"
+)
+
+# Bounded reachability probe for the MAIN_APP feed (bot_module/main_app_feed.py).
+#
+# The timeout is SHORT on purpose: a health check must never be able to stall
+# the bot, so it sits far below the 10s `open_timeout` the consumer itself
+# uses. The cache keeps a per-tick caller (the ~2s state publisher) from
+# re-probing the same host 30 times a minute.
+#
+# A malformed value falls back to the default instead of raising at import
+# time -- a typo in an env var must not stop the whole bot from starting.
+try:
+    MAIN_APP_FEED_PROBE_TIMEOUT_SECONDS = float(
+        os.environ.get("MAIN_APP_FEED_PROBE_TIMEOUT_SECONDS", "2.5")
+    )
+except (TypeError, ValueError):
+    MAIN_APP_FEED_PROBE_TIMEOUT_SECONDS = 2.5
+try:
+    MAIN_APP_FEED_PROBE_CACHE_SECONDS = float(
+        os.environ.get("MAIN_APP_FEED_PROBE_CACHE_SECONDS", "60")
+    )
+except (TypeError, ValueError):
+    MAIN_APP_FEED_PROBE_CACHE_SECONDS = 60.0
 # Consecutive Main_app_ws failures after which the outage is escalated from a
 # throttled WARNING to a CRITICAL trading-outage notice. There is no automatic
 # fallback to SYMBOL_SOURCE_STATIC_LIST, so while this feed is down every

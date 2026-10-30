@@ -1194,8 +1194,28 @@ class StrategyInfo(StrategyRunRequest):  # For response
     status_detail: Optional[str] = Field(
         None,
         description=(
-            "Why this strategy reports status='cannot_trade', when it does. "
-            "Set by the bot at instance creation; absent for every other status."
+            "Why this strategy reports status='cannot_trade' or "
+            "status='degraded', when it does. Set by the bot at instance "
+            "creation for 'cannot_trade', and at publish time for 'degraded' "
+            "(the screener feed this strategy depends on is not answering). "
+            "Absent for every other status."
+        ),
+    )
+    # The health of the MAIN_APP screener feed this deployment is configured
+    # to use. ADDITIVE and OPTIONAL: a consumer that ignores it sees exactly
+    # what it saw before.
+    #
+    # `state` is "ok" or "degraded". When it is "degraded", `reason` names the
+    # unreachable URL and the failure (dns / tcp / tls / "http <status>" /
+    # timeout) so the UI can explain the outage instead of only colouring a
+    # badge. It describes the FEED, not this strategy -- whether THIS
+    # strategy is affected by the outage is what `status` says.
+    feed_health: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Health of the configured MAIN_APP screener feed: "
+            "{state, url, reachable, failure, status_code, detail, reason, "
+            "checked_at}. 'degraded' means the feed is NOT answering."
         ),
     )
 

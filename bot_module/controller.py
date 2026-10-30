@@ -41,6 +41,10 @@ from bot_module.regime_feed import (
     arms_breakeven_on_regime_change,
     screener_feed_can_deliver_regime_data,
 )
+from bot_module.main_app_feed import (
+    get_main_app_feed_status_async,
+    strategy_depends_on_main_app_feed,
+)
 from bot_module.symbol_selection import SymbolSelectionConfig
 from bot_module.strategy import (
     StrategySignal,
@@ -109,7 +113,9 @@ def _make_position_key(market_type: Optional[Any], symbol: str) -> str:
 
 
 def _derive_strategy_status(
-    open_positions: int, cannot_trade_reason: Optional[str]
+    open_positions: int,
+    cannot_trade_reason: Optional[str],
+    feed_degraded_reason: Optional[str] = None,
 ) -> str:
     """Derives the published status for one running strategy instance.
 
@@ -119,9 +125,26 @@ def _derive_strategy_status(
     NO ENTRY CONDITIONS); this carries the same fact out to the UI so a dead
     strategy stops being rendered as a working one.
 
-    Precedence is deliberate: an open position still wins, because it is the
-    risk-relevant fact and a config warning must never hide it.
+    `feed_degraded_reason` adds a third state: "degraded". It is set when the
+    MAIN_APP screener feed this deployment is configured to use is NOT
+    answering, and THIS strategy depends on it (DYNAMIC symbol selection, or
+    a `breakeven_on_regime_change` stop that only that feed can fire). Such a
+    strategy must NOT be rendered as a healthy "running" one: it starts, it
+    reports a heartbeat, and it never trades -- the exact failure
+    bot_module/config.py calls "the worst failure mode for a product,
+    because it looks healthy".
+
+    Precedence is deliberate:
+      * A DEGRADED feed wins over everything. A green "in_position" badge on
+        a strategy whose regime-change stop is inert (or whose symbol source
+        is dead) is the lie this change exists to remove, and an open position
+        is still reported through `open_positions` / `unrealized_pnl`
+        regardless of the badge.
+      * An open position still wins over "cannot_trade", because it is the
+        risk-relevant fact and a config warning must never hide it.
     """
+    if feed_degraded_reason:
+        return "degraded"
     if open_positions > 0:
         return "in_position"
     if cannot_trade_reason:
@@ -4784,6 +4807,30 @@ class TradingController:
         # PnL instead of a fake break-even.
         pnl_known = pnl_aggregates is not None
 
+        # REACHABILITY OF THE MAIN_APP SCREENER FEED, ONCE PER PUBLISH CYCLE.
+        #
+        # The probe is bounded (2.5s) and CACHED (60s), so this costs one
+        # connection attempt per cache window, not one per tick, and it runs
+        # in a worker thread so the publish loop is never stalled.
+        #
+        # A strategy that DEPENDS on this feed must not be published as a
+        # healthy "running" one while the feed is dead: it would start, look
+        # fine, and never trade.
+        _feed_health: Dict[str, Any] = {}
+        _feed_degraded_reason: Optional[str] = None
+        try:
+            _feed_status = await get_main_app_feed_status_async()
+            _feed_health = _feed_status.to_payload()
+            if not _feed_status.reachable:
+                _feed_degraded_reason = _feed_status.reason
+        except Exception as e_feed:  # noqa: BLE001 - health must never break publishing
+            logger.warning(
+                "[PublishState:User%s] Could not read MAIN_APP feed health: %s. "
+                "Publishing without a feed verdict rather than guessing one.",
+                self.user_id,
+                e_feed,
+            )
+
         for config_id, (instance, config_dict) in instances_copy.items():
             symbols_str = "Dynamic (All)"
             # FIXED and STATIC are BOTH explicit-symbol modes
@@ -4851,6 +4898,31 @@ class TradingController:
             # as such, rather than as a healthy "running" one.
             _cannot_trade_reason = config_dict.get("cannot_trade_reason")
 
+            # Does THIS strategy depend on the MAIN_APP screener feed?
+            #
+            # Two dependencies exist and they are the same two the launch
+            # guards already know about: DYNAMIC symbol selection (the feed is
+            # the only source of symbols) and `breakeven_on_regime_change` (the
+            # feed is the only source of the regime change that fires that
+            # stop). A pinned-symbol STATIC/FIXED strategy with no regime stop
+            # keeps trading on its own symbols while the feed is down, so it is
+            # NOT degraded -- marking it would be a lie of its own.
+            _feed_affects_strategy = False
+            _strategy_feed_reason: Optional[str] = None
+            if _feed_degraded_reason:
+                _feed_affects_strategy = strategy_depends_on_main_app_feed(
+                    config_dict.get("symbol_selection_mode"),
+                    config_dict.get("config_data"),
+                )
+                if _feed_affects_strategy:
+                    _strategy_feed_reason = _feed_degraded_reason
+
+            # Both reasons can be true at once. Keep BOTH: the feed outage is
+            # the headline, the structural problem is still the user's to fix.
+            _status_detail = "; ".join(
+                part for part in (_strategy_feed_reason, _cannot_trade_reason) if part
+            ) or None
+
             strat_data = {
                 "id": config_id,
                 "strategy_name": instance.NAME,
@@ -4859,9 +4931,20 @@ class TradingController:
                 .get("marketType", "PAPER")
                 .lower(),
                 "status": _derive_strategy_status(
-                    instance_open_positions, _cannot_trade_reason
+                    instance_open_positions,
+                    _cannot_trade_reason,
+                    _strategy_feed_reason,
                 ),
-                "status_detail": _cannot_trade_reason,
+                "status_detail": _status_detail,
+                # The health of the screener feed this deployment is configured
+                # to use, so the UI can say WHY a strategy is degraded instead
+                # of only colouring it. `state` is "ok" or "degraded"; when it
+                # is "degraded", `reason` names the unreachable URL and the
+                # failure (dns / tcp / tls / http <status> / timeout).
+                #
+                # It describes the FEED, not this strategy: whether this
+                # strategy is affected is what `status` says.
+                "feed_health": _feed_health or None,
                 # `pnl` keeps its meaning: what the strategy is worth RIGHT
                 # NOW = the money it realized (from the trades table) plus
                 # what its open positions are worth. The realized part used

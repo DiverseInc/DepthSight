@@ -29,6 +29,9 @@ from bot_module.regime_feed import (
     arms_breakeven_on_regime_change as _arms_breakeven_on_regime_change,
     screener_feed_can_deliver_regime_data as _screener_feed_can_deliver_regime_data,
 )
+from bot_module.main_app_feed import (
+    get_main_app_feed_status_async as _get_main_app_feed_status_async,
+)
 
 try:
     from bot_module import config as bot_config
@@ -106,6 +109,43 @@ async def get_strategy_evaluation_state(
         logger.error(f"[/strategies/evaluation-state] failed: {e}", exc_info=True)
 
     return {"data": {"evaluation_state": states}}
+
+
+@strategies_router.get(
+    "/feed-health", response_model=schemas.ApiResponseData[Dict[str, Any]]
+)
+async def get_main_app_feed_health():
+    """Is the screener feed this deployment is configured to use answering?
+
+    The strategies list already carries a per-strategy `feed_health`, but a
+    deployment can be degraded while NO strategy is running, so the
+    deployment-level answer needs its own route.
+
+    The probe is bounded (2.5s) and CACHED (60s), and it runs in a worker
+    thread, so this never stalls the API's event loop and never turns into a
+    request-per-tick flood against a dead host.
+    """
+    try:
+        status = await _get_main_app_feed_status_async()
+    except Exception as e:  # noqa: BLE001 - a health route must not 500
+        logger.warning(f"[/strategies/feed-health] probe failed: {e}")
+        return {
+            "data": {
+                "state": "unknown",
+                "url": str(getattr(bot_config, "MAIN_APP_WS_URL", "") or ""),
+                "reachable": False,
+                "failure": "probe_error",
+                "status_code": None,
+                "detail": "the reachability probe could not be completed",
+                "reason": (
+                    "MAIN_APP feed reachability is UNKNOWN: the probe could "
+                    "not be completed"
+                ),
+                "checked_at": None,
+                "elapsed_ms": None,
+            }
+        }
+    return {"data": status.to_payload()}
 
 
 def _age_seconds(iso_ts: Optional[str], now: datetime, negate: bool = False) -> Optional[float]:

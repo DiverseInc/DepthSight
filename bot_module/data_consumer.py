@@ -22,6 +22,11 @@ import math
 import uuid
 
 from bot_module import config
+from bot_module.main_app_feed import (
+    get_main_app_feed_status_async,
+    origin_header_for_url,
+    report_main_app_feed_unreachable_once,
+)
 from .data_loader import download_klines, download_open_interest  # Ensure imported
 from .utils import (
     calculate_scalper_natr,
@@ -521,6 +526,45 @@ class DataConsumer:
                 and self._main_app_ws_url
                 and self._main_app_ws_url.startswith(("ws://", "wss://"))
             ):
+                # REACHABILITY, NOT CONFIGURATION.
+                #
+                # Everything above this point can only tell whether the feed is
+                # CONFIGURED. The configured host can still be dead -- and the
+                # shipped default IS dead (HTTP 525, measured 2026-10-29) --
+                # in which case DYNAMIC strategies would start, report
+                # "running", and never trade.
+                #
+                # So measure it. The probe is bounded (2.5s by default) and
+                # runs in a worker thread, so it cannot stall this loop, and
+                # its result is cached, so it costs one connection attempt per
+                # cache window rather than one per account.
+                #
+                # The reconnect loop below still runs: the host can come back,
+                # and stopping it would make the outage permanent. What changes
+                # is that the outage is no longer invisible.
+                try:
+                    _feed_status = await get_main_app_feed_status_async(
+                        self._main_app_ws_url
+                    )
+                except Exception as e_probe:  # noqa: BLE001 - never block startup
+                    logger.warning(
+                        "Could not probe the MAIN_APP feed at %s: %s. Treating "
+                        "the feed as UNVERIFIED rather than reachable.",
+                        self._main_app_ws_url,
+                        e_probe,
+                    )
+                else:
+                    if _feed_status.reachable:
+                        logger.info(
+                            "MAIN_APP feed reachability probe: %s is answering "
+                            "(%s).",
+                            _feed_status.url,
+                            _feed_status.detail,
+                        )
+                    else:
+                        # Loud, ONCE per process, naming the URL and the failure.
+                        report_main_app_feed_unreachable_once(_feed_status)
+
                 self._main_app_ws_task = self.loop.create_task(
                     self._main_app_ws_loop(), name="MainAppWSLoop"
                 )
@@ -3348,9 +3392,16 @@ class DataConsumer:
                     # BROWSER MASKING
                     # This will make Cloudflare think we are Chrome and let us through
                     # even without configuring IP whitelists.
+                    #
+                    # The Origin is DERIVED from the URL we actually connect to.
+                    # It used to be hardcoded to "https://screener.depthsight.pro"
+                    # regardless of MAIN_APP_WS_URL, so pointing the deployment at
+                    # a different feed claimed to be a different site. For the
+                    # configured default this is byte-identical to the old
+                    # hardcoded value.
                     extra_headers = {
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        "Origin": "https://screener.depthsight.pro",
+                        "Origin": origin_header_for_url(self._main_app_ws_url),
                         "Accept-Language": "en-US,en;q=0.9",
                     }
 
@@ -3488,10 +3539,22 @@ class DataConsumer:
                 now = asyncio.get_event_loop().time()
                 first_seen = last_warn_ts.get(err_key) is None
                 if first_seen or (now - last_warn_ts[err_key]) >= WARN_THROTTLE_SECONDS:
+                    # Name the CLASSIFIED failure, not just the exception text.
+                    # The probe is cached, so this costs no extra connections
+                    # beyond the one the cache window already allows.
+                    _probe_hint = ""
+                    try:
+                        _probe_status = await get_main_app_feed_status_async(
+                            self._main_app_ws_url
+                        )
+                        if not _probe_status.reachable:
+                            _probe_hint = f" [{_probe_status.reason}]"
+                    except Exception:  # noqa: BLE001 - logging must never break trading
+                        _probe_hint = ""
                     logger.warning(
                         f"Main_app_ws {err_key}: {e_conn} "
                         f"(consecutive_failures={consecutive_failures + 1}, "
-                        f"next retry in {reconnect_delay:.0f}s)"
+                        f"next retry in {reconnect_delay:.0f}s){_probe_hint}"
                     )
                     last_warn_ts[err_key] = now
                 consecutive_failures += 1

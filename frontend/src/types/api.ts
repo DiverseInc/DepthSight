@@ -66,12 +66,33 @@ export interface StrategyData {
 	market_type: string;
 	status: string;
 	/**
-	 * Present only when `status` is "cannot_trade" -- the engine detected at
-	 * instance start that this strategy can never signal (e.g. its config uses
-	 * the legacy `blocks` shape, which the trading engine does not read).
+	 * Present only when `status` is "cannot_trade" or "degraded" -- the engine
+	 * detected at instance start that this strategy can never signal (e.g. its
+	 * config uses the legacy `blocks` shape, which the trading engine does not
+	 * read), or the screener feed this strategy depends on is not answering.
 	 * Carries the human-readable reason so the UI can explain, not just colour.
 	 */
 	status_detail?: string | null;
+	/**
+	 * Health of the MAIN_APP screener feed this deployment is configured to
+	 * use. Present on every running strategy the bot publishes. `state` is
+	 * "ok" or "degraded"; when it is "degraded", `reason` names the
+	 * unreachable URL and the failure (dns / tcp / tls / "http <status>" /
+	 * timeout) so the UI can explain the outage instead of only colouring a
+	 * badge. It describes the FEED -- whether THIS strategy is affected is
+	 * what `status` says.
+	 */
+	feed_health?: {
+		state: string;
+		url: string;
+		reachable: boolean;
+		failure: string | null;
+		status_code: number | null;
+		detail: string;
+		reason: string | null;
+		checked_at: string;
+		elapsed_ms: number;
+	} | null;
 	/**
 	 * The strategy's PnL. Null means UNKNOWN -- the bot could not read the
 	 * number (the database was unreachable). It is never a fake 0.0.
