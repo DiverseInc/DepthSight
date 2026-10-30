@@ -1666,6 +1666,7 @@ class RiskManager:
                     )
                     self._guard_state_scope_unknown = False
                     self._guard_state_scope_unknown_day_str = ""
+                    self._guard_state_scope_unknown_scope = ""
                 else:
                     logger.critical(
                         "[RiskGuard] The persisted trading-guard state's day stamp "
@@ -2889,6 +2890,58 @@ class RiskManager:
         self.paper_stats.start_of_day_balance = 0.0
         self.paper_stats.start_of_day_day_str = ""
         self._anchor_paper_start_of_day_base(self.paper_stats.current_balance)
+        self._release_paper_scope_unknown_latch_at_rollover(current_day_str_utc)
+
+    def _release_paper_scope_unknown_latch_at_rollover(self, current_day_str_utc) -> None:
+        """Release a PAPER-scoped unknown-scope latch at the PAPER day rollover.
+
+        The unknown-scope latch has ONE release site, the LIVE rollover
+        (`_check_and_reset_daily_stats`). A keyless PAPER account has no live
+        executor, so `initialize_balance` returns before the live start-up
+        machinery and EVERY rollover it ever runs is the PAPER one -- it can
+        never reach the release site. Its paper gate therefore stayed closed
+        for the life of the process, and because `save_state` refuses to write
+        while the scope is unknown, the unreadable payload survived every
+        restart: the account was bricked, not merely paused for a day.
+
+        The same reasoning that releases the LIVE latch applies here: a new UTC
+        day starts the day's PnL and the loss streak at zero by definition, so
+        whatever the unreadable payload held belonged to the day that just
+        ended. The release is therefore on a STRICTLY LATER day only, exactly
+        as the LIVE one is.
+
+        It is released ONLY for a PAPER-scoped latch, and ONLY for an account
+        with no live executor. A LIVE-scoped latch is left alone, because the
+        PAPER rollover does not restart the LIVE day counters; and an account
+        that HAS a live sandbox keeps its single release site, so this adds no
+        second, looser path to opening a live gate.
+        """
+        if not getattr(self, "_guard_state_scope_unknown", False):
+            return
+        if getattr(self, "_guard_state_scope_unknown_scope", "") != "paper":
+            return
+        if getattr(self, "executor", None) is not None:
+            return
+        unknown_day_str = getattr(self, "_guard_state_scope_unknown_day_str", "")
+        if not unknown_day_str or current_day_str_utc <= unknown_day_str:
+            logger.critical(
+                "[RiskGuard] The persisted PAPER sandbox state's day stamp could "
+                f"not be read on UTC day {unknown_day_str or 'unknown'}, and the "
+                f"rollover to {current_day_str_utc} is not strictly past it, so "
+                "today's paper PnL and the paper loss streak are still unknown. "
+                "Paper trading stays DISABLED."
+            )
+            return
+        logger.critical(
+            "[RiskGuard] The persisted PAPER sandbox state's day stamp could not "
+            f"be read on UTC day {unknown_day_str}; the rollover to "
+            f"{current_day_str_utc} resets the paper day's PnL and the paper loss "
+            "streak to zero, so this account is no longer trading on unknown "
+            "numbers. Paper trading is released for the new day."
+        )
+        self._guard_state_scope_unknown = False
+        self._guard_state_scope_unknown_day_str = ""
+        self._guard_state_scope_unknown_scope = ""
 
     def _check_paper_risk_limits(self) -> None:
         """Evaluate the PAPER sandbox's limits against the PAPER counters.
@@ -4105,7 +4158,7 @@ class RiskManager:
         if not self._emergency_stop_active:
             self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
 
-    def _mark_guard_state_scope_unknown(self) -> None:
+    def _mark_guard_state_scope_unknown(self, scope: str = "live") -> None:
         """Latch the fail-closed state for a persisted state whose SCOPE is unknown.
 
         The state was READ, but the day stamp it carries cannot be: the field
@@ -4124,12 +4177,28 @@ class RiskManager:
         STRICTLY LATER day than the day the scope became unreadable, for the
         same reason the lost state's latch is that strict.
 
+        `scope` says WHICH sandbox's day stamp could not be read ("live" or
+        "paper"). It is recorded so that the PAPER rollover can release a
+        PAPER-scoped latch for an account that has no live sandbox behind it
+        -- see `_check_and_reset_paper_daily_stats`. It never widens what a
+        rollover may release: the LIVE rollover releases any scope, and the
+        PAPER rollover releases only a PAPER scope, and only for an account
+        with no live executor.
+
         This is the PAPER/LIVE-parity twin of `_mark_guard_state_lost`: both
         sandboxes must fail closed on an unreadable scope, and they must do it
         through the same mechanism, so the two cannot drift apart.
         """
         self._guard_state_scope_unknown = True
         self._guard_state_scope_unknown_day_str = self._current_utc_day_str()
+        # WHICH sandbox's scope could not be read. "both" is the conservative
+        # answer when the two do not agree: neither rollover may then release
+        # the latch on the other's behalf.
+        previous_scope = getattr(self, "_guard_state_scope_unknown_scope", "")
+        if previous_scope and previous_scope != scope:
+            self._guard_state_scope_unknown_scope = "both"
+        else:
+            self._guard_state_scope_unknown_scope = scope
         self._is_trading_allowed = False
         self._global_gate_disable_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
         if not self._emergency_stop_active:
@@ -4211,6 +4280,40 @@ class RiskManager:
             return None, "the persisted payload is not a JSON object"
         return payload, None
 
+    def _paper_payload_scope_is_readable(self, paper_payload: Dict[str, Any]) -> bool:
+        """Can the PERSISTED PAPER section's scope be read?
+
+        The paper sandbox carries its OWN day stamp in its OWN section of the
+        payload, so its scope is a SEPARATE question from the live section's
+        -- and it must stay answerable even when the live section short-
+        circuits the restore (see `_apply_persisted_guard_state`).
+
+        False means UNKNOWN: the paper counters cannot be shown to be within
+        limits, so the paper gate must fail closed.
+
+        The ONE exception is a FACT rather than a corruption: `save_state`
+        writes the paper day stamp as "" when the paper sandbox has never been
+        persisted, so an EMPTY stamp on a section whose counters are all
+        READABLE and zero is the "never persisted" marker. A MISSING or
+        unreadable counter is NOT a zero -- it is an unknown value -- so the
+        marker is only a fact when every counter is readable *and* zero.
+        """
+        raw_paper_day_str = paper_payload.get("day_str")
+        paper_counters = {
+            name: _read_persisted_number(paper_payload, name, cast)
+            for name, cast in (
+                ("consecutive_losses", int),
+                ("today_pnl", float),
+                ("start_of_day_balance", float),
+            )
+        }
+        paper_counters_are_zero = all(
+            value is not None and value == 0 for value in paper_counters.values()
+        )
+        return isinstance(raw_paper_day_str, str) and (
+            raw_paper_day_str.strip() != "" or paper_counters_are_zero
+        )
+
     def _apply_persisted_guard_state(self, payload: Dict[str, Any]) -> bool:
         """Apply a persisted guard state to this RiskManager.
 
@@ -4245,7 +4348,7 @@ class RiskManager:
             isinstance(raw_day_str, str) and raw_day_str.strip() != ""
         )
         if not day_scope_is_readable:
-            self._mark_guard_state_scope_unknown()
+            self._mark_guard_state_scope_unknown("live")
             logger.critical(
                 "[RiskGuard] The persisted trading-guard state has an UNREADABLE "
                 "day stamp (present=%s, value=%r), so it is NOT known whether it "
@@ -4319,6 +4422,32 @@ class RiskManager:
             # and must never be installed as today's opening balance.
             self._account_has_traded_before = True
             self._account_history_resolved = True
+            # The PAPER sandbox's scope is a SEPARATE question, and this early
+            # return must not hide it.
+            #
+            # The paper section carries its OWN day stamp, so it can be
+            # UNREADABLE even when the live section says "another day" -- and
+            # an unreadable paper scope is unknown, not another day. Skipping
+            # it left the paper counters at the process-born zeros, and the
+            # PAPER gate then re-opened on them at the next paper balance
+            # update. A readable paper stamp still means what it always
+            # meant: another day, discarded.
+            paper_payload = payload.get("paper")
+            if isinstance(paper_payload, dict) and not (
+                self._paper_payload_scope_is_readable(paper_payload)
+            ):
+                self._mark_guard_state_scope_unknown("paper")
+                logger.critical(
+                    "[RiskGuard] The persisted PAPER sandbox state has an "
+                    "UNREADABLE day stamp (present=%s, value=%r), so it is NOT "
+                    "known whether it holds today's numbers or yesterday's. "
+                    "The live section belongs to another UTC day, but that "
+                    "says nothing about the paper section's own day stamp, so "
+                    "the paper scope is UNKNOWN and the paper gate fails "
+                    "CLOSED.",
+                    "day_str" in paper_payload,
+                    paper_payload.get("day_str"),
+                )
             return False
 
         # A PERSISTED VALUE THAT IS MISSING, NULL OR NOT A NUMBER IS NOT A
@@ -4500,19 +4629,11 @@ class RiskManager:
             # Anything else -- a missing stamp, a null stamp, a stamp that is
             # not a string, or an EMPTY stamp on a section that DOES carry
             # state -- leaves the scope UNKNOWN.
-            paper_counters_are_zero = all(
-                not _read_persisted_number(paper_payload, name, cast)
-                for name, cast in (
-                    ("consecutive_losses", int),
-                    ("today_pnl", float),
-                    ("start_of_day_balance", float),
-                )
-            )
-            paper_scope_is_readable = isinstance(raw_paper_day_str, str) and (
-                raw_paper_day_str.strip() != "" or paper_counters_are_zero
+            paper_scope_is_readable = self._paper_payload_scope_is_readable(
+                paper_payload
             )
             if not paper_scope_is_readable:
-                self._mark_guard_state_scope_unknown()
+                self._mark_guard_state_scope_unknown("paper")
                 logger.critical(
                     "[RiskGuard] The persisted PAPER sandbox state has an "
                     "UNREADABLE day stamp (present=%s, value=%r), so it is NOT "

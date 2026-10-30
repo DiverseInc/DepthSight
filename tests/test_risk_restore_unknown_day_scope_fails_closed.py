@@ -435,3 +435,177 @@ async def test_an_unknown_scope_state_is_not_re_persisted(redis_store):
     assert payload.get("today_pnl") == pytest.approx(
         LIVE_LOSS_THAT_BREACHES_THE_DAILY_LIMIT
     ), "the unknown-scope state was re-persisted with this process's zero " "day's PnL"
+
+
+# ---------------------------------------------------------------------------
+# 5. A MISSING COUNTER IS NOT A ZERO
+# ---------------------------------------------------------------------------
+
+
+async def test_a_paper_payload_with_a_missing_counter_is_not_never_persisted(
+    redis_store, caplog
+):
+    """A MISSING paper counter is UNREADABLE, not a zero.
+
+    The paper day stamp is written as "" when the paper sandbox has never been
+    persisted, so an EMPTY stamp on a section that carries no state at all is
+    the "never persisted" marker, and it must not be read as an unknown scope
+    (that would block every account that never paper-traded).
+
+    But the carve-out that reads the marker used ``not
+    _read_persisted_number(...)``, and that idiom cannot tell a MISSING
+    counter from a genuine zero -- it reads BOTH as zero. So a paper section
+    whose counters could not be read was declared "never persisted" and thrown
+    away: the unreadable paper loss streak was silently discarded and the
+    paper gate was left to re-open on zeros. A missing field is UNREADABLE,
+    not a zero, and the marker is only a FACT when every counter is READABLE
+    *and* zero.
+    """
+    rm = await _seed_a_previous_process_losing_paper_day(redis_store)
+    _write_payload(
+        redis_store,
+        rm,
+        drop_paper=("today_pnl",),
+        paper_overrides={
+            "day_str": "",
+            "consecutive_losses": 0,
+            "start_of_day_balance": 0.0,
+            "start_of_day_day_str": "",
+        },
+    )
+
+    rm_b = _restart(redis_store)
+    with caplog.at_level(logging.CRITICAL, logger="bot_module.risk_manager"):
+        await rm_b.restore_state()
+
+    assert rm_b._guard_state_scope_unknown is True, (
+        "a PAPER section whose counters could not be read was declared 'never "
+        "persisted': its unreadable loss streak was thrown away and the state "
+        "was laundered back into the payload as a known, empty one"
+    )
+    assert rm_b._paper_is_trading_allowed is False, (
+        "the PAPER gate was left OPEN on a section whose scope and counters "
+        "could not be read"
+    )
+
+    # And the next PAPER balance update must not re-open it on zeros either.
+    await rm_b.update_balance(mode="paper")
+    assert rm_b._paper_is_trading_allowed is False, (
+        "a later PAPER balance update re-opened the gate on zeroed counters: "
+        "the unreadable paper state was discarded as 'never persisted' and "
+        "re-anchored a fresh base on top of it"
+    )
+
+
+async def test_a_paper_payload_with_an_empty_day_stamp_and_zero_counters_is_never_persisted(
+    redis_store,
+):
+    """The COUNTERWEIGHT: the "never persisted" marker must keep working.
+
+    An EMPTY paper day stamp on a section whose counters are all READABLE and
+    zero is the product's own "the paper sandbox was never persisted" marker.
+    Reading it as an unknown scope would block every account that never
+    paper-traded -- the opposite failure, and a much more common one than a
+    corrupt payload.
+    """
+    rm = await _seed_a_previous_process_losing_paper_day(redis_store)
+    _write_payload(
+        redis_store,
+        rm,
+        paper_overrides={
+            "day_str": "",
+            "consecutive_losses": 0,
+            "today_pnl": 0.0,
+            "start_of_day_balance": 0.0,
+            "start_of_day_day_str": "",
+        },
+    )
+
+    rm_b = _restart(redis_store)
+    await rm_b.restore_state()
+
+    assert rm_b._guard_state_scope_unknown is False, (
+        "an EMPTY paper day stamp on a section whose counters are all readable "
+        "and zero is the 'never persisted' marker, not an unknown scope: "
+        "blocking here would lock out every account that never paper-traded"
+    )
+    assert rm_b.paper_stats.consecutive_losses == 0
+    assert rm_b.paper_stats.today_pnl == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# 6. THE PAPER SCOPE IS A SEPARATE QUESTION FROM THE LIVE ONE
+# ---------------------------------------------------------------------------
+
+
+async def test_a_corrupt_paper_section_is_not_hidden_by_a_previous_day_live_section(
+    redis_store, caplog
+):
+    """The live section's early return must not hide the paper section.
+
+    The restore short-circuits on a live payload that belongs to another day
+    and returns before the paper section is looked at. But the paper section
+    carries its OWN day stamp: a paper section whose stamp cannot be read is
+    an UNKNOWN paper scope even when the live section says "another day".
+    Skipping it left the paper counters at the process-born zeros, and the
+    PAPER gate re-opened on them at the next paper balance update.
+    """
+    rm = await _seed_a_previous_process_losing_paper_day(redis_store)
+    _write_payload(
+        redis_store,
+        rm,
+        live_overrides={"day_str": A_PREVIOUS_DAY},
+        drop_paper=("day_str",),
+    )
+
+    rm_b = _restart(redis_store)
+    with caplog.at_level(logging.CRITICAL, logger="bot_module.risk_manager"):
+        await rm_b.restore_state()
+
+    assert rm_b._guard_state_scope_unknown is True, (
+        "the unreadable PAPER day stamp was hidden behind the live section's "
+        "'another day' early return: the paper scope is UNKNOWN and must fail "
+        "closed like every other unknown scope"
+    )
+    assert rm_b._paper_is_trading_allowed is False, (
+        "the PAPER gate was left OPEN on a section whose scope could not be "
+        "read"
+    )
+
+    # And a later PAPER balance update must not re-open it on zeros.
+    await rm_b.update_balance(mode="paper")
+    assert rm_b._paper_is_trading_allowed is False, (
+        "a later PAPER balance update re-opened the gate on zeroed counters: "
+        "the unreadable paper section was skipped entirely"
+    )
+
+
+async def test_a_previous_day_paper_section_is_still_discarded_with_a_previous_day_live_section(
+    redis_store,
+):
+    """The COUNTERWEIGHT: a READABLE previous-day paper stamp is still dropped.
+
+    The paper section is only re-examined because its SCOPE must be read. A
+    stamp that reads as another day is another day, and yesterday's paper
+    numbers must not be resurrected.
+    """
+    rm = await _seed_a_previous_process_losing_paper_day(redis_store)
+    _write_payload(
+        redis_store,
+        rm,
+        live_overrides={"day_str": A_PREVIOUS_DAY},
+        paper_overrides={"day_str": A_PREVIOUS_DAY},
+    )
+
+    rm_b = _restart(redis_store)
+    await rm_b.restore_state()
+
+    assert (
+        rm_b._guard_state_scope_unknown is False
+    ), "a READABLE previous-day paper stamp is another day, not an unknown scope"
+    assert (
+        rm_b.paper_stats.consecutive_losses == 0
+    ), "yesterday's PAPER loss streak must NOT be resurrected"
+    assert rm_b.paper_stats.today_pnl == pytest.approx(
+        0.0
+    ), "yesterday's PAPER day's PnL must NOT be carried into today"
