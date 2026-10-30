@@ -668,3 +668,39 @@ def test_the_undo_does_not_delete_a_name_the_module_adopted_out_of_band():
         "proxy put there, so it must not delete it."
     )
     assert target.brand_new is shared
+
+
+def test_the_undo_forgets_the_name_it_restored():
+    """After the undo, the proxy must not keep remembering that name.
+
+    The proxy remembers what the proxied object held for each name it wrote,
+    so that it can put the original back. Once the undo is done the proxy no
+    longer owns the name and no longer needs the memory: keeping it would make
+    the bookkeeping grow with every distinct name ever patched, for the rest of
+    the session, and would keep a reference to a value the proxy has no further
+    use for.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    proxy.existing = "patched"  # type: ignore[assignment]
+    assert target.existing == "patched"
+
+    del proxy.existing  # type: ignore[attr-defined]
+
+    assert target.existing == "original", (
+        "the undo did not put the original back"
+    )
+    assert "existing" not in proxy._restore, (
+        "the proxy still remembers the original value for a name it has "
+        "already reverted"
+    )
+    assert "existing" not in proxy._written, (
+        "the proxy still remembers what it wrote for a name it has already "
+        "reverted"
+    )
+    assert "existing" not in proxy._touched, (
+        "the proxy still claims a name it has already reverted"
+    )

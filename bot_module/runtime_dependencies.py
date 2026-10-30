@@ -157,7 +157,17 @@ class DependencyProxy:
         # Put the original back. Deleting it instead would take the attribute
         # out of the proxied module for good.
         setattr(self._target, name, saved)
-        self._written[name] = saved
+        # The undo is complete for this name: the proxy restored the original
+        # and does not own the name any more, so it must not keep remembering
+        # it. Keeping the entry would make _restore/_written/_touched grow
+        # with every distinct name ever patched for the rest of the session,
+        # and would keep a reference to a value the proxy has no further use
+        # for. A later undo of this name now finds it untouched and leaves the
+        # target alone, which is the correct outcome: the proxy has nothing
+        # left to revert.
+        self._restore.pop(name, None)
+        self._written.pop(name, None)
+        self._touched.discard(name)
 
 
 class CallableDependency:
