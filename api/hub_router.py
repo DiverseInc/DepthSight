@@ -51,6 +51,71 @@ def verify_and_clean_admin_name(
     return author_name, False
 
 
+MAX_AUTHOR_NAME_LEN = 50
+
+
+def derive_author_name(user: models.User) -> str:
+    """Build the display name of a hub post from the authenticated account.
+
+    The name is NEVER taken from the request body. A caller used to be able
+    to send any author_name it liked, which let an anonymous poster publish
+    under the administrator's name. The account's own username is used
+    instead, and an admin's name is signed so that it is still recognised as
+    the administrator's.
+    """
+    name = (user.username or "").strip()[:MAX_AUTHOR_NAME_LEN]
+    if not name:
+        name = "user"
+    if user.role == "admin":
+        name = sign_admin_name(name, HUB_ADMIN_API_KEY)
+    return name
+
+
+async def resolve_poster_author_name(
+    current_user: Optional[models.User],
+    authorization: Optional[str],
+    db: AsyncSession,
+) -> str:
+    """Return the display name to store for a post, derived server-side.
+
+    Raises 401 when the caller is anonymous, and 403 when the shared hub
+    admin key is presented but no administrator account exists to author the
+    post.
+    """
+    if current_user is not None:
+        return derive_author_name(current_user)
+
+    # The shared hub admin key still lets the administrator post without a
+    # session (it is how the hub itself is administered). The name is still
+    # derived server-side -- from the administrator's account -- and never
+    # from the request body.
+    if HUB_ADMIN_API_KEY and authorization and authorization.startswith("Bearer "):
+        presented = authorization.split(" ", 1)[1].strip()
+        if presented and hmac.compare_digest(
+            presented.encode("utf-8"), HUB_ADMIN_API_KEY.encode("utf-8")
+        ):
+            stmt = (
+                select(models.User)
+                .filter(models.User.role == "admin")
+                .order_by(models.User.id.asc())
+                .limit(1)
+            )
+            res = await db.execute(stmt)
+            admin_user = res.scalars().first()
+            if admin_user is not None:
+                return derive_author_name(admin_user)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No administrator account exists to author this post.",
+            )
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="You must be signed in to post in the community hub.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
 def make_topic_response(topic: models.HubTopic) -> schemas.HubTopicResponse:
     clean_name, is_admin = verify_and_clean_admin_name(
         topic.author_name, HUB_ADMIN_API_KEY
@@ -399,24 +464,25 @@ async def unpin_news_item(
 async def post_news_comment(
     news_id: int,
     comment: schemas.HubNewsCommentCreate,
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
     authorization: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Adds a comment to a news item.
+
+    The author name is derived from the authenticated account; the one in the
+    request body is ignored.
+    """
+    comment.author_name = await resolve_poster_author_name(
+        current_user, authorization, db
+    )
     try:
         stmt = select(models.HubNewsItem).filter(models.HubNewsItem.id == news_id)
         res = await db.execute(stmt)
         if not res.scalars().first():
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="News item not found."
-            )
-
-        admin_key = None
-        if authorization and authorization.startswith("Bearer "):
-            admin_key = authorization.split(" ")[1]
-
-        if HUB_ADMIN_API_KEY and admin_key == HUB_ADMIN_API_KEY:
-            comment.author_name = sign_admin_name(
-                comment.author_name, HUB_ADMIN_API_KEY
             )
 
         new_comment = await crud.create_hub_news_comment(
@@ -479,7 +545,9 @@ async def post_hub_feedback(
 
         assoc_user = current_user
         if assoc_user is None:
-            stmt_admin = select(models.User).filter(models.User.role == "admin").limit(1)
+            stmt_admin = (
+                select(models.User).filter(models.User.role == "admin").limit(1)
+            )
             res_admin = await db.execute(stmt_admin)
             assoc_user = res_admin.scalars().first()
 
@@ -559,20 +627,21 @@ async def get_hub_topics(
 async def post_hub_topic(
     request: Request,
     topic: schemas.HubTopicCreate,
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
     authorization: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Publishes a new topic (strategy idea or discussion) to the Hub.
+
+    The author name is derived from the authenticated account; the one in the
+    request body is ignored, so a poster cannot pass themselves off as the
+    administrator.
     """
+    topic.author_name = await resolve_poster_author_name(
+        current_user, authorization, db
+    )
     try:
-        admin_key = None
-        if authorization and authorization.startswith("Bearer "):
-            admin_key = authorization.split(" ")[1]
-
-        if HUB_ADMIN_API_KEY and admin_key == HUB_ADMIN_API_KEY:
-            topic.author_name = sign_admin_name(topic.author_name, HUB_ADMIN_API_KEY)
-
         new_topic = await crud.create_hub_topic(db, topic_data=topic)
         await db.commit()
         await db.refresh(new_topic)
@@ -644,22 +713,20 @@ async def post_hub_comment(
     request: Request,
     topic_id: str,
     comment: schemas.HubCommentCreate,
+    current_user: Optional[models.User] = Depends(get_optional_current_user),
     authorization: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Adds a new comment to a specific Hub topic.
+
+    The author name is derived from the authenticated account; the one in the
+    request body is ignored.
     """
+    comment.author_name = await resolve_poster_author_name(
+        current_user, authorization, db
+    )
     try:
-        admin_key = None
-        if authorization and authorization.startswith("Bearer "):
-            admin_key = authorization.split(" ")[1]
-
-        if HUB_ADMIN_API_KEY and admin_key == HUB_ADMIN_API_KEY:
-            comment.author_name = sign_admin_name(
-                comment.author_name, HUB_ADMIN_API_KEY
-            )
-
         new_comment = await crud.create_hub_comment(
             db, topic_id=topic_id, comment_data=comment
         )
