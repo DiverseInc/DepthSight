@@ -168,7 +168,8 @@ def register_external_strategies() -> Dict[str, Type[BaseStrategy]]:
             if reason:
                 logger.error(
                     f"Strategy '{name}' REJECTED from the registry: {reason}. "
-                    f"A client that picks it would get a strategy that cannot start."
+                    f"A client that picks it would get a strategy that cannot "
+                    f"start, or cannot trade."
                 )
                 continue
             STRATEGIES[name] = candidate

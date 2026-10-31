@@ -476,22 +476,28 @@ async def test_a_save_with_no_risk_settings_leaves_the_account_untouched(
 
 
 def test_the_api_selectable_set_is_the_runtime_registry():
-    """No strategy the runtime can run may be refused by the API."""
+    """No strategy the runtime can run may be refused by the API.
+
+    And nothing the runtime CANNOT run may be offered: the client's list is
+    the registry, and the registry holds only strategies that pass the
+    verification. Whether ``CompassStrategy`` is in it depends on whether
+    this server has its trained model -- see
+    ``tests/test_gate4_operational_registry.py``, which is where that
+    question is asked.
+    """
     assert set(CLIENT_SELECTABLE_STRATEGIES) == set(STRATEGIES.keys())
-    assert "CompassStrategy" in CLIENT_SELECTABLE_STRATEGIES
-    assert "CompassStrategy" in STRATEGIES
 
 
-def test_compass_strategy_went_through_the_verification():
-    """It is registered VERIFIED, not on the strength of its name."""
+def test_every_strategy_the_client_may_pick_went_through_the_verification():
+    """Every offered name is registered VERIFIED, not on the strength of its name."""
     from bot_module.strategy import _verify_registry_candidate
-    from bot_module.compass_strategy import CompassStrategy
 
-    assert STRATEGIES["CompassStrategy"] is CompassStrategy
-    assert _verify_registry_candidate(CompassStrategy) is None
+    for name in CLIENT_SELECTABLE_STRATEGIES:
+        reason = _verify_registry_candidate(STRATEGIES[name])
+        assert reason is None, "%s is offered but was refused: %s" % (name, reason)
 
 
-def test_a_fresh_interpreter_import_registers_compass_strategy():
+def test_a_fresh_interpreter_ends_with_the_same_registry():
     """The API process must end up with the same registry as the bot.
 
     Measured in a FRESH interpreter, because the defect was an import-order
@@ -500,8 +506,7 @@ def test_a_fresh_interpreter_import_registers_compass_strategy():
     """
     script = (
         "import bot_module.strategy_registry as sr;"
-        "print('COMPASS_IN_REGISTRY', 'CompassStrategy' in sr.STRATEGIES);"
-        "print('COMPASS_SELECTABLE', 'CompassStrategy' in sr.CLIENT_SELECTABLE_STRATEGIES)"
+        "print('SETS_MATCH', set(sr.CLIENT_SELECTABLE_STRATEGIES) == set(sr.STRATEGIES.keys()))"
     )
     result = subprocess.run(
         [sys.executable, "-c", script],
@@ -510,23 +515,30 @@ def test_a_fresh_interpreter_import_registers_compass_strategy():
         timeout=300,
     )
     assert result.returncode == 0, result.stderr
-    assert "COMPASS_IN_REGISTRY True" in result.stdout, result.stdout
-    assert "COMPASS_SELECTABLE True" in result.stdout, result.stdout
+    assert "SETS_MATCH True" in result.stdout, result.stdout
 
 
 @pytest.mark.asyncio
-async def test_the_api_accepts_a_client_pick_of_compass_strategy(
+async def test_the_api_agrees_with_the_registry_about_compass(
     authenticated_client, db_session, pro_user
 ):
-    """The regression was that the API REFUSED a strategy the bot can run."""
+    """D2: the API must not refuse a strategy the registry offers.
+
+    Whether ``CompassStrategy`` is offered depends on whether this server has
+    its trained model, so the API has to agree with the registry EITHER WAY:
+    offered -> accepted; not offered -> refused, with a reason.
+    """
+    offered = "CompassStrategy" in CLIENT_SELECTABLE_STRATEGIES
     response = await authenticated_client.post(
         STRATEGIES_URL, json=_save_payload(strategy_name="CompassStrategy")
     )
-    assert response.status_code == 201, response.text
-
-    stored = await _stored_configs(db_session, pro_user.id)
-    assert len(stored) == 1
-    assert stored[0].config_data["strategy_name"] == "CompassStrategy"
+    if offered:
+        assert response.status_code == 201, response.text
+        stored = await _stored_configs(db_session, pro_user.id)
+        assert len(stored) == 1
+        assert stored[0].config_data["strategy_name"] == "CompassStrategy"
+    else:
+        assert response.status_code == 422, response.text
 
 
 # --- F4: what is persisted is what is enforced ------------------------------

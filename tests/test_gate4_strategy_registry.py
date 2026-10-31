@@ -416,6 +416,31 @@ def test_every_previously_blocked_name_is_accounted_for():
             assert name not in STRATEGIES
 
 
+def test_compass_is_accounted_for_and_never_silently_dropped():
+    """CompassStrategy trades on a trained model that may not be installed.
+
+    It is in the registry EXACTLY when it can actually trade here, and when it
+    is not, the reason names the file that is missing. A name that is dropped
+    without a reason is the defect this whole file exists to prevent -- and
+    the opposite defect (offering a strategy that starts and then never
+    signals) is just as bad.
+    """
+    from bot_module.compass_strategy import CompassStrategy
+    from bot_module.strategy import _verify_registry_candidate
+
+    reason = _verify_registry_candidate(CompassStrategy)
+    if reason is None:
+        assert "CompassStrategy" in STRATEGIES, (
+            "Compass can trade on this machine, so it must be in the registry"
+        )
+    else:
+        assert "CompassStrategy" not in STRATEGIES, (
+            "Compass cannot trade on this machine (%s), so it must not be in "
+            "the registry" % reason
+        )
+        assert "compass_model" in reason, reason
+
+
 def test_first_pullbacks_subscribes_to_the_series_its_volume_foundation_reads():
     """The volume-confirmation foundation reads kline_1m by default.
 

@@ -120,6 +120,27 @@ class CompassStrategy(BaseStrategy):
         """Validates that we have Klines, Orderbook, and Tape data."""
         return {"kline_1m", "depth", "aggTrade"}
 
+    def operational_problem(self) -> Optional[str]:
+        """The Compass strategy trades on a TRAINED model.
+
+        The model file is not in the repository (``data/`` is gitignored and no
+        script in the repo produces it); it is bind-mounted onto the server
+        from the host. Where the file is absent, ``_load_models`` logs an error
+        and leaves ``self.compass_model`` as None, and ``check_signal`` then
+        returns no signal FOREVER (``if not self.compass_model: return None``).
+
+        So this strategy STARTS everywhere and TRADES only where its model is
+        installed. Saying so here is what keeps the registry from offering a
+        client a strategy that would sit there doing nothing -- which is the
+        decorative library this whole change exists to prevent.
+        """
+        if self.compass_model is None:
+            return (
+                "the Compass model file is not present at "
+                f"{self.compass_model_path}"
+            )
+        return None
+
     async def check_signal(
         self,
         pair_info: Dict[str, Any],

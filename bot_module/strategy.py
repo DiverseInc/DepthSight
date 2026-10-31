@@ -2837,6 +2837,25 @@ class BaseStrategy:
             )
             return None
 
+    def operational_problem(self) -> Optional[str]:
+        """Why this strategy cannot TRADE here, or None when it can.
+
+        A strategy that STARTS is not necessarily a strategy that TRADES. One
+        may need a trained artifact -- a model file, a data set -- that is not
+        present on this machine. Such a strategy starts cleanly, then returns
+        no signal forever, and a client who picked it would be left looking at
+        a product that silently does nothing.
+
+        That is the exact failure the registry verification exists to prevent,
+        so the question is asked on the instance the verification already
+        builds, and the answer is a string so it can be logged with the
+        strategy's name on it.
+
+        The default is None: a strategy that needs nothing extra is
+        operational.
+        """
+        return None
+
     @property
     def required_data_types(self) -> Set[str]:
         """
@@ -12767,6 +12786,20 @@ def _verify_registry_candidate(cls: Type[BaseStrategy]) -> Optional[str]:
         return "declares no required data types"
     if not all(isinstance(item, str) for item in required):
         return "required_data_types contains non-string entries"
+
+    # 4. It must be able to DO its job. Starting is not the same as trading:
+    #    a strategy whose trained artifact is missing starts cleanly and then
+    #    returns no signal forever, so a client who picked it would be left
+    #    looking at a product that silently does nothing -- which is what the
+    #    whole verification exists to prevent. The reason is asked on the
+    #    instance built above, and it names the file that is missing, so the
+    #    operator can see WHY a strategy is not offered.
+    try:
+        problem = instance.operational_problem()
+    except Exception as exc:
+        return f"operational_problem raised {type(exc).__name__}: {exc}"
+    if problem:
+        return problem
     return None
 
 
@@ -12789,8 +12822,11 @@ def _build_strategy_registry() -> Dict[str, Type[BaseStrategy]]:
         if cls is None:
             # NOT a silent drop: this name is advertised, so say where it
             # lives. CompassStrategy is defined in its own module (which
-            # imports xgboost) and is registered by bot_runner.py at process
-            # start; it is deliberately not imported from here.
+            # imports xgboost), so it is not a subclass yet when this
+            # registry is built; it is registered through
+            # bot_module.strategy_registry.register_external_strategies(),
+            # which puts it through the SAME verification every other
+            # candidate passes.
             #
             # WARNING, not INFO: this line is the only trace of a strategy
             # that was advertised but did not make it into the registry, and
@@ -12805,7 +12841,8 @@ def _build_strategy_registry() -> Dict[str, Type[BaseStrategy]]:
         if reason:
             logger.error(
                 f"Strategy '{name}' REJECTED from the registry: {reason}. "
-                f"A client that picks it would get a strategy that cannot start."
+                f"A client that picks it would get a strategy that cannot "
+                f"start, or cannot trade."
             )
             continue
         STRATEGIES[name] = cls
