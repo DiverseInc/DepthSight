@@ -64,9 +64,16 @@ async def test_full_settings_workflow(authenticated_client: AsyncClient):
 
     # --- 5. Updating the Risk Management section ---
     print("[E2E Settings Test] 5. Updating risk management settings...")
+    # CORRECTION (2026-10-31, round 22d): this used to send
+    # ``maxDrawdown = 15.5``. An account is handed ``maxDrawdown = 10.0``
+    # (MEASURED, ``api/crud.py`` ``create_user``), so 15.5 was a LOOSENING
+    # of the account's own limit, and the Risk Settings route now refuses it
+    # -- correctly: a client may tighten a risk limit and never loosen one.
+    # 8.0 is a real tightening, so the script still exercises a successful
+    # partial update.
     risk_update_payload = {
         "risk_management": {
-            "maxDrawdown": 15.5,
+            "maxDrawdown": 8.0,
             "maxConcurrentTrades": 7,
             "stopLossEnabled": False,
         }
@@ -74,7 +81,7 @@ async def test_full_settings_workflow(authenticated_client: AsyncClient):
     response_update_risk = await client.put("/api/v1/config", json=risk_update_payload)
     assert response_update_risk.status_code == 200
     config3 = schemas.AppConfig.model_validate(response_update_risk.json()["data"])
-    assert config3.risk_management.maxDrawdown == 15.5
+    assert config3.risk_management.maxDrawdown == 8.0
     assert config3.risk_management.maxConcurrentTrades == 7
     assert config3.risk_management.stopLossEnabled is False
 
