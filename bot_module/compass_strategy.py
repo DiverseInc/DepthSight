@@ -36,8 +36,18 @@ class CompassStrategy(BaseStrategy):
         "move_sl_to_be_after_first_tp": True,
     }
 
-    def __init__(self):
-        super().__init__()
+    def __init__(
+        self,
+        params: Optional[Dict[str, Any]] = None,
+        contract_id: Optional[str] = None,
+    ):
+        # The engine constructs every strategy with
+        # ``cls(params=..., contract_id=...)``
+        # (bot_module/strategy.py:create_strategy_instance), so a class whose
+        # __init__ takes neither cannot be started at all -- and it cannot be
+        # verified by ``_verify_registry_candidate`` either, which is why it
+        # was missing from the registry the API reads.
+        super().__init__(params=params, contract_id=contract_id)
 
         # Paths
         # Try to get paths from config, else use defaults relative to project root
@@ -363,11 +373,23 @@ class CompassStrategy(BaseStrategy):
             return None, 0.0, None
 
     def _get_param(self, key: str, default: Any = None) -> Any:
-        """Helper to get param from config or defaults."""
-        # 1. Check if configured in global config.STRATEGY_DEFAULTS specifically for this instance
-        # Typically BaseStrategy handles this if we implement config loading there.
-        # Here we assume 'self.config' might be populated or we use a direct config lookup.
-        # For now, simplest is to use internal defaults + generic config check.
+        """Helper to get param from the instance, the config or the defaults.
+
+        The order is the one ``BaseStrategy._get_param`` uses
+        (bot_module/strategy.py:2386-2404): the client's own parameters
+        first, then the shipped defaults. This override used to skip the
+        client's parameters completely, so a client that picked this
+        strategy could not configure it at all.
+        """
+        # 1. The client's own parameters, as the engine passes them in.
+        instance_params = getattr(self, "_instance_params", None)
+        if isinstance(instance_params, dict):
+            if key in instance_params:
+                return instance_params[key]
+            nested = instance_params.get("config")
+            if isinstance(nested, dict) and key in nested:
+                return nested[key]
+        # 2. The shipped defaults for this strategy.
         val = config.get_strategy_param(
             self.NAME, key, self.DEFAULT_PARAMS.get(key, default)
         )

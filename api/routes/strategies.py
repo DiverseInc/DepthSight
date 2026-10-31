@@ -109,7 +109,7 @@ def _client_config_refused(exc: Exception) -> JSONResponse:
 
 async def _apply_client_risk_settings(
     db: AsyncSession, user_id: int, client_config: Any
-) -> None:
+) -> Dict[str, Any]:
     """Merge the client's risk limits into the account's ``risk_management``.
 
     The bot reads its limits from the ACCOUNT settings, not from the strategy
@@ -121,8 +121,19 @@ async def _apply_client_risk_settings(
 
     The merge is a merge, not a replace: the account's ``blacklist`` and
     every other key it holds are left alone.
+
+    ONLY the fields the client actually sent are touched. A save with no
+    ``risk_settings`` at all leaves the account's block EXACTLY as it was --
+    it used to be rewritten with the server floor on EVERY save, which
+    silently undid an account's own tighter limits (and an account that had
+    switched its risk per trade OFF).
+
+    Returns the applied values, so the caller can persist what is enforced.
     """
-    from bot_module.strategy_registry import apply_client_risk_config
+    from bot_module.strategy_registry import (
+        RISK_FIELD_TO_RM_KEY,
+        apply_client_risk_config,
+    )
 
     db_config = await crud.get_config_model(db, user_id=user_id)
     current: Dict[str, Any] = {}
@@ -130,9 +141,19 @@ async def _apply_client_risk_settings(
         current = dict(db_config.risk_management)
 
     applied = apply_client_risk_config(client_config, current)
+
+    sent = list(client_config.risk_settings.keys()) if client_config else []
+    if not sent:
+        # Nothing was sent: there is nothing to merge, and the account's
+        # block must not be rewritten.
+        return applied
+
     merged = dict(current)
-    merged.update(applied["risk_management"])
+    for field_name in sent:
+        rm_key = RISK_FIELD_TO_RM_KEY[field_name]
+        merged[rm_key] = applied["risk_management"][rm_key]
     await crud.update_config_section(db, user_id, "risk_management", merged)
+    return applied
 
 
 @strategies_router.get("/registry", response_model=schemas.ApiResponseData[Dict[str, Any]])
@@ -416,6 +437,7 @@ async def save_strategy_configuration(
     )
     from bot_module.strategy_registry import (
         ClientConfigError,
+        build_bounded_config_data,
         validate_client_strategy_config,
     )
 
@@ -441,7 +463,20 @@ async def save_strategy_configuration(
 
     # The bot reads its limits from the account settings, so the client's
     # limits are merged into them here.
-    await _apply_client_risk_settings(db, current_user.id, client_config)
+    applied = await _apply_client_risk_settings(db, current_user.id, client_config)
+
+    # What is STORED must be what is ENFORCED. The raw request is not
+    # persisted: the validated pick, the validated risk settings and the
+    # bounded per-trade risk are written over the client's own values, and
+    # the client's strategy parameters are placed where the strategies read
+    # them. A stored configuration can never carry a per-trade risk looser
+    # than the server floor.
+    bounded_config_data = build_bounded_config_data(
+        config_data, client_config, applied
+    )
+    strategy_create = strategy_create.model_copy(
+        update={"config_data": bounded_config_data}
+    )
 
     db_config = await crud.create_strategy_config(
         db=db, user_id=current_user.id, config_create=strategy_create
@@ -508,6 +543,7 @@ async def update_saved_strategy_configuration(
     )
     from bot_module.strategy_registry import (
         ClientConfigError,
+        build_bounded_config_data,
         validate_client_strategy_config,
     )
 
@@ -531,7 +567,14 @@ async def update_saved_strategy_configuration(
                 f"server refused: {exc}"
             )
             return _client_config_refused(exc)
-        await _apply_client_risk_settings(db, current_user.id, client_config)
+        applied = await _apply_client_risk_settings(db, current_user.id, client_config)
+        # What is STORED must be what is ENFORCED -- same as the create path.
+        bounded_config_data = build_bounded_config_data(
+            config_data, client_config, applied
+        )
+        strategy_update = strategy_update.model_copy(
+            update={"config_data": bounded_config_data}
+        )
     updated_config = await crud.update_strategy_config(
         db, user_id=current_user.id, config_id=config_id, config_update=strategy_update
     )

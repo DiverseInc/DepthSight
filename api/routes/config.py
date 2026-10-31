@@ -5,7 +5,7 @@ import redis.asyncio as redis
 
 import json
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from .. import crud, models, schemas
 from ..auth import get_current_user
@@ -79,6 +79,57 @@ async def get_config_endpoint(
     return {"data": config}
 
 
+def _refuse_a_risk_per_trade_above_the_floor(
+    payload: Dict[str, Any], section: str
+) -> None:
+    """Refuse a per-trade risk the server will not honour.
+
+    The RiskManager enforces the server's own floor on every trade: no
+    single trade may risk more than ``DEFAULT_RISK_PER_TRADE_PERCENT`` of
+    the balance (bot_module/config.py; the registry reads the same constant
+    as ``SERVER_RISK_PER_TRADE_PCT``). A Risk Settings page that stored a
+    larger number would display a limit the server does not honour.
+
+    REFUSED, not clamped: a silently clamped number is a number the client
+    did not ask for and does not see, and the page would keep showing the
+    value it sent. The client is told the limit instead.
+
+    The error shape is this file's own: an ``HTTPException`` with a
+    ``detail``. The status is 422, the same code the strategy contract uses
+    for the same class of refusal (a value the server will not accept).
+    """
+    value = payload.get("riskPerTradePercent")
+    if value is None:
+        return
+    floor = float(
+        getattr(bot_config, "DEFAULT_RISK_PER_TRADE_PERCENT", 1.0)
+    )
+    try:
+        risk_per_trade = float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{section}.riskPerTradePercent must be a number.",
+        )
+    if risk_per_trade < 0.0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"{section}.riskPerTradePercent={risk_per_trade} is not a valid "
+                f"risk per trade."
+            ),
+        )
+    if risk_per_trade > floor:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"{section}.riskPerTradePercent={risk_per_trade} is looser than "
+                f"the server limit of {floor}% of the balance. The server "
+                f"enforces that limit on every trade, so it cannot be raised here."
+            ),
+        )
+
+
 @config_router.put(
     "/config",
     response_model=schemas.ApiResponseData[schemas.AppConfig],
@@ -96,11 +147,15 @@ async def update_config_endpoint(
 
     updated_any_section = False
     if new_config.risk_management:
+        risk_payload = new_config.risk_management.model_dump(by_alias=True)
+        # The per-trade risk is bounded by the server's floor: the page may
+        # not display a limit the server will not honour.
+        _refuse_a_risk_per_trade_above_the_floor(risk_payload, "risk_management")
         await crud.update_config_section(
             db,
             current_user.id,
             "risk_management",
-            new_config.risk_management.model_dump(by_alias=True),
+            risk_payload,
         )
         updated_any_section = True
     if new_config.exchange_settings:
@@ -125,11 +180,19 @@ async def update_config_endpoint(
         )
         updated_any_section = True
     if new_config.backtest_risk_management:
+        backtest_risk_payload = new_config.backtest_risk_management.model_dump(
+            by_alias=True
+        )
+        # The paper account is the one the bot sizes its paper trades with
+        # (bot_module/risk_manager.py:188-195), so it is bounded the same way.
+        _refuse_a_risk_per_trade_above_the_floor(
+            backtest_risk_payload, "backtest_risk_management"
+        )
         await crud.update_config_section(
             db,
             current_user.id,
             "backtest_risk_management",
-            new_config.backtest_risk_management.model_dump(by_alias=True),
+            backtest_risk_payload,
         )
         updated_any_section = True
 

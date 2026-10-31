@@ -12732,11 +12732,22 @@ def _verify_registry_candidate(cls: Type[BaseStrategy]) -> Optional[str]:
     #    named "GeneticStrategy", so it inherits the interpreter and does not
     #    define the hook either. A name-based check would have let that
     #    second candidate of the same kind into the registry unverified.
-    if (
-        "_check_specific_signal_logic" not in cls.__dict__
-        and not issubclass(cls, VisualBuilderStrategy)
-    ):
-        return "does not implement _check_specific_signal_logic"
+    #
+    #    A strategy may also implement the ASYNC entry point instead of the
+    #    sync hook: the controller calls ``await instance.check_signal(...)``
+    #    (bot_module/controller.py:7763, :8712), so a class that overrides
+    #    ``check_signal`` drives its own signals and never reaches
+    #    ``_check_specific_signal_logic`` at all. That override is checked
+    #    STRUCTURALLY too (it has to be in the class itself), for the same
+    #    reason: without it, a strategy that really can trade -- the Compass
+    #    strategy does -- would be rejected for using the other half of the
+    #    same interface.
+    implements_own_signal = (
+        "_check_specific_signal_logic" in cls.__dict__
+        or "check_signal" in cls.__dict__
+    )
+    if not implements_own_signal and not issubclass(cls, VisualBuilderStrategy):
+        return "does not implement _check_specific_signal_logic or check_signal"
 
     # 2. It must be constructible the way the engine constructs it.
     #    create_strategy_instance() calls cls(params=..., contract_id=...); a
