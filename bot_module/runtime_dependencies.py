@@ -4,11 +4,6 @@ from typing import Any, Callable, Optional
 # which is a legitimate attribute value.
 _MISSING = object()
 
-# Sentinel for "this proxy no longer owns this name". It is set when the
-# proxied object was changed out of band, so the proxy's snapshot for that
-# name no longer describes reality and must not be applied again.
-_ABANDONED = object()
-
 # The proxy's own bookkeeping. These names live on the proxy, never on the
 # proxied object, and the proxy must not be able to delete them from itself.
 _INTERNAL_ATTRS = frozenset(
@@ -22,15 +17,20 @@ class DependencyProxy:
         self._target: Optional[Any] = None
         self._overrides: dict[str, Any] = {}
         # What the proxied object had for a name before this proxy wrote to it.
-        # Used to put the original back instead of deleting it.
+        # Used to put the original back instead of deleting it. The entry is
+        # dropped as soon as the undo for that name is over - see _forget.
         self._restore: dict[str, Any] = {}
         # What this proxy last wrote to the proxied object for a name. Used to
         # tell "the target still holds what we put there" (ours to revert)
         # from "the target was changed out of band since" (not ours to revert).
+        # The entry is dropped as soon as the undo for that name is over - see
+        # _forget.
         self._written: dict[str, Any] = {}
         # The names this proxy has actually written TO THE PROXIED OBJECT.
         # A name that is not in here was never the proxy's to revert, so the
-        # proxy must not remove it from the proxied object.
+        # proxy must not remove it from the proxied object. A name the proxy
+        # has given up is removed from here too: the proxy does not own it any
+        # more. See _forget.
         self._touched: set[str] = set()
 
     def configure(self, target: Any) -> None:
@@ -75,9 +75,11 @@ class DependencyProxy:
             # stale original over the out-of-band value, or delete a name the
             # object gained in the meantime.
             #
-            # An abandoned name lands here as well: `_ABANDONED` is never the
-            # value the object holds, so patching an abandoned name
-            # re-baselines the same way.
+            # A name the proxy has GIVEN UP lands here as well: the proxy no
+            # longer remembers it (see _forget), so this is a first write for
+            # the proxy and the baseline is taken from what the object holds
+            # NOW. That is the out-of-band value, which must never be
+            # overwritten by the stale original the proxy has already dropped.
             self._restore[name] = getattr(self._target, name, _MISSING)
         setattr(self._target, name, value)
         self._written[name] = value
@@ -101,10 +103,18 @@ class DependencyProxy:
         if self._target is None:
             raise AttributeError(name)
         if name not in self._touched:
-            # This proxy never wrote this name to the proxied object, so
-            # there is nothing of the proxy's there to revert. Touching the
-            # proxied object would delete an attribute the proxy does not
-            # own - the real one the proxied object always had.
+            # This proxy never wrote this name to the proxied object, or it
+            # wrote it and has since given it up. Either way there is nothing
+            # of the proxy's there to revert. Touching the proxied object
+            # would delete an attribute the proxy does not own - the real one
+            # the proxied object always had.
+            #
+            # A name the proxy gave up is in the same position as one it never
+            # wrote: the proxy has forgotten it, so there is nothing left to
+            # revert and the undo leaves the proxied object alone. If the
+            # proxied object does not have the name either, the undo raises
+            # AttributeError - exactly as it does for a name the proxy never
+            # wrote.
             self._restore.pop(name, None)
             self._written.pop(name, None)
             if not hasattr(self._target, name):
@@ -127,11 +137,12 @@ class DependencyProxy:
             # can never be overwritten by a stale original - which is exactly
             # what this guard exists to prevent.
             #
-            # An abandoned name is caught here too: `_ABANDONED` is never the
-            # value the target holds, so a repeated undo lands here, re-baselines
-            # on the same value and changes nothing.
-            self._restore[name] = getattr(self._target, name, _MISSING)
-            self._written[name] = _ABANDONED
+            # The proxy stops claiming the name here, and it stops REMEMBERING
+            # it as well: the snapshot it kept describes a value that is gone
+            # and the value the target holds now is not the proxy's to keep a
+            # reference to. A repeated undo of this name finds nothing the
+            # proxy owns and leaves the target alone.
+            self._forget(name)
             return
         if saved is _MISSING:
             # This proxy CREATED the name: the proxied object did not have it
@@ -140,8 +151,8 @@ class DependencyProxy:
             # owns - the proxied object may have adopted the very same object
             # out of band, and identity cannot tell that apart from "it still
             # holds exactly what we put there" (which is all the guard above
-            # can check). So the attribute is LEFT IN PLACE and the name is
-            # recorded as ABANDONED: the proxy stops claiming it.
+            # can check). So the attribute is LEFT IN PLACE and the proxy
+            # stops claiming the name.
             #
             # The trade-off, stated plainly: a name the proxy created stays on
             # the proxied object after the undo. That is the safe direction -
@@ -152,7 +163,11 @@ class DependencyProxy:
             # `setattr(self._target, name, saved)` and is never deleted, so
             # the pytest undo path that caused the original incident behaves
             # exactly as before.
-            self._written[name] = _ABANDONED
+            #
+            # As with the out-of-band case above, the proxy stops remembering
+            # the name: there is no original to remember, and the name is no
+            # longer the proxy's to revert.
+            self._forget(name)
             return
         # Put the original back. Deleting it instead would take the attribute
         # out of the proxied module for good.
@@ -165,6 +180,36 @@ class DependencyProxy:
         # for. A later undo of this name now finds it untouched and leaves the
         # target alone, which is the correct outcome: the proxy has nothing
         # left to revert.
+        self._forget(name)
+
+    def _forget(self, name: str) -> None:
+        """Drop every trace of a name the proxy no longer owns.
+
+        Called when the undo for a name is over - the original was put back -
+        and when the proxy gives a name up: the proxied object was changed
+        out of band, or the proxy created the name and cannot prove it still
+        owns it.
+
+        All three pieces of bookkeeping describe a write the proxy has
+        finished with. The snapshot describes a value that is no longer where
+        the proxy put it, the recorded write is no longer the proxy's to
+        revert, and the claim on the name is over. Keeping them would make the
+        bookkeeping grow with every distinct name ever patched, for the rest
+        of the session, and would keep a reference to values the proxy has no
+        further use for - including, in the out-of-band case, somebody else's
+        value.
+
+        Forgetting the name is also what makes a LATER undo of it inert: the
+        name is no longer in `_touched`, so the undo takes the "this proxy
+        never wrote that name" path, which leaves the proxied object alone.
+
+        It is safe to forget the snapshot: `__setattr__` takes the baseline
+        from what the proxied object holds at the moment of the NEXT write, so
+        a forgotten name is re-baselined from reality before any undo can
+        read it. The original value is therefore never lost for a name the
+        proxied object really had - the undo of that name restores it with
+        `setattr(self._target, name, saved)` before this is ever reached.
+        """
         self._restore.pop(name, None)
         self._written.pop(name, None)
         self._touched.discard(name)

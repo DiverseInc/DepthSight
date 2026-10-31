@@ -64,6 +64,25 @@ class _Target:
         self.existing = value
 
 
+class _DeletionWatchTarget(_Target):
+    """A target that records every attribute deletion.
+
+    The proxy must never delete an attribute of the proxied object. The
+    original incident was a `delattr` that took a real function out of a
+    module for the rest of the session, and after the value was restored
+    there would be nothing left to see. This target makes the deletion
+    itself visible, instead of leaving it to be inferred afterwards.
+    """
+
+    def __init__(self, value: Any = "original") -> None:
+        super().__init__(value)
+        self.deleted: list[str] = []
+
+    def __delattr__(self, name: str) -> None:
+        self.deleted.append(name)
+        object.__delattr__(self, name)
+
+
 class _Value:
     """A distinct, identifiable value.
 
@@ -703,4 +722,246 @@ def test_the_undo_forgets_the_name_it_restored():
     )
     assert "existing" not in proxy._touched, (
         "the proxy still claims a name it has already reverted"
+    )
+
+
+def test_the_undo_forgets_a_name_it_created_and_gave_up():
+    """A name the proxy CREATED and then gave up must not stay remembered.
+
+    The proxy created the name, so the undo leaves the attribute in place
+    and stops claiming the name - there is nothing left for it to revert.
+    When it stops claiming the name it must also stop REMEMBERING it: the
+    snapshot, the recorded write and the claim are all about a write the
+    proxy has finished with, and keeping them makes the bookkeeping grow
+    with every distinct name ever patched, for the rest of the session.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    for index in range(50):
+        name = f"created_{index}"
+        setattr(proxy, name, index)
+        delattr(proxy, name)
+
+    assert len(proxy._restore) == 0, (
+        "the proxy still remembers the original value of names it created "
+        "and gave up"
+    )
+    assert len(proxy._written) == 0, (
+        "the proxy still remembers what it wrote for names it gave up"
+    )
+    assert len(proxy._touched) == 0, (
+        "the proxy still claims names it gave up"
+    )
+
+
+def test_the_undo_forgets_a_name_that_was_changed_out_of_band():
+    """A name changed out of band must not stay remembered either.
+
+    The value the target holds after an out-of-band change is not the
+    proxy's to revert, so the proxy gives the name up. The value it holds
+    now is also not the proxy's to keep a reference to: it is somebody
+    else's value, and the proxy has no further use for it.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    for index in range(50):
+        name = f"changed_{index}"
+        setattr(proxy, name, index)
+        setattr(target, name, f"out-of-band-{index}")
+        delattr(proxy, name)
+
+    assert len(proxy._restore) == 0, (
+        "the proxy kept the out-of-band value for a name it gave up"
+    )
+    assert len(proxy._written) == 0, (
+        "the proxy still remembers what it wrote for names it gave up"
+    )
+    assert len(proxy._touched) == 0, (
+        "the proxy still claims names it gave up"
+    )
+
+
+def test_undoing_an_abandoned_name_again_changes_nothing_and_deletes_nothing():
+    """A REPEATED undo of an abandoned name must not touch the target.
+
+    The proxy gave the name up: the value on the target is not the proxy's
+    to touch. A second undo must therefore neither change the target nor
+    delete anything from it, and it must not raise.
+    """
+
+    target = _DeletionWatchTarget()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    patched = _Value("patched")
+    changed_elsewhere = _Value("changed-elsewhere")
+
+    proxy.existing = patched  # type: ignore[assignment]
+    target.existing = changed_elsewhere  # out of band, bypassing the proxy
+
+    del proxy.existing  # type: ignore[attr-defined]  # the proxy gives it up
+    del proxy.existing  # type: ignore[attr-defined]  # must not raise
+
+    assert (
+        target.existing is changed_elsewhere
+    ), "a repeated undo of an abandoned name changed the value on the target"
+    assert target.deleted == [], (
+        "a repeated undo of an abandoned name deleted something from the "
+        "proxied object"
+    )
+
+
+def test_undoing_an_abandoned_created_name_again_deletes_nothing():
+    """A repeated undo of a name the proxy CREATED must not delete it.
+
+    The proxy created the name and left it in place when it gave it up. A
+    second undo must not take it away: the proxy cannot prove the target
+    still holds only what the proxy put there.
+    """
+
+    target = _DeletionWatchTarget()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    proxy.brand_new = "STUB"  # type: ignore[attr-defined]
+    del proxy.brand_new  # type: ignore[attr-defined]  # the proxy gives it up
+    del proxy.brand_new  # type: ignore[attr-defined]  # must not raise
+
+    assert hasattr(target, "brand_new"), (
+        "a repeated undo of an abandoned name deleted it from the proxied "
+        "object"
+    )
+    assert target.brand_new == "STUB"  # type: ignore[attr-defined]
+    assert target.deleted == [], (
+        "a repeated undo of an abandoned name deleted something from the "
+        "proxied object"
+    )
+
+
+def test_a_name_the_target_had_is_restored_and_never_deleted():
+    """The undo must PUT THE ORIGINAL BACK - never delete the attribute.
+
+    This is the original incident, stated as a property of the proxy: the
+    name the proxied object already had is restored with
+    `setattr(target, name, saved)` and is never deleted from it, no matter
+    how often the undo is repeated.
+    """
+
+    target = _DeletionWatchTarget()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    original = target.existing
+
+    proxy.existing = "patched"  # type: ignore[assignment]
+    del proxy.existing  # type: ignore[attr-defined]
+    del proxy.existing  # type: ignore[attr-defined]  # must not raise
+
+    assert target.existing == original, (
+        "the undo did not put the original back"
+    )
+    assert target.deleted == [], (
+        "the undo deleted the attribute from the proxied object instead of "
+        "restoring it - that is the incident this proxy exists to prevent"
+    )
+
+
+def test_a_name_patched_again_after_the_undo_is_restored_correctly():
+    """A LATER patch of a name the proxy has forgotten must still restore.
+
+    The undo drops the proxy's snapshot of a name once it is done with it,
+    so the next patch of that name starts from scratch: the baseline it
+    takes is what the proxied object holds NOW. That is the original value
+    the undo put back, so the second undo restores it again.
+
+    The failure this guards against is the proxy mistaking the name for one
+    it CREATED - "there was no original to restore" - because the snapshot
+    it popped is gone. The original must never be lost that way.
+    """
+
+    target = _DeletionWatchTarget()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    original = target.existing
+
+    proxy.existing = "first"  # type: ignore[assignment]
+    del proxy.existing  # type: ignore[attr-defined]  # puts the original back
+    assert target.existing == original
+
+    proxy.existing = "second"  # type: ignore[assignment]
+    del proxy.existing  # type: ignore[attr-defined]  # must put it back again
+
+    assert target.existing == original, (
+        "the second undo did not put the original back. The proxy forgets a "
+        "name when it is done with it, and the next patch of that name has "
+        "to re-baseline on what the proxied object holds now."
+    )
+    assert target.deleted == [], (
+        "the undo deleted the attribute from the proxied object instead of "
+        "restoring it"
+    )
+
+
+def test_undoing_a_name_that_is_gone_from_the_target_raises():
+    """A repeated undo of a name the target no longer has raises.
+
+    Once the proxy has given a name up it has forgotten it, so the name is in
+    the same position as one the proxy never wrote: there is nothing left to
+    revert, so the undo leaves the proxied object alone. And if the proxied
+    object does not have the name either, the undo raises AttributeError -
+    exactly as it does for a name the proxy never wrote.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    proxy.brand_new = "stub"  # type: ignore[attr-defined]
+    del proxy.brand_new  # type: ignore[attr-defined]  # the proxy gives it up
+    delattr(target, "brand_new")  # the name goes away out of band
+
+    with pytest.raises(AttributeError):
+        del proxy.brand_new  # type: ignore[attr-defined]
+
+
+def test_the_pytest_undo_path_leaves_no_bookkeeping_behind():
+    """pytest's own undo must not leave the proxy holding the name.
+
+    pytest's undo of a name the proxied object never had arrives as a
+    `delattr` on the proxy, and the proxy cannot restore what was never
+    there, so it gives the name up. It must then forget the name: the
+    bookkeeping is about a write the proxy has finished with.
+    """
+
+    target = _Target()
+    proxy = DependencyProxy("t")
+    proxy.configure(target)
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(proxy, "ghost", "stub", raising=False)
+        mp.undo()
+    finally:
+        mp.undo()
+
+    assert len(proxy._restore) == 0, (
+        "the proxy still remembers a name pytest's undo already took back"
+    )
+    assert len(proxy._written) == 0, (
+        "the proxy still remembers what it wrote for a name pytest's undo "
+        "already took back"
+    )
+    assert len(proxy._touched) == 0, (
+        "the proxy still claims a name pytest's undo already took back"
+    )
+    assert target.ghost == "stub", (  # type: ignore[attr-defined]
+        "the undo deleted the name the proxy created; a leftover stub is the "
+        "safe direction, a deleted attribute is not"
     )
