@@ -4,23 +4,23 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable</title>
-  <meta name="description" content="DepthSight is a multi-exchange, multi-timeframe crypto algo-trading platform. Paper-test any strategy risk-free, then go live on Binance, OKX, Bybit, Bitget, Gate.io, or BingX with one click." />
+  <meta name="description" content="DepthSight is a multi-exchange, multi-timeframe crypto algo-trading platform. Paper-test any strategy risk-free, then go live on Bybit for Free, or on any of six exchanges on a paid plan." />
   <meta name="theme-color" content="#0b1220" />
 
   <!-- Open Graph -->
   <meta property="og:type" content="website" />
   <meta property="og:title" content="DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable" />
-  <meta property="og:description" content="Backtest, paper-trade, then go live on the exchange of your choice. 14 services. 6 exchanges. 1m to 4h timeframes. Engineered by traders who actually run it in production." />
+  <meta property="og:description" content="Backtest, paper-trade, then go live on Bybit (Free) or on the exchange of your choice (paid plans). 13 services. 6 exchanges. 1m to 4h timeframes. Engineered by traders who actually run it in production." />
   <meta property="og:url" content="https://depthsight.diverseinc.net" />
   <meta property="og:site_name" content="DepthSight" />
   <meta property="og:image" content="https://depthsight.diverseinc.net/og-image.png" />
   <meta property="og:image:type" content="image/png" />
   <meta property="og:image:width" content="1200" />
   <meta property="og:image:height" content="630" />
-  <meta property="og:image:alt" content="DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable. 14 Docker services, 6 exchanges, 1m to 4h timeframes." />
+  <meta property="og:image:alt" content="DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable. 13 Docker services, 6 exchanges, 1m to 4h timeframes." />
   <meta name="twitter:card" content="summary_large_image" />
   <meta name="twitter:title" content="DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable" />
-  <meta name="twitter:description" content="Backtest, paper-trade, then go live. 6 exchanges. 1m to 4h. Multi-user SaaS. Engineered in production." />
+  <meta name="twitter:description" content="Backtest, paper-trade, then go live on Bybit (Free) or on any of six exchanges (paid plans). 1m to 4h. Engineered in production." />
   <meta name="twitter:image" content="https://depthsight.diverseinc.net/og-image.png" />
   <meta name="twitter:image:alt" content="DepthSight — Algorithmic crypto trading, paper-tested and live-tradeable." />
 
@@ -37,7 +37,7 @@
       "alternateName": "DiverseInc DepthSight",
       "url": "https://depthsight.diverseinc.net",
       "logo": "https://depthsight.diverseinc.net/logo.svg",
-      "description": "Multi-exchange, multi-timeframe crypto algo-trading platform. Paper-test any strategy risk-free, then go live on Binance, OKX, Bybit, Bitget, Gate.io, or BingX with one click.",
+      "description": "Multi-exchange, multi-timeframe crypto algo-trading platform. Paper-test any strategy risk-free, then go live on Bybit on the Free plan, or on any of six exchanges on a paid plan.",
       "sameAs": [
         "https://github.com/DiverseInc/DepthSight"
       ]
@@ -49,19 +49,19 @@
       "applicationSubCategory": "Algorithmic Trading Platform",
       "operatingSystem": "Web",
       "url": "https://depthsight.diverseinc.net",
-      "description": "Build, backtest, and deploy crypto trading strategies on OKX, Binance, Bybit, Bitget, Gate.io, and BingX. Paper trade first, graduate to live when ready.",
+      "description": "Build, backtest, and deploy crypto trading strategies on six exchanges. Paper trade first; go live on Bybit on the Free plan, or on any of the six on a paid plan.",
       "offers": [
-        { "@type": "Offer", "name": "Free", "price": "0", "priceCurrency": "USD", "description": "Paper trading, 1 strategy, all exchanges" },
-        { "@type": "Offer", "name": "Pro", "price": "29", "priceCurrency": "USD", "description": "Live trading, unlimited strategies, priority support" },
-        { "@type": "Offer", "name": "Team", "price": "99", "priceCurrency": "USD", "description": "Multi-user accounts, shared strategies, dedicated support" }
+        { "@type": "Offer", "name": "Free", "price": "0", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/register", "description": "20 fast backtests per day, 10 AI Assistant queries per day, paper trading" },
+        { "@type": "Offer", "name": "Standard", "price": "30", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/welcome#pricing", "description": "50 fast backtests per day, 20 AI Assistant queries per day, 10 live trading strategies" },
+        { "@type": "Offer", "name": "Professional", "price": "100", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/welcome#pricing", "description": "Unlimited backtests, PRO blocks, genetic strategy search, 30 live trading strategies" }
       ],
       "featureList": [
         "Paper trading against real candles",
-        "Live trading on 6 exchanges",
-        "20+ pre-built strategies",
+        "Live trading on 6 exchanges for paid plans (Bybit only on Free)",
+        "Strategy templates you can import",
         "Visual no-code strategy builder",
-        "Genetic strategy search",
-        "ML model laboratory",
+        "Genetic strategy search (Professional plan only)",
+        "ML model laboratory (Professional plan only)",
         "TradingView webhooks"
       ]
     }
@@ -168,6 +168,10 @@
     .price li::before{content:"✓";color:var(--green);font-weight:700}
     .price li.no{color:var(--muted)}
     .price li.no::before{content:"—";color:var(--muted)}
+    .price .notinc-title{margin:0 0 6px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+    .price ul.notinc{margin:0 0 20px;padding:0;list-style:none;font-size:13px;color:var(--muted)}
+    .price ul.notinc li{padding:3px 0;border-bottom:none;display:block}
+    .price ul.notinc li::before{content:"—";color:var(--muted);font-weight:400;margin-right:6px}
     .price .btn{margin-top:auto;justify-content:center;width:100%}
     .price .btn:disabled{opacity:.7;cursor:not-allowed}
 
@@ -208,7 +212,7 @@
       <a href="#pricing">Pricing</a>
       <a href="https://depthsight.diverseinc.net" target="_blank" rel="noopener">Live app ↗</a>
     </div>
-    <a class="nav-cta" href="#waitlist">Join waitlist</a>
+    <a class="nav-cta" href="/register">Start free</a>
   </div>
 </nav>
 
@@ -219,16 +223,16 @@
     <h1>Algorithmic crypto trading, <br/><span class="grad">paper-tested and live-tradeable.</span></h1>
     <p class="lede">
       Backtest a strategy against 6 exchanges and 1-minute to 4-hour candles. Paper-trade it with live market data, no
-      capital at risk. Then flip the same config to a live account — Binance, OKX, Bybit, Bitget, Gate.io, or BingX —
-      with one click. <span class="hl">No code. No vendor lock. No black box.</span>
+      capital at risk. Then flip the same config to a live account — Bybit on the Free plan, or any of six exchanges on
+      a paid plan — with one click. <span class="hl">No code. No vendor lock. No black box.</span>
     </p>
     <div class="hero-cta">
-      <a class="btn btn-primary" href="#waitlist">Get launch access →</a>
-      <a class="btn btn-ghost" href="https://depthsight.diverseinc.net" target="_blank" rel="noopener">Try the live demo</a>
+      <a class="btn btn-primary" href="/register">Create your free account →</a>
+      <a class="btn btn-ghost" href="https://depthsight.diverseinc.net" target="_blank" rel="noopener">Open the live app ↗</a>
     </div>
 
     <div class="hero-stats">
-      <div><b>14</b>Docker services</div>
+      <div><b>13</b>Docker services</div>
       <div><b>6</b>exchanges supported</div>
       <div><b>1m → 4h</b>timeframes</div>
       <div><b><span class="live-dot" aria-hidden="true"></span> Live now</b>in production since Aug 2026</div>
@@ -251,7 +255,7 @@
       <div class="card">
         <div class="icon">⟲</div>
         <h3>Backtest first</h3>
-        <p>Vectorized historical engine runs years of 1m candles in seconds. Walk-forward, monte-carlo, and genetic optimization out of the box.</p>
+        <p>Vectorized historical engine runs years of 1m candles in seconds. Optimization runs and genetic strategy search on the Professional plan.</p>
         <div class="tag-row"><span class="tag">vector_backtester</span><span class="tag">optuna</span></div>
       </div>
 
@@ -265,8 +269,8 @@
       <div class="card">
         <div class="icon">▣</div>
         <h3>Go live with one toggle</h3>
-        <p>Flip <code class="inline">mode: paper</code> to <code class="inline">mode: live</code>. Same strategy, same risk envelope, real fills. Read-only API keys by default.</p>
-        <div class="tag-row"><span class="tag">6 venues</span><span class="tag">read-only keys</span></div>
+        <p>Flip <code class="inline">mode: paper</code> to <code class="inline">mode: live</code>. Same strategy, same risk envelope, real fills — Bybit on the Free plan, or any of six exchanges on a paid plan. Configure your exchange keys with trade permissions only — never enable withdrawals.</p>
+        <div class="tag-row"><span class="tag">6 venues</span><span class="tag">bring trade-only keys</span></div>
       </div>
     </div>
   </div>
@@ -277,13 +281,13 @@
   <div class="wrap">
     <span class="eyebrow">Tech highlights</span>
     <h2>Built for traders who <span class="grad">actually run it in production.</span></h2>
-    <p class="sub">A 14-service distributed system with the boring parts done right: real auth, real persistence, real pub/sub, real WebSocket resilience.</p>
+    <p class="sub">A 13-service distributed system with the boring parts done right: real auth, real persistence, real pub/sub, real WebSocket resilience.</p>
 
     <div class="grid-3">
       <div class="card">
         <div class="icon">⌬</div>
         <h3>Multi-exchange by default</h3>
-        <p>One strategy, six venues. CCXT-powered executors route to Binance, OKX, Bybit, Bitget, Gate.io, BingX. Spot and futures USDT-margin in the same instance.</p>
+        <p>One strategy, six venues. CCXT-powered executors route to Binance, OKX, Bybit, Bitget, Gate.io, BingX — all six on a paid plan, Bybit only on Free. Spot and futures USDT-margin in the same instance.</p>
       </div>
       <div class="card">
         <div class="icon">⧗</div>
@@ -303,7 +307,7 @@
       <div class="card">
         <div class="icon">⛬</div>
         <h3>Genetic + Bayesian optimizer</h3>
-        <p>Dynamic gene pools evolve strategy templates. Optuna search for parameter sweeps. Both run on Celery workers, not your laptop.</p>
+        <p>Professional plan. Dynamic gene pools evolve strategy templates. Optuna search for parameter sweeps. Both run on Celery workers, not your laptop.</p>
       </div>
       <div class="card">
         <div class="icon">⌖</div>
@@ -389,96 +393,137 @@
 <section id="pricing">
   <div class="wrap">
     <span class="eyebrow">Pricing</span>
-    <h2>Simple tiers. <span class="grad">Cancel any time.</span></h2>
-    <p class="sub">All plans include the backtester, paper-trading, and the Discovery Hub. Paid plans add live trading, more AI usage, and alerts.</p>
+    <h2>Simple tiers. <span class="grad">Start free.</span></h2>
+    <p class="sub">Prices are per month, in USD. Every plan includes the fast backtester and paper-trading. Paid plans add the other venues and more AI usage; Professional adds optimization runs, genetic searches and model trainings.</p>
 
     <div class="price-grid">
-      <div class="price">
+      <div class="price" data-plan-key="free">
         <h3>Free</h3>
-        <div class="amt">$0<small> /month</small></div>
-        <p class="desc">For trying things out. Paper trading only.</p>
+        <div class="amt">$0<small> forever</small></div>
+        <p class="desc">Basic capabilities and standard strategy blocks.</p>
         <ul>
-          <li>1 paper strategy</li>
-          <li>20 AI Co-Pilot requests / day</li>
-          <li>10 backtest runs / day</li>
-          <li>30-day data retention</li>
-          <li>Community + docs support</li>
-          <li class="no">Live trading</li>
-          <li class="no">Email / Telegram alerts</li>
+          <li>20 fast backtests per day</li>
+          <li>10 AI Assistant queries per day</li>
+          <li>Strategy backtesting</li>
+          <li>90-day backtest history</li>
+          <li>Standard blocks (Logic, Indicators, Proximity)</li>
+          <li>Paper trading</li>
+          <li>Live trading on Bybit (up to 5 live trading strategies)</li>
+          <li>Saved strategies</li>
         </ul>
-        <a class="btn btn-ghost" href="#waitlist">Join waitlist</a>
+        <p class="notinc-title">Not included</p>
+        <ul class="notinc">
+          <li>Kline backtests</li>
+          <li>Portfolio backtesting</li>
+          <li>Live trading on other venues</li>
+          <li>PRO blocks (Tape, Book, Open Interest)</li>
+          <li>Optimization runs</li>
+          <li>Genetic searches</li>
+          <li>Model trainings</li>
+        </ul>
+        <a class="btn btn-ghost" href="/register">Start free</a>
       </div>
 
-      <div class="price featured">
+      <div class="price featured" data-plan-key="standard">
         <div class="badge">MOST POPULAR</div>
-        <h3>Pro</h3>
-        <div class="amt">$29<small> /month</small></div>
-        <p class="desc">For solo traders ready to go live.</p>
+        <h3>Standard</h3>
+        <div class="amt">$30<small> /month</small></div>
+        <p class="desc">For active traders. Live trading and standard blocks.</p>
         <ul>
-          <li>5 strategies (live trading enabled)</li>
-          <li>500 AI Co-Pilot requests / day</li>
-          <li>100 backtest runs / day</li>
-          <li>1-year data retention</li>
-          <li>Email + Telegram alerts</li>
-          <li>3 connected exchanges</li>
-          <li>2 concurrent bot runners</li>
+          <li>50 fast backtests per day</li>
+          <li>20 AI Assistant queries per day</li>
+          <li>Strategy backtesting</li>
+          <li>Portfolio backtesting</li>
+          <li>Saved strategies</li>
+          <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>
+          <li>10 live trading strategies</li>
+          <li>1-year backtest history</li>
+          <li>Standard blocks (Logic, Indicators, Proximity)</li>
+          <li>Paper trading</li>
         </ul>
-        <a class="btn btn-primary" href="#waitlist">Get Pro access</a>
+        <p class="notinc-title">Not included</p>
+        <ul class="notinc">
+          <li>PRO blocks (Tape, Book, Open Interest)</li>
+          <li>Strategy optimization</li>
+          <li>Genetic strategy search</li>
+          <li>ML Model Laboratory</li>
+          <li>Kline backtests</li>
+        </ul>
+        <a class="btn btn-primary" href="/register?plan=standard">Choose Standard</a>
+        <p class="fineprint">Registration starts you on the Free plan. We activate the paid tier for you — tell us which plan you want after you sign up.</p>
       </div>
 
-      <div class="price">
-        <h3>Team</h3>
-        <div class="amt">$99<small> /month</small></div>
-        <p class="desc">For funds and small desks. Multi-user.</p>
+      <div class="price" data-plan-key="pro">
+        <h3>Professional</h3>
+        <div class="amt">$100<small> /month</small></div>
+        <p class="desc">Maximum power. Access to all PRO blocks and genetic search.</p>
         <ul>
-          <li>Unlimited strategies</li>
-          <li>5,000 AI Co-Pilot requests / day</li>
-          <li>Unlimited backtest runs</li>
-          <li>Forever data retention</li>
-          <li>Slack + Telegram + Email alerts</li>
-          <li>Unlimited exchanges & bot runners</li>
-          <li>Up to 5 team seats + RBAC</li>
-          <li>Priority support, 4-hour response</li>
+          <li>Unlimited backtests</li>
+          <li>Unlimited kline backtests</li>
+          <li>50 AI Assistant queries per day</li>
+          <li>50 optimization runs per month</li>
+          <li>10 genetic searches per month</li>
+          <li>30 dataset generations per month</li>
+          <li>15 model trainings per month</li>
+          <li>Strategy backtesting</li>
+          <li>Portfolio backtesting</li>
+          <li>Strategy optimization</li>
+          <li>Genetic strategy search</li>
+          <li>Portfolio simulation</li>
+          <li>Dataset generation</li>
+          <li>ML Model Laboratory</li>
+          <li>Saved strategies</li>
+          <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>
+          <li>30 live trading strategies</li>
+          <li>Unlimited backtest history</li>
+          <li>PRO blocks (Tape, Book, Open Interest)</li>
+          <li>Standard blocks (Logic, Indicators, Proximity)</li>
+          <li>Paper trading</li>
         </ul>
-        <a class="btn btn-ghost" href="#waitlist">Talk to us</a>
+        <a class="btn btn-ghost" href="/register?plan=pro">Choose Professional</a>
+        <p class="fineprint">Registration starts you on the Free plan. We activate the paid tier for you — tell us which plan you want after you sign up.</p>
       </div>
     </div>
 
-    <p class="fineprint">Annual prepay saves ~17%. Stripe Checkout in test mode for now; swap to live keys when you're ready to bill. Source available under AGPL v3.</p>
+    <p class="fineprint">New accounts start on the Free plan. Standard and Professional are $30 and $100 per month — sign up, then tell us which plan you want and we will set it up for your account. Prices are monthly, in USD. Source available under AGPL v3.</p>
   </div>
 </section>
 
 <!-- ───────────────────────── Waitlist ───────────────────────── -->
 <section id="waitlist" style="padding-bottom:96px">
   <div class="wrap">
-    <span class="eyebrow">Waitlist</span>
-    <h2>Be first when we open the doors.</h2>
-    <p class="sub">We're onboarding users in batches. Drop your email and we'll send you a launch invite plus a $20 credit toward your first month.</p>
+    <span class="eyebrow">Contact</span>
+    <h2>Questions before you start?</h2>
+    <p class="sub">Registration is open — you can create an account now and start on the Free plan straight away, with no card required. If you would rather talk it through first, leave your details below and we will reply by email.</p>
 
     <div class="waitlist">
       <div>
-        <h3 style="margin:0 0 8px">Join the DepthSight waitlist</h3>
-        <p style="margin:0 0 18px;color:var(--muted);font-size:15px">No spam. One launch email, one reminder, then you decide.</p>
+        <h3 style="margin:0 0 8px">Talk to the team</h3>
+        <p style="margin:0 0 18px;color:var(--muted);font-size:15px">We read every message. No marketing list.</p>
 
-        <!-- Formspree endpoint — Anthony Watson's "A New Form" (form ID xljewqgy) -->
+        <!-- Formspree endpoint — Anthony Watson's "A New Form" (form ID xljewqgy).
+             Verified live: POST /f/xljewqgy returns 200 {"ok":true}, while a
+             bogus form id returns 404 FORM_NOT_FOUND. This form really posts. -->
         <form action="https://formspree.io/f/xljewqgy" method="POST" id="wl-form">
           <input type="text" name="name" required placeholder="Your name" autocomplete="name" style="margin-bottom:10px" />
           <input type="email" name="email" required placeholder="you@example.com" autocomplete="email" style="margin-bottom:10px" />
           <textarea name="message" rows="3" placeholder="What are you looking for? (optional)" style="margin-bottom:10px;font-family:inherit"></textarea>
           <select name="service" style="margin-bottom:14px">
             <option value="">What interests you most? (optional)</option>
+            <option>Standard plan ($30/month)</option>
+            <option>Professional plan ($100/month)</option>
             <option>Paper trading</option>
             <option>Live trading</option>
-            <option>Multi-user / team</option>
+            <option>Portfolio backtesting</option>
             <option>Custom strategy</option>
             <option>Just curious</option>
           </select>
           <!-- Honeypot — bots fill this, humans don't; Formspree silently rejects -->
           <input type="text" name="_gotcha" style="display:none" tabindex="-1" autocomplete="off" />
-          <button class="btn btn-primary" type="submit">Join waitlist →</button>
+          <button class="btn btn-primary" type="submit">Send message →</button>
         </form>
         <p class="small">
-          Prefer not to use a form? <a href="mailto:hello@depthsight.diverseinc.net?subject=Waitlist">Email us directly</a>.
+          Prefer not to use a form? <a href="mailto:hello@depthsight.diverseinc.net?subject=DepthSight">Email us directly</a>.
           We read every message.
         </p>
       </div>
@@ -487,9 +532,9 @@
         <h4 style="margin:0 0 10px;font-size:15px">What you get on day one</h4>
         <ul style="margin:0;padding:0;list-style:none;color:var(--muted);font-size:14.5px;line-height:1.8">
           <li>✓ Free plan access — no card required</li>
-          <li>✓ $20 credit if you upgrade within 30 days</li>
-          <li>✓ Direct line to the founders</li>
-          <li>✓ Early access to the genetic optimizer beta</li>
+          <li>✓ 20 fast backtests per day and 10 AI Assistant queries per day</li>
+          <li>✓ Paper trading on live market data</li>
+          <li>✓ Tell us which plan you want and we will set it up for your account</li>
         </ul>
       </div>
     </div>
@@ -508,24 +553,6 @@
     </div>
   </div>
 </footer>
-
-<script>
-  // Lightweight, dependency-free waitlist UX
-  (function(){
-    var form = document.getElementById('wl-form');
-    if(!form) return;
-    form.addEventListener('submit', function(e){
-      // If the user hasn't yet wired up Formspree, do a graceful client-side thank-you.
-      // This keeps the page functional without a backend.
-      var action = form.getAttribute('action') || '';
-      if(action.indexOf('your-form-id') !== -1){
-        e.preventDefault();
-        var email = form.querySelector('input[type=email]').value;
-        form.innerHTML = '<div style="padding:14px 0;color:var(--green);font-weight:600">Thanks — we\'ll be in touch at '+ email +'.</div>';
-      }
-    });
-  })();
-</script>
 
 </body>
 </html>

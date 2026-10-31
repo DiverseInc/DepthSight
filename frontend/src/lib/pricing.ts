@@ -86,6 +86,13 @@ export const formatUsd = (amount: number): string => {
  * one-off. Comes from the backend catalog, so it cannot be stale.
  */
 export const lifetimePriceFor = (plan: PublicPlan): string | null => {
+	// A one-off price may only be advertised when the deployment is
+	// actually selling one. The catalog exposes BOTH the lifetime block
+	// (enabled, price_usd) AND the active billing_mode, and in this
+	// deployment billing_mode is "monthly": the one-off price is
+	// configured but NOT sold, so advertising it would be a price the
+	// backend does not sell.
+	if (plan.billing_mode !== "lifetime") return null;
 	const lifetime = plan.billing?.lifetime;
 	if (!lifetime?.enabled) return null;
 	if (typeof lifetime.price_usd !== "number") return null;
@@ -158,6 +165,11 @@ export const buildPricingCards = (
  *
  * It states what a new account actually gets, so the page never implies a
  * trial (or a paid tier at signup) that the backend does not grant.
+ *
+ * It also never promises a SELF-SERVE upgrade. There is none: the payment
+ * provider is opt-in (api/routes/payments.py:121-125 raises "Payment
+ * provider is not configured." without it, and deploy.sh:135 ships Bitcart
+ * disabled), so a paid tier is set up by an operator. The sentence says that.
  */
 export const buildSignupNote = (
 	catalog: PublicPlanCatalog | null | undefined,
@@ -176,5 +188,5 @@ export const buildSignupNote = (
 		return "New accounts start on the Free plan.";
 	}
 	const names = paid.map((p) => p.name).join(" or ");
-	return `New accounts start on the Free plan. You can upgrade to ${names} at any time from your account.`;
+	return `New accounts start on the Free plan. Sign up, then tell us which plan you want and we will set up the ${names} tier for your account.`;
 };
