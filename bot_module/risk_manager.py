@@ -2426,21 +2426,86 @@ class RiskManager:
         if current_balance_val <= 1e-9:
             return False, None, 0.0, "ZERO_BALANCE"
 
+        # --- THE PER-TRADE RISK CEILING -------------------------------------
+        # A signal may TIGHTEN the per-trade risk but never LOOSEN it.
+        #
+        # `signal.risk_pct` and `signal.risk_usd` are the strategy's own
+        # budget for a trade, and they REPLACE the account's budget for that
+        # trade (the `risk_pct` branch below). Both of them are reachable
+        # from the CLIENT's own configuration -- `risk_pct` through the
+        # strategy parameter `risk_pct_per_trade`, which the strategy reads
+        # out of the client's `config_data`
+        # (bot_module/strategy.py:2386-2404), and `risk_usd` through the
+        # visual builder's "risk_value"/"risk_type" action parameter
+        # (bot_module/strategy.py:5004-5016) -- so without a ceiling here a
+        # client could ask for 99% of the balance on a single trade.
+        #
+        # The ceiling is the account's own effective limit, itself capped by
+        # the server's floor:
+        #   * `self.risk_per_trade` is the account's `riskPerTradePercent`
+        #     (bot_module/risk_manager.py:222-229). It is used in preference
+        #     to `self.live_risk_per_trade` because the latter is 0.0 when
+        #     the account has no `riskPerTradePercent` at all, and clamping
+        #     to 0 would newly reject every trade.
+        #   * the server floor is `config.DEFAULT_RISK_PER_TRADE_PERCENT`,
+        #     a PERCENT, expressed here as a FRACTION -- the unit
+        #     `signal.risk_pct` is in.
+        server_floor_fraction = (
+            float(config.DEFAULT_RISK_PER_TRADE_PERCENT) / 100.0
+        )
+        risk_ceiling_fraction = max(
+            0.0, min(self.risk_per_trade, server_floor_fraction)
+        )
+        if mode == "paper":
+            # The paper budget is never 0 (it falls back to the live block
+            # and then to the server default), so it can only tighten the
+            # ceiling here.
+            risk_ceiling_fraction = min(
+                risk_ceiling_fraction, max(0.0, self.paper_risk_per_trade)
+            )
+        logger.debug(
+            f"{log_prefix} Per-trade risk ceiling: {risk_ceiling_fraction * 100:.4f}% "
+            f"of the balance (account limit {self.risk_per_trade * 100:.4f}%, "
+            f"server floor {server_floor_fraction * 100:.4f}%)"
+        )
+
         # 1. By default, the final risk is equal to the base risk for the current mode.
         if signal.risk_usd is not None:
-            initial_base_risk_usd_planned = max(float(signal.risk_usd), 0.0)
-            logger.debug(
-                f"{log_prefix} Using fixed risk budget from strategy signal: ${initial_base_risk_usd_planned:.2f}"
-            )
+            requested_risk_usd = max(float(signal.risk_usd), 0.0)
+            max_risk_usd = current_balance_val * risk_ceiling_fraction
+            initial_base_risk_usd_planned = min(requested_risk_usd, max_risk_usd)
+            if initial_base_risk_usd_planned < requested_risk_usd:
+                logger.warning(
+                    f"{log_prefix} Signal risk budget CLAMPED: the strategy asked for "
+                    f"${requested_risk_usd:.2f} but the account's per-trade limit "
+                    f"({risk_ceiling_fraction * 100:.4f}% of "
+                    f"${current_balance_val:.2f} = ${max_risk_usd:.2f}) allows no more. "
+                    f"Using ${initial_base_risk_usd_planned:.2f}."
+                )
+            else:
+                logger.debug(
+                    f"{log_prefix} Using fixed risk budget from strategy signal: ${initial_base_risk_usd_planned:.2f}"
+                )
         else:
             risk_per_trade_final = risk_per_trade_base
 
-            # 2. If there is an override in the signal, use it.
+            # 2. If there is an override in the signal, use it -- but never
+            #    above the ceiling computed above.
             if signal.risk_pct is not None:
-                risk_per_trade_final = max(float(signal.risk_pct), 0.0)
-                logger.debug(
-                    f"{log_prefix} Using risk per trade from strategy signal: {risk_per_trade_final * 100:.2f}%"
-                )
+                requested_risk_pct = max(float(signal.risk_pct), 0.0)
+                risk_per_trade_final = min(requested_risk_pct, risk_ceiling_fraction)
+                if risk_per_trade_final < requested_risk_pct:
+                    logger.warning(
+                        f"{log_prefix} Signal risk per trade CLAMPED: the strategy asked "
+                        f"for {requested_risk_pct * 100:.4f}% of the balance but the "
+                        f"account's per-trade limit is "
+                        f"{risk_ceiling_fraction * 100:.4f}%. Using "
+                        f"{risk_per_trade_final * 100:.4f}%."
+                    )
+                else:
+                    logger.debug(
+                        f"{log_prefix} Using risk per trade from strategy signal: {risk_per_trade_final * 100:.2f}%"
+                    )
 
             # Now `risk_per_trade_final` always has a correct value.
             initial_base_risk_usd_planned = current_balance_val * risk_per_trade_final

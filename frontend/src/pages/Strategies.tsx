@@ -34,6 +34,15 @@ import {
 	LaunchStrategyModal,
 } from "@/components/strategies/LaunchStrategyModal";
 import { StrategyDetailsPanel } from "@/components/strategies/StrategyDetailsPanel";
+import {
+	applyStrategyRegistry,
+	hasRefusedPerTradeRisk,
+	hasStrategyRiskErrors,
+	isStrategyClassRegistered,
+	isStrategyRegistryLoaded,
+	validateRiskSettingsForSend,
+	validateStrategyClass,
+} from "@/components/strategies/strategyEditorSettings";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -62,9 +71,16 @@ import {
 	useStopStrategy,
 	useStrategies,
 	useStrategyConfigsList,
+	useStrategyRegistry,
+	useUpdateStrategyConfig,
 } from "@/lib/api";
 import { useAccountStore } from "@/stores/accountStore";
-import type { StrategyConfig, StrategyData } from "@/types/api";
+import type {
+	StrategyConfig,
+	StrategyConfigCreatePayload,
+	StrategyConfigData,
+	StrategyData,
+} from "@/types/api";
 
 // --- Helper Functions ---
 const calculateRuntime = (startTime: string | undefined): string => {
@@ -111,6 +127,11 @@ const StrategyCard = forwardRef<
 	) => {
 		const { t } = useTranslation(["strategies", "common"]);
 		const isRunning = strategy.status?.toUpperCase() !== "STOPPED";
+		// The strategy class the client picked. It is saved on the strategy and
+		// is what the trading bot has to instantiate.
+		const strategyClass =
+			strategy.strategy_name || strategy.config_data?.strategy_name || null;
+		const riskSettings = strategy.config_data?.risk_settings;
 
 		return (
 			<TooltipProvider>
@@ -161,11 +182,34 @@ const StrategyCard = forwardRef<
 									{t("colStrategy")}:
 								</span>
 								<span className="font-medium">
-									{strategy.strategy_name ||
-										strategy.config_data?.strategy_name ||
-										"N/A"}
+									{strategyClass || "N/A"}
 								</span>
 							</div>
+
+							{/* A class the trading bot does not register cannot start. */}
+							{strategyClass &&
+								isStrategyRegistryLoaded() &&
+								!isStrategyClassRegistered(strategyClass) && (
+								<p className="text-xs text-destructive">
+									{t(
+										"strategyClassNotRegistered",
+										"This strategy class is not registered by the trading bot, so it may not start.",
+									)}
+								</p>
+							)}
+
+							{/* Risk limits saved with the strategy */}
+							{riskSettings && (
+								<div className="flex items-center justify-between text-sm">
+									<span className="text-muted-foreground">
+										{t("colRiskLimits", "Risk Limits")}:
+									</span>
+									<span className="font-medium text-xs">
+										{riskSettings.daily_loss_limit_pct}% daily /{" "}
+										{riskSettings.risk_per_trade_pct}% per trade
+									</span>
+								</div>
+							)}
 
 							{/* Symbols */}
 							<div className="flex items-center justify-between text-sm">
@@ -317,6 +361,7 @@ const StrategyCard = forwardRef<
 											size="icon"
 											onClick={onStart}
 											disabled={isPending}
+											aria-label={t("startTooltip", "Start")}
 											className="bg-emerald-500/80 hover:bg-emerald-600 text-white"
 										>
 											{isPending ? (
@@ -436,6 +481,14 @@ export default function Strategies() {
 		error: errorConfigs,
 	} = useStrategyConfigsList();
 
+	// The server's registry is the authority on which strategy classes can
+	// run; it is applied here so the card badge below is right.
+	const { data: strategyRegistry } = useStrategyRegistry();
+	useMemo(() => {
+		applyStrategyRegistry(strategyRegistry);
+		return strategyRegistry;
+	}, [strategyRegistry]);
+
 	const runningStrategies = useMemo(() => {
 		return [...liveRunningStrategies, ...paperRunningStrategies];
 	}, [liveRunningStrategies, paperRunningStrategies]);
@@ -443,6 +496,8 @@ export default function Strategies() {
 	const isLoadingRunning = isLoadingLive || isLoadingPaper;
 	const { mutate: stopStrategy, isPending: isStopping } = useStopStrategy();
 	const { mutate: startStrategy, isPending: isStarting } = useStartStrategy();
+	const { mutate: updateStrategyConfig, isPending: isUpdatingConfig } =
+		useUpdateStrategyConfig();
 	const { mutate: deleteStrategyConfig, isPending: isDeleting } =
 		useDeleteStrategyConfig();
 
@@ -601,6 +656,59 @@ export default function Strategies() {
 	const handleConfirmStart = (formData: LaunchFormData) => {
 		if (!launchConfig.configId) return;
 
+		// The launch update carries the strategy's saved settings back to the
+		// server. The server refuses a configuration it will not accept -- a
+		// risk limit looser than its floor, a strategy class it cannot run --
+		// and it refuses the WHOLE update, so the strategy would never start
+		// and the only sign of it would be a bare error. The client checks the
+		// same rules first, and says which one it is.
+		const savedConfigData = launchConfig.strategy?.config_data;
+		const savedRiskErrors = validateRiskSettingsForSend(
+			savedConfigData?.risk_settings,
+		);
+		if (hasStrategyRiskErrors(savedRiskErrors)) {
+			toast({
+				variant: "destructive",
+				title: t("common:errorTitle"),
+				description: t(
+					"launchRiskLimitsRejected",
+					"This strategy's risk limits are looser than the server's limit, so the server would refuse to save it. Tighten them in the editor first.",
+				),
+			});
+			return;
+		}
+		const savedClassError = validateStrategyClass(
+			savedConfigData?.strategy_name,
+		);
+		if (savedClassError.className === "notRegistered") {
+			toast({
+				variant: "destructive",
+				title: t("common:errorTitle"),
+				description: t(
+					"launchStrategyClassRejected",
+					"This strategy's class is not one the trading bot registers, so the server would refuse to save it.",
+				),
+			});
+			return;
+		}
+		// The per-trade risk is not only in the risk block: a strategy may
+		// read it from `config_data.risk_pct_per_trade`, from
+		// `config_data.config.risk_pct_per_trade` or from
+		// `config_data.strategy_params.risk_pct_per_trade`. The server refuses
+		// a value looser than its floor in every one of them, and it refuses
+		// the WHOLE update when it does.
+		if (hasRefusedPerTradeRisk(savedConfigData)) {
+			toast({
+				variant: "destructive",
+				title: t("common:errorTitle"),
+				description: t(
+					"launchPerTradeRiskRejected",
+					"This strategy carries a per-trade risk the server would refuse, so it was not launched. Open it in the editor and save it again.",
+				),
+			});
+			return;
+		}
+
 		setPendingActionId(launchConfig.configId);
 
 		// Prepare symbols array
@@ -650,21 +758,71 @@ export default function Strategies() {
 		configDataOverrides.breakeven_on_regime_change =
 			formData.breakevenOnRegimeChange ?? false;
 
-		startStrategy(
+		// Persist the client's launch settings on the saved strategy BEFORE it
+		// starts. `startStrategy` only merges the overrides into the RUNNING
+		// instance (the backend never writes them back to the saved config), so
+		// without this the client's pick would never be recorded.
+		const savedStrategy = launchConfig.strategy;
+		const persistedConfigData = {
+			...(savedStrategy?.config_data ?? {}),
+			...configDataOverrides,
+		} as StrategyConfigData;
+
+		const persistPayload: StrategyConfigCreatePayload = {
+			name: savedStrategy?.name ?? "",
+			description: savedStrategy?.description ?? "",
+			config_data: persistedConfigData,
+			symbol_selection_mode:
+				formData.symbolSelectionMode === "DYNAMIC" ? "DYNAMIC" : "STATIC",
+			symbols: symbolsArray ?? [],
+			use_ml_confirmation: persistedConfigData.use_ml_confirmation ?? false,
+			foundation_weights: persistedConfigData.foundation_weights ?? null,
+			oracle_regime: persistedConfigData.oracle_regime ?? null,
+			oracle_confidence: persistedConfigData.oracle_confidence ?? undefined,
+		};
+
+		updateStrategyConfig(
+			{ id: launchConfig.configId, payload: persistPayload },
 			{
-				configId: launchConfig.configId,
-				mode: formData.mode,
-				symbol_selection_mode: formData.symbolSelectionMode,
-				symbols: symbolsArray,
-				// Pass overrides as part of params (which merges into config_data on backend)
-				params: configDataOverrides,
-				apiKeyId:
-					typeof selectedApiKeyId === "number" ? selectedApiKeyId : undefined,
-			},
-			{
-				onSettled: () => {
+				onSuccess: () => {
+					startStrategy(
+						{
+							configId: launchConfig.configId as string,
+							mode: formData.mode,
+							symbol_selection_mode: formData.symbolSelectionMode,
+							symbols: symbolsArray,
+							// Pass overrides as part of params (which merges into config_data on backend)
+							params: configDataOverrides,
+							apiKeyId:
+								typeof selectedApiKeyId === "number"
+									? selectedApiKeyId
+									: undefined,
+						},
+						{
+							onSettled: () => {
+								setPendingActionId(null);
+								setLaunchConfig({
+									open: false,
+									configId: null,
+									strategy: null,
+								});
+							},
+						},
+					);
+				},
+				onError: () => {
+					// The strategy was not started: the client's settings could not
+					// be saved, so starting now would run settings that are not
+					// recorded anywhere.
 					setPendingActionId(null);
-					setLaunchConfig({ open: false, configId: null, strategy: null });
+					toast({
+						variant: "destructive",
+						title: t("common:errorTitle"),
+						description: t(
+							"launchSettingsNotSaved",
+							"The launch settings could not be saved, so the strategy was not started.",
+						),
+					});
 				},
 			},
 		);
@@ -831,7 +989,7 @@ export default function Strategies() {
 				}
 				onConfirm={handleConfirmStart}
 				strategyName={launchConfig.strategy?.name}
-				isLoading={isStarting}
+				isLoading={isStarting || isUpdatingConfig}
 				currentSymbols={launchConfig.strategy?.symbols || []}
 				currentMode={launchConfig.strategy?.symbol_selection_mode}
 			/>

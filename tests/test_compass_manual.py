@@ -6,10 +6,24 @@ import os
 sys.path.append(os.getcwd())  # Add current directory to path
 import pandas as pd
 from bot_module.compass_strategy import CompassStrategy
-from bot_module.strategy import STRATEGIES
 
-# Register CompassStrategy manually for the test since we removed circular import
-STRATEGIES["CompassStrategy"] = CompassStrategy
+# NOTE: this file used to register CompassStrategy into the GLOBAL registry at
+# import time:
+#
+#     from bot_module.strategy import STRATEGIES
+#     STRATEGIES["CompassStrategy"] = CompassStrategy
+#
+# pytest imports every test module during COLLECTION, so that line ran in
+# EVERY session -- it put CompassStrategy into the registry whether or not
+# the registry should have contained it. It was invisible because the
+# registry's client list is computed at import time and did not move with
+# it. Once the registry can refuse a strategy that cannot actually trade,
+# the two drifted apart and the invariant "the client's list is exactly the
+# runtime registry" broke -- because of a line in a MANUAL script.
+#
+# A manual script has no business mutating global state at import time, so
+# it uses its own mapping.
+LOCAL_REGISTRY = {"CompassStrategy": CompassStrategy}
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
@@ -18,11 +32,11 @@ logger = logging.getLogger("test_compass")
 
 async def test_compass_logic():
     print("\n--- Testing Compass Strategy Instantiation ---")
-    if "CompassStrategy" not in STRATEGIES:
-        print("FAIL: CompassStrategy not in STRATEGIES registry.")
+    if "CompassStrategy" not in LOCAL_REGISTRY:
+        print("FAIL: CompassStrategy not in the local registry.")
         return
 
-    strategy = STRATEGIES["CompassStrategy"]()
+    strategy = LOCAL_REGISTRY["CompassStrategy"]()
     print(f"PASS: Strategy Instantiated. Enabled: {strategy.enabled}")
     print(f"Features: {strategy.feature_names}")
 

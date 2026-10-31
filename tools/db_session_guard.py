@@ -157,7 +157,7 @@ SESSION_METHODS = frozenset(
 # quietly, and an entry that stops matching (because it was fixed) fails
 # the test until it is removed.
 ALLOWED: Dict[Tuple[str, int], str] = {
-    ("bot_runner.py", 397): (
+    ("bot_runner.py", 403): (
         "The shard's bootstrap session is also the write session of every "
         "controller (bot_module/paper_executor.py:81), so it cannot be "
         "released here without the per-controller session refactor "
