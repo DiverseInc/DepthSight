@@ -264,7 +264,7 @@ def _real_risk_manager():
     """A real RiskManager with its heavy collaborators stubbed out."""
     from bot_module.risk_manager import RiskManager
 
-    return RiskManager(
+    rm = RiskManager(
         executor=None,
         paper_executor=None,
         user_id=USER_ID,
@@ -272,6 +272,14 @@ def _real_risk_manager():
         user_settings={},
         api_key_name="paper",
     )
+    # This RiskManager stands for a KEYED (live) controller, so the numbers it
+    # publishes are the LIVE sandbox's -- `self.stats`, which is what the
+    # tests below set up. A controller with NO api key is a PAPER-ONLY
+    # controller and publishes the PAPER sandbox's (`self.paper_stats`)
+    # instead; the api key id is what decides, and the controller these
+    # payloads belong to publishes under the ":1" key.
+    rm.api_key_id = 1
+    return rm
 
 
 def _risk_manager_blocked_at_the_loss_limit():

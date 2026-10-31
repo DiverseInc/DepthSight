@@ -4564,6 +4564,49 @@ class TradingController:
             "emergency_stop_source": emergency_stop_source,
         }
 
+    def _published_account_state(self) -> Dict[str, Any]:
+        """The risk state of the sandbox THIS controller trades, as published.
+
+        A controller with NO api key is a PAPER-ONLY controller -- there is no
+        live account behind it -- so the numbers it publishes are the PAPER
+        sandbox's. A controller WITH an api key publishes the LIVE sandbox's.
+        The API reads the paper portfolio from exactly the paper-only
+        published keys (the key suffix is the api_key_id, and a paper-only
+        controller has none) and the live portfolio from the live ones, so the
+        published numbers have to be the numbers of the sandbox the controller
+        actually trades.
+
+        The RiskManager owns the choice, so the two can never drift: it
+        publishes the sandbox it was built for.
+
+        Read defensively: `self.rm` is a real RiskManager in production but a
+        mock in some tests, and a Mock's attribute is truthy while its
+        callable child returns a Mock, which cannot be rounded.
+        """
+        snapshot = None
+        snapshot_getter = getattr(self.rm, "published_account_snapshot", None)
+        if callable(snapshot_getter):
+            try:
+                candidate = snapshot_getter()
+                if isinstance(candidate, dict) and isinstance(
+                    candidate.get("current_balance"), (int, float)
+                ):
+                    snapshot = candidate
+            except Exception:
+                snapshot = None
+        if snapshot is None:
+            # A mocked RiskManager (its attribute is truthy while its
+            # callable child returns a Mock, which cannot be rounded).
+            snapshot = {
+                "current_balance": self.rm.stats.current_balance,
+                "today_pnl": self.rm.stats.today_pnl,
+                "consecutive_losses": self.rm.stats.consecutive_losses,
+                "is_trading_allowed": bool(
+                    getattr(self.rm, "_is_trading_allowed", True)
+                ),
+            }
+        return snapshot
+
     async def _fetch_strategy_pnl_aggregates(
         self, config_ids: List[str]
     ) -> Optional[Dict[Tuple[str, str], Dict[str, Any]]]:
@@ -4903,7 +4946,18 @@ class TradingController:
 
         # 3. Collecting PORTFOLIO data
         # Getting balance from RiskManager
-        wallet_balance = self.rm.stats.current_balance  # Wallet balance (without PnL)
+        #
+        # WHICH SANDBOX IS PUBLISHED, and the numbers that go with it, are
+        # decided by `_published_account_state()` -- the RiskManager owns that
+        # choice, so the two cannot drift.
+        #
+        # ONE read: the walrus binds the snapshot in the same statement that
+        # uses it, so the published numbers and the published gate cannot come
+        # from two different reads of a moving account.
+        _gate_open = bool(
+            (_snapshot := self._published_account_state())["is_trading_allowed"]
+        )
+        wallet_balance = _snapshot["current_balance"]  # Wallet balance (without PnL)
         equity = wallet_balance + total_unrealized_pnl  # Equity (including PnL)
 
         # The live emergency-stop latch, published so the API can report it.
@@ -4926,7 +4980,6 @@ class TradingController:
         # Read defensively -- `self.rm` is a real RiskManager in production but
         # a mock in some tests, and a Mock's attribute is truthy while its
         # callable child returns a Mock, which json.dumps cannot serialize.
-        _gate_open = bool(getattr(self.rm, "_is_trading_allowed", True))
         _reason_getter = getattr(self.rm, "get_trading_disabled_reason", None)
         _disabled_reason = None
         if not _gate_open and callable(_reason_getter):
@@ -4938,8 +4991,8 @@ class TradingController:
             "total_wallet_balance": round(wallet_balance, 2),
             "total_unrealized_pnl": round(total_unrealized_pnl, 2),
             "total_equity": round(equity, 2),
-            "today_pnl": round(self.rm.stats.today_pnl, 2),
-            "consecutive_losses": self.rm.stats.consecutive_losses,
+            "today_pnl": round(_snapshot["today_pnl"], 2),
+            "consecutive_losses": _snapshot["consecutive_losses"],
             "is_trading_allowed": _gate_open,
             "trading_disabled_reason": _disabled_reason,
             **self._emergency_stop_state_for_publish(),
@@ -8896,45 +8949,10 @@ class TradingController:
                     logger.warning(f"{log_prefix} Placeholder position lost. Aborting.")
                     return
 
-                # A start-up fail-closed latch (Redis was unreachable when this
-                # controller came up) is an infrastructure fault, not an
-                # operator decision. Release it as soon as Redis can be read
-                # again and no emergency stop is recorded -- no restart and no
-                # operator action required. An operator's kill switch is NOT
-                # affected: _maybe_release_unverified_emergency_stop() refuses
-                # to touch it.
-                await self._maybe_release_unverified_emergency_stop()
-
-                if not await self.rm.is_symbol_trading_allowed(signal.symbol):
-                    # Name the cause. The gate used to return a bare False and
-                    # every cause was logged as "(general block)", which is how
-                    # a full trading day was lost to an invisible latch on
-                    # 2026-10-19. The original wording is kept as a prefix so
-                    # existing log greps still match; the reason is APPENDED.
-                    block_reason = self.rm.get_trading_disabled_reason()
-                    block_reason_text = block_reason or "reason not recorded"
-                    logger.warning(
-                        f"{log_prefix} Signal REJECTED by rm.is_symbol_trading_allowed (general block). "
-                        f"Reason: {block_reason_text}"
-                    )
-                    self.trade_logger.log_event(
-                        event_type="SIGNAL_REJECTED_RISK_BLOCK",
-                        data={
-                            "symbol": signal.symbol,
-                            "strategy": signal.strategy_name,
-                            "direction": signal.direction.name,
-                            "reason": (
-                                "Symbol blocked by RiskManager (general block): "
-                                f"{block_reason_text}"
-                            ),
-                            "details": signal.details,
-                        },
-                    )
-                    # Cleanup the placeholder
-                    async with self._positions_dict_lock:
-                        self._active_position_pop(signal.symbol, initial_market_type)
-                    return
-
+                # The start-up fail-closed latch (Redis was unreachable when
+                # this controller came up) is released below, once the
+                # signal's trading mode is known -- the release and the gate
+                # check are both mode-aware.
             # 2. CONFIGURATION SEARCH AND ML-FLAG CHECK
             running_instance_config = None
             instance_user_id = None
@@ -8975,6 +8993,64 @@ class TradingController:
             mode = running_instance_config.get(
                 "mode", "live"
             )  # Default to 'live' for safety
+
+            # THE RISK GATE IS CONSULTED FOR THIS SIGNAL'S OWN SANDBOX.
+            #
+            # The live sandbox and the paper sandbox have separate counters,
+            # separate thresholds and separate gates, so the gate has to be
+            # asked about the mode this signal trades in: a PAPER loss cannot
+            # refuse a LIVE signal, and a LIVE loss cannot refuse a PAPER
+            # signal. This check used to sit inside the symbol lock, BEFORE
+            # the mode was known, so it always consulted the LIVE gate and a
+            # live loss blocked paper trading as well.
+            #
+            # It also moved OUT of the symbol lock, because the mode is only
+            # known after the configuration search above. The RESERVING
+            # placeholder still protects the symbol meanwhile: a second
+            # signal for the same symbol is rejected by the
+            # "active position already exists" check above.
+            #
+            # A start-up fail-closed latch (Redis was unreachable when this
+            # controller came up) is an infrastructure fault, not an
+            # operator decision. Release it as soon as Redis can be read
+            # again and no emergency stop is recorded -- no restart and no
+            # operator action required. An operator's kill switch is NOT
+            # affected: _maybe_release_unverified_emergency_stop() refuses
+            # to touch it.
+            await self._maybe_release_unverified_emergency_stop()
+
+            if not await self.rm.is_symbol_trading_allowed(
+                signal.symbol, mode=mode
+            ):
+                # Name the cause. The gate used to return a bare False and
+                # every cause was logged as "(general block)", which is how
+                # a full trading day was lost to an invisible latch on
+                # 2026-10-19. The original wording is kept as a prefix so
+                # existing log greps still match; the reason is APPENDED.
+                block_reason = self.rm.get_trading_disabled_reason()
+                block_reason_text = block_reason or "reason not recorded"
+                logger.warning(
+                    f"{log_prefix} Signal REJECTED by rm.is_symbol_trading_allowed (general block). "
+                    f"Reason: {block_reason_text}"
+                )
+                self.trade_logger.log_event(
+                    event_type="SIGNAL_REJECTED_RISK_BLOCK",
+                    data={
+                        "symbol": signal.symbol,
+                        "strategy": signal.strategy_name,
+                        "direction": signal.direction.name,
+                        "reason": (
+                            "Symbol blocked by RiskManager (general block): "
+                            f"{block_reason_text}"
+                        ),
+                        "details": signal.details,
+                    },
+                )
+                # Cleanup the placeholder
+                async with self._positions_dict_lock:
+                    self._active_position_pop(signal.symbol, initial_market_type)
+                return
+
             market_type = self._market_type_for_strategy_config(running_instance_config)
             if isinstance(signal.details, dict):
                 signal.details["market_type"] = market_type
@@ -11431,11 +11507,19 @@ class TradingController:
             funding_already_reported = float(
                 getattr(position_to_process_copy, "funding_pnl_reported", 0.0) or 0.0
             )
+            # Route the close into the POSITION'S OWN sandbox: a PAPER close
+            # feeds the paper counters only, and a LIVE close feeds the live
+            # counters only. Without this, a loss on simulated money was
+            # added to the LIVE `today_pnl` / `consecutive_losses` and the
+            # LIVE gate closed on it -- real money blocked by a paper loss.
+            # Upstream does the same (`bot_module/controller.py:11360`-`:11365`).
+            close_mode = getattr(position_to_process_copy, "mode", "live") or "live"
             await self.rm.update_trade_result(
                 symbol,
                 position_to_process_copy.pnl - funding_already_reported,
                 exit_reason=reason,
-            )  # Global risk update
+                mode=close_mode,
+            )  # Per-mode risk update
 
             # NEW: CREATE PHANTOM TRADE FOR BE ANALYSIS
             # When exiting by STOP_LOSS_BE, create a phantom trade for tracking

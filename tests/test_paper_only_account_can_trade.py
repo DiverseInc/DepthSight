@@ -18,6 +18,19 @@ Observed live: balance pinned at 10,000 with "trade is running" in the UI.
 
 This asserts the OUTCOME (trading becomes allowed), not the shape of the fix,
 so re-ordering the fallback inside update_balance cannot make it pass vacuously.
+
+2026-10-27: THE PAPER SANDBOX NOW OWNS THE PAPER ACCOUNT'S NUMBERS
+--------------------------------------------------------------------
+The live and the paper sandboxes are separate (`self.stats` and
+`self.paper_stats`), so a paper-only account's balance is now read into the
+PAPER sandbox, and the gate that governs it is the PAPER gate
+(`_paper_is_trading_allowed`) rather than the live one.
+
+The assertions below were updated accordingly: they used to assert
+`rm.stats.current_balance`, which is the LIVE sandbox's balance and is
+correctly 0 for an account with no live account behind it. The INTENT of
+each assertion -- "the paper account's balance was fetched" and "trading
+becomes allowed" -- is unchanged, only the sandbox that holds the number.
 """
 import asyncio
 import datetime
@@ -28,7 +41,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bot_module.risk_manager import RiskManager  # noqa: E402
+from bot_module.risk_manager import RiskManager, TradeStats  # noqa: E402
 
 
 class _PaperOnlyExecutor:
@@ -51,17 +64,28 @@ def _make_rm(paper_executor):
     rm.stats = type("S", (), {})()
     rm.stats.current_balance = 0.0
     rm.stats.start_of_day_balance = 0.0
+    rm.stats.start_of_day_day_str = ""
     rm.stats.today_pnl = 0.0
     rm.stats.consecutive_losses = 0
     rm.stats.current_trading_day_start_ts = 0.0
     rm.stats.last_known_day_str = None
+    # The PAPER sandbox: for an account with no live account behind it, this
+    # is the account's sandbox -- its balance, its PnL and its gate.
+    rm.paper_stats = TradeStats()
     rm.min_balance_threshold = 0.0
     rm.daily_max_loss_threshold = 0.99
     rm.max_drawdown_threshold = 0.99
     rm.max_consecutive_losses = 5
+    rm.paper_daily_max_loss_threshold = 0.99
+    rm.paper_max_drawdown_threshold = 0.99
+    rm.paper_max_consecutive_losses = 5
     rm.telegram_notifier = None
     rm.loop_from_controller = None
     rm._is_trading_allowed = False
+    rm._paper_is_trading_allowed = False
+    rm._paper_global_gate_disable_reason = None
+    rm._paper_last_disable_reason = None
+    rm._paper_balance_known = False
     rm._emergency_stop_active = False
     rm._emergency_stop_reason = None
 
@@ -88,28 +112,48 @@ def test_paper_only_account_fetches_balance_without_live_executor():
 
     assert paper.calls >= 1, "paper executor was never consulted"
     assert ok is True, "update_balance must succeed for a keyless paper account"
-    assert rm.stats.current_balance == pytest.approx(10000.0)
+    assert rm.paper_stats.current_balance == pytest.approx(10000.0)
 
 
 def test_paper_only_account_enables_trading_after_initialize():
     """The user-visible outcome: initialize_balance must leave trading ALLOWED.
 
     This is the assertion that would have caught the original bug. It fails on
-    the unfixed code with _is_trading_allowed == False.
+    the unfixed code with the gate == False.
     """
     paper = _PaperOnlyExecutor(10000.0)
     rm = _make_rm(paper)
 
-    # Neutralise _check_risk_limits so this test isolates the balance fetch.
-    rm._check_risk_limits = lambda: None
+    # Neutralise the limit check so this test isolates the balance fetch.
+    rm._check_risk_limits = lambda *args, **kwargs: None
     rm._get_current_day_start_info = lambda: (0.0, "2026-10-05")
 
     asyncio.run(rm.initialize_balance())
 
-    assert rm.stats.current_balance == pytest.approx(10000.0)
-    assert rm._is_trading_allowed is True, (
+    assert rm.paper_stats.current_balance == pytest.approx(10000.0)
+    assert rm._paper_is_trading_allowed is True, (
         "trading stayed disabled: initialize_balance could not read the paper "
         "balance, so the RiskManager blocks every signal with 'general block'"
+    )
+
+
+def test_paper_only_account_enables_trading_with_the_real_limit_check():
+    """The same outcome, with the REAL paper limit check running.
+
+    The test above stubs the limit check out to isolate the balance fetch.
+    This one does not, so it also pins that the paper gate is evaluated
+    against the PAPER wallet -- and that a healthy paper account ends up
+    with its gate OPEN.
+    """
+    paper = _PaperOnlyExecutor(10000.0)
+    rm = _make_rm(paper)
+    rm._get_current_day_start_info = lambda: (0.0, "2026-10-05")
+
+    asyncio.run(rm.initialize_balance())
+
+    assert rm.paper_stats.current_balance == pytest.approx(10000.0)
+    assert rm._paper_is_trading_allowed is True, (
+        "the PAPER gate stayed closed for a healthy paper account"
     )
 
 
@@ -138,3 +182,4 @@ def test_no_executor_at_all_fails_closed_not_open():
     ok = asyncio.run(rm.update_balance())
     assert ok is False
     assert rm._is_trading_allowed is False
+    assert rm._paper_is_trading_allowed is False

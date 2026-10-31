@@ -363,13 +363,27 @@ async def _run_paper_close(
         paper_executor, controller, entry_price=entry_price, qty=qty
     )
 
+    # THE PAPER WALLET'S BALANCE IS READ FIRST, exactly as the product does:
+    # the PAPER gate is judged against the PAPER wallet's balance, and
+    # `_check_paper_risk_limits()` refuses to judge an UNKNOWN number -- so
+    # without this read the paper limits are never judged at all and the
+    # daily-loss guard can never fire, in either direction.
+    #
+    # It must come BEFORE the pinning below: `update_balance()` only records
+    # the balance as KNOWN when it CHANGED, so pinning `current_balance`
+    # first would make the read a no-op and the gate would stay unjudged.
+    assert await rm.update_balance(mode="paper") is True
+
     # Pin the day so the UTC rollover cannot fire and be mistaken for the
-    # effect under test.
-    rm.stats.last_known_day_str = _utc_day_str()
-    rm.stats.current_balance = 1000.0
-    rm.stats.start_of_day_balance = (
-        1000.0 if start_of_day_balance is None else start_of_day_balance
-    )
+    # effect under test. BOTH sandboxes are pinned: these are PAPER trades,
+    # so they are booked into the PAPER sandbox, and an unpinned PAPER day
+    # would roll over and zero the paper day's PnL mid-test.
+    for _stats in (rm.stats, rm.paper_stats):
+        _stats.last_known_day_str = _utc_day_str()
+        _stats.current_balance = 1000.0
+        _stats.start_of_day_balance = (
+            1000.0 if start_of_day_balance is None else start_of_day_balance
+        )
 
     _rest_exit_order(
         paper_executor, qty=qty, price=exit_price, order_type=order_type
@@ -409,17 +423,28 @@ async def test_paper_loss_reaches_the_risk_manager_as_a_negative_net_pnl(money):
 
     await _finalize(controller, "STOP_LOSS")
 
-    assert rm.stats.today_pnl == pytest.approx(wallet_delta, abs=1e-9), (
-        f"the risk manager was told {rm.stats.today_pnl!r} but the wallet moved "
+    assert rm.paper_stats.today_pnl == pytest.approx(wallet_delta, abs=1e-9), (
+        f"the risk manager was told {rm.paper_stats.today_pnl!r} but the wallet moved "
         f"{wallet_delta!r}; the guard and the API must read the same number"
     )
-    assert rm.stats.today_pnl < 0, (
+    assert rm.paper_stats.today_pnl < 0, (
         "today_pnl must go negative on a paper loss, otherwise the daily-loss "
         "guard can never fire"
     )
-    assert rm.stats.consecutive_losses == 1, (
+    assert rm.paper_stats.consecutive_losses == 1, (
         f"one losing close must count as one loss, got "
-        f"{rm.stats.consecutive_losses}"
+        f"{rm.paper_stats.consecutive_losses}"
+    )
+    # The LIVE sandbox must not have heard about it. This was simulated
+    # money: booking it against the live day's PnL is the defect this
+    # branch exists to fix (a paper loss closing the live gate).
+    assert rm.stats.today_pnl == pytest.approx(0.0, abs=1e-9), (
+        f"the PAPER loss was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl!r})"
+    )
+    assert rm.stats.consecutive_losses == 0, (
+        f"the PAPER loss was counted in the LIVE loss streak "
+        f"({rm.stats.consecutive_losses})"
     )
 
 
@@ -442,21 +467,32 @@ async def test_paper_profit_reaches_the_risk_manager_and_resets_the_streak(money
     wallet_delta = money["wallet"][0]["amount"]
     assert wallet_delta > 0, f"a take-profit must credit the wallet, got {wallet_delta}"
 
-    # A streak that is already running must be cleared by the win.
-    rm.stats.consecutive_losses = 3
+    # A streak that is already running must be cleared by the win. It is the
+    # PAPER streak: this is a paper account, so its loss streak lives in the
+    # paper sandbox.
+    rm.paper_stats.consecutive_losses = 3
 
     await _finalize(controller, "TAKE_PROFIT")
 
-    assert rm.stats.today_pnl == pytest.approx(wallet_delta, abs=1e-9), (
-        f"the risk manager was told {rm.stats.today_pnl!r} but the wallet moved "
+    assert rm.paper_stats.today_pnl == pytest.approx(wallet_delta, abs=1e-9), (
+        f"the risk manager was told {rm.paper_stats.today_pnl!r} but the wallet moved "
         f"{wallet_delta!r}"
     )
-    assert rm.stats.today_pnl > 0, (
+    assert rm.paper_stats.today_pnl > 0, (
         "today_pnl must go positive on a paper profit"
     )
-    assert rm.stats.consecutive_losses == 0, (
+    assert rm.paper_stats.consecutive_losses == 0, (
         f"a winning close must reset the loss streak, got "
-        f"{rm.stats.consecutive_losses}"
+        f"{rm.paper_stats.consecutive_losses}"
+    )
+    # The LIVE sandbox must not have heard about it.
+    assert rm.stats.today_pnl == pytest.approx(0.0, abs=1e-9), (
+        f"the PAPER profit was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl!r})"
+    )
+    assert rm.stats.consecutive_losses == 0, (
+        f"the PAPER win was booked against the LIVE loss streak "
+        f"({rm.stats.consecutive_losses})"
     )
 
 
@@ -499,13 +535,22 @@ async def test_commission_can_turn_a_gross_profit_into_a_loss(money):
 
     await _finalize(controller, "TAKE_PROFIT")
 
-    assert rm.stats.today_pnl == pytest.approx(-0.1007997, abs=1e-9), (
-        f"the risk manager must see the NET result, got {rm.stats.today_pnl!r}"
+    assert rm.paper_stats.today_pnl == pytest.approx(-0.1007997, abs=1e-9), (
+        f"the risk manager must see the NET result, got "
+        f"{rm.paper_stats.today_pnl!r}"
     )
-    assert rm.stats.today_pnl < 0, "a net-negative close is a LOSS"
-    assert rm.stats.consecutive_losses == 1, (
+    assert rm.paper_stats.today_pnl < 0, "a net-negative close is a LOSS"
+    assert rm.paper_stats.consecutive_losses == 1, (
         f"a net-negative close must count as a loss, got "
-        f"{rm.stats.consecutive_losses}"
+        f"{rm.paper_stats.consecutive_losses}"
+    )
+    assert rm.stats.today_pnl == pytest.approx(0.0, abs=1e-9), (
+        f"the PAPER close was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl!r})"
+    )
+    assert rm.stats.consecutive_losses == 0, (
+        f"the PAPER close was counted in the LIVE loss streak "
+        f"({rm.stats.consecutive_losses})"
     )
 
 
@@ -530,21 +575,31 @@ async def test_daily_loss_guard_fires_when_the_days_real_loss_exceeds_the_limit(
     )
 
     wallet_delta = money["wallet"][0]["amount"]
-    loss_pct = abs(wallet_delta / rm.stats.start_of_day_balance)
-    assert loss_pct > rm.daily_max_loss_threshold, (
+    loss_pct = abs(wallet_delta / rm.paper_stats.start_of_day_balance)
+    assert loss_pct > rm.paper_daily_max_loss_threshold, (
         f"the test must exceed the daily limit: {loss_pct * 100:.2f}% > "
-        f"{rm.daily_max_loss_threshold * 100:.2f}%"
+        f"{rm.paper_daily_max_loss_threshold * 100:.2f}%"
     )
 
     await _finalize(controller, "STOP_LOSS")
 
-    assert rm._is_trading_allowed is False, (
-        "the daily-loss guard must close the gate when the day's real loss "
-        "exceeds the limit"
+    assert rm._paper_is_trading_allowed is False, (
+        "the daily-loss guard must close the PAPER gate when the day's real "
+        "loss exceeds the limit"
     )
-    assert "Daily loss" in (rm._global_gate_disable_reason or ""), (
+    assert "Daily loss" in (rm._paper_global_gate_disable_reason or ""), (
         f"the gate must name the daily-loss breach, got "
+        f"{rm._paper_global_gate_disable_reason!r}"
+    )
+    # The LIVE gate must still be open: this loss was simulated money, and a
+    # paper loss closing the live gate is the defect this branch fixes.
+    assert rm._is_trading_allowed is True, (
+        f"a PAPER loss closed the LIVE gate, reason "
         f"{rm._global_gate_disable_reason!r}"
+    )
+    assert rm.stats.today_pnl == pytest.approx(0.0, abs=1e-9), (
+        f"the PAPER loss was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl!r})"
     )
 
 
@@ -563,17 +618,21 @@ async def test_daily_loss_guard_does_not_fire_within_the_limit(money):
     )
 
     wallet_delta = money["wallet"][0]["amount"]
-    loss_pct = abs(wallet_delta / rm.stats.start_of_day_balance)
-    assert loss_pct < rm.daily_max_loss_threshold, (
+    loss_pct = abs(wallet_delta / rm.paper_stats.start_of_day_balance)
+    assert loss_pct < rm.paper_daily_max_loss_threshold, (
         f"the test must stay inside the daily limit: {loss_pct * 100:.2f}%"
     )
 
     await _finalize(controller, "STOP_LOSS")
 
-    assert rm.stats.today_pnl == pytest.approx(wallet_delta, abs=1e-9)
-    assert rm._is_trading_allowed is True, (
-        f"a loss inside the daily limit must not close the gate, got "
-        f"{rm._global_gate_disable_reason!r}"
+    assert rm.paper_stats.today_pnl == pytest.approx(wallet_delta, abs=1e-9)
+    assert rm._paper_is_trading_allowed is True, (
+        f"a loss inside the daily limit must not close the PAPER gate, got "
+        f"{rm._paper_global_gate_disable_reason!r}"
+    )
+    assert rm.stats.today_pnl == pytest.approx(0.0, abs=1e-9), (
+        f"the PAPER close was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl!r})"
     )
 
 
@@ -596,40 +655,49 @@ async def test_balance_update_rolls_the_day_over_without_a_trade_closing(money):
     # the balance source -- exactly as bot_runner.py builds it.
     rm.executor = None
 
-    # The blocked state: over the consecutive-loss limit, gate closed.
-    rm.stats.consecutive_losses = rm.max_consecutive_losses
-    rm.stats.today_pnl = -100.0
-    rm.stats.current_balance = 1000.0
-    rm.stats.start_of_day_balance = 1000.0
-    rm._check_risk_limits()
-    assert rm._is_trading_allowed is False, "precondition: the gate is closed"
+    # The PAPER wallet's balance must be KNOWN before the paper limits can be
+    # judged (`_check_paper_risk_limits` refuses to judge an unknown number),
+    # so read it first -- exactly what the real start-up does.
+    assert await rm.update_balance() is True
+
+    # The blocked state: over the consecutive-loss limit, gate closed. These
+    # are the PAPER sandbox's counters: they are the ones this account's gate
+    # reads.
+    rm.paper_stats.consecutive_losses = rm.paper_max_consecutive_losses
+    rm.paper_stats.today_pnl = -100.0
+    rm.paper_stats.current_balance = 1000.0
+    rm.paper_stats.start_of_day_balance = 1000.0
+    rm._check_risk_limits(mode="paper")
+    assert rm._paper_is_trading_allowed is False, (
+        "precondition: the gate is closed"
+    )
 
     # A balance update on the SAME UTC day must NOT clear the counters.
-    rm.stats.last_known_day_str = _utc_day_str()
+    rm.paper_stats.last_known_day_str = _utc_day_str()
     assert await rm.update_balance() is True
-    assert rm.stats.consecutive_losses == rm.max_consecutive_losses, (
+    assert rm.paper_stats.consecutive_losses == rm.paper_max_consecutive_losses, (
         "a balance update inside the same UTC day must not clear the "
         "consecutive-loss counter"
     )
-    assert rm.stats.today_pnl == -100.0, (
+    assert rm.paper_stats.today_pnl == -100.0, (
         "a balance update inside the same UTC day must not clear today's PnL"
     )
-    assert rm._is_trading_allowed is False, (
+    assert rm._paper_is_trading_allowed is False, (
         "a balance update inside the same UTC day must not re-open the gate"
     )
 
     # A balance update on a NEW UTC day MUST clear them -- the documented
     # daily rollover, with no trade closing.
-    rm.stats.last_known_day_str = _utc_day_str(offset_days=-1)
+    rm.paper_stats.last_known_day_str = _utc_day_str(offset_days=-1)
     assert await rm.update_balance() is True
-    assert rm.stats.consecutive_losses == 0, (
+    assert rm.paper_stats.consecutive_losses == 0, (
         "a new UTC day must reset the consecutive-loss counter even when no "
         "trade closed"
     )
-    assert rm.stats.today_pnl == 0.0, (
+    assert rm.paper_stats.today_pnl == 0.0, (
         "a new UTC day must reset today's PnL even when no trade closed"
     )
-    assert rm._is_trading_allowed is True, (
+    assert rm._paper_is_trading_allowed is True, (
         "a new UTC day must re-open the gate when no risk limit is in force"
     )
 
@@ -651,19 +719,32 @@ async def test_balance_update_does_not_reopen_the_gate_under_an_emergency_stop(
     # the balance source -- exactly as bot_runner.py builds it.
     rm.executor = None
 
-    rm.stats.consecutive_losses = rm.max_consecutive_losses
-    rm.stats.current_balance = 1000.0
-    rm.stats.start_of_day_balance = 1000.0
-    rm.trigger_emergency_stop("operator pulled the kill switch")
-
-    rm.stats.last_known_day_str = _utc_day_str(offset_days=-1)
+    # The PAPER wallet's balance must be KNOWN before the paper limits can be
+    # judged.
     assert await rm.update_balance() is True
 
-    assert rm.stats.consecutive_losses == 0, (
+    rm.paper_stats.consecutive_losses = rm.paper_max_consecutive_losses
+    rm.paper_stats.current_balance = 1000.0
+    rm.paper_stats.start_of_day_balance = 1000.0
+    rm._check_risk_limits(mode="paper")
+    assert rm._paper_is_trading_allowed is False, (
+        "precondition: the paper gate is closed"
+    )
+
+    rm.trigger_emergency_stop("operator pulled the kill switch")
+
+    rm.paper_stats.last_known_day_str = _utc_day_str(offset_days=-1)
+    assert await rm.update_balance() is True
+
+    assert rm.paper_stats.consecutive_losses == 0, (
         "the day-scoped counters are reset on a new day even under an "
         "emergency stop"
     )
     assert rm.is_emergency_stop_active() is True, "the latch itself must survive"
+    assert rm._paper_is_trading_allowed is False, (
+        "a new UTC day must NOT re-open the PAPER gate while the "
+        "emergency-stop latch is engaged"
+    )
     assert rm._is_trading_allowed is False, (
         "a new UTC day must NOT re-open the gate while the emergency-stop "
         "latch is engaged"
@@ -1360,9 +1441,16 @@ async def test_a_paper_long_closed_by_the_controller_credits_the_wallet_and_tell
     # The commission the opening fill actually paid. The controller knows it,
     # so `_handle_final_exit` subtracts it from the gross result.
     position.entry_commission = 0.06
-    rm.stats.last_known_day_str = _utc_day_str()
-    rm.stats.current_balance = 1000.0
-    rm.stats.start_of_day_balance = 1000.0
+    # The PAPER wallet's balance is read first: the PAPER gate is judged
+    # against it, and an UNKNOWN number is not judged at all.
+    assert await rm.update_balance(mode="paper") is True
+    # Pin BOTH sandboxes for the day: this close is a PAPER trade, so it is
+    # booked into the PAPER sandbox, and an unpinned PAPER day would roll
+    # over and zero the paper day's PnL mid-test.
+    for _stats in (rm.stats, rm.paper_stats):
+        _stats.last_known_day_str = _utc_day_str()
+        _stats.current_balance = 1000.0
+        _stats.start_of_day_balance = 1000.0
 
     await controller.close_position(
         SYMBOL, reason=_CLOSURE_REASON, market_type=MARKET_TYPE
@@ -1395,23 +1483,41 @@ async def test_a_paper_long_closed_by_the_controller_credits_the_wallet_and_tell
     )
 
     # 3. The guard was told about the close, and about the SAME result.
-    assert rm.stats.today_pnl > 0, (
-        f"the risk manager was told {rm.stats.today_pnl!r}; a winning close "
-        f"must not be booked as a loss"
+    #
+    #    The close is a PAPER close, so it is booked into the PAPER sandbox
+    #    (`rm.paper_stats`). It used to be asserted against `rm.stats`, the
+    #    LIVE sandbox -- which is the very defect this branch fixes: a
+    #    simulated close was written into the LIVE day's PnL and the LIVE
+    #    loss streak, and a paper loss could close the LIVE gate. The
+    #    assertions below therefore read the PAPER sandbox and then pin
+    #    that the LIVE sandbox never heard about it.
+    assert rm.paper_stats.today_pnl > 0, (
+        f"the risk manager was told {rm.paper_stats.today_pnl!r}; a winning "
+        f"close must not be booked as a loss"
     )
-    assert rm.stats.today_pnl == pytest.approx(api_number, rel=0.02), (
-        f"the risk manager was told {rm.stats.today_pnl!r} but the API and the "
-        f"wallet say {api_number!r}; the guard and the API must read the same "
-        f"number"
+    assert rm.paper_stats.today_pnl == pytest.approx(api_number, rel=0.02), (
+        f"the risk manager was told {rm.paper_stats.today_pnl!r} but the API "
+        f"and the wallet say {api_number!r}; the guard and the API must read "
+        f"the same number"
     )
 
     # 4. A WIN must not increment the loss streak.
-    assert rm.stats.consecutive_losses == 0, (
+    assert rm.paper_stats.consecutive_losses == 0, (
         f"a winning close must not increment the loss streak, got "
-        f"{rm.stats.consecutive_losses}"
+        f"{rm.paper_stats.consecutive_losses}"
     )
 
-    # 5. No phantom position is left behind in the paper book.
+    # 5. The LIVE sandbox must not have heard about it at all.
+    assert rm.stats.today_pnl == pytest.approx(0.0, abs=1e-9), (
+        f"the PAPER close was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl!r})"
+    )
+    assert rm.stats.consecutive_losses == 0, (
+        f"the PAPER close was counted in the LIVE loss streak "
+        f"({rm.stats.consecutive_losses})"
+    )
+
+    # 6. No phantom position is left behind in the paper book.
     assert SYMBOL not in paper_executor._positions, (
         f"the paper book still holds {paper_executor._positions.get(SYMBOL)!r}"
     )
@@ -1447,9 +1553,16 @@ async def test_a_paper_short_closed_by_the_controller_is_not_charged_twice(
 
     controller, paper_executor, rm = _build_controller(price=90.0)
     _seed_short(paper_executor, controller, entry_price=ENTRY_PRICE, qty=QTY)
-    rm.stats.last_known_day_str = _utc_day_str()
-    rm.stats.current_balance = 1000.0
-    rm.stats.start_of_day_balance = 1000.0
+    # The PAPER wallet's balance is read first: the PAPER gate is judged
+    # against it, and an UNKNOWN number is not judged at all.
+    assert await rm.update_balance(mode="paper") is True
+    # Pin BOTH sandboxes for the day: this close is a PAPER trade, so it is
+    # booked into the PAPER sandbox, and an unpinned PAPER day would roll
+    # over and zero the paper day's PnL mid-test.
+    for _stats in (rm.stats, rm.paper_stats):
+        _stats.last_known_day_str = _utc_day_str()
+        _stats.current_balance = 1000.0
+        _stats.start_of_day_balance = 1000.0
 
     await controller.close_position(
         SYMBOL, reason=_CLOSURE_REASON, market_type=MARKET_TYPE
@@ -1485,13 +1598,33 @@ async def test_a_paper_short_closed_by_the_controller_is_not_charged_twice(
     )
 
     # And the guard was told about the close at all.
-    assert rm.stats.today_pnl > 0, (
-        f"the risk manager was told {rm.stats.today_pnl!r}; the close never "
-        f"reached the risk manager"
+    #
+    # The close is a PAPER close, so it is booked into the PAPER sandbox. It
+    # used to be asserted against `rm.stats`, the LIVE sandbox -- which is
+    # the defect this branch fixes (a simulated close written into the LIVE
+    # day's PnL and the LIVE loss streak).
+    assert rm.paper_stats.today_pnl > 0, (
+        f"the risk manager was told {rm.paper_stats.today_pnl!r}; the close "
+        f"never reached the risk manager"
+    )
+    assert rm.paper_stats.today_pnl == pytest.approx(wallet_delta, rel=0.02), (
+        f"the risk manager was told {rm.paper_stats.today_pnl!r} but the "
+        f"wallet moved {wallet_delta!r}; the retry must not book the close "
+        f"twice"
+    )
+    assert rm.paper_stats.consecutive_losses == 0, (
+        f"a winning close must not increment the loss streak, got "
+        f"{rm.paper_stats.consecutive_losses}"
+    )
+
+    # The LIVE sandbox must not have heard about it.
+    assert rm.stats.today_pnl == pytest.approx(0.0, abs=1e-9), (
+        f"the PAPER close was booked against the LIVE day's PnL "
+        f"({rm.stats.today_pnl!r})"
     )
     assert rm.stats.consecutive_losses == 0, (
-        f"a winning close must not increment the loss streak, got "
-        f"{rm.stats.consecutive_losses}"
+        f"the PAPER close was counted in the LIVE loss streak "
+        f"({rm.stats.consecutive_losses})"
     )
 
 

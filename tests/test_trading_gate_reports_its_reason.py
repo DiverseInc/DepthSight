@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -609,6 +610,20 @@ def _build_process_signal_controller(rm, redis_client):
     controller._active_positions = ctrl_module.ActivePositionMap()
     controller._symbol_locks = {}
     controller.loop = asyncio.get_event_loop()
+    # THE TRADING MODE IS RESOLVED BEFORE THE GATE IS CONSULTED.
+    #
+    # The gate is per sandbox: a PAPER loss must not refuse a LIVE signal and
+    # a LIVE loss must not refuse a PAPER signal. The controller therefore
+    # resolves the signal's own mode from the strategy registry FIRST, and
+    # then asks the gate about THAT sandbox -- which is why the registry is
+    # now part of the state this double has to supply.
+    controller.instances_lock = asyncio.Lock()
+    controller.running_strategy_instances = {
+        1: (
+            SimpleNamespace(NAME="VisualBuilderStrategy"),
+            {"mode": "paper"},
+        )
+    }
     return controller
 
 
