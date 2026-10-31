@@ -558,6 +558,13 @@ MAIN_APP_WS_URL = (
 # uses. The cache keeps a per-tick caller (the ~2s state publisher) from
 # re-probing the same host 30 times a minute.
 #
+# This value is the probe's wall-clock budget for the WHOLE probe -- DNS
+# included. DNS gets its own share of it, because `getaddrinfo` does not
+# honour a socket timeout and would otherwise run for the resolver's own
+# 10-20s. The value is also CAPPED at
+# bot_module/main_app_feed.py:MAX_PROBE_TIMEOUT_SECONDS, so a large number
+# here cannot turn a health check into a long stall.
+#
 # A malformed value falls back to the default instead of raising at import
 # time -- a typo in an env var must not stop the whole bot from starting.
 try:

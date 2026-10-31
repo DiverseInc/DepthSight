@@ -42,8 +42,11 @@ from bot_module.regime_feed import (
     screener_feed_can_deliver_regime_data,
 )
 from bot_module.main_app_feed import (
+    deployment_uses_main_app_feed,
     get_main_app_feed_status_async,
+    resolve_symbol_selection_mode,
     strategy_depends_on_main_app_feed,
+    unknown_feed_health_payload,
 )
 from bot_module.symbol_selection import SymbolSelectionConfig
 from bot_module.strategy import (
@@ -4816,20 +4819,57 @@ class TradingController:
         # A strategy that DEPENDS on this feed must not be published as a
         # healthy "running" one while the feed is dead: it would start, look
         # fine, and never trade.
+        #
+        # THE VERDICT IS FOUR-VALUED, and the fourth value is the one this
+        # fix is about:
+        #
+        #   "ok"               -- the feed answered. Normal publishing.
+        #   "degraded"         -- the feed answered and said it is dead.
+        #                          Feed-dependent strategies are degraded.
+        #   "unknown"          -- THE PROBE ITSELF FAILED. We have no
+        #                          verdict at all. FAIL CLOSED: nothing is
+        #                          published as "running", because "running"
+        #                          without a positive reachability verdict is
+        #                          exactly the lie this branch exists to
+        #                          remove. (The old code left the reason empty
+        #                          here and published "running" with
+        #                          feed_health=None -- a dead feed reported
+        #                          healthy.)
+        #   "not_applicable"   -- this deployment does not use the MAIN_APP
+        #                          feed at all, so there is nothing to probe
+        #                          and nothing to be uncertain about.
         _feed_health: Dict[str, Any] = {}
         _feed_degraded_reason: Optional[str] = None
-        try:
-            _feed_status = await get_main_app_feed_status_async()
-            _feed_health = _feed_status.to_payload()
-            if not _feed_status.reachable:
-                _feed_degraded_reason = _feed_status.reason
-        except Exception as e_feed:  # noqa: BLE001 - health must never break publishing
-            logger.warning(
-                "[PublishState:User%s] Could not read MAIN_APP feed health: %s. "
-                "Publishing without a feed verdict rather than guessing one.",
-                self.user_id,
-                e_feed,
-            )
+        _feed_unknown_reason: Optional[str] = None
+        _feed_verdict = "not_applicable"
+        if deployment_uses_main_app_feed():
+            try:
+                _feed_status = await get_main_app_feed_status_async()
+                _feed_health = _feed_status.to_payload()
+                if _feed_status.reachable:
+                    _feed_verdict = "ok"
+                else:
+                    _feed_verdict = "degraded"
+                    _feed_degraded_reason = _feed_status.reason
+            except Exception as e_feed:  # noqa: BLE001 - health must never break publishing
+                # FAIL CLOSED. The probe could not tell us whether the feed
+                # is alive, so we do NOT get to publish "running": the
+                # verdict is UNKNOWN and it is published as such.
+                _feed_verdict = "unknown"
+                _feed_health = unknown_feed_health_payload(
+                    config.MAIN_APP_WS_URL,
+                    "probe_error",
+                    f"{e_feed.__class__.__name__}: {e_feed}",
+                )
+                _feed_unknown_reason = _feed_health["reason"]
+                logger.warning(
+                    "[PublishState:User%s] Could not read MAIN_APP feed health: %s. "
+                    "Publishing the feed verdict as UNKNOWN and refusing to "
+                    "report any strategy as 'running' without a positive "
+                    "reachability verdict.",
+                    self.user_id,
+                    e_feed,
+                )
 
         for config_id, (instance, config_dict) in instances_copy.items():
             symbols_str = "Dynamic (All)"
@@ -4907,15 +4947,21 @@ class TradingController:
             # stop). A pinned-symbol STATIC/FIXED strategy with no regime stop
             # keeps trading on its own symbols while the feed is down, so it is
             # NOT degraded -- marking it would be a lie of its own.
+            #
+            # The UNKNOWN verdict is different: we could not find out whether
+            # the feed is alive, so we may not certify ANY strategy as
+            # "running". Failing open there is the bug this fix removes.
             _feed_affects_strategy = False
             _strategy_feed_reason: Optional[str] = None
-            if _feed_degraded_reason:
+            if _feed_verdict == "degraded":
                 _feed_affects_strategy = strategy_depends_on_main_app_feed(
                     config_dict.get("symbol_selection_mode"),
                     config_dict.get("config_data"),
                 )
                 if _feed_affects_strategy:
                     _strategy_feed_reason = _feed_degraded_reason
+            elif _feed_verdict == "unknown":
+                _strategy_feed_reason = _feed_unknown_reason
 
             # Both reasons can be true at once. Keep BOTH: the feed outage is
             # the headline, the structural problem is still the user's to fix.
@@ -4977,9 +5023,14 @@ class TradingController:
                 "params": config_dict.get("config_data", {}).get("params", {}),
                 "user_id": config_dict.get("user_id"),
                 "api_key_id": strat_api_key_id,  # Added api_key_id with fallback
-                "symbol_selection_mode": config_dict.get(
-                    "symbol_selection_mode", "STATIC"
-                ),
+                # ONE authoritative reading of the mode. It used to default
+                # to "STATIC" here while the RESOLVER (which decides how the
+                # strategy actually trades) defaulted to "DYNAMIC", so a
+                # config with no `symbol_selection_mode` was published as a
+                # pinned STATIC strategy while it traded as DYNAMIC -- and
+                # therefore needed the very feed it was reported as not
+                # needing. The default now matches the resolver.
+                "symbol_selection_mode": resolve_symbol_selection_mode(config_dict),
                 "mode": config_dict.get("mode", "live"),
             }
             strategies_to_publish.append(strat_data)
@@ -7176,7 +7227,7 @@ class TradingController:
                     (see ``api/routes/onboarding.py``). It used to fall through
                     every branch and yield an empty list.
         """
-        mode = str(config_dict.get("symbol_selection_mode") or "DYNAMIC").strip().upper()
+        mode = resolve_symbol_selection_mode(config_dict).upper()
 
         if mode == "DYNAMIC":
             global_mode = self.symbol_selection_config.mode

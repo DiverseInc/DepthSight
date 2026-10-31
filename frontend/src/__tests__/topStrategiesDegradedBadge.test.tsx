@@ -19,6 +19,8 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import i18n from "i18next";
 import { initReactI18next } from "react-i18next";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type React from "react";
 import indexEn from "@/locales/en/index.json";
 import commonEn from "@/locales/en/common.json";
@@ -71,15 +73,44 @@ const healthyStrategy = {
 	},
 };
 
-let strategies = [degradedStrategy];
+// The union keeps `status_detail` honest: a healthy strategy has NO
+// reason, so it is `null`, while a degraded one carries the reason.
+let strategies: Array<typeof degradedStrategy | typeof healthyStrategy> = [
+	degradedStrategy,
+];
+
+// The saved CONFIGS the strategies page lists. The page merges the running
+// strategy data over these, so a config without a status still renders the
+// running status.
+let savedConfigs = [
+	{
+		id: "cfg-dynamic",
+		name: "EMA 50/200 Golden Cross",
+		description: "",
+		config_data: { strategy_name: "VisualBuilderStrategy" },
+		symbols: ["BTCUSDT"],
+		mode: "paper",
+		symbol_selection_mode: "DYNAMIC",
+	},
+];
 
 vi.mock("@/lib/api", () => ({
-	useStrategies: () => ({
-		data: strategies,
+	useStrategies: (params?: { mode?: string }) => ({
+		data: params?.mode === "paper" ? strategies : [],
 		isLoading: false,
 		isError: false,
 		error: null,
 	}),
+	useStrategyConfigsList: () => ({
+		data: savedConfigs,
+		isLoading: false,
+		isError: false,
+		error: null,
+	}),
+	useStopStrategy: () => ({ mutate: vi.fn(), isPending: false }),
+	useStartStrategy: () => ({ mutate: vi.fn(), isPending: false }),
+	useDeleteStrategyConfig: () => ({ mutate: vi.fn(), isPending: false }),
+	useRunBacktest: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 
 vi.mock("@/context/PortfolioModeContext", () => ({
@@ -100,7 +131,26 @@ vi.mock("react-router-dom", () => ({
 	useNavigate: () => () => {},
 }));
 
+// The page shell and the three modals need app-level providers that have
+// nothing to do with the badge. They are stubbed so this test renders the
+// strategy card itself.
+vi.mock("@/components/layout/PageLayout", () => ({
+	PageLayout: ({ children }: { children: React.ReactNode }) => (
+		<div>{children}</div>
+	),
+}));
+vi.mock("@/components/strategies/BacktestModal", () => ({
+	BacktestModal: () => null,
+}));
+vi.mock("@/components/strategies/LaunchStrategyModal", () => ({
+	LaunchStrategyModal: () => null,
+}));
+vi.mock("@/components/strategies/StrategyDetailsPanel", () => ({
+	StrategyDetailsPanel: () => null,
+}));
+
 import { TopStrategiesTable } from "@/components/dashboard/TopStrategiesTable";
+import StrategiesPage from "@/pages/Strategies";
 
 beforeAll(async () => {
 	await i18n.use(initReactI18next).init({
@@ -156,5 +206,78 @@ describe("the dashboard shows a DEGRADED strategy as degraded", () => {
 		} finally {
 			strategies = [degradedStrategy];
 		}
+	});
+});
+
+// The SAME defect, on the OTHER page that lists strategies. It had its own
+// `getStatusColor` with no "degraded" case, so a degraded strategy fell
+// through to the GREY default, and it never rendered `status_detail` at
+// all -- so the user saw a grey badge and no explanation.
+describe("the strategies page shows a DEGRADED strategy as degraded", () => {
+	it("labels the strategy DEGRADED, not RUNNING", () => {
+		const html = renderToStaticMarkup(<StrategiesPage />);
+		expect(html).toContain("DEGRADED");
+		expect(html).not.toContain("RUNNING");
+	});
+
+	it("paints the badge amber, not green and not the grey default", () => {
+		const html = renderToStaticMarkup(<StrategiesPage />);
+		// Amber = impaired by an outage.
+		expect(html).toContain("bg-amber-500");
+		// NEVER green: green means "this strategy is working".
+		expect(html).not.toContain("bg-emerald-500");
+		// And NOT the grey "unknown status" default.
+		expect(html).not.toContain("bg-slate-400");
+	});
+
+	it("shows the reason -- the unreachable URL and the failure", () => {
+		const html = renderToStaticMarkup(<StrategiesPage />);
+		expect(html).toContain("screener.depthsight.pro");
+		expect(html).toContain("525");
+		// The reason must be RENDERED TEXT, not only an attribute value.
+		// The badge carries it in a `title` too, and `expect(html).toContain(
+		// reason)` would be satisfied by that attribute alone -- which is
+		// how the reason stayed invisible on this page.
+		expect(html).toContain(`>${FEED_REASON}<`);
+	});
+
+	it("still shows a healthy strategy as running, in green, with no reason", () => {
+		strategies = [healthyStrategy];
+		savedConfigs = [
+			{ ...savedConfigs[0], id: "cfg-static", name: "Pinned BTC strategy" },
+		];
+		try {
+			const html = renderToStaticMarkup(<StrategiesPage />);
+			expect(html).toContain("RUNNING");
+			expect(html).toContain("bg-emerald-500");
+			expect(html).not.toContain("DEGRADED");
+			expect(html).not.toContain("screener.depthsight.pro");
+		} finally {
+			strategies = [degradedStrategy];
+			savedConfigs = [
+				{
+					id: "cfg-dynamic",
+					name: "EMA 50/200 Golden Cross",
+					description: "",
+					config_data: { strategy_name: "VisualBuilderStrategy" },
+					symbols: ["BTCUSDT"],
+					mode: "paper",
+					symbol_selection_mode: "DYNAMIC",
+				},
+			];
+		}
+	});
+});
+
+// The backend added a deployment-level route for the feed's health. Without
+// a client it was DEAD CODE: the route answered nobody.
+describe("the feed-health route has a client", () => {
+	it("is reachable from the frontend", () => {
+		const source = readFileSync(
+			join(__dirname, "../lib/api.ts"),
+			"utf8",
+		);
+		expect(source).toContain("useMainAppFeedHealth");
+		expect(source).toContain("/strategies/feed-health");
 	});
 });

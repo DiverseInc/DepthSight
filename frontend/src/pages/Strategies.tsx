@@ -76,16 +76,48 @@ const calculateRuntime = (startTime: string | undefined): string => {
 	}
 };
 
-const getStatusColor = (status: string | undefined) => {
+export const getStatusColor = (status: string | undefined) => {
 	const s = status?.toLowerCase() || "stopped";
 	if (s === "running" || s === "active" || s === "in_position")
 		return "bg-emerald-500 hover:bg-emerald-600 text-white";
+	// A DEGRADED strategy is impaired by an OUTAGE: the screener feed it
+	// depends on is not answering, so it cannot do the thing it was started
+	// for. Amber -- impaired, not structurally broken -- and NEVER green:
+	// green means "this strategy is working", and it is not.
+	if (s === "degraded")
+		return "bg-amber-500 hover:bg-amber-600 text-white";
 	if (s === "stopped" || s === "paused")
 		return "bg-slate-400 hover:bg-slate-500 text-white";
 	if (s === "error" || s === "failed")
 		return "bg-red-500 hover:bg-red-600 text-white";
 	return "bg-slate-400 hover:bg-slate-500 text-white";
 };
+
+/**
+ * The status badge, plus the reason the bot published for it.
+ *
+ * The reason matters as much as the colour: a strategy that is degraded
+ * because its screener feed is dead must SAY which feed and which failure,
+ * so the user is not left with a bare amber badge and no explanation.
+ */
+export const StrategyStatusBadge = ({
+	status,
+	statusDetail,
+}: {
+	status?: string;
+	statusDetail?: string | null;
+}) => (
+	<div className="flex flex-col gap-1 items-end">
+		<Badge className={getStatusColor(status)} title={statusDetail || undefined}>
+			{status?.toUpperCase() || "STOPPED"}
+		</Badge>
+		{statusDetail && (
+			<p className="max-w-[220px] text-right text-[11px] leading-tight text-amber-600 dark:text-amber-400">
+				{statusDetail}
+			</p>
+		)}
+	</div>
+);
 
 // --- Export CombinedStrategy for reuse ---
 export type CombinedStrategy = StrategyConfig &
@@ -134,9 +166,10 @@ const StrategyCard = forwardRef<
 									</CardDescription>
 								</div>
 								<div className="flex flex-col gap-1 items-end flex-shrink-0">
-									<Badge className={getStatusColor(strategy.status)}>
-										{strategy.status?.toUpperCase() || "STOPPED"}
-									</Badge>
+									<StrategyStatusBadge
+										status={strategy.status}
+										statusDetail={strategy.status_detail}
+									/>
 									<Badge
 										variant={
 											strategy.mode === "live" ? "destructive" : "secondary"

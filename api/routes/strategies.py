@@ -31,6 +31,7 @@ from bot_module.regime_feed import (
 )
 from bot_module.main_app_feed import (
     get_main_app_feed_status_async as _get_main_app_feed_status_async,
+    unknown_feed_health_payload as _unknown_feed_health_payload,
 )
 
 try:
@@ -129,21 +130,16 @@ async def get_main_app_feed_health():
         status = await _get_main_app_feed_status_async()
     except Exception as e:  # noqa: BLE001 - a health route must not 500
         logger.warning(f"[/strategies/feed-health] probe failed: {e}")
+        # The reason names the URL and the failure, exactly like
+        # `FeedReachability.reason` does for a verdict we DID get: a human
+        # reading "the probe could not be completed" learns nothing about
+        # WHICH feed or WHY.
         return {
-            "data": {
-                "state": "unknown",
-                "url": str(getattr(bot_config, "MAIN_APP_WS_URL", "") or ""),
-                "reachable": False,
-                "failure": "probe_error",
-                "status_code": None,
-                "detail": "the reachability probe could not be completed",
-                "reason": (
-                    "MAIN_APP feed reachability is UNKNOWN: the probe could "
-                    "not be completed"
-                ),
-                "checked_at": None,
-                "elapsed_ms": None,
-            }
+            "data": _unknown_feed_health_payload(
+                str(getattr(bot_config, "MAIN_APP_WS_URL", "") or ""),
+                "probe_error",
+                f"{e.__class__.__name__}: {e}",
+            )
         }
     return {"data": status.to_payload()}
 

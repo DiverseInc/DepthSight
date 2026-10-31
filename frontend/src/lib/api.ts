@@ -942,6 +942,41 @@ export const useCandleHealth = (params?: { mode?: "live" | "paper" }) => {
 		refetchOnWindowFocus: true,
 	});
 };
+// The deployment-level health of the MAIN_APP screener feed.
+//
+// The per-strategy payload (`feed_health` on every running strategy) says
+// whether the feed THIS STRATEGY depends on is answering. This route
+// answers the deployment-level question, which matters when NO strategy is
+// running -- a deployment can be degraded with nothing to show for it.
+//
+// `state` is "ok" (the feed answered), "degraded" (it answered and said it
+// is dead), or "unknown" (the probe itself could not be completed -- NOT
+// the same as "ok", and never treated as it).
+export interface MainAppFeedHealth {
+	state: string;
+	url: string;
+	reachable: boolean;
+	failure: string | null;
+	status_code: number | null;
+	detail: string | null;
+	reason: string | null;
+	checked_at: string | null;
+	elapsed_ms: number | null;
+}
+
+export const useMainAppFeedHealth = () => {
+	return useQuery<MainAppFeedHealth, Error>({
+		queryKey: authScopedQueryKey("mainAppFeedHealth"),
+		queryFn: () => apiClient<MainAppFeedHealth>("/strategies/feed-health"),
+		// The probe is cached server-side for 60s, so polling faster than
+		// that would only re-read the same answer.
+		refetchInterval: 30000,
+		staleTime: 0,
+		gcTime: 0,
+		refetchOnMount: "always",
+	});
+};
+
 // Retrieves a single strategy configuration. The returned data type has been updated.
 export const useGetStrategy = (id: string | null) => {
 	return useQuery<StrategyConfig, Error>({

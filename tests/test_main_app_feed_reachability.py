@@ -37,6 +37,8 @@ timeout cases. A mocked socket would only prove the mock agrees with itself.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import socket
 import threading
 import time
@@ -57,6 +59,7 @@ from bot_module.main_app_feed import (
     report_main_app_feed_unreachable_once,
     reset_main_app_feed_cache,
     reset_startup_report,
+    resolve_symbol_selection_mode,
     strategy_depends_on_main_app_feed,
 )
 
@@ -65,13 +68,51 @@ from bot_module.main_app_feed import (
 # A real local WebSocket-ish server
 # --------------------------------------------------------------------------
 
+# RFC 6455: the server answers a WebSocket upgrade with
+# base64(sha1(client_key + GUID)) in `Sec-WebSocket-Accept`.
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _ws_accept(key: str) -> str:
+    """The `Sec-WebSocket-Accept` a compliant server must answer."""
+    digest = hashlib.sha1((key + WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def _with_ws_accept(request: bytes, response: bytes) -> bytes:
+    """Add the correct `Sec-WebSocket-Accept` to a 101 response.
+
+    The probe now REQUIRES it: a bare 101 is not a WebSocket handshake, and
+    a host that answers one is not a feed this bot could trade on. So the
+    test server has to behave like a compliant server.
+    """
+    if not response.startswith(b"HTTP/1.1 101"):
+        return response
+    key = ""
+    for line in request.decode("latin-1").split("\r\n"):
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == "sec-websocket-key":
+            key = value.strip()
+    if not key:
+        return response
+    return response.replace(
+        b"\r\n\r\n",
+        f"\r\nSec-WebSocket-Accept: {_ws_accept(key)}\r\n\r\n".encode("ascii"),
+        1,
+    )
+
 
 @contextmanager
-def _tcp_server(response: bytes = b"", respond_delay: float = 0.0):
+def _tcp_server(
+    response: bytes = b"", respond_delay: float = 0.0, valid_ws_accept: bool = True
+):
     """A real TCP server on 127.0.0.1 that answers with `response`.
 
     `response=b""` + `respond_delay>0` models a host that ACCEPTS the
     connection and then says nothing -- the timeout case.
+
+    `valid_ws_accept=False` models a host that answers a bare HTTP 101
+    without a `Sec-WebSocket-Accept` -- NOT a WebSocket handshake.
     """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -91,14 +132,23 @@ def _tcp_server(response: bytes = b"", respond_delay: float = 0.0):
                 return
             try:
                 conn.settimeout(2.0)
+                request = b""
                 try:
-                    conn.recv(4096)
+                    request = conn.recv(4096)
+                    while b"\r\n\r\n" not in request and len(request) < 16384:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        request += chunk
                 except OSError:
                     pass
                 if respond_delay:
                     stop.wait(respond_delay)
                 if response:
-                    conn.sendall(response)
+                    payload = response
+                    if valid_ws_accept:
+                        payload = _with_ws_accept(request, payload)
+                    conn.sendall(payload)
                 time.sleep(0.05)
             except OSError:
                 pass
@@ -202,6 +252,55 @@ def test_a_non_ws_url_is_rejected_without_a_network_call():
     assert result.failure == "invalid_url"
 
 
+def test_a_malformed_url_never_raises():
+    """`urlsplit` RAISES on a malformed IPv6 authority.
+
+    The module promises "never raises", and the promise was FALSE: the URL
+    parsing sat OUTSIDE the try, so `probe_main_app_feed("wss://[::1")`
+    raised ValueError instead of answering. A health check that throws is
+    indistinguishable from a crash -- and a crash in a health check is
+    worse than an unhealthy answer.
+    """
+    result = probe_main_app_feed("wss://[::1", timeout=1.0)
+
+    assert result.reachable is False
+    assert result.failure, "a failed probe must say WHY it failed"
+    assert "wss://[::1" in result.reason
+    assert result.reason.startswith("MAIN_APP feed unreachable: ")
+
+
+def test_a_101_without_a_valid_accept_is_not_reachable():
+    """A bare 101 is NOT a WebSocket handshake.
+
+    The probe used to declare "reachable" on any HTTP 101, so a host that
+    answered 101 without a correct `Sec-WebSocket-Accept` was reported as a
+    working feed. It is not: that server never agreed to a WebSocket, so
+    the bot could never trade on it.
+    """
+    with _tcp_server(ACCEPTED, valid_ws_accept=False) as url:
+        result = probe_main_app_feed(url, timeout=5.0)
+
+    assert result.reachable is False
+    assert result.failure == "handshake"
+    assert "Sec-WebSocket-Accept" in result.detail
+    assert url in result.reason
+
+
+def test_a_101_without_the_upgrade_header_is_not_reachable():
+    """The 101 must also say `Upgrade: websocket`."""
+    response = (
+        b"HTTP/1.1 101 Switching Protocols\r\n"
+        b"Connection: Upgrade\r\n"
+        b"\r\n"
+    )
+    with _tcp_server(response) as url:
+        result = probe_main_app_feed(url, timeout=5.0)
+
+    assert result.reachable is False
+    assert result.failure == "handshake"
+    assert "Upgrade: websocket" in result.detail
+
+
 # --------------------------------------------------------------------------
 # 2. A timeout cannot hang the bot
 # --------------------------------------------------------------------------
@@ -230,6 +329,47 @@ def test_the_configured_probe_timeout_is_short():
     """
     assert bot_config.MAIN_APP_FEED_PROBE_TIMEOUT_SECONDS <= 3.0
     assert bot_config.MAIN_APP_FEED_PROBE_TIMEOUT_SECONDS < 10.0
+
+
+def test_the_configured_probe_timeout_is_capped(monkeypatch):
+    """An operator must not be able to turn a health check into a stall.
+
+    The budget used to be `max(0.05, raw)` with NO upper bound, so
+    MAIN_APP_FEED_PROBE_TIMEOUT_SECONDS=60 turned a health check into a
+    60-second stall -- exactly what the property above forbids.
+    """
+    monkeypatch.setattr(bot_config, "MAIN_APP_FEED_PROBE_TIMEOUT_SECONDS", 600.0)
+
+    assert main_app_feed._configured_timeout() == main_app_feed.MAX_PROBE_TIMEOUT_SECONDS
+    assert main_app_feed._configured_timeout(600.0) == main_app_feed.MAX_PROBE_TIMEOUT_SECONDS
+    # And a sane value is used as-is.
+    assert main_app_feed._configured_timeout(1.5) == 1.5
+
+
+async def test_the_probe_is_bounded_when_dns_blackholes(monkeypatch):
+    """A blackholing resolver must not make the probe run for 10-20s.
+
+    `socket.create_connection` resolves the name BEFORE the socket timeout
+    applies, so the DNS step used to run for the resolver's own timeout
+    (10-20s) instead of the configured 2.5s -- the docstring's "capped by
+    timeout" claim was false. DNS now has its own wall-clock budget.
+    """
+    reset_main_app_feed_cache()
+
+    def _blackhole(*args, **kwargs):
+        time.sleep(30)
+        return []
+
+    monkeypatch.setattr(socket, "getaddrinfo", _blackhole)
+
+    started = time.monotonic()
+    result = await get_main_app_feed_status_async("wss://blackholed.invalid/ws/bot/")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0, f"the probe ran for {elapsed:.1f}s"
+    assert result.reachable is False
+    assert result.failure == "timeout"
+    reset_main_app_feed_cache()
 
 
 # --------------------------------------------------------------------------
@@ -340,7 +480,7 @@ def _build_controller(strategies):
     return controller, redis_client
 
 
-def _strategy_entry(*, mode="STATIC", config_data=None):
+def _strategy_entry(*, mode="STATIC", config_data=None, omit_mode=False):
     instance = types.SimpleNamespace(NAME="VisualBuilderStrategy")
     config_dict = {
         "user_id": 1,
@@ -350,6 +490,11 @@ def _strategy_entry(*, mode="STATIC", config_data=None):
         "config_data": config_data if config_data is not None else {"params": {}},
         "started_at": "2026-10-29T00:00:00+00:00",
     }
+    if omit_mode:
+        # A config written before `symbol_selection_mode` existed, or one
+        # that never had it set. It TRADES as DYNAMIC (that is the
+        # resolver's default), so it depends on the feed.
+        config_dict.pop("symbol_selection_mode")
     return (instance, config_dict)
 
 
@@ -508,7 +653,135 @@ def test_which_strategies_depend_on_the_feed():
     )
     assert strategy_depends_on_main_app_feed("STATIC", {}) is False
     assert strategy_depends_on_main_app_feed("FIXED", {"params": {}}) is False
-    assert strategy_depends_on_main_app_feed(None, None) is False
+    # A MISSING `symbol_selection_mode` means DYNAMIC -- the same default
+    # the resolver that decides how the strategy TRADES uses. This
+    # assertion used to say False, and that was the defect: the predicate
+    # read a missing key as "" (not feed-dependent) while the strategy
+    # traded as DYNAMIC (needs the feed).
+    assert strategy_depends_on_main_app_feed(None, None) is True
+
+
+def test_a_missing_symbol_selection_mode_means_dynamic():
+    """ONE default, in ONE place, used by everyone.
+
+    The predicate, the strategy resolver and the published payload used to
+    disagree about a missing `symbol_selection_mode` ("" vs "DYNAMIC" vs
+    "STATIC"). A config without the key therefore TRADES as DYNAMIC -- it
+    needs the screener feed -- while being published as a pinned STATIC
+    strategy that did not.
+    """
+    assert resolve_symbol_selection_mode({}) == "DYNAMIC"
+    assert resolve_symbol_selection_mode({"symbol_selection_mode": None}) == "DYNAMIC"
+    assert resolve_symbol_selection_mode({"symbol_selection_mode": ""}) == "DYNAMIC"
+    assert resolve_symbol_selection_mode({"symbol_selection_mode": "STATIC"}) == "STATIC"
+    assert resolve_symbol_selection_mode({"symbol_selection_mode": "FIXED"}) == "FIXED"
+
+    # And the predicate agrees with it.
+    assert strategy_depends_on_main_app_feed(None, {}) is True
+    assert strategy_depends_on_main_app_feed("", {}) is True
+
+
+async def test_a_config_without_a_symbol_selection_mode_is_degraded(monkeypatch):
+    """It TRADES as DYNAMIC, so a dead feed must degrade it."""
+    _patch_feed(monkeypatch, DEAD_FEED)
+    strategies = {"cfg-no-mode": _strategy_entry(omit_mode=True)}
+    controller, redis_client = _build_controller(strategies)
+
+    await controller._publish_state_to_redis()
+    published = _published(redis_client)["cfg-no-mode"]
+
+    assert published["status"] == "degraded", published
+    assert "screener.depthsight.pro" in published["status_detail"]
+    # And it is PUBLISHED as what it actually is.
+    assert published["symbol_selection_mode"] == "DYNAMIC"
+
+
+async def test_a_probe_failure_is_never_published_as_running(monkeypatch):
+    """FAIL CLOSED: no verdict means no "running".
+
+    The old handler caught the probe's exception and left the degraded
+    reason EMPTY, so the strategy was published as status="running" with
+    feed_health=None -- a dead feed reported healthy, which is the exact
+    failure this branch exists to remove.
+
+    The invariant: "running" is only ever published on a POSITIVE
+    reachability verdict.
+    """
+
+    async def _explode(*args, **kwargs):
+        raise RuntimeError("the probe exploded")
+
+    monkeypatch.setattr(
+        "bot_module.controller.get_main_app_feed_status_async",
+        _explode,
+        raising=True,
+    )
+    strategies = {
+        "cfg-dynamic": _strategy_entry(mode="DYNAMIC"),
+        "cfg-pinned": _strategy_entry(mode="STATIC"),
+    }
+    controller, redis_client = _build_controller(strategies)
+
+    await controller._publish_state_to_redis()
+    published = _published(redis_client)
+
+    for key in ("cfg-dynamic", "cfg-pinned"):
+        assert published[key]["status"] != "running", published[key]
+        assert published[key]["status"] == "degraded", published[key]
+        assert "UNKNOWN" in published[key]["status_detail"]
+
+    health = published["cfg-dynamic"]["feed_health"]
+    assert health is not None
+    assert health["state"] == "unknown"
+    assert health["url"], "the unknown verdict must name the URL"
+    assert "probe_error" in health["reason"]
+    assert "the probe exploded" in health["detail"]
+
+
+async def test_a_deployment_that_does_not_use_the_feed_is_not_judged_by_it(
+    monkeypatch,
+):
+    """No feed, no probe, no verdict, no degradation.
+
+    In a deployment that does not use the MAIN_APP feed, the probe would
+    answer a question about a URL this deployment never opens.
+    """
+    monkeypatch.setattr(bot_config, "SYMBOL_SOURCE_MODE", "STATIC_LIST")
+
+    async def _must_not_run(*args, **kwargs):
+        raise AssertionError(
+            "the probe must not run in a deployment that does not use the feed"
+        )
+
+    monkeypatch.setattr(
+        "bot_module.controller.get_main_app_feed_status_async",
+        _must_not_run,
+        raising=True,
+    )
+    strategies = {"cfg-dynamic": _strategy_entry(mode="DYNAMIC")}
+    controller, redis_client = _build_controller(strategies)
+
+    await controller._publish_state_to_redis()
+    published = _published(redis_client)["cfg-dynamic"]
+
+    assert published["status"] == "running", published
+    assert published["feed_health"] is None
+
+
+def test_the_predicate_ignores_a_deployment_without_the_feed(monkeypatch):
+    """A deployment that does not use the feed depends on nothing here."""
+    monkeypatch.setattr(bot_config, "SYMBOL_SOURCE_MODE", "STATIC_LIST")
+    assert strategy_depends_on_main_app_feed("DYNAMIC", {}) is False
+    assert (
+        strategy_depends_on_main_app_feed(
+            "STATIC", {"breakeven_on_regime_change": True}
+        )
+        is False
+    )
+
+    monkeypatch.setattr(bot_config, "SYMBOL_SOURCE_MODE", "MAIN_APP")
+    monkeypatch.setattr(bot_config, "MAIN_APP_WS_ENABLED", False)
+    assert strategy_depends_on_main_app_feed("DYNAMIC", {}) is False
 
 
 # --------------------------------------------------------------------------
@@ -579,7 +852,15 @@ def test_the_cache_expires(monkeypatch):
 
 
 def test_a_reachable_probe_does_not_block_the_event_loop(monkeypatch):
-    """The probe runs in a worker thread, so the bot's loop never stalls."""
+    """The probe runs in a worker thread, so the bot's loop never stalls.
+
+    The tick counter is SHARED with the heartbeat task and the assertion is
+    `ticks > 0`. The previous version of this test read `beat.result()`
+    from a heartbeat task that NEVER finishes, so `ticks` was always None
+    and `assert ticks is None or ticks > 0` was vacuously true: the test
+    could not fail, whatever the probe did. That is why the CI gate stayed
+    green while the probe was unbounded.
+    """
     reset_main_app_feed_cache()
 
     def _slow_probe(url, timeout=None):
@@ -588,8 +869,10 @@ def test_a_reachable_probe_does_not_block_the_event_loop(monkeypatch):
 
     monkeypatch.setattr(main_app_feed, "probe_main_app_feed", _slow_probe)
 
+    ticks = 0
+
     async def _heartbeat():
-        ticks = 0
+        nonlocal ticks
         while True:
             await asyncio.sleep(0.01)
             ticks += 1
@@ -597,12 +880,12 @@ def test_a_reachable_probe_does_not_block_the_event_loop(monkeypatch):
     async def _run():
         beat = asyncio.ensure_future(_heartbeat())
         await get_main_app_feed_status_async("wss://screener.depthsight.pro/ws/bot/")
-        ticks = beat.result() if beat.done() else None
+        observed = ticks
         beat.cancel()
-        return ticks
+        return observed
 
-    ticks = asyncio.get_event_loop().run_until_complete(_run())
-    assert ticks is None or ticks > 0, "the event loop was blocked by the probe"
+    observed = asyncio.new_event_loop().run_until_complete(_run())
+    assert observed > 0, "the event loop was blocked by the probe"
     reset_main_app_feed_cache()
 
 
@@ -705,6 +988,35 @@ async def test_the_feed_health_route_reports_the_degraded_feed(
     assert data["state"] == "degraded"
     assert data["status_code"] == 525
     assert "screener.depthsight.pro" in data["reason"]
+
+
+async def test_the_feed_health_route_names_the_url_and_the_failure(
+    authenticated_client, monkeypatch
+):
+    """The "unknown" answer must be as actionable as a verdict.
+
+    It used to say only "the probe could not be completed", which names
+    neither the feed nor the failure -- so a human reading it learns
+    nothing about WHICH feed or WHY.
+    """
+    from api.routes import strategies as strategies_route
+
+    async def _explode(*args, **kwargs):
+        raise RuntimeError("the probe exploded")
+
+    monkeypatch.setattr(
+        strategies_route, "_get_main_app_feed_status_async", _explode, raising=True
+    )
+
+    response = await authenticated_client.get("/api/v1/strategies/feed-health")
+
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["state"] == "unknown"
+    assert data["url"], "the unknown verdict must name the URL"
+    assert data["url"] in data["reason"]
+    assert "probe_error" in data["reason"]
+    assert "the probe exploded" in data["reason"]
 
 
 # --------------------------------------------------------------------------
