@@ -38,17 +38,79 @@ const runBacktestMock = vi.fn();
 // The panel derives `activeApiKeys` from `useConfig()` in a render-phase sync,
 // so the mocked config has to be a STABLE object: a fresh one on every render
 // makes the panel re-render forever.
-const { configMock, savedConfigsMock } = vi.hoisted(() => ({
+//
+// `registryMock` is the server's own answer: the client no longer carries a
+// hand-written list of strategy classes, it asks the server which classes
+// this server can run (`GET /api/v1/strategies/registry`).
+const { configMock, savedConfigsMock, registryMock } = vi.hoisted(() => ({
 	configMock: {
 		apiKeys: [{ id: 1, isActive: true, status: "valid" }],
 	},
 	savedConfigsMock: [] as unknown[],
+	registryMock: {
+		strategy_pick: {
+			field: "config_data.strategy_name",
+			type: "string",
+			required: true,
+			available: [
+				"AggTradeReversal",
+				"ConsolidationImpulse",
+				"DensityBounce",
+				"FakeBreakout",
+				"FirstPullbacksInTrend",
+				"GeneticStrategy",
+				"ReverseFakeBreakout",
+				"ReverseVolumeBreakout",
+				"VisualBuilderStrategy",
+				"VolumeBreakout",
+			],
+		},
+		strategy_params: {
+			field: "config_data.strategy_params",
+			type: "object",
+			required: false,
+		},
+		risk_settings: {
+			field: "config_data.risk_settings",
+			type: "object",
+			required: false,
+			fields: {},
+		},
+		symbol_selection_mode: {
+			field: "config_data.symbol_selection_mode",
+			type: "string",
+			required: false,
+			allowed: ["manual", "auto", "all"],
+		},
+		symbols: {
+			field: "config_data.symbols",
+			type: "array<string>",
+			required: "when symbol_selection_mode is 'manual'",
+		},
+		mode: {
+			field: "config_data.mode",
+			type: "string",
+			required: false,
+			allowed: ["paper", "live"],
+		},
+		server_floor: {
+			risk_per_trade_pct: 1,
+			max_drawdown_pct: 20,
+			daily_loss_limit_pct: 5,
+			position_size_pct: 1,
+			max_stop_distance_pct: 5,
+			max_consecutive_losses: 10,
+		},
+		rules: [],
+	},
 }));
 
 vi.mock("@/lib/api", () => ({
 	fetchSymbolSelectionSettings: vi.fn().mockResolvedValue({}),
 	updateSymbolSelectionSettings: vi.fn().mockResolvedValue({}),
 	useConfig: () => ({ data: configMock }),
+	// The server's registry: the strategy classes it can run and its floors.
+	useStrategyRegistry: () => ({ data: registryMock }),
 	// No saved strategy yet: the editor is creating a new one.
 	useStrategyConfigsList: () => ({ data: savedConfigsMock }),
 	useRunBacktest: () => ({ mutate: runBacktestMock, isPending: false }),

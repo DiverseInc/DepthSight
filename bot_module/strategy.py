@@ -12279,6 +12279,61 @@ class FirstPullbacksInTrendStrategy(BaseStrategy):
             return None  # pragma: no cover
 
 
+def _partial_exits_cover_whole_position(raw: Any) -> bool:
+    """True when a partial-exit configuration closes the WHOLE position.
+
+    The partial targets are ``(rr, fraction)`` pairs. When the fractions add
+    up to 1.0 (or more) the position is fully closed by the partials and the
+    signal carries NO take-profit.
+    """
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return False
+    total = 0.0
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return False
+        try:
+            total += float(item[1])
+        except (TypeError, ValueError):
+            return False
+    return total >= 1.0
+
+
+def _borrowed_original_strategy_params(strategy: BaseStrategy) -> Dict[str, Any]:
+    """The params for the strategy a "Reverse*" strategy borrows its signal from.
+
+    The client's own parameters are forwarded, so the borrowed strategy runs
+    with the settings the client picked (the timeframe it asked for, and so
+    on) instead of the config defaults.
+
+    The partial-exit override is the ONE exception: it is applied separately,
+    because the reverse is built from the ORIGINAL signal's take-profit. A
+    partial-exit configuration that covers 100% of the position leaves the
+    original signal with no take-profit at all -- there is then nothing to
+    reverse and the strategy could never fire. Such a configuration is
+    dropped here so a final take-profit always exists. A configuration that
+    leaves room for a final take-profit is kept: the client asked for it.
+
+    A partial-exit configuration the client did NOT send is cleared as well:
+    the shipped default (bot_module/config.py) covers 100% of the position,
+    which is the state the reverse could never fire from.
+    """
+    client_params = strategy._instance_params.get("strategy_params")
+    params: Dict[str, Any] = {}
+    if isinstance(client_params, dict):
+        params.update(client_params)
+    # The partial-exit override is applied below, never copied through.
+    params.pop("partial_exit_rr_config", None)
+
+    raw_partial = strategy._instance_params.get("partial_exit_rr_config")
+    if raw_partial is None and isinstance(client_params, dict):
+        raw_partial = client_params.get("partial_exit_rr_config")
+    if raw_partial is None or _partial_exits_cover_whole_position(raw_partial):
+        raw_partial = None
+    params["partial_exit_rr_config"] = raw_partial
+    return params
+
+
 class ReverseVolumeBreakoutStrategy(BaseStrategy):
     NAME = "ReverseVolumeBreakout"
     description = "Reverses VolumeBreakoutStrategy signals based on volume confirmation and price action."
@@ -12319,18 +12374,25 @@ class ReverseVolumeBreakoutStrategy(BaseStrategy):
 
         get_strategy_instance() hands out a SHARED instance built from the
         config defaults, and a client's parameters never reach it. So the
-        original strategy is rebuilt here from the config defaults with ONE
-        change: the partial exits are cleared, unless the client set them
-        explicitly, so that a final take-profit exists to reverse.
+        original strategy is rebuilt here from the config defaults with the
+        client's own parameters, and with ONE change: the partial exits are
+        cleared, unless the client set them explicitly without covering the
+        whole position, so that a final take-profit exists to reverse.
+
+        The rebuilt instance is CACHED on this strategy: it used to be
+        constructed again on every candle, which is both slow and pointless
+        -- the parameters it is built from cannot change while it runs.
         """
-        base_params: Dict[str, Any] = {}
-        if "partial_exit_rr_config" in self._instance_params:
-            base_params["partial_exit_rr_config"] = self._instance_params[
-                "partial_exit_rr_config"
-            ]
-        else:
-            base_params["partial_exit_rr_config"] = None
-        return create_strategy_instance(self.ORIGINAL_STRATEGY_NAME, params=base_params)
+        cached = getattr(self, "_original_strategy_instance", None)
+        if cached is not None:
+            return cached
+        base_params = _borrowed_original_strategy_params(self)
+        instance = create_strategy_instance(
+            self.ORIGINAL_STRATEGY_NAME, params=base_params
+        )
+        if instance is not None:
+            self._original_strategy_instance = instance
+        return instance
 
     def _check_specific_signal_logic(
         self,
@@ -12457,18 +12519,25 @@ class ReverseFakeBreakoutStrategy(BaseStrategy):
 
         get_strategy_instance() hands out a SHARED instance built from the
         config defaults, and a client's parameters never reach it. So the
-        original strategy is rebuilt here from the config defaults with ONE
-        change: the partial exits are cleared, unless the client set them
-        explicitly, so that a final take-profit exists to reverse.
+        original strategy is rebuilt here from the config defaults with the
+        client's own parameters, and with ONE change: the partial exits are
+        cleared, unless the client set them explicitly without covering the
+        whole position, so that a final take-profit exists to reverse.
+
+        The rebuilt instance is CACHED on this strategy: it used to be
+        constructed again on every candle, which is both slow and pointless
+        -- the parameters it is built from cannot change while it runs.
         """
-        base_params: Dict[str, Any] = {}
-        if "partial_exit_rr_config" in self._instance_params:
-            base_params["partial_exit_rr_config"] = self._instance_params[
-                "partial_exit_rr_config"
-            ]
-        else:
-            base_params["partial_exit_rr_config"] = None
-        return create_strategy_instance(self.ORIGINAL_STRATEGY_NAME, params=base_params)
+        cached = getattr(self, "_original_strategy_instance", None)
+        if cached is not None:
+            return cached
+        base_params = _borrowed_original_strategy_params(self)
+        instance = create_strategy_instance(
+            self.ORIGINAL_STRATEGY_NAME, params=base_params
+        )
+        if instance is not None:
+            self._original_strategy_instance = instance
+        return instance
 
     def _check_specific_signal_logic(
         self,
@@ -12656,9 +12725,16 @@ def _verify_registry_candidate(cls: Type[BaseStrategy]) -> Optional[str]:
     #    strategy is the documented exception: it is driven by the JSON
     #    interpreter inside check_signal_sync, not by that hook (the same
     #    name-based special case is already used by required_indicators).
+    #
+    #    The exception is checked STRUCTURALLY (a subclass of
+    #    VisualBuilderStrategy), not by name: the genetic adapter
+    #    (bot_module/genetic_adapter.py) is a VisualBuilderStrategy subclass
+    #    named "GeneticStrategy", so it inherits the interpreter and does not
+    #    define the hook either. A name-based check would have let that
+    #    second candidate of the same kind into the registry unverified.
     if (
         "_check_specific_signal_logic" not in cls.__dict__
-        and cls.NAME != "VisualBuilderStrategy"
+        and not issubclass(cls, VisualBuilderStrategy)
     ):
         return "does not implement _check_specific_signal_logic"
 
@@ -12704,7 +12780,12 @@ def _build_strategy_registry() -> Dict[str, Type[BaseStrategy]]:
             # lives. CompassStrategy is defined in its own module (which
             # imports xgboost) and is registered by bot_runner.py at process
             # start; it is deliberately not imported from here.
-            logger.info(
+            #
+            # WARNING, not INFO: this line is the only trace of a strategy
+            # that was advertised but did not make it into the registry, and
+            # at the default log level INFO is not shown at all -- so a
+            # dropped candidate was invisible.
+            logger.warning(
                 f"Strategy '{name}' is not a direct BaseStrategy subclass at "
                 f"import time; it is not registered here."
             )
@@ -12742,17 +12823,29 @@ else:
     )  # pragma: no cover
 
 # Genetic Strategy Adapter Registration
+#
+# The adapter is verified like every other candidate: a strategy that cannot
+# be constructed, or that cannot say what data it needs, must not sit in the
+# registry where a client can pick it and get nothing.
 try:
     from bot_module.genetic_adapter import GeneticCompatibleStrategy
 
-    if GeneticCompatibleStrategy.NAME in STRATEGIES:
-        logger.warning(
-            f"Overwriting strategy {GeneticCompatibleStrategy.NAME} with adapter version."
+    _genetic_reason = _verify_registry_candidate(GeneticCompatibleStrategy)
+    if _genetic_reason:
+        logger.error(
+            f"Strategy '{GeneticCompatibleStrategy.NAME}' REJECTED from the registry: "
+            f"{_genetic_reason}. A client that picks it would get a strategy that "
+            f"cannot start."
         )
-    STRATEGIES[GeneticCompatibleStrategy.NAME] = GeneticCompatibleStrategy
-    logger.info(
-        f"Registered GeneticCompatibleStrategy as '{GeneticCompatibleStrategy.NAME}'"
-    )
+    else:
+        if GeneticCompatibleStrategy.NAME in STRATEGIES:
+            logger.warning(
+                f"Overwriting strategy {GeneticCompatibleStrategy.NAME} with adapter version."
+            )
+        STRATEGIES[GeneticCompatibleStrategy.NAME] = GeneticCompatibleStrategy
+        logger.info(
+            f"Registered GeneticCompatibleStrategy as '{GeneticCompatibleStrategy.NAME}'"
+        )
 except ImportError as e:
     logger.warning(f"Could not import GeneticCompatibleStrategy: {e}")
 

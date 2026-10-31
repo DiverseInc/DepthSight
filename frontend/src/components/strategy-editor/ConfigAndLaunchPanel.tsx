@@ -24,8 +24,11 @@ import {
 } from "@/components/strategies/StrategyEditorSettingsCards";
 import {
 	DEFAULT_STRATEGY_RISK_SETTINGS,
+	SERVER_RISK_FLOOR,
+	applyStrategyRegistry,
 	parseRiskDraft,
 	toRiskDraft,
+	toRiskSettingsFromAccount,
 	validateStrategyClass,
 	validateStrategyRiskSettings,
 } from "@/components/strategies/strategyEditorSettings";
@@ -38,7 +41,7 @@ import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 
 // UI Components
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -74,6 +77,7 @@ import {
 	useSendTradingViewTestSignal,
 	useStartStrategy,
 	useStrategyConfigsList,
+	useStrategyRegistry,
 	useTradingViewWebhookInfo,
 	useTradingViewWebhookStatus,
 	useUpdateStrategyConfig,
@@ -149,6 +153,17 @@ export const ConfigAndLaunchPanel = memo(
 			useUpdateStrategyConfig();
 		const { data: config } = useConfig();
 		const { data: savedStrategyConfigs } = useStrategyConfigsList();
+		const { data: strategyRegistry } = useStrategyRegistry();
+
+		// The server's registry IS the list of strategy classes and the list of
+		// risk floors. It is applied before the picker renders, so the options
+		// on screen are the server's own and not a hand-written copy of them.
+		// (The module-level array is filled IN PLACE, so every component that
+		// reads it sees the server's answer.)
+		useMemo(() => {
+			applyStrategyRegistry(strategyRegistry);
+			return strategyRegistry;
+		}, [strategyRegistry]);
 		const [selectedApiKeyId, setSelectedApiKeyId] = useState<number | null>(
 			null,
 		);
@@ -301,8 +316,19 @@ export const ConfigAndLaunchPanel = memo(
 		>(undefined);
 
 		// Render-phase sync of the client-typed settings with the saved strategy.
+		//
+		// The risk limits are seeded from the ACCOUNT's live `risk_management`
+		// -- the same block the bot reads its limits from
+		// (`bot_module/risk_manager.py:179`) -- so the editor shows the limits
+		// that are actually in force instead of a hardcoded guess. A limit
+		// saved with THIS strategy still wins over the account's default.
+		const accountRiskSettings = useMemo(
+			() => toRiskSettingsFromAccount(config?.riskManagement),
+			[config],
+		);
 		const savedSettingsSeed = JSON.stringify({
 			risk: savedStrategyConfig?.config_data?.risk_settings ?? null,
+			accountRisk: accountRiskSettings,
 			class: savedStrategyConfig?.config_data?.strategy_name ?? null,
 		});
 		const [lastSavedSettingsSeed, setLastSavedSettingsSeed] = useState<
@@ -312,7 +338,11 @@ export const ConfigAndLaunchPanel = memo(
 			setLastSavedSettingsSeed(savedSettingsSeed);
 			const savedRisk = savedStrategyConfig?.config_data?.risk_settings;
 			setRiskDraft(
-				toRiskDraft(savedRisk ?? DEFAULT_STRATEGY_RISK_SETTINGS),
+				toRiskDraft(
+					savedRisk ??
+						accountRiskSettings ??
+						DEFAULT_STRATEGY_RISK_SETTINGS,
+				),
 			);
 			setRiskErrors({});
 			setStrategyClass(
@@ -440,10 +470,11 @@ export const ConfigAndLaunchPanel = memo(
 				return;
 			}
 
-			// The strategy class has to be picked. The picker only offers classes
-			// the trading bot registers, so an unknown class can only come back
-			// from the server: that is surfaced as a warning, and the server
-			// stays the authority on what it can instantiate.
+			// The strategy class has to be picked, and it has to be one the
+			// SERVER can run: the list the picker offers is the server's own
+			// registry, and the server refuses the save with 422 for a class it
+			// cannot instantiate. So an unknown class blocks the deploy here
+			// instead of only warning about it.
 			const nextClassError = validateStrategyClass(strategyClass);
 			setStrategyClassError(nextClassError.className);
 			if (nextClassError.className === "empty") {
@@ -459,12 +490,14 @@ export const ConfigAndLaunchPanel = memo(
 			}
 			if (nextClassError.className === "notRegistered") {
 				toast({
-					title: t("common:successTitle"),
+					variant: "destructive",
+					title: t("common:errorTitle"),
 					description: t(
 						"configPanel.strategyEngineUnregisteredWarning",
-						"This strategy class is not in the trading bot's known list, so it may not start.",
+						"This strategy class is not registered by the trading bot, so it may not start.",
 					),
 				});
+				return;
 			}
 
 			try {
@@ -985,6 +1018,98 @@ export const ConfigAndLaunchPanel = memo(
 							}}
 							disabled={isAnythingLoading}
 						/>
+
+						{/*
+						 * The two limits the server's floor also covers: the
+						 * largest stop distance and the number of consecutive
+						 * losses. They are optional -- an empty field means
+						 * "leave the account's own value alone" -- and they are
+						 * seeded from the account, so an untouched form never
+						 * sends anything looser than the account already has.
+						 */}
+						<Card>
+							<CardHeader>
+								<CardTitle>
+									{t("configPanel.riskLimitsExtraTitle", "Risk Limits (advanced)")}
+								</CardTitle>
+								<CardDescription>
+									{t(
+										"configPanel.riskLimitsExtraDescription",
+										"Leave a field empty to keep the account's current value.",
+									)}
+								</CardDescription>
+							</CardHeader>
+							<CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+								{(["max_stop_distance_pct", "max_consecutive_losses"] as const).map(
+									(field) => {
+										const inputId = `risk-${field}`;
+										const fieldError = riskErrors?.[field];
+										return (
+											<div key={field} className="space-y-1">
+												<Label htmlFor={inputId}>
+													{field === "max_stop_distance_pct"
+														? t(
+												"configPanel.maxStopDistanceLabel",
+												"Max Stop Distance (%)",
+											)
+														: t(
+												"configPanel.maxConsecutiveLossesLabel",
+												"Max Consecutive Losses",
+											)}
+												</Label>
+												<Input
+													id={inputId}
+													type="number"
+													inputMode="decimal"
+													step={field === "max_stop_distance_pct" ? "0.5" : "1"}
+													min="0"
+													value={riskDraft[field]}
+													disabled={isAnythingLoading}
+													aria-invalid={Boolean(fieldError)}
+													aria-describedby={`${inputId}-desc`}
+													onChange={(event) => {
+														const nextDraft = {
+															...riskDraft,
+															[field]: event.target.value,
+														};
+														setRiskDraft(nextDraft);
+														setRiskErrors(
+															validateStrategyRiskSettings(
+																parseRiskDraft(nextDraft),
+															),
+														);
+													}}
+												/>
+												<p id={`${inputId}-desc`} className="text-xs text-muted-foreground">
+													{t("configPanel.riskServerFloor", {
+														defaultValue: `Server floor: ${SERVER_RISK_FLOOR[field]}.`,
+														floor: SERVER_RISK_FLOOR[field],
+													})}
+												</p>
+												{fieldError ? (
+													<p role="alert" className="text-xs text-destructive">
+														{fieldError === "aboveFloor"
+															? t(
+																	"configPanel.riskErrorAboveFloor",
+																	`The server rejects a value above ${SERVER_RISK_FLOOR[field]}.`,
+																)
+															: fieldError === "notPositive"
+																? t(
+																	"configPanel.riskErrorNotPositive",
+																	"Must be greater than zero.",
+																)
+																: t(
+																	"configPanel.riskErrorNotANumber",
+																	"Enter a number.",
+																)}
+													</p>
+												) : null}
+											</div>
+										);
+									},
+								)}
+							</CardContent>
+						</Card>
 
 						<Card>
 							<CardHeader>

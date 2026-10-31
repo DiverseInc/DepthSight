@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 import redis.asyncio as redis
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import update
 
@@ -58,6 +59,97 @@ strategies_router = APIRouter(
     tags=["Strategies"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+# --- the client contract -----------------------------------------------------
+#
+# ``bot_module/strategy_registry.py`` is the ONE contract for the strategy
+# pick and the risk limits. It used to be imported by nothing in ``api/``,
+# which is why every guarantee it encodes existed only inside the tests:
+# a raw POST with ``daily_loss_limit_pct = 99``, an unknown risk key, or a
+# strategy name the server cannot run was STORED, not refused, and the bot
+# read its limits from the account settings -- which nothing merged the
+# client's limits into.
+#
+# The registry is the authority at the request boundary from now on.
+
+
+def _client_contract_payload(config_data: Dict[str, Any]) -> Dict[str, Any]:
+    """The payload the client-contract validator reads.
+
+    Only ``config_data`` is handed over, on purpose. The API's own
+    ``symbol_selection_mode`` ("STATIC" / "FIXED" / "DYNAMIC") is a
+    DIFFERENT vocabulary from the bot's ("manual" / "auto" / "all"), so
+    passing it to the registry validator would refuse every request for a
+    reason that has nothing to do with the contract. The bot-level mode is
+    read from ``config_data`` only when a client puts one there.
+    """
+    return {"config_data": config_data}
+
+
+def _client_config_refused(exc: Exception) -> JSONResponse:
+    """The 422 answer for a payload the contract refuses.
+
+    Every problem is returned at once, so the client does not have to fix
+    them one round trip at a time. The list is in ``error.issues``; the
+    summary is in ``detail`` as well, because that is the field the client
+    shows to the user.
+    """
+    issues = list(getattr(exc, "issues", []) or [str(exc)])
+    summary = "The strategy configuration was refused: " + "; ".join(issues)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": {"message": summary, "issues": issues},
+            "detail": summary,
+            "data": None,
+        },
+    )
+
+
+async def _apply_client_risk_settings(
+    db: AsyncSession, user_id: int, client_config: Any
+) -> None:
+    """Merge the client's risk limits into the account's ``risk_management``.
+
+    The bot reads its limits from the ACCOUNT settings, not from the strategy
+    config: ``bot_module/risk_manager.py:179`` reads
+    ``user_settings["risk_management"]``. So the applied values are MERGED
+    back into that block -- keys the client did not set keep the account's
+    own value, and no value is ever looser than the account's own value or
+    the server floor (``apply_client_risk_config`` does the clamping).
+
+    The merge is a merge, not a replace: the account's ``blacklist`` and
+    every other key it holds are left alone.
+    """
+    from bot_module.strategy_registry import apply_client_risk_config
+
+    db_config = await crud.get_config_model(db, user_id=user_id)
+    current: Dict[str, Any] = {}
+    if db_config is not None and isinstance(db_config.risk_management, dict):
+        current = dict(db_config.risk_management)
+
+    applied = apply_client_risk_config(client_config, current)
+    merged = dict(current)
+    merged.update(applied["risk_management"])
+    await crud.update_config_section(db, user_id, "risk_management", merged)
+
+
+@strategies_router.get("/registry", response_model=schemas.ApiResponseData[Dict[str, Any]])
+async def get_strategy_registry(
+    current_user: models.User = Depends(get_current_user),
+):
+    """The strategy pick and the risk limits the client may use.
+
+    This is the contract the frontend used to GUESS: it carried its own
+    hand-written list of strategy names and its own hand-written copy of the
+    server's risk floors, so the two could drift apart and the client would
+    offer a strategy the server cannot run. The list and the floors are
+    generated from the same constants the validator uses, so they cannot.
+    """
+    from bot_module.strategy_registry import describe_client_contract
+
+    return {"data": describe_client_contract()}
 
 
 @strategies_router.get("/evaluation-state")
@@ -322,12 +414,35 @@ async def save_strategy_configuration(
         _coerce_strategy_config_dict,
         _enforce_strategy_plan_restrictions,
     )
+    from bot_module.strategy_registry import (
+        ClientConfigError,
+        validate_client_strategy_config,
+    )
 
     logger.info(
         f"User '{current_user.username}' (ID: {current_user.id}) saving new strategy config: {strategy_create.name}"
     )
     config_data = _coerce_strategy_config_dict(strategy_create.config_data, "new")
     _enforce_strategy_plan_restrictions(config_data, current_user)
+
+    # The contract decides whether this configuration may be stored at all.
+    # It runs BEFORE the row is written, so a refused payload leaves nothing
+    # behind.
+    try:
+        client_config = validate_client_strategy_config(
+            _client_contract_payload(config_data)
+        )
+    except ClientConfigError as exc:
+        logger.warning(
+            f"User '{current_user.username}' sent a strategy configuration the "
+            f"server refused: {exc}"
+        )
+        return _client_config_refused(exc)
+
+    # The bot reads its limits from the account settings, so the client's
+    # limits are merged into them here.
+    await _apply_client_risk_settings(db, current_user.id, client_config)
+
     db_config = await crud.create_strategy_config(
         db=db, user_id=current_user.id, config_create=strategy_create
     )
@@ -391,6 +506,10 @@ async def update_saved_strategy_configuration(
         _enforce_strategy_plan_restrictions,
         count_blocks,
     )
+    from bot_module.strategy_registry import (
+        ClientConfigError,
+        validate_client_strategy_config,
+    )
 
     logger.info(
         f"User '{current_user.username}' (ID: {current_user.id}) updating config: {config_id}"
@@ -400,6 +519,19 @@ async def update_saved_strategy_configuration(
             strategy_update.config_data, config_id
         )
         _enforce_strategy_plan_restrictions(config_data, current_user)
+        # Same contract as the create path: a configuration the server refuses
+        # is not written, and the row keeps what it had.
+        try:
+            client_config = validate_client_strategy_config(
+                _client_contract_payload(config_data)
+            )
+        except ClientConfigError as exc:
+            logger.warning(
+                f"User '{current_user.username}' sent a strategy configuration the "
+                f"server refused: {exc}"
+            )
+            return _client_config_refused(exc)
+        await _apply_client_risk_settings(db, current_user.id, client_config)
     updated_config = await crud.update_strategy_config(
         db, user_id=current_user.id, config_id=config_id, config_update=strategy_update
     )

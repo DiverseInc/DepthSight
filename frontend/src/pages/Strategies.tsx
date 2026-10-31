@@ -34,7 +34,11 @@ import {
 	LaunchStrategyModal,
 } from "@/components/strategies/LaunchStrategyModal";
 import { StrategyDetailsPanel } from "@/components/strategies/StrategyDetailsPanel";
-import { isStrategyClassRegistered } from "@/components/strategies/strategyEditorSettings";
+import {
+	applyStrategyRegistry,
+	isStrategyClassRegistered,
+	isStrategyRegistryLoaded,
+} from "@/components/strategies/strategyEditorSettings";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -63,6 +67,7 @@ import {
 	useStopStrategy,
 	useStrategies,
 	useStrategyConfigsList,
+	useStrategyRegistry,
 	useUpdateStrategyConfig,
 } from "@/lib/api";
 import { useAccountStore } from "@/stores/accountStore";
@@ -178,7 +183,9 @@ const StrategyCard = forwardRef<
 							</div>
 
 							{/* A class the trading bot does not register cannot start. */}
-							{strategyClass && !isStrategyClassRegistered(strategyClass) && (
+							{strategyClass &&
+								isStrategyRegistryLoaded() &&
+								!isStrategyClassRegistered(strategyClass) && (
 								<p className="text-xs text-destructive">
 									{t(
 										"strategyClassNotRegistered",
@@ -469,6 +476,14 @@ export default function Strategies() {
 		isError: isErrorConfigs,
 		error: errorConfigs,
 	} = useStrategyConfigsList();
+
+	// The server's registry is the authority on which strategy classes can
+	// run; it is applied here so the card badge below is right.
+	const { data: strategyRegistry } = useStrategyRegistry();
+	useMemo(() => {
+		applyStrategyRegistry(strategyRegistry);
+		return strategyRegistry;
+	}, [strategyRegistry]);
 
 	const runningStrategies = useMemo(() => {
 		return [...liveRunningStrategies, ...paperRunningStrategies];

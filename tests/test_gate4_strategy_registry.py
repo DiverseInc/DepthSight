@@ -34,7 +34,7 @@ strategy that stops working shows up as a failure here.
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pytest
@@ -48,7 +48,11 @@ from bot_module.strategy import (
 
 #: The strategies this gate puts into the registry, with the pattern each one
 #: is expected to detect on the scenario built for it.
-ENABLED_CLASSIC_STRATEGIES: Dict[str, str] = {
+#:
+#: ``None`` means "this strategy has no named pattern": it is driven by the
+#: blocks of the configuration it is given, so what has to hold is that its
+#: own configuration fired and produced a trade.
+ENABLED_CLASSIC_STRATEGIES: Dict[str, Optional[str]] = {
     "VolumeBreakout": "VolBreakUp",
     "FakeBreakout": "FakeBreakUp",
     "DensityBounce": "DensityBounceLong",
@@ -57,6 +61,49 @@ ENABLED_CLASSIC_STRATEGIES: Dict[str, str] = {
     "FirstPullbacksInTrend": "PullbackSmaLong",
     "ReverseVolumeBreakout": "VolBreakUp",
     "ReverseFakeBreakout": "FakeBreakUp",
+    # The genetic adapter executes the visual blocks of the configuration it
+    # is handed (bot_module/genetic_adapter.py), so it has no named pattern.
+    "GeneticStrategy": None,
+}
+
+#: The configuration the genetic adapter is given. Without it the adapter has
+#: nothing to execute, so it is part of the scenario, not an afterthought.
+GENETIC_VISUAL_CONFIG: Dict[str, Any] = {
+    "name": "Genetic Strategy",
+    "min_total_foundation_weight_threshold": 0,
+    "entryConditions": {
+        "id": "e_root",
+        "type": "AND",
+        "children": [
+            {
+                "type": "price_vs_level",
+                "params": {
+                    "price_source": {"source": "candle", "key": "close"},
+                    "operator": "gt",
+                    "level_source": {"source": "value", "value": 99},
+                },
+            }
+        ],
+    },
+    "initialization": {
+        "id": "act1",
+        "type": "open_position",
+        "params": {
+            "direction": "LONG",
+            "sl_type": "fixed_price",
+            "sl_value": 98.0,
+            "tp_type": "fixed_price",
+            "tp_value": 110.0,
+        },
+    },
+    "positionManagement": [],
+}
+
+#: The params a strategy is constructed with. The engine's own call is
+#: ``create_strategy_instance(name, params={"enabled": True})``; a strategy
+#: that is driven by a configuration needs that configuration.
+STRATEGY_INSTANCE_PARAMS: Dict[str, Dict[str, Any]] = {
+    "GeneticStrategy": {"enabled": True, "config": GENETIC_VISUAL_CONFIG},
 }
 
 #: Named strategies that are deliberately NOT in the registry, and why.
@@ -223,6 +270,15 @@ def _first_pullbacks_scenario() -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str,
     return candles, _pair_info(100.0, len(market["kline_5m"]) - 1), market
 
 
+def _genetic_scenario() -> Tuple[pd.DataFrame, Dict[str, Any], Dict[str, Any]]:
+    # The genetic adapter runs the blocks of the configuration it is handed:
+    # a close above 99 opens a long with a stop at 98 and a target at 110.
+    rows = _flat(60)
+    rows.append([100.0, 101.0, 99.9, 100.8, 3000.0])
+    candles = _candles(rows)
+    return candles, _pair_info(100.8, len(candles) - 1), _market_data(candles)
+
+
 SCENARIOS = {
     "VolumeBreakout": _volume_breakout_scenario,
     "FakeBreakout": _fake_breakout_scenario,
@@ -232,6 +288,7 @@ SCENARIOS = {
     "FirstPullbacksInTrend": _first_pullbacks_scenario,
     "ReverseVolumeBreakout": _volume_breakout_scenario,
     "ReverseFakeBreakout": _fake_breakout_scenario,
+    "GeneticStrategy": _genetic_scenario,
 }
 
 
@@ -259,7 +316,9 @@ def test_registry_is_not_the_old_two_entry_list():
 @pytest.mark.parametrize("name", sorted(ENABLED_CLASSIC_STRATEGIES))
 def test_enabled_strategy_constructs_through_the_engine(name):
     """The engine's own construction call must work for every enabled name."""
-    instance = create_strategy_instance(name, params={"enabled": True})
+    instance = create_strategy_instance(
+        name, params=STRATEGY_INSTANCE_PARAMS.get(name, {"enabled": True})
+    )
     assert instance is not None, f"{name} could not be constructed by the engine"
     assert isinstance(instance, BaseStrategy)
     assert instance.NAME == name
@@ -269,10 +328,21 @@ def test_enabled_strategy_constructs_through_the_engine(name):
 @pytest.mark.parametrize("name", sorted(ENABLED_CLASSIC_STRATEGIES))
 def test_enabled_strategy_detects_its_own_pattern(name):
     """The strategy's own pattern check must fire on a scenario built for it."""
-    instance = create_strategy_instance(name, params={"enabled": True})
+    expected = ENABLED_CLASSIC_STRATEGIES[name]
+    instance = create_strategy_instance(
+        name, params=STRATEGY_INSTANCE_PARAMS.get(name, {"enabled": True})
+    )
     _, pair_info, market = SCENARIOS[name]()
+    if expected is None:
+        # A configuration-driven strategy has no named pattern: what detects
+        # the setup is the blocks in its own configuration, so the assertion is
+        # that those blocks fired.
+        signal, _, _ = instance.check_signal_sync(pair_info, market)
+        assert signal is not None, f"{name} produced no signal on its own scenario"
+        assert signal.details["decision_trace"]["result"] is True
+        return
     foundations, _ = instance.check_foundations(pair_info, market)
-    assert foundations.get("pattern_detected") == ENABLED_CLASSIC_STRATEGIES[name]
+    assert foundations.get("pattern_detected") == expected
 
 
 @pytest.mark.parametrize("name", sorted(ENABLED_CLASSIC_STRATEGIES))
@@ -282,14 +352,38 @@ def test_enabled_strategy_emits_a_signal_end_to_end(name):
     This runs the whole path the bot runs: check_signal_sync -> foundations ->
     the strategy's own signal logic -> the foundation weight gate.
     """
-    instance = create_strategy_instance(name, params={"enabled": True})
+    instance = create_strategy_instance(
+        name, params=STRATEGY_INSTANCE_PARAMS.get(name, {"enabled": True})
+    )
     _, pair_info, market = SCENARIOS[name]()
     signal, weight, trace = instance.check_signal_sync(pair_info, market)
     assert signal is not None, f"{name} produced no signal on its own scenario"
     assert signal.direction is not None
     assert signal.stop_loss is not None
-    assert weight > 0
     assert trace
+    if ENABLED_CLASSIC_STRATEGIES[name] is None:
+        # A configuration-driven strategy has no named pattern and no
+        # "expensive signal" weight; what has to hold is that its own
+        # configuration fired.
+        assert signal.details["decision_trace"]["result"] is True
+    else:
+        assert weight > 0
+
+
+def test_the_genetic_adapter_went_through_the_registry_verification():
+    """The genetic adapter must be VERIFIED, not just registered.
+
+    ``bot_module/strategy.py`` used to drop the adapter into the registry
+    without asking the same questions it asks every other candidate, so a
+    broken adapter would still be offered to a client -- and a client that
+    picked it would get a strategy that cannot start.
+    """
+    from bot_module.genetic_adapter import GeneticCompatibleStrategy
+    from bot_module.strategy import _verify_registry_candidate
+
+    assert GeneticCompatibleStrategy.NAME in STRATEGIES
+    assert STRATEGIES[GeneticCompatibleStrategy.NAME] is GeneticCompatibleStrategy
+    assert _verify_registry_candidate(GeneticCompatibleStrategy) is None
 
 
 def test_online_agent_strategy_is_deliberately_not_registered():

@@ -1755,6 +1755,29 @@ class StrategyV2ConfigData(BaseModel):
     oracle_confidence: Optional[float] = None
     use_ml_confirmation: Optional[bool] = False
     breakeven_on_regime_change: Optional[bool] = False
+    # The client's strategy PICK parameters and RISK limits.
+    #
+    # These two blocks are part of the contract the API validates
+    # (bot_module/strategy_registry.py). They MUST be declared fields here:
+    # `model_dump()` drops every key that is not a declared field, so an
+    # undeclared `risk_settings` was silently removed from the payload the
+    # routes persist -- the client set a risk limit and the server stored
+    # nothing.
+    risk_settings: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "The client's risk limits, validated against the server floor by "
+            "bot_module/strategy_registry.py. Every key is optional; omitting "
+            "one means 'leave the account's current value alone'."
+        ),
+    )
+    strategy_params: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "The per-strategy parameter set merged into the params the strategy "
+            "instance is constructed with."
+        ),
+    )
 
 
 # AI_CONTEXT_END

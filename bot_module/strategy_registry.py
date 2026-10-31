@@ -164,6 +164,16 @@ POSITION_SIZE_STRATEGY_PARAM: str = "risk_pct_per_trade"
 #: is not here cannot be started and is not offered.
 CLIENT_SELECTABLE_STRATEGIES: Tuple[str, ...] = tuple(sorted(STRATEGIES.keys()))
 
+#: The pick the server uses when a client made none.
+#:
+#: It is the schema's own default (``api/schemas.py``: ``StrategyV2ConfigData.
+#: strategy_name``) and the controller's fallback (``bot_module/controller.py``
+#: assigns "VisualBuilderStrategy" when ``config_data`` has no
+#: ``strategy_name``). A client that made no pick therefore gets exactly the
+#: strategy it gets today -- it is NOT refused, because refusing it would
+#: break every configuration that was saved before the pick existed.
+DEFAULT_CLIENT_STRATEGY_NAME: str = "VisualBuilderStrategy"
+
 #: The strategy modes a client may ask for.
 CLIENT_ALLOWED_MODES: Tuple[str, ...] = ("paper", "live")
 
@@ -263,7 +273,10 @@ def validate_client_strategy_config(payload: Mapping[str, Any]) -> ClientStrateg
 
     * ``config_data.strategy_name`` must name a strategy that is in the
       registry. A name that is not registered cannot be started, so it is
-      refused rather than stored and silently ignored.
+      refused rather than stored and silently ignored. A configuration with
+      NO pick at all is not refused: the server's own default applies
+      (``DEFAULT_CLIENT_STRATEGY_NAME``), which is what the controller does
+      with it anyway.
     * Every risk number must be a number greater than zero and no larger
       than the server floor for that field.
     * Unknown risk settings are refused. A setting the server does not know
@@ -286,7 +299,13 @@ def validate_client_strategy_config(payload: Mapping[str, Any]) -> ClientStrateg
     config_data = dict(config_data)
 
     strategy_name = config_data.get("strategy_name")
-    if not isinstance(strategy_name, str) or not strategy_name.strip():
+    if strategy_name is None:
+        # No pick was made. The server's own default applies -- the same
+        # strategy the controller falls back to. A pick that is PRESENT must
+        # be a strategy this server can run; a pick that is absent is not a
+        # broken pick, it is no pick.
+        strategy_name = DEFAULT_CLIENT_STRATEGY_NAME
+    elif not isinstance(strategy_name, str) or not strategy_name.strip():
         issues.append("config_data.strategy_name is required")
         strategy_name = ""
     else:
@@ -483,7 +502,13 @@ def describe_client_contract() -> Dict[str, Any]:
         "strategy_pick": {
             "field": "config_data.strategy_name",
             "type": "string",
-            "required": True,
+            "required": False,
+            "description": (
+                "The pick. A name this server cannot run is refused. A "
+                "configuration that carries NO pick is not refused: the "
+                "server's own default applies, which is what the controller "
+                "does with it anyway."
+            ),
             "available": list(CLIENT_SELECTABLE_STRATEGIES),
         },
         "strategy_params": {
