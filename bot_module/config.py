@@ -225,6 +225,33 @@ BINANCE_SPOT_DATA_API_URL_FOR_LOADER = "https://api.binance.com/api/v3"
 BINANCE_FUTURES_USDTM_DATA_API_URL_FOR_LOADER = "https://fapi.binance.com/fapi/v1"
 BINANCE_FUTURES_COINM_DATA_API_URL_FOR_LOADER = "https://dapi.binance.com/dapi/v1"
 
+# Binance's public bulk-archive host. It serves the SAME klines as the REST
+# market-data endpoints above, but on a different host that stays reachable
+# when those are geo/IP-blocked (they answer HTTP 451 from some networks).
+# Used only as a FALLBACK; the REST path above is still tried first and is
+# unchanged.
+BINANCE_BULK_ARCHIVE_DATA_URL = "https://data.binance.vision/data"
+
+# The TOTAL time ONE bulk-archive fallback load may spend, across every
+# request it makes: the monthly archives plus the daily files of the
+# trailing month.  Without a cap, an unreachable archive host costs one
+# request timeout per file and the trailing month alone can need 31 of them
+# -- MINUTES of stall before the loader gives up.  The cap makes the
+# failure predictable and bounded: the fallback gives up, the load fails
+# loudly, and nothing partial is ever served.
+#
+# 120s covers a legitimate long window (a year of months plus a trailing
+# month is ~43 requests) even on a slow link, while bounding an unreachable
+# host to about two minutes instead of half an hour.
+BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS = 120.0
+
+# The cap on ONE archive request.  It is the same value the REST path uses
+# for its own requests (data_loader.py), and it is further bounded by the
+# total budget above: a request never gets more time than the load has
+# left, and a request that cannot finish inside the remaining budget is
+# not started at all.
+BULK_ARCHIVE_REQUEST_TIMEOUT_SECONDS = 30.0
+
 # These are already defined above, but we ensure they exist for clarity in DataLoader context
 # BINANCE_SPOT_TESTNET_API_URL_FOR_LOADER = "https://testnet.binance.vision/api/v3"
 # BINANCE_FUTURES_TESTNET_API_URL_FOR_LOADER = "https://testnet.binancefuture.com/fapi/v1"
@@ -269,9 +296,7 @@ REDIS_STATE_KEY_POSITIONS = os.environ.get(
 # REDIS_STATE_KEY_PORTFOLIO: that key is the PUBLISHED view of the account
 # and PR #25 fixed the API's reading of it, so its shape must not change.
 # This key is written and read only by the bot.
-REDIS_STATE_KEY_RISK = os.environ.get(
-    "REDIS_STATE_KEY_RISK", "depthsight:state:risk"
-)
+REDIS_STATE_KEY_RISK = os.environ.get("REDIS_STATE_KEY_RISK", "depthsight:state:risk")
 
 # Market-data specific Redis (separate instance for fan-out).
 MARKET_REDIS_HOST = os.environ.get("MARKET_REDIS_HOST", REDIS_HOST)
@@ -850,9 +875,7 @@ ML_CONFIRMATION_ENABLED = os.environ.get(
 ).strip().lower() in ("1", "true", "yes", "on")
 # Path to the model for confirmation (can be the same as ML_OFFLINE_TRAINED_MODEL_PATH)
 ML_CONFIRMATION_MODEL_PATH = Path(
-    os.environ.get(
-        "ML_CONFIRMATION_MODEL_PATH", "data/offline_trained_model.joblib"
-    )
+    os.environ.get("ML_CONFIRMATION_MODEL_PATH", "data/offline_trained_model.joblib")
 )
 # FIX 2026-10-07: what to do when a strategy asks for ML confirmation but the
 # model cannot run -- no model file, a failed load, or unavailable components.

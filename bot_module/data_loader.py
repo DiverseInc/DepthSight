@@ -10,6 +10,11 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 
 from . import config
+from .bulk_archive import (
+    COVERAGE_GAP_ATTR,
+    BulkArchiveCoverageError,
+    fetch_klines_from_bulk_archive,
+)
 from .utils import (
     add_relative_volume,
     calculate_scalper_natr,
@@ -99,17 +104,58 @@ def get_local_path(
     )
 
 
+def _is_binance_location_block(error: Exception) -> bool:
+    """True when the REST endpoint refused us because of where we are.
+
+    Binance answers HTTP 451 ("Service unavailable from a restricted
+    location according to 'b. Eligibility' ...") from geo/IP-blocked
+    networks.  That is the signature this repository already records for the
+    production servers: ``market_data_service.py:155-157`` ("Binance is
+    geo-blocked from many Elestio server IPs (HTTP 451)") and
+    ``bot_runner.py:612`` ("a fresh Binance consumer that 451s on REST
+    history").
+
+    ONLY HTTP 451 counts.  Every other failure -- a 4xx/5xx answer, a bad
+    request, a bug, a DNS/TLS failure, a timeout, an exhausted retry -- keeps
+    the behaviour it has today and is re-raised unchanged.  A genuine fault
+    must never be masked by silently serving archive data instead: the
+    archive holds only closed bars and its trailing edge is short by the
+    publication lag, so serving it in place of a fault could quietly shorten
+    a backtest window and change the number it reports.
+    """
+    if isinstance(error, requests.exceptions.HTTPError):
+        response = getattr(error, "response", None)
+        return response is not None and response.status_code == 451
+    return False
+
+
 @backoff.on_exception(
     backoff.expo,
     requests.exceptions.RequestException,
     max_tries=5,
     max_time=60,
     logger=logger,
+    giveup=_is_binance_location_block,
 )
 def _make_api_request(
     endpoint: str, params: Optional[Dict[str, Any]] = None, market_type: str = "spot"
 ) -> List[Any]:
-    """Performs a request to the Binance API with consideration of the environment (mainnet/testnet)."""
+    """Performs a request to the Binance API with consideration of the environment (mainnet/testnet).
+
+    A GEO-BLOCK IS NOT RETRIED.  ``giveup=_is_binance_location_block`` stops
+    the retry loop the moment the answer is HTTP 451, and nothing else:
+    every other failure keeps the five tries and the 60 second budget it
+    has always had.
+
+    The reason is measured, not assumed: before this change a blocked load
+    made FIVE requests to the same blocked host (the retry loop measured
+    5.75s on this machine, with a jittered worst case of 15s and a 60s
+    ceiling) before the bulk-archive fallback was even tried.  HTTP 451 is
+    Binance's deterministic answer to a request from a blocked address --
+    the same request from the same address gets the same answer a second
+    later -- so those four extra attempts could not succeed and only
+    delayed the fallback that does work.
+    """
     if config.ACTIVE_TRADING_ENVIRONMENT == "testnet":
         base_url = (
             config.BINANCE_SPOT_TESTNET_API_URL_FOR_LOADER
@@ -172,6 +218,111 @@ def _download_klines_from_api(
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
     df = df[~df.index.duplicated(keep="first")]
     return df[["open", "high", "low", "close", "volume", "number_of_trades"]]
+
+
+def _download_klines_from_api_with_archive_fallback(
+    symbol: str, timeframe: str, start_dt: datetime, end_dt: datetime, market_type: str
+) -> Optional[pd.DataFrame]:
+    """Downloads klines via the Binance REST API, falling back to the bulk archive.
+
+    The Binance REST market-data endpoints (api.binance.com / fapi.binance.com)
+    answer HTTP 451 -- "Service unavailable from a restricted location" -- from
+    geo/IP-blocked networks, which makes every backtest fail with "Failed to
+    load historical data for <symbol>". Binance publishes the SAME candles as
+    downloadable archives on data.binance.vision, so the loader can still
+    produce data for the same venue, symbol and window.
+
+    The REST path itself is untouched: it is still tried first and it is still
+    what wins whenever it answers. The archive is a strictly additive third
+    source, used ONLY when the REST path fails with a location block (HTTP
+    451). Every other failure -- a 4xx/5xx, a bad request, a timeout, an
+    exhausted retry, a bug -- is re-raised unchanged, so a genuine fault is
+    never masked by quietly serving archive data instead.
+
+    Two rules keep the venue honest and the failure honest:
+
+    * The archive holds MAINNET Binance candles only, so it is never used
+      when the loader is pointed at testnet.  A testnet request must never
+      be answered with mainnet candles.
+    * When the archive cannot supply the window, this returns ``None`` --
+      exactly what the loader returned before the fallback existed -- so the
+      existing hard stops still fire.  It never returns an empty frame in
+      place of a failure: an empty frame is not the same thing as "no data
+      loaded", and several callers treat them differently.
+
+    THE TWO PATHS REPORT "NO DATA" DIFFERENTLY, AND BOTH ARE CORRECT.  The
+    REST path is only reached when it ANSWERED, so "no klines in this
+    window" is a successful load of an empty window and it stays an empty
+    frame.  The archive path is only reached after the REST path was
+    BLOCKED (HTTP 451), so an archive with nothing in it means the load
+    produced no candles at all, and it is ``None`` -- the failure the
+    callers' hard stops exist for.  Neither path ever serves a frame with
+    a hole in it.
+    """
+    try:
+        frame = _download_klines_from_api(
+            symbol, timeframe, start_dt, end_dt, market_type
+        )
+        logger.info(
+            f"klines_source=rest_api symbol={symbol} timeframe={timeframe} "
+            f"rows={0 if frame is None else len(frame)}"
+        )
+        return frame
+    except Exception as api_error:
+        if not _is_binance_location_block(api_error):
+            # Not a location block: keep the behaviour this loader has today.
+            raise
+        if config.ACTIVE_TRADING_ENVIRONMENT == "testnet":
+            # data.binance.vision only publishes MAINNET candles. Serving them
+            # for a testnet request would silently swap the venue.
+            logger.error(
+                f"Binance REST klines unavailable for {symbol} ({timeframe}) on "
+                f"testnet: {api_error}. The bulk archive holds mainnet candles "
+                "only and is not used on testnet."
+            )
+            raise
+        logger.warning(
+            f"Binance REST klines unavailable for {symbol} ({timeframe}): "
+            f"{api_error}. Falling back to the Binance bulk archive."
+        )
+
+    try:
+        frame = fetch_klines_from_bulk_archive(
+            symbol, timeframe, start_dt, end_dt, market_type
+        )
+        if frame is None or frame.empty:
+            # The archive produced no candles.  That is a FAILURE, and it
+            # must look like one: an empty frame is not "no data loaded",
+            # and trainer.py / data_consumer.py / portfolio_backtester.py
+            # key on that difference to decide whether to hard-stop.
+            logger.error(
+                f"Bulk archive returned no klines for {symbol} ({timeframe}) "
+                f"between {start_dt} and {end_dt}."
+            )
+            logger.info(
+                f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0"
+            )
+            return None
+        logger.info(
+            f"klines_source=bulk_archive symbol={symbol} timeframe={timeframe} "
+            f"rows={len(frame)}"
+        )
+        return frame
+    except BulkArchiveCoverageError as coverage_error:
+        logger.error(
+            f"Bulk archive cannot cover the requested window for {symbol} "
+            f"({timeframe}): {coverage_error}",
+            exc_info=True,
+        )
+        logger.info(f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0")
+        return None
+    except Exception as archive_error:
+        logger.error(
+            f"Bulk archive klines failed for {symbol} ({timeframe}): {archive_error}",
+            exc_info=True,
+        )
+        logger.info(f"klines_source=none symbol={symbol} timeframe={timeframe} rows=0")
+        return None
 
 
 def _download_agg_trades_from_api(
@@ -305,6 +456,27 @@ async def download_klines(
     """
     (ASYNCHRONOUS) Hybrid klines loader.
     All blocking operations (file reading, HTTP requests) are executed in separate threads.
+
+    THE FRAME MAY COVER A SHORTER PERIOD THAN THE ONE REQUESTED.  When
+    the REST API is geo-blocked (HTTP 451) the loader falls back to
+    Binance's bulk archives, and the archives hold only what Binance
+    published.  A symbol that was listed later than the requested window
+    therefore comes back starting later.  That is NOT a failure -- but it
+    must never be silent, so the loader measures the leading edge and
+    reports it.
+
+    A caller that must not trade a shorter window than it asked for can
+    see the gap on the returned frame: it is recorded in the frame's
+    ``attrs`` under the key ``COVERAGE_GAP_ATTR``
+    ("bulk_archive_coverage_gap"), as a dict with ``requested_start``,
+    ``first_bar``, ``gap_days``, ``leading_month``,
+    ``leading_month_published`` and ``reason``.  Read it with
+    ``bulk_archive.coverage_gap(frame)``, which returns ``None`` when
+    there is no gap.  The ``attrs`` do not change the frame's shape, its
+    columns or its values, so the existing callers are unaffected.
+
+    The gap is reported at WARNING level in the log as well, with the
+    exact numbers.
     """
     try:
         if isinstance(start_dt, str):
@@ -346,6 +518,10 @@ async def download_klines(
                 logger.info(
                     "Local data is complete and contains indicators. Returning from cache."
                 )
+                logger.info(
+                    f"klines_source=local_cache symbol={symbol} timeframe={timeframe} "
+                    f"rows={len(df_local)}"
+                )
                 return df_local
 
         api_start_dt = start_dt_utc
@@ -354,7 +530,7 @@ async def download_klines(
 
         df_api = await loop.run_in_executor(
             None,
-            _download_klines_from_api,
+            _download_klines_from_api_with_archive_fallback,
             symbol,
             timeframe,
             api_start_dt,
@@ -362,8 +538,45 @@ async def download_klines(
             market_type,
         )
 
-        if df_api is None and (df_local is None or df_local.empty):
+        if df_api is None:
+            # The remote source failed. Before the bulk-archive fallback this
+            # branch read ``if df_api is None and (df_local is None or
+            # df_local.empty)``, so a PARTIAL local cache was shipped on its
+            # own whenever the API helper RETURNED None while the local
+            # cache was not empty: pandas' ``concat`` SKIPS a None element
+            # (``pd.concat([df_local, None])`` returns df_local's rows), so
+            # the merge silently succeeded and the truncated window was
+            # handed back as if it were the requested one.
+            #
+            # That only ever happened when the helper returned None rather
+            # than raising: an exception propagated out of this function and
+            # failed the load loudly instead.  The backtest then ran on a
+            # window shorter than the one that was asked for, reporting the
+            # KPIs of that shorter window as if they were the requested ones.
+            # A truncated window is a wrong number, so this now fails the
+            # WHOLE load instead: callers distinguish "no data loaded" (None)
+            # from "loaded, but empty", and only None fails the hard stops.
+            #
+            # The REST path's own "no klines in this window" answer is a
+            # DIFFERENT thing and is deliberately left alone: it is an EMPTY
+            # frame (see ``_download_klines_from_api``), so the source
+            # answered, and the merge below keeps the local cache, which is
+            # the history that exists for the window.
+            logger.error(
+                f"Klines unavailable for {symbol} ({timeframe}): no data from "
+                "the REST API or the bulk archive."
+            )
             return None
+
+        # The leading-edge coverage gap the archive recorded on its frame.
+        # It is captured HERE because the operations below do not all carry
+        # it over: ``pandas.concat`` DROPS the ``attrs`` when the frames it
+        # merges do not all have the same ones, and the local cache (read
+        # from parquet) has none.  It is put back on the frame that is
+        # returned, so the caller can always see it.
+        coverage_gap = (
+            df_api.attrs.get(COVERAGE_GAP_ATTR) if df_api is not None else None
+        )
 
         df_final = pd.concat([df_local, df_api]) if df_local is not None else df_api
         if df_final.empty:
@@ -381,6 +594,9 @@ async def download_klines(
             return df_processed
 
         df_processed = await loop.run_in_executor(None, _process_indicators, df_final)
+
+        if coverage_gap is not None:
+            df_processed.attrs[COVERAGE_GAP_ATTR] = coverage_gap
 
         logger.info(f"Loaded/merged and processed {len(df_final)} candles.")
         return df_processed
