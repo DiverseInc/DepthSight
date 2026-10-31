@@ -36,8 +36,12 @@ import {
 import { StrategyDetailsPanel } from "@/components/strategies/StrategyDetailsPanel";
 import {
 	applyStrategyRegistry,
+	hasRefusedPerTradeRisk,
+	hasStrategyRiskErrors,
 	isStrategyClassRegistered,
 	isStrategyRegistryLoaded,
+	validateRiskSettingsForSend,
+	validateStrategyClass,
 } from "@/components/strategies/strategyEditorSettings";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -651,6 +655,59 @@ export default function Strategies() {
 
 	const handleConfirmStart = (formData: LaunchFormData) => {
 		if (!launchConfig.configId) return;
+
+		// The launch update carries the strategy's saved settings back to the
+		// server. The server refuses a configuration it will not accept -- a
+		// risk limit looser than its floor, a strategy class it cannot run --
+		// and it refuses the WHOLE update, so the strategy would never start
+		// and the only sign of it would be a bare error. The client checks the
+		// same rules first, and says which one it is.
+		const savedConfigData = launchConfig.strategy?.config_data;
+		const savedRiskErrors = validateRiskSettingsForSend(
+			savedConfigData?.risk_settings,
+		);
+		if (hasStrategyRiskErrors(savedRiskErrors)) {
+			toast({
+				variant: "destructive",
+				title: t("common:errorTitle"),
+				description: t(
+					"launchRiskLimitsRejected",
+					"This strategy's risk limits are looser than the server's limit, so the server would refuse to save it. Tighten them in the editor first.",
+				),
+			});
+			return;
+		}
+		const savedClassError = validateStrategyClass(
+			savedConfigData?.strategy_name,
+		);
+		if (savedClassError.className === "notRegistered") {
+			toast({
+				variant: "destructive",
+				title: t("common:errorTitle"),
+				description: t(
+					"launchStrategyClassRejected",
+					"This strategy's class is not one the trading bot registers, so the server would refuse to save it.",
+				),
+			});
+			return;
+		}
+		// The per-trade risk is not only in the risk block: a strategy may
+		// read it from `config_data.risk_pct_per_trade`, from
+		// `config_data.config.risk_pct_per_trade` or from
+		// `config_data.strategy_params.risk_pct_per_trade`. The server refuses
+		// a value looser than its floor in every one of them, and it refuses
+		// the WHOLE update when it does.
+		if (hasRefusedPerTradeRisk(savedConfigData)) {
+			toast({
+				variant: "destructive",
+				title: t("common:errorTitle"),
+				description: t(
+					"launchPerTradeRiskRejected",
+					"This strategy carries a per-trade risk the server would refuse, so it was not launched. Open it in the editor and save it again.",
+				),
+			});
+			return;
+		}
 
 		setPendingActionId(launchConfig.configId);
 

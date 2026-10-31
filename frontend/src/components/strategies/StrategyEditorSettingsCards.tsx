@@ -24,6 +24,7 @@ import {
 	BOT_REGISTERED_STRATEGY_CLASSES,
 	SERVER_RISK_FLOOR_PCT,
 	divergesFromVisualBuilder,
+	hasServerRiskFloors,
 } from "./strategyEditorSettings";
 import type {
 	StrategyClassErrorCode,
@@ -135,15 +136,24 @@ export function StrategyRiskSettingsSection({
 			<CardContent className="space-y-4">
 				<div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
 					<AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-					<span>
-						{t("configPanel.riskServerFloorsNotice", {
-							defaultValue: `Server floors: ${SERVER_RISK_FLOOR_PCT.daily_loss_limit_pct}% daily loss, ${SERVER_RISK_FLOOR_PCT.risk_per_trade_pct}% risk per trade, ${SERVER_RISK_FLOOR_PCT.max_drawdown_pct}% drawdown, ${SERVER_RISK_FLOOR_PCT.position_size_pct}% position size. A limit can only be tightened, never loosened.`,
-							dailyLossFloor: SERVER_RISK_FLOOR_PCT.daily_loss_limit_pct,
-							riskPerTradeFloor: SERVER_RISK_FLOOR_PCT.risk_per_trade_pct,
-							drawdownFloor: SERVER_RISK_FLOOR_PCT.max_drawdown_pct,
-							positionSizeFloor: SERVER_RISK_FLOOR_PCT.position_size_pct,
-						})}
-					</span>
+					{hasServerRiskFloors() ? (
+						<span>
+							{t("configPanel.riskServerFloorsNotice", {
+								defaultValue: `Server floors: ${SERVER_RISK_FLOOR_PCT.daily_loss_limit_pct}% daily loss, ${SERVER_RISK_FLOOR_PCT.risk_per_trade_pct}% risk per trade, ${SERVER_RISK_FLOOR_PCT.max_drawdown_pct}% drawdown, ${SERVER_RISK_FLOOR_PCT.position_size_pct}% position size. A limit can only be tightened, never loosened.`,
+								dailyLossFloor: SERVER_RISK_FLOOR_PCT.daily_loss_limit_pct,
+								riskPerTradeFloor: SERVER_RISK_FLOOR_PCT.risk_per_trade_pct,
+								drawdownFloor: SERVER_RISK_FLOOR_PCT.max_drawdown_pct,
+								positionSizeFloor: SERVER_RISK_FLOOR_PCT.position_size_pct,
+							})}
+						</span>
+					) : (
+						<span>
+							{t(
+								"configPanel.riskServerFloorsLoading",
+								"The server's risk limits have not loaded yet, so no limit can be checked or saved until they do.",
+							)}
+						</span>
+					)}
 				</div>
 
 				<div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -172,7 +182,10 @@ export function StrategyRiskSettingsSection({
 								<p id={`${inputId}-desc`} className="text-xs text-muted-foreground">
 									{t(meta.descKey, meta.descDefault)}{" "}
 									{t("configPanel.riskServerFloor", {
-										defaultValue: `Server floor: ${SERVER_RISK_FLOOR_PCT[meta.field]}%.`,
+										defaultValue:
+											typeof SERVER_RISK_FLOOR_PCT[meta.field] === "number"
+												? `Server floor: ${SERVER_RISK_FLOOR_PCT[meta.field]}%.`
+												: "The server's limit for this field has not loaded yet.",
 										floor: SERVER_RISK_FLOOR_PCT[meta.field],
 									})}
 								</p>

@@ -29,6 +29,13 @@ const updateStrategyConfigMock = vi.fn();
 const stopStrategyMock = vi.fn();
 const deleteStrategyConfigMock = vi.fn();
 const runBacktestMock = vi.fn();
+// The toast is the page's only way of saying WHY it refused, so it is
+// captured instead of rendered.
+const toastMock = vi.fn();
+
+vi.mock("@/components/ui/use-toast", () => ({
+	useToast: () => ({ toast: toastMock }),
+}));
 
 const savedConfig = {
 	id: "cfg-1",
@@ -144,6 +151,22 @@ vi.mock("@/lib/api", () => ({
 				max_stop_distance_pct: 5,
 				max_consecutive_losses: 10,
 			},
+			// The per-trade risk has its own floor, in its own unit: a
+			// FRACTION of the balance (0.01 is 1%).
+			per_trade_risk: {
+				parameter: "risk_pct_per_trade",
+				unit: "fraction",
+				unit_note: "0.01 means 1% of the balance.",
+				server_floor: 0.01,
+				server_floor_percent: 1,
+				paths: [
+					"config_data.risk_pct_per_trade",
+					"config_data.config.risk_pct_per_trade",
+					"config_data.strategy_params.risk_pct_per_trade",
+				],
+				description:
+					"The per-trade risk, in every place a strategy may read it from.",
+			},
 			rules: [],
 		},
 	}),
@@ -201,6 +224,10 @@ const persistedPayload = () => {
 	};
 };
 
+/** Every message the page has shown the client. */
+const toastMessages = () =>
+	toastMock.mock.calls.map((call) => String(call[0]?.description ?? ""));
+
 beforeAll(async () => {
 	// jsdom has neither of these, and the radix controls the launch modal uses
 	// (slider, radio group, checkbox) need them to render at all.
@@ -238,6 +265,7 @@ beforeEach(() => {
 	stopStrategyMock.mockReset();
 	deleteStrategyConfigMock.mockReset();
 	runBacktestMock.mockReset();
+	toastMock.mockReset();
 	updateStrategyConfigMock.mockImplementation(
 		(
 			_vars: unknown,
@@ -300,5 +328,80 @@ describe("the Strategies page records the client's launch settings (GATE 4)", ()
 
 		await waitFor(() => expect(updateStrategyConfigMock).toHaveBeenCalled());
 		expect(startStrategyMock).not.toHaveBeenCalled();
+	});
+});
+
+// The launch update carries the strategy's SAVED settings back to the server.
+// The server refuses a configuration it will not accept -- a risk limit
+// looser than its floor, a strategy class it cannot run -- and it refuses the
+// WHOLE update, so the strategy would never start and the only sign of it
+// would be a bare error. The client checks the same rules first.
+describe("the Strategies page does not send what the server will refuse (GATE 4)", () => {
+	it("refuses to launch a strategy whose saved risk limit is looser than the server's", async () => {
+		const saved = savedConfig.config_data.risk_settings;
+		savedConfig.config_data.risk_settings = {
+			...saved,
+			// The server's floor is 1% per trade. This strategy was saved when
+			// the server allowed 3%.
+			risk_per_trade_pct: 3,
+		};
+
+		try {
+			renderPage();
+			await openLaunchModal();
+
+			confirmLaunch();
+
+			await waitFor(() => expect(toastMock).toHaveBeenCalled());
+			expect(updateStrategyConfigMock).not.toHaveBeenCalled();
+			expect(startStrategyMock).not.toHaveBeenCalled();
+			expect(toastMessages().some((m) => /looser than the server/i.test(m))).toBe(
+				true,
+			);
+		} finally {
+			savedConfig.config_data.risk_settings = saved;
+		}
+	});
+
+	it("refuses to launch a strategy whose class the trading bot does not register", async () => {
+		const saved = savedConfig.config_data.strategy_name;
+		savedConfig.config_data.strategy_name = "RemovedStrategy";
+
+		try {
+			renderPage();
+			await openLaunchModal();
+
+			confirmLaunch();
+
+			await waitFor(() => expect(toastMock).toHaveBeenCalled());
+			expect(updateStrategyConfigMock).not.toHaveBeenCalled();
+			expect(startStrategyMock).not.toHaveBeenCalled();
+			expect(toastMessages().some((m) => /registers/i.test(m))).toBe(true);
+		} finally {
+			savedConfig.config_data.strategy_name = saved;
+		}
+	});
+
+	it("refuses to launch a strategy whose saved per-trade risk the server would refuse", async () => {
+		// The per-trade risk is a FRACTION of the balance in the strategy
+		// parameter. A configuration saved before the server bounded it may
+		// carry a PERCENT there (0.5 = 0.5%), which the server reads as 50%
+		// and refuses.
+		const saved = savedConfig.config_data as unknown as Record<string, unknown>;
+		saved.risk_pct_per_trade = 0.5;
+
+		try {
+			renderPage();
+			await openLaunchModal();
+
+			confirmLaunch();
+
+			await waitFor(() => expect(toastMock).toHaveBeenCalled());
+			expect(updateStrategyConfigMock).not.toHaveBeenCalled();
+			expect(startStrategyMock).not.toHaveBeenCalled();
+			expect(toastMessages().some((m) => /per-trade risk/i.test(m))).toBe(true);
+		} finally {
+			delete saved.risk_pct_per_trade;
+		}
 	});
 });

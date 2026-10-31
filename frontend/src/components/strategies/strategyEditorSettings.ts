@@ -21,6 +21,10 @@
 // `bot_module/strategy_registry.py`, generated from the very constants the
 // validator uses). `applyStrategyRegistry()` applies that answer, so the
 // list and the floors on screen are the server's own.
+//
+// There is NO hand-written copy of either left in this file. A copy could
+// only ever be right by luck, and a copy that was LOOSER than the server's
+// own would have the editor offering a limit the server refuses.
 
 import type {
 	RiskManagementSettings,
@@ -31,33 +35,34 @@ import type {
 export type StrategyRiskField = keyof StrategyRiskSettings;
 
 /**
- * The server's risk floors.
+ * The server's risk floors, per field.
  *
- * These mirror `bot_module/strategy_registry.py`'s `SERVER_RISK_FLOOR`, which
- * reads them from `bot_module/config.py`:
+ * The server owns them. `GET /api/v1/strategies/registry` publishes the floor
+ * for every risk setting, generated from the very constants the validator
+ * uses (`bot_module/strategy_registry.py`'s `SERVER_RISK_FLOOR`, which reads
+ * them from `bot_module/config.py`):
  *
  *   DEFAULT_RISK_PER_TRADE_PERCENT = 1.0
  *   DEFAULT_MAX_DRAWDOWN_PERCENT   = 20.0
  *   DEFAULT_DAILY_MAX_LOSS_PERCENT = 5.0
- *   DEFAULT_MAX_STOP_DISTANCE_PCT  = 5.0
  *   DEFAULT_MAX_CONSECUTIVE_LOSSES = 10
  *
- * The values below are the FALLBACK for the first render. The server's own
- * answer overwrites them as soon as the registry arrives
- * (`applyStrategyRegistry`), so the client never owns a copy of the floor
- * that can drift away from the one the server enforces.
+ * There is NO hand-written copy of them here any more. `null` means the
+ * server has not answered yet: the floor for that field is UNKNOWN, so
+ * nothing can be checked against it and nothing may be sent -- the editor
+ * would otherwise be offering a limit the server refuses.
  *
  * The server refuses a client value that is LOOSER than the floor for that
  * field. The client may only TIGHTEN a limit, so the UI mirrors the same
  * ceilings and refuses to offer anything looser.
  */
-export const SERVER_RISK_FLOOR: Record<StrategyRiskField, number> = {
-	risk_per_trade_pct: 1,
-	max_drawdown_pct: 20,
-	daily_loss_limit_pct: 5,
-	position_size_pct: 1,
-	max_stop_distance_pct: 5,
-	max_consecutive_losses: 10,
+export const SERVER_RISK_FLOOR: Record<StrategyRiskField, number | null> = {
+	risk_per_trade_pct: null,
+	max_drawdown_pct: null,
+	daily_loss_limit_pct: null,
+	position_size_pct: null,
+	max_stop_distance_pct: null,
+	max_consecutive_losses: null,
 };
 
 /**
@@ -68,22 +73,35 @@ export const SERVER_RISK_FLOOR: Record<StrategyRiskField, number> = {
  */
 export const SERVER_RISK_FLOOR_PCT = SERVER_RISK_FLOOR;
 
-export const SERVER_DAILY_MAX_LOSS_FLOOR_PCT = SERVER_RISK_FLOOR.daily_loss_limit_pct;
-export const SERVER_RISK_PER_TRADE_FLOOR_PCT = SERVER_RISK_FLOOR.risk_per_trade_pct;
-export const SERVER_MAX_DRAWDOWN_FLOOR_PCT = SERVER_RISK_FLOOR.max_drawdown_pct;
-
 /**
- * Defaults shown in the editor when neither the saved strategy nor the
- * account carries a value. They are the ACCOUNT's own defaults
- * (`api/crud.py`: riskPerTradePercent 1.0, maxDrawdown 10.0,
- * dailyMaxLossPercent 5.0), so an untouched form never sends anything
- * looser than the account already has.
+ * The risk limits the editor starts from when neither the saved strategy nor
+ * the account carries a value.
+ *
+ * They are the ACCOUNT's own defaults (`api/crud.py`: riskPerTradePercent
+ * 1.0, maxDrawdown 10.0, dailyMaxLossPercent 5.0), pulled DOWN to the
+ * server's floor for every field the floor is known for. An untouched form
+ * therefore never sends anything the server would refuse -- and when the
+ * server's floor is tighter than the account's default, the floor wins.
  */
-export const DEFAULT_STRATEGY_RISK_SETTINGS: StrategyRiskSettings = {
-	risk_per_trade_pct: 1,
-	max_drawdown_pct: 10,
-	daily_loss_limit_pct: SERVER_RISK_FLOOR.daily_loss_limit_pct,
-	position_size_pct: 1,
+export const defaultStrategyRiskSettings = (): StrategyRiskSettings => {
+	const settings = {
+		risk_per_trade_pct: 1,
+		max_drawdown_pct: 10,
+		daily_loss_limit_pct: 5,
+		position_size_pct: 1,
+	};
+	for (const field of Object.keys(settings) as (keyof typeof settings)[]) {
+		const floor = SERVER_RISK_FLOOR[field];
+		if (typeof floor === "number") {
+			settings[field] = Math.min(settings[field], floor);
+		}
+	}
+	// The per-strategy position budget may not exceed the risk per trade.
+	settings.position_size_pct = Math.min(
+		settings.position_size_pct,
+		settings.risk_per_trade_pct,
+	);
+	return settings;
 };
 
 export type StrategyRiskErrorCode =
@@ -118,6 +136,33 @@ export const OPTIONAL_RISK_FIELDS: StrategyRiskField[] = [
 ];
 
 /**
+ * True once the server's floor is known for EVERY risk field.
+ *
+ * Until then the client cannot tell a limit the server accepts from one it
+ * refuses, so nothing may be sent: see `hasServerRiskFloors`.
+ */
+export const hasServerRiskFloors = (): boolean =>
+	RISK_FIELDS.every((field) => typeof SERVER_RISK_FLOOR[field] === "number");
+
+/**
+ * The one rule per field the server REFUSES a value over.
+ *
+ * `_validate_risk_settings` in `bot_module/strategy_registry.py` refuses a
+ * value that is not a number, that is not greater than zero, and that is
+ * looser than the server's floor for that field. A floor the server has not
+ * published yet cannot be exceeded, so nothing is reported for it.
+ */
+const validateRiskField = (
+	raw: unknown,
+	floor: number | null,
+): StrategyRiskErrorCode | undefined => {
+	if (typeof raw !== "number" || !Number.isFinite(raw)) return "notANumber";
+	if (raw <= 0) return "notPositive";
+	if (typeof floor === "number" && raw > floor) return "aboveFloor";
+	return undefined;
+};
+
+/**
  * Validates the risk limits the client typed.
  *
  * The rules mirror the server's `_validate_risk_settings` so the UI can never
@@ -149,17 +194,8 @@ export const validateStrategyRiskSettings = (
 			errors[field] = "notANumber";
 			continue;
 		}
-		if (typeof raw !== "number" || !Number.isFinite(raw)) {
-			errors[field] = "notANumber";
-			continue;
-		}
-		if (raw <= 0) {
-			errors[field] = "notPositive";
-			continue;
-		}
-		if (raw > SERVER_RISK_FLOOR[field]) {
-			errors[field] = "aboveFloor";
-		}
+		const error = validateRiskField(raw, SERVER_RISK_FLOOR[field]);
+		if (error) errors[field] = error;
 	}
 
 	if (
@@ -168,6 +204,34 @@ export const validateStrategyRiskSettings = (
 		value.position_size_pct > value.risk_per_trade_pct
 	) {
 		errors.position_size_pct = "positionExceedsRisk";
+	}
+
+	return errors;
+};
+
+/**
+ * Validates the risk limits the client is about to SEND BACK to the server.
+ *
+ * The server treats every risk setting as optional ("omitting one means
+ * leave the account's current value alone"), so only the settings that are
+ * actually present are checked -- and a present one must be one the server
+ * accepts: a number greater than zero and no looser than the floor.
+ *
+ * The position budget is not checked here: the server CLAMPS it to the
+ * account's risk per trade (`apply_client_risk_config`) rather than refusing
+ * it, so a value above it is not something the server will turn down.
+ */
+export const validateRiskSettingsForSend = (
+	value: StrategyRiskSettings | null | undefined,
+): StrategyRiskErrors => {
+	const errors: StrategyRiskErrors = {};
+	if (!value) return errors;
+
+	for (const field of RISK_FIELDS) {
+		const raw = value[field];
+		if (raw === undefined || raw === null) continue;
+		const error = validateRiskField(raw, SERVER_RISK_FLOOR[field]);
+		if (error) errors[field] = error;
 	}
 
 	return errors;
@@ -265,12 +329,7 @@ export const toRiskSettingsFromAccount = (
 ): StrategyRiskSettings | null => {
 	if (!riskManagement || typeof riskManagement !== "object") return null;
 	const source = riskManagement as Record<string, unknown>;
-	const settings: StrategyRiskSettings = {
-		risk_per_trade_pct: DEFAULT_STRATEGY_RISK_SETTINGS.risk_per_trade_pct,
-		max_drawdown_pct: DEFAULT_STRATEGY_RISK_SETTINGS.max_drawdown_pct,
-		daily_loss_limit_pct: DEFAULT_STRATEGY_RISK_SETTINGS.daily_loss_limit_pct,
-		position_size_pct: DEFAULT_STRATEGY_RISK_SETTINGS.position_size_pct,
-	};
+	const settings: StrategyRiskSettings = defaultStrategyRiskSettings();
 	let found = false;
 	for (const field of Object.keys(
 		RISK_FIELD_TO_ACCOUNT_KEY,
@@ -279,7 +338,8 @@ export const toRiskSettingsFromAccount = (
 		if (!key) continue;
 		const raw = source[key];
 		if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) continue;
-		settings[field] = Math.min(raw, SERVER_RISK_FLOOR[field]);
+		const floor = SERVER_RISK_FLOOR[field];
+		settings[field] = typeof floor === "number" ? Math.min(raw, floor) : raw;
 		found = true;
 	}
 	if (!found) return null;
@@ -290,6 +350,37 @@ export const toRiskSettingsFromAccount = (
 		settings.risk_per_trade_pct,
 	);
 	return settings;
+};
+
+/**
+ * Pulls every limit that is looser than the server's floor DOWN to the floor.
+ *
+ * The server refuses a limit that is looser than its floor, so a form that
+ * still shows one is offering something the server will not take. This runs
+ * when the server's contract arrives, so the numbers on screen are never
+ * looser than the server's own ceiling.
+ *
+ * The draft is returned unchanged when nothing had to be pulled down, so the
+ * editor does not rewrite what the client typed.
+ */
+export const clampRiskDraftToFloors = (
+	draft: StrategyRiskDraft,
+): StrategyRiskDraft => {
+	let changed = false;
+	const clamped: StrategyRiskDraft = { ...draft };
+	for (const field of RISK_FIELDS) {
+		const floor = SERVER_RISK_FLOOR[field];
+		if (typeof floor !== "number") continue;
+		const raw = draft?.[field];
+		if (typeof raw !== "string" || raw.trim() === "") continue;
+		const value = Number(raw);
+		if (!Number.isFinite(value)) continue;
+		if (value > floor) {
+			clamped[field] = String(floor);
+			changed = true;
+		}
+	}
+	return changed ? clamped : draft;
 };
 
 /**
@@ -311,11 +402,104 @@ let registryLoaded = false;
 export const isStrategyRegistryLoaded = (): boolean => registryLoaded;
 
 /**
+ * The server's floor for the per-trade risk, in the unit the strategy
+ * parameter uses: a FRACTION of the balance (0.01 is 1%).
+ *
+ * `null` means the server has not published it (or does not publish it at
+ * all). The `risk_settings` block is in PERCENT, so the two must never be
+ * mixed: 1.0 in `risk_settings` is 1%, and 0.01 in the parameter is 1%.
+ */
+let perTradeRiskFloorFraction: number | null = null;
+
+/** The name of the strategy parameter that carries the per-trade risk. */
+let perTradeRiskParameter = "risk_pct_per_trade";
+
+/** The server's per-trade-risk floor, as a fraction of the balance. */
+export const serverPerTradeRiskFloorFraction = (): number | null =>
+	perTradeRiskFloorFraction;
+
+/** The name of the strategy parameter that carries the per-trade risk. */
+export const serverPerTradeRiskParameter = (): string => perTradeRiskParameter;
+
+/**
+ * The per-trade risks a `config_data` carries, with the path each sits at.
+ *
+ * The per-trade risk is not only in `risk_settings`: a strategy may read it
+ * from `config_data.risk_pct_per_trade`, from
+ * `config_data.config.risk_pct_per_trade` or from
+ * `config_data.strategy_params.risk_pct_per_trade`
+ * (`BaseStrategy._get_param` in `bot_module/strategy.py` reads the first two,
+ * the "Reverse*" strategies read the third). The server bounds all three and
+ * REFUSES a value looser than its floor, so the client has to look in all
+ * three before it sends anything.
+ */
+export const collectPerTradeRisks = (
+	configData: unknown,
+): { path: string; value: unknown }[] => {
+	const found: { path: string; value: unknown }[] = [];
+	if (!configData || typeof configData !== "object") return found;
+	const source = configData as Record<string, unknown>;
+	const parameter = perTradeRiskParameter;
+
+	const top = source[parameter];
+	if (top !== undefined && top !== null) {
+		found.push({ path: `config_data.${parameter}`, value: top });
+	}
+
+	const nested = source.config;
+	if (nested && typeof nested === "object") {
+		const nestedValue = (nested as Record<string, unknown>)[parameter];
+		if (nestedValue !== undefined && nestedValue !== null) {
+			found.push({
+				path: `config_data.config.${parameter}`,
+				value: nestedValue,
+			});
+		}
+	}
+
+	const params = source.strategy_params;
+	if (params && typeof params === "object") {
+		const paramValue = (params as Record<string, unknown>)[parameter];
+		if (paramValue !== undefined && paramValue !== null) {
+			found.push({
+				path: `config_data.strategy_params.${parameter}`,
+				value: paramValue,
+			});
+		}
+	}
+
+	return found;
+};
+
+/**
+ * True when the client is about to send a per-trade risk the server refuses.
+ *
+ * The server refuses a value that is not a number, that is negative, and
+ * that is looser than its floor (a FRACTION of the balance). A value the
+ * client cannot judge -- because the server has not published its floor --
+ * is left to the server, but a value that is no number at all is refused
+ * either way.
+ */
+export const hasRefusedPerTradeRisk = (configData: unknown): boolean => {
+	const floor = perTradeRiskFloorFraction;
+	for (const { value } of collectPerTradeRisks(configData)) {
+		if (typeof value !== "number" || !Number.isFinite(value)) return true;
+		if (value < 0) return true;
+		if (typeof floor === "number" && value > floor) return true;
+	}
+	return false;
+};
+
+/**
  * Apply the server's contract: the strategy names it can run, and its risk
  * floors.
  *
  * The array is emptied and refilled IN PLACE, so every component that holds
  * a reference to it sees the server's list.
+ *
+ * A contract that does not carry a floor for every risk field leaves that
+ * field unknown (`hasServerRiskFloors()` is then false), and nothing may be
+ * sent while a floor is unknown.
  */
 export const applyStrategyRegistry = (
 	contract: StrategyRegistryContract | null | undefined,
@@ -339,6 +523,21 @@ export const applyStrategyRegistry = (
 			}
 		}
 	}
+
+	// The per-trade risk has its own floor, in its own unit (a FRACTION of
+	// the balance, where the `risk_settings` block is in PERCENT). The server
+	// refuses a value looser than it, in every place it may hide.
+	const perTradeRisk = contract.per_trade_risk;
+	if (perTradeRisk && typeof perTradeRisk === "object") {
+		if (typeof perTradeRisk.parameter === "string" && perTradeRisk.parameter) {
+			perTradeRiskParameter = perTradeRisk.parameter;
+		}
+		const fraction = perTradeRisk.server_floor;
+		if (typeof fraction === "number" && Number.isFinite(fraction)) {
+			perTradeRiskFloorFraction = fraction;
+		}
+	}
+
 	registryLoaded = true;
 };
 
