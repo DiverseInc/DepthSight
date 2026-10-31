@@ -130,6 +130,173 @@ def _refuse_a_risk_per_trade_above_the_floor(
         )
 
 
+def _the_fields_the_client_actually_sent(section_model: Any) -> Dict[str, Any]:
+    """The fields the client actually sent -- and ONLY those.
+
+    Pydantic fills in the schema default for every field the client omitted,
+    so a dumped payload cannot tell "the client sent 1.0" from "the client
+    sent nothing, and the default happens to be 1.0". MEASURED on
+    ``RiskManagementSettings``: a client that sent three fields gets a dumped
+    payload of eighteen, including ``riskPerTradePercent: 1.0`` that nobody
+    asked for.
+
+    That distinction decides TWO things, and getting it wrong breaks the
+    product rather than merely looking wrong:
+
+    * the GUARD must compare only what was sent. Otherwise a client that
+      tightened its per-trade risk to 0.5 in the strategy editor is refused
+      on the Risk Settings page for a ``1.0`` it never sent -- and the page
+      can never be saved again, because the only way back is to raise the
+      limit, which the guard itself forbids.
+    * the WRITE must carry only what was sent. ``update_config_section``
+      MERGES, but it merges every key it is handed, and an injected default
+      is not None: so a field the client omitted would silently overwrite
+      the tightened value the account already had.
+
+    ``model_fields_set`` is the instrument: it holds the fields the client
+    explicitly provided, and nothing else.
+    """
+    fields = type(section_model).model_fields
+    sent: Dict[str, Any] = {}
+    for name in section_model.model_fields_set:
+        info = fields.get(name)
+        if info is None:
+            continue
+        value = getattr(section_model, name, None)
+        if value is None:
+            continue
+        sent[info.alias or name] = value
+    return sent
+
+
+def _refuse_a_risk_limit_looser_than_its_ceiling(
+    payload: Dict[str, Any], section: str, current: Dict[str, Any]
+) -> None:
+    """Refuse a risk limit the server will not honour.
+
+    FIVE account-level risk limits have a server floor, and the floors live in
+    ONE place -- ``bot_module/strategy_registry.py``: ``SERVER_RISK_FLOOR`` is
+    the limit and ``RISK_FIELD_TO_RM_KEY`` is the account key each one is
+    stored under. The account key names ARE the schema's field names
+    (``api/schemas.py`` ``RiskManagementSettings``), measured: the alias of
+    ``maxDrawdown`` is ``maxDrawdown``, and so on for all five.
+
+    WHAT THE FLOORS ACTUALLY ARE, measured against the block a new account is
+    handed (``api/crud.py`` ``create_user``):
+
+    | limit | declared floor | the account is handed | |
+    |---|---|---|---|
+    | ``risk_per_trade_pct`` | 1.0 % | 1.0 % | the same |
+    | ``max_consecutive_losses`` | 10 | 10 | the same |
+    | ``daily_loss_limit_pct`` | 5.0 % | *nothing* | the floor fills in |
+    | ``max_drawdown_pct`` | 20.0 % | 10.0 % | the account is TIGHTER than the floor |
+    | ``max_stop_distance_pct`` | 5.0 % | 10.0 % | the account is LOOSER than the floor |
+
+    So "an account that has never changed one is exactly at its floor" is
+    true for two of the five, and FALSE for the other three. The two that
+    disagree are the platform's own inconsistency, and it is recorded for the
+    owner rather than silently resolved here: changing a risk limit is the
+    owner's decision, not this route's.
+
+    The strategy route already refuses a limit looser than its floor. THIS
+    route did not, so a client could raise four of the five through the Risk
+    Settings page -- and the RiskManager enforces the ACCOUNT's stored value
+    (bot_module/risk_manager.py:210-232 reads it and only falls back to the
+    server constant when the key is absent), so the raised number really did
+    govern.
+
+    WHICH LIMITS ARE READ FROM WHICH BLOCK. The RiskManager reads
+    ``maxDrawdown``, ``dailyMaxLossPercent`` and ``maxConsecutiveLosses``
+    from the LIVE ``risk_management`` block only; the backtest block's
+    copies of those three are dead data. It reads ``riskPerTradePercent``
+    and ``maxStopDistancePct`` from the backtest block. Guarding all five in
+    both sections is the conservative choice, but only the two above govern
+    the paper account.
+
+    A client may TIGHTEN a limit and never LOOSEN one, so the ceiling is the
+    account's OWN current value where the account holds one, and the server
+    floor where it holds none. The RiskManager enforces the account's stored
+    number, so that stored number IS the limit -- it is not a suggestion the
+    server quietly ignores. Where the account's own default is looser than the
+    declared floor (the stop distance), the account's value wins: it is the
+    platform's own default, it is what the RiskManager enforces, and refusing
+    it would break the Risk Settings page for every client.
+
+    ``payload`` here is ONLY the fields the client actually sent -- see
+    ``_the_fields_the_client_actually_sent``. A value the client never sent
+    must not be compared, and must not be written either.
+
+    REFUSED, not clamped: a silently clamped number is a number the client
+    did not ask for and does not see, and the page would keep showing the
+    value it sent. The client is told the limit instead.
+
+    ``position_size_pct`` has no account key of its own -- it is the position
+    budget, carried by the strategy's own per-trade parameter -- so it is not
+    in this set, and a save that carries it changes nothing here.
+    """
+    from bot_module.strategy_registry import RISK_FIELD_TO_RM_KEY, SERVER_RISK_FLOOR
+
+    current = current or {}
+    for field_name, rm_key in RISK_FIELD_TO_RM_KEY.items():
+        value = payload.get(rm_key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{section}.{rm_key} must be a number.",
+            )
+        if number < 0.0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{section}.{rm_key}={number} is not a valid risk limit.",
+            )
+        ceiling = float(SERVER_RISK_FLOOR[field_name])
+        current_value = current.get(rm_key)
+        if current_value is not None:
+            try:
+                held = float(current_value)
+            except (TypeError, ValueError):
+                held = None
+            if held is not None:
+                # The account's OWN value is the ceiling: a client may TIGHTEN
+                # a limit and never LOOSEN one, which is the same rule the
+                # strategy route already applies
+                # (bot_module/strategy_registry.py: ``apply_client_risk_config``
+                # caps the request at the account's current value).
+                #
+                # Where the account already holds a value LOOSER than the
+                # declared floor, that value wins: it is the platform's own
+                # default, the RiskManager enforces it
+                # (bot_module/risk_manager.py:250-257 reads the account's
+                # value), and refusing it would change a limit the platform
+                # handed out and break the Risk Settings page for every
+                # client. The floor still applies to a field the account has
+                # no value for.
+                #
+                # NOTE (2026-10-31, round 21): the platform declares a 5%
+                # maximum stop distance (bot_module/strategy_registry.py:
+                # SERVER_MAX_STOP_DISTANCE_PCT) but hands out 10% as the
+                # account default, and the RiskManager's own fallback is 2%
+                # (bot_module/config.py: RISK_MANAGER_MAX_STOP_DISTANCE_PCT).
+                # Three numbers for one limit. The DECLARED floor is left
+                # alone here -- changing a risk limit is the owner's call --
+                # and the question is recorded in the vault.
+                ceiling = held
+        if number > ceiling:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"{section}.{rm_key}={number} is looser than the limit of "
+                    f"{ceiling}. A client may tighten a risk limit but never "
+                    f"loosen it, and the server enforces {ceiling} on every "
+                    f"trade."
+                ),
+            )
+
+
 @config_router.put(
     "/config",
     response_model=schemas.ApiResponseData[schemas.AppConfig],
@@ -146,11 +313,37 @@ async def update_config_endpoint(
     )
 
     updated_any_section = False
+
+    # The account's CURRENT risk settings. A client may tighten a limit and
+    # never loosen one, so the ceiling for each limit is the value the
+    # account already holds, or the server floor where the account holds
+    # none.
+    db_config = await crud.get_config_model(db, user_id=current_user.id)
+    live_current: Dict[str, Any] = {}
+    backtest_current: Dict[str, Any] = {}
+    if db_config is not None:
+        raw_live = getattr(db_config, "risk_management", None)
+        if isinstance(raw_live, dict):
+            live_current = dict(raw_live)
+        raw_backtest = getattr(db_config, "backtest_risk_management", None)
+        if isinstance(raw_backtest, dict):
+            backtest_current = dict(raw_backtest)
+
     if new_config.risk_management:
-        risk_payload = new_config.risk_management.model_dump(by_alias=True)
+        # ONLY the fields the client actually sent. Pydantic injects the
+        # schema default for every field the client omitted, and an injected
+        # default is neither a value the client asked for nor a value that
+        # may be written over what the account already has.
+        risk_payload = _the_fields_the_client_actually_sent(new_config.risk_management)
         # The per-trade risk is bounded by the server's floor: the page may
         # not display a limit the server will not honour.
         _refuse_a_risk_per_trade_above_the_floor(risk_payload, "risk_management")
+        # And every account-level limit is bounded by the account's own
+        # current value, or by the server floor where the account holds none:
+        # a client may tighten a limit and never loosen one.
+        _refuse_a_risk_limit_looser_than_its_ceiling(
+            risk_payload, "risk_management", live_current
+        )
         await crud.update_config_section(
             db,
             current_user.id,
@@ -180,13 +373,18 @@ async def update_config_endpoint(
         )
         updated_any_section = True
     if new_config.backtest_risk_management:
-        backtest_risk_payload = new_config.backtest_risk_management.model_dump(
-            by_alias=True
+        # Only the fields the client actually sent -- same reason as the live
+        # section above.
+        backtest_risk_payload = _the_fields_the_client_actually_sent(
+            new_config.backtest_risk_management
         )
         # The paper account is the one the bot sizes its paper trades with
         # (bot_module/risk_manager.py:188-195), so it is bounded the same way.
         _refuse_a_risk_per_trade_above_the_floor(
             backtest_risk_payload, "backtest_risk_management"
+        )
+        _refuse_a_risk_limit_looser_than_its_ceiling(
+            backtest_risk_payload, "backtest_risk_management", backtest_current
         )
         await crud.update_config_section(
             db,

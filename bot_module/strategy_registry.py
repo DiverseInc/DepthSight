@@ -791,7 +791,49 @@ def build_bounded_config_data(
     bounded["strategy_name"] = config_or_none.strategy_name
     bounded["enabled"] = bool(params.get("enabled", True))
     bounded["strategy_params"] = params
-    bounded["risk_settings"] = dict(config_or_none.risk_settings)
+    # WHAT IS STORED MUST BE WHAT IS ENFORCED. The client's REQUESTED
+    # numbers are not stored: the EFFECTIVE ones are -- the request capped by
+    # the server floor AND by the account's own current value, which is what
+    # ``apply_client_risk_config`` computes and what the account block is
+    # written with.
+    #
+    # Otherwise a configuration could carry ``max_drawdown_pct: 10`` while the
+    # account enforces 2: the stored configuration would contradict the
+    # route's own comment, and the client would read back a limit the bot
+    # does not apply.
+    #
+    # An EMPTY block must not be written at all. The schema dumps a default
+    # ``risk_settings`` of ``{}`` into the request (exclude_none does not
+    # drop an empty dict), so writing the block unconditionally stored a
+    # ``risk_settings: {}`` on a configuration whose client had never
+    # mentioned a risk setting -- and a save that carries no risk settings
+    # would then REPLACE the ones the configuration already had with an
+    # empty block. Absent means "this configuration has no risk block";
+    # present means "here are the enforced ones".
+    risk_management = (applied or {}).get("risk_management") or {}
+    enforced: Dict[str, Any] = {}
+    for field_name in config_or_none.risk_settings:
+        rm_key = RISK_FIELD_TO_RM_KEY.get(field_name)
+        if rm_key is not None:
+            value = risk_management.get(rm_key)
+            if value is not None:
+                enforced[field_name] = value
+            continue
+        if field_name == "position_size_pct":
+            # The position budget has no account key of its own: it is
+            # bounded into the strategy's own per-trade parameter. It is
+            # stored here in PERCENT, which is the unit this field is in.
+            per_trade_pct = risk_management.get("riskPerTradePercent")
+            if per_trade_pct is not None:
+                enforced[field_name] = min(
+                    float(config_or_none.risk_settings[field_name]),
+                    float(per_trade_pct),
+                    float(SERVER_RISK_FLOOR[field_name]),
+                )
+    if enforced:
+        bounded["risk_settings"] = enforced
+    else:
+        bounded.pop("risk_settings", None)
     # The per-trade risk, in every place a strategy may read it from. The
     # stored configuration can never carry a per-trade risk looser than the
     # server floor.

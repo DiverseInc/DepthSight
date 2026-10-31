@@ -299,3 +299,172 @@ async def test_the_saved_row_keeps_the_clients_risk_settings(
     config_data = stored[0].config_data
     assert config_data["risk_settings"]["daily_loss_limit_pct"] == 2.0
     assert config_data["strategy_params"]["lookback_candles"] == 100
+
+
+# --- item 8: the position budget has no account key of its own ----------------
+#
+# ``position_size_pct`` IS a validated client field (it is in
+# ``SERVER_RISK_FLOOR``) and the editor sends it, but it has NO account key:
+# it is the position budget, and it is bounded into the strategy's own
+# per-trade parameter. The merge loop looked an account key up for EVERY field
+# the client sent, so this one raised a KeyError and a legitimate save became
+# a 500.
+
+
+@pytest.mark.asyncio
+async def test_the_position_budget_is_saved_instead_of_crashing_the_route(
+    authenticated_client, db_session, pro_user
+):
+    """A payload carrying the position budget must be saved, not crashed."""
+    response = await authenticated_client.post(
+        STRATEGIES_URL,
+        json=_save_payload(risk_settings={"position_size_pct": 0.5}),
+    )
+    assert response.status_code == 201, response.text
+
+    stored = await _stored_configs(db_session, pro_user.id)
+    assert len(stored) == 1
+    # The position budget is bounded into the strategy's own parameter, so it
+    # is never looser than the server floor.
+    assert stored[0].config_data["strategy_params"]["risk_pct_per_trade"] <= 0.005
+
+
+# --- item 9: what is stored must be what is enforced --------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_stored_block_carries_the_enforced_limit_not_the_requested_one(
+    authenticated_client, db_session, pro_user
+):
+    """The stored configuration must not contradict what the bot enforces."""
+    await _set_account_risk_management(db_session, pro_user.id, {"maxDrawdown": 5.0})
+
+    response = await authenticated_client.post(
+        STRATEGIES_URL,
+        json=_save_payload(risk_settings={"max_drawdown_pct": 10.0}),
+    )
+    assert response.status_code == 201, response.text
+
+    stored = await _stored_configs(db_session, pro_user.id)
+    assert len(stored) == 1
+    # The account enforces 5 -- the client's 10 was capped by the account's own
+    # value -- so the configuration must carry 5, not 10.
+    assert stored[0].config_data["risk_settings"]["max_drawdown_pct"] == 5.0
+
+
+# --- item 10: the Risk Settings page may not RAISE a limit --------------------
+#
+# The strategy route refuses a limit looser than the server floor. The
+# Settings route did not, so a client could raise four of the five limits
+# through it -- and the RiskManager enforces the ACCOUNT's stored value
+# (bot_module/risk_manager.py:210-232), so the raised number really did
+# govern.
+
+CONFIG_URL = "/api/v1/config"
+
+
+@pytest.mark.asyncio
+async def test_the_settings_page_may_not_raise_a_risk_limit(
+    authenticated_client, db_session, pro_user
+):
+    """A limit looser than the server floor is refused, and nothing changes."""
+    await _set_account_risk_management(db_session, pro_user.id, {"maxDrawdown": 5.0})
+
+    current = await _account_risk_management(db_session, pro_user.id)
+    payload = dict(current)
+    payload["maxDrawdown"] = 50.0
+    response = await authenticated_client.put(
+        CONFIG_URL, json={"risk_management": payload}
+    )
+    assert response.status_code == 422, response.text
+    assert "looser than the limit" in response.text, response.text
+
+    # And the account still has what it had.
+    after = await _account_risk_management(db_session, pro_user.id)
+    assert after["maxDrawdown"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_the_settings_page_may_not_loosen_past_the_accounts_own_value(
+    authenticated_client, db_session, pro_user
+):
+    """A client may TIGHTEN a limit and never loosen one."""
+    await _set_account_risk_management(db_session, pro_user.id, {"maxDrawdown": 5.0})
+
+    current = await _account_risk_management(db_session, pro_user.id)
+    payload = dict(current)
+    payload["maxDrawdown"] = 10.0
+    response = await authenticated_client.put(
+        CONFIG_URL, json={"risk_management": payload}
+    )
+    assert response.status_code == 422, response.text
+    assert "looser than the limit" in response.text, response.text
+
+    after = await _account_risk_management(db_session, pro_user.id)
+    assert after["maxDrawdown"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_the_settings_page_may_tighten_a_risk_limit(
+    authenticated_client, db_session, pro_user
+):
+    """Tightening is the whole point of the page, so it must still work."""
+    await _set_account_risk_management(db_session, pro_user.id, {"maxDrawdown": 20.0})
+
+    current = await _account_risk_management(db_session, pro_user.id)
+    payload = dict(current)
+    payload["maxDrawdown"] = 8.0
+    response = await authenticated_client.put(
+        CONFIG_URL, json={"risk_management": payload}
+    )
+    assert response.status_code == 200, response.text
+
+    after = await _account_risk_management(db_session, pro_user.id)
+    assert after["maxDrawdown"] == 8.0
+
+
+# --- item 11: a limit the client NEVER SENT ----------------------------------
+#
+# Pydantic fills the schema default in for every field the client omitted, so
+# a client that never mentioned ``riskPerTradePercent`` reaches the route
+# carrying 1.0. MEASURED: a client that sent three fields gets a dumped
+# payload of eighteen.
+#
+# An account that tightened its per-trade risk to 0.5 in the strategy editor
+# would be REFUSED on the Risk Settings page for a 1.0 it never sent -- and
+# the only way back would be to raise the limit, which the guard itself
+# forbids, so the page would be dead for that account for good.
+#
+# The same default would also be WRITTEN over the account's tightened 0.5:
+# a default is not None, and ``update_config_section`` merges every key it
+# is handed.
+
+
+@pytest.mark.asyncio
+async def test_a_limit_the_client_never_sent_is_neither_refused_nor_rewritten(
+    authenticated_client, db_session, pro_user
+):
+    """An omitted field must not be compared, and must not be written."""
+    await _set_account_risk_management(
+        db_session, pro_user.id, {"riskPerTradePercent": 0.5}
+    )
+    before = await _account_risk_management(db_session, pro_user.id)
+    assert before["riskPerTradePercent"] == 0.5
+
+    response = await authenticated_client.put(
+        CONFIG_URL,
+        json={
+            "risk_management": {
+                "maxDrawdown": 8.0,
+                "maxConcurrentTrades": 5,
+                "stopLossEnabled": True,
+            }
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    after = await _account_risk_management(db_session, pro_user.id)
+    assert after["maxDrawdown"] == 8.0
+    # The field the client never sent is untouched: not refused, and not
+    # rewritten with the schema's default.
+    assert after["riskPerTradePercent"] == 0.5

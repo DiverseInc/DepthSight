@@ -851,13 +851,37 @@ class TestBacktesterV2Lifecycle:
             assert len(bt.trade_log) == 1
             return bt.trade_log[0]
 
+        trade_25 = await _run_single_trade(25.0)
+        trade_75 = await _run_single_trade(75.0)
         trade_100 = await _run_single_trade(100.0)
         trade_300 = await _run_single_trade(300.0)
 
-        assert trade_300["quantity"] == pytest.approx(
-            trade_100["quantity"] * 3.0, rel=1e-3
+        # Under the account's per-trade limit, the fixed-USD budget scales the
+        # first entry exactly. (The tolerance covers the step-size rounding:
+        # a quantity is floored to the exchange's step, so three times a
+        # rounded quantity is not exactly three times the unrounded one.)
+        assert trade_75["quantity"] / trade_25["quantity"] == pytest.approx(
+            3.0, rel=1e-2
         )
-        assert trade_300["pnl"] == pytest.approx(trade_100["pnl"] * 3.0, rel=1e-3)
+
+        # CORRECTION (2026-10-31, round 21): this assertion used to be
+        # `trade_300 == trade_100 * 3.0`. It asserted that a fixed-USD request
+        # of $300 was honoured IN FULL, on a $10,000 balance whose per-trade
+        # limit is 1% ($100). That was the D1 hole: the visual builder's
+        # "risk_value"/"risk_type" action parameter reaches
+        # `signal.risk_usd` (bot_module/strategy.py:5004-5016), so without a
+        # ceiling on that channel a client could ask for 99% of the balance in
+        # a single trade.
+        #
+        # The budget is now capped by the account's own limit, so a request
+        # above it cannot buy a bigger position. $100 IS the ceiling here
+        # (1% of $10,000), so $300 and $100 produce the same position.
+        assert trade_300["quantity"] == pytest.approx(
+            trade_100["quantity"], rel=1e-3
+        )
+        # And the same position earns the same PnL: the clamp is on the
+        # POSITION, not only on the number the strategy asked for.
+        assert trade_300["pnl"] == pytest.approx(trade_100["pnl"], rel=1e-3)
 
     @pytest.mark.asyncio
     async def test_v2_level_touch_analyzer_executes_in_backtester(

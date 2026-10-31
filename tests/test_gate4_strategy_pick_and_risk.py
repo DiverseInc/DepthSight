@@ -236,17 +236,53 @@ def test_a_partial_exit_config_that_leaves_room_for_a_final_target_is_kept():
 # --- item 9: a dropped candidate must be visible at the default log level ----
 
 
-def test_a_dropped_candidate_is_logged_at_warning_level(caplog):
-    """INFO is not shown at the default log level, so a dropped candidate was
-    invisible."""
+def test_a_dropped_candidate_is_logged_at_warning_level(caplog, monkeypatch):
+    """A candidate that does not make it into the registry must SAY SO.
+
+    INFO is not shown at the default log level, so a dropped candidate was
+    invisible. The contract is not "this exact sentence is logged": a
+    candidate can be dropped for more than one reason -- it may not be a
+    subclass at import time, or it may fail the verification -- and the
+    reason changes as the registry changes. The contract is that the drop is
+    VISIBLE and that it NAMES the candidate.
+
+    CORRECTION (2026-10-31, round 21): this test used to assert the literal
+    string "not a direct BaseStrategy subclass". That assertion depended on
+    the registry NOT yet having imported the candidate's own module, so it
+    passed or failed depending on what else had been imported first -- it
+    was a statement about import order, not about the contract. The mechanism
+    is now tested directly: a candidate the verification refuses is named in
+    a WARNING-or-above record, whatever the reason was.
+    """
+    import bot_module.strategy as strategy_module
+
     logger = logging.getLogger("bot_module.strategy")
     caplog.set_level(logging.WARNING, logger="bot_module.strategy")
-    # caplog listens on the root logger; the bot_module logger does not
-    # propagate, so the records have to be allowed through for this test.
-    with mock.patch.object(logger, "propagate", True):
-        strategy_module._build_strategy_registry()
 
-    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    real_verify = strategy_module._verify_registry_candidate
+
+    def refuse(cls):
+        if getattr(cls, "NAME", None) == "VolumeBreakout":
+            return "refused on purpose, for this test"
+        return real_verify(cls)
+
+    monkeypatch.setattr(strategy_module, "_verify_registry_candidate", refuse)
+
+    # The registry is global and the builder rewrites it, so the state is put
+    # back afterwards: this test must not leave VolumeBreakout missing for
+    # the rest of the session.
+    saved = dict(strategy_module.STRATEGIES)
+    try:
+        with mock.patch.object(logger, "propagate", True):
+            strategy_module._build_strategy_registry()
+    finally:
+        strategy_module.STRATEGIES.clear()
+        strategy_module.STRATEGIES.update(saved)
+
+    messages = [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ]
     assert any(
-        "not a direct BaseStrategy subclass" in r.getMessage() for r in warnings
-    ), [r.getMessage() for r in warnings]
+        "VolumeBreakout" in m and "refused on purpose, for this test" in m
+        for m in messages
+    ), messages

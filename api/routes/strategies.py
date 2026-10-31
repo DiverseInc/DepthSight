@@ -150,7 +150,21 @@ async def _apply_client_risk_settings(
 
     merged = dict(current)
     for field_name in sent:
-        rm_key = RISK_FIELD_TO_RM_KEY[field_name]
+        rm_key = RISK_FIELD_TO_RM_KEY.get(field_name)
+        if rm_key is None:
+            # A client field with NO account key of its own.
+            # ``position_size_pct`` is one: it is the position budget, and it
+            # is bounded in ``apply_client_risk_config`` into the strategy's
+            # own per-trade parameter (``risk_pct_per_trade``), which is
+            # stored in the strategy's parameters. There is no account block
+            # to merge it into -- and looking one up anyway raised a
+            # KeyError, which turned a legitimate save into a 500.
+            logger.debug(
+                f"Risk field '{field_name}' has no account key; it is carried "
+                f"by the strategy's own parameters, so the account block is "
+                f"left alone."
+            )
+            continue
         merged[rm_key] = applied["risk_management"][rm_key]
     await crud.update_config_section(db, user_id, "risk_management", merged)
     return applied

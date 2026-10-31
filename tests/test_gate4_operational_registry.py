@@ -78,7 +78,7 @@ def test_a_strategy_without_its_model_is_refused_with_the_reason(
         "a strategy with no model must not pass the verification -- it starts "
         "cleanly and then never signals"
     )
-    assert "compass_model" in reason, reason
+    assert "Compass model file" in reason, reason
     assert str(tmp_path / "no-compass.json") in reason, reason
 
 

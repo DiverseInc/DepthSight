@@ -438,7 +438,7 @@ def test_compass_is_accounted_for_and_never_silently_dropped():
             "Compass cannot trade on this machine (%s), so it must not be in "
             "the registry" % reason
         )
-        assert "compass_model" in reason, reason
+        assert "Compass model file" in reason, reason
 
 
 def test_first_pullbacks_subscribes_to_the_series_its_volume_foundation_reads():

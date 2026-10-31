@@ -643,12 +643,26 @@ async def test_the_risk_settings_page_cannot_store_an_unenforceable_limit(
 async def test_the_risk_settings_page_can_still_tighten_the_limit(
     authenticated_client, db_session, pro_user
 ):
-    """The bound is a ceiling: a tighter limit is still accepted."""
+    """The bound is a ceiling: a tighter limit is still accepted.
+
+    CORRECTION (2026-10-31, round 22): this test used to send
+    ``maxDrawdown = 15.5`` and expect it to be accepted, on the assumption
+    that 15.5 was "tighter" than the server's 20.0 floor. It was not
+    tightening anything: a new account is handed ``maxDrawdown = 10.0``
+    (MEASURED, ``api/crud.py`` ``create_user``), so 15.5 was a LOOSENING of
+    the account's own limit -- and the test was asserting the very behaviour
+    the Settings route did not guard, which is how a client could raise four
+    of the five limits through this page and the RiskManager would enforce
+    the raised number.
+
+    The rule is the recorded one: a client may TIGHTEN a risk limit and never
+    LOOSEN one. So the account holds 10.0 and the client may send 8.0.
+    """
     response = await authenticated_client.put(
         CONFIG_URL,
         json={
             "risk_management": {
-                "maxDrawdown": 15.5,
+                "maxDrawdown": 8.0,
                 "maxConcurrentTrades": 7,
                 "stopLossEnabled": False,
                 "riskPerTradePercent": 0.5,
@@ -659,6 +673,7 @@ async def test_the_risk_settings_page_can_still_tighten_the_limit(
 
     after = await _account_risk_management(db_session, pro_user.id)
     assert after["riskPerTradePercent"] == 0.5
+    assert after["maxDrawdown"] == 8.0
 
 
 # --- the constants the tests above rely on ----------------------------------
