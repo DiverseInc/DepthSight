@@ -11803,6 +11803,13 @@ class FirstPullbacksInTrendStrategy(BaseStrategy):
         tf_trend = self._get_param("trend_timeframe", "5m")
         base_reqs = super().required_data_types
         strategy_reqs = {f"kline_{tf_entry}", f"kline_{tf_trend}", "aggTrade"}
+        # kline_1m is required by the VOLUME-CONFIRMATION foundation, which
+        # reads that series by default (see _check_foundation_volume_confirmation
+        # _wrapper) and which this strategy's signal logic REQUIRES: without it
+        # the foundation is always False and the strategy never signals. The
+        # controller hands a strategy only the keys it asked for, so a series
+        # that is read but not requested is simply absent.
+        strategy_reqs.add("kline_1m")
         return base_reqs.union(strategy_reqs)
 
     def _check_pattern_pullback(
@@ -12276,9 +12283,12 @@ class ReverseVolumeBreakoutStrategy(BaseStrategy):
     NAME = "ReverseVolumeBreakout"
     description = "Reverses VolumeBreakoutStrategy signals based on volume confirmation and price action."
 
+    #: The strategy whose signal this one reverses.
+    ORIGINAL_STRATEGY_NAME = "VolumeBreakout"
+
     @property
     def required_data_types(self) -> Set[str]:
-        orig_strat = get_strategy_instance("VolumeBreakout")
+        orig_strat = get_strategy_instance(self.ORIGINAL_STRATEGY_NAME)
         return (
             orig_strat.required_data_types
             if orig_strat
@@ -12288,12 +12298,39 @@ class ReverseVolumeBreakoutStrategy(BaseStrategy):
     def check_foundations(
         self, pair_info: Dict[str, Any], market_data: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        orig_strat = get_strategy_instance("VolumeBreakout")
+        orig_strat = get_strategy_instance(self.ORIGINAL_STRATEGY_NAME)
         return (
             orig_strat.check_foundations(pair_info, market_data)
             if orig_strat
             else super().check_foundations(pair_info, market_data)
         )  # pragma: no cover
+
+    def _original_strategy(self) -> Optional[BaseStrategy]:
+        """The VolumeBreakout instance whose signal this strategy reverses.
+
+        WHY THIS IS NOT get_strategy_instance()
+        ------------------------------------------
+        The reversed trade is built from the ORIGINAL signal's TAKE-PROFIT --
+        it becomes the new stop-loss. With the shipped partial-exit
+        configuration (bot_module/config.py:1064-1069) the partial targets
+        cover 100% of the position, so the original signal has NO take-profit
+        and this strategy returned None on every candle, silently, for every
+        client who picked it.
+
+        get_strategy_instance() hands out a SHARED instance built from the
+        config defaults, and a client's parameters never reach it. So the
+        original strategy is rebuilt here from the config defaults with ONE
+        change: the partial exits are cleared, unless the client set them
+        explicitly, so that a final take-profit exists to reverse.
+        """
+        base_params: Dict[str, Any] = {}
+        if "partial_exit_rr_config" in self._instance_params:
+            base_params["partial_exit_rr_config"] = self._instance_params[
+                "partial_exit_rr_config"
+            ]
+        else:
+            base_params["partial_exit_rr_config"] = None
+        return create_strategy_instance(self.ORIGINAL_STRATEGY_NAME, params=base_params)
 
     def _check_specific_signal_logic(
         self,
@@ -12320,7 +12357,7 @@ class ReverseVolumeBreakoutStrategy(BaseStrategy):
             if original_direction == SignalDirection.LONG
             else SignalDirection.LONG
         )
-        original_strat = get_strategy_instance("VolumeBreakout")
+        original_strat = self._original_strategy()
         if not original_strat:
             logger.error(
                 f"{log_prefix} Could not get original VolumeBreakoutStrategy instance."
@@ -12384,9 +12421,12 @@ class ReverseFakeBreakoutStrategy(BaseStrategy):
     NAME = "ReverseFakeBreakout"
     description = "Reverses FakeBreakoutStrategy signals based on volume confirmation and price action."
 
+    #: The strategy whose signal this one reverses.
+    ORIGINAL_STRATEGY_NAME = "FakeBreakout"
+
     @property
     def required_data_types(self) -> Set[str]:
-        orig_strat = get_strategy_instance("FakeBreakout")
+        orig_strat = get_strategy_instance(self.ORIGINAL_STRATEGY_NAME)
         return (
             orig_strat.required_data_types
             if orig_strat
@@ -12396,12 +12436,39 @@ class ReverseFakeBreakoutStrategy(BaseStrategy):
     def check_foundations(
         self, pair_info: Dict[str, Any], market_data: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        orig_strat = get_strategy_instance("FakeBreakout")
+        orig_strat = get_strategy_instance(self.ORIGINAL_STRATEGY_NAME)
         return (
             orig_strat.check_foundations(pair_info, market_data)
             if orig_strat
             else super().check_foundations(pair_info, market_data)
         )  # pragma: no cover
+
+    def _original_strategy(self) -> Optional[BaseStrategy]:
+        """The FakeBreakout instance whose signal this strategy reverses.
+
+        WHY THIS IS NOT get_strategy_instance()
+        ------------------------------------------
+        The reversed trade is built from the ORIGINAL signal's TAKE-PROFIT --
+        it becomes the new stop-loss. With the shipped partial-exit
+        configuration (bot_module/config.py:1064-1069) the partial targets
+        cover 100% of the position, so the original signal has NO take-profit
+        and this strategy returned None on every candle, silently, for every
+        client who picked it.
+
+        get_strategy_instance() hands out a SHARED instance built from the
+        config defaults, and a client's parameters never reach it. So the
+        original strategy is rebuilt here from the config defaults with ONE
+        change: the partial exits are cleared, unless the client set them
+        explicitly, so that a final take-profit exists to reverse.
+        """
+        base_params: Dict[str, Any] = {}
+        if "partial_exit_rr_config" in self._instance_params:
+            base_params["partial_exit_rr_config"] = self._instance_params[
+                "partial_exit_rr_config"
+            ]
+        else:
+            base_params["partial_exit_rr_config"] = None
+        return create_strategy_instance(self.ORIGINAL_STRATEGY_NAME, params=base_params)
 
     def _check_specific_signal_logic(
         self,
@@ -12428,7 +12495,7 @@ class ReverseFakeBreakoutStrategy(BaseStrategy):
             if original_direction == SignalDirection.LONG
             else SignalDirection.LONG
         )
-        original_strat = get_strategy_instance("FakeBreakout")
+        original_strat = self._original_strategy()
         if not original_strat:
             logger.error(
                 f"{log_prefix} Could not get original FakeBreakoutStrategy instance."
@@ -12496,15 +12563,167 @@ except ImportError:
     logger.warning("OnlineAgentStrategy could not be imported.")
     ML_STRATEGY_CLASS = None  # pragma: no cover
 
-ALLOWED_DEFAULT_STRATEGIES = ["VisualBuilderStrategy", "CompassStrategy"]
 
-STRATEGIES: Dict[str, Type[BaseStrategy]] = {
-    cls.NAME: cls
-    for cls in BaseStrategy.__subclasses__()
-    if hasattr(cls, "NAME")
-    and cls is not ML_STRATEGY_CLASS
-    and cls.NAME in ALLOWED_DEFAULT_STRATEGIES
-}
+# Shared instances live here so that a strategy which borrows another
+# strategy's logic can look it up while the registry is still being built
+# (see _build_strategy_registry below). get_strategy_instance is defined
+# BEFORE the registry on purpose: the two "Reverse*" strategies call it from
+# required_data_types, and that call happens while they are being verified.
+#
+# STRATEGIES is declared (empty) before get_strategy_instance because that
+# function reads it, and it is populated in place further down.
+STRATEGIES: Dict[str, Type[BaseStrategy]] = {}
+
+_strategy_instances: Dict[str, BaseStrategy] = {}
+
+
+def get_strategy_instance(strategy_name: str) -> Optional[BaseStrategy]:
+    instance = _strategy_instances.get(strategy_name)
+    if instance:
+        return instance
+    strategy_class = STRATEGIES.get(strategy_name)
+    if strategy_class:
+        logger.debug(f"Instantiating shared strategy '{strategy_name}'...")
+        try:
+            instance = strategy_class()
+            _strategy_instances[strategy_name] = instance
+            logger.info(f"Shared instance created for '{strategy_name}'.")
+            return instance
+        except Exception as e:
+            logger.error(
+                f"Error instantiating shared strategy '{strategy_name}': {e}",
+                exc_info=True,
+            )
+    else:
+        logger.warning(
+            f"Strategy class '{strategy_name}' not found in STRATEGIES registry for shared instance. Available: {list(STRATEGIES.keys())}"
+        )
+    return None
+
+
+# --- Strategy registry ------------------------------------------------------
+#
+# WHY THIS IS NOT JUST A LIST OF NAMES
+#
+# The registry used to be a bare name filter over BaseStrategy.__subclasses__():
+#
+#     {cls.NAME: cls for cls in BaseStrategy.__subclasses__()
+#      if hasattr(cls, "NAME") and cls is not ML_STRATEGY_CLASS
+#      and cls.NAME in ALLOWED_DEFAULT_STRATEGIES}
+#
+# A name was therefore only ever a CANDIDATE and nothing checked that the class
+# behind it could actually be started. Nine named strategies sat in exactly that
+# state: real implementations, a real NAME attribute, and no way to reach them
+# from the engine -- so a client who picked one got a product that looked
+# broken. The list of names was decorative.
+#
+# A name is now only a CANDIDATE. Every candidate is verified by
+# _verify_registry_candidate() before it is allowed to register, and a candidate
+# that fails is REJECTED WITH A LOG LINE naming the reason. It is never
+# silently dropped, and it is never admitted on the strength of its name.
+#
+# ALLOWED_DEFAULT_STRATEGIES is in REGISTRATION ORDER on purpose. The two
+# "Reverse*" strategies borrow another strategy's logic (VolumeBreakout and
+# FakeBreakout) and look that dependency up in the registry while they are
+# being verified, so the dependency has to be registered first.
+ALLOWED_DEFAULT_STRATEGIES = [
+    "VisualBuilderStrategy",
+    "CompassStrategy",
+    "VolumeBreakout",
+    "FakeBreakout",
+    "DensityBounce",
+    "ConsolidationImpulse",
+    "AggTradeReversal",
+    "FirstPullbacksInTrend",
+    "ReverseVolumeBreakout",
+    "ReverseFakeBreakout",
+]
+
+
+def _verify_registry_candidate(cls: Type[BaseStrategy]) -> Optional[str]:
+    """Return None when `cls` may enter the classic STRATEGIES registry.
+
+    Return a human-readable reason string when it may not. The reason is the
+    point: a strategy that cannot be started has to say WHY, otherwise a client
+    who picked it is left looking at a product that silently does nothing.
+    """
+    name = getattr(cls, "NAME", None)
+    if not isinstance(name, str) or not name:
+        return "no usable NAME attribute"
+
+    # 1. It must have a signal implementation of its own. The BaseStrategy stub
+    #    logs "not implemented" and returns None forever. The visual builder
+    #    strategy is the documented exception: it is driven by the JSON
+    #    interpreter inside check_signal_sync, not by that hook (the same
+    #    name-based special case is already used by required_indicators).
+    if (
+        "_check_specific_signal_logic" not in cls.__dict__
+        and cls.NAME != "VisualBuilderStrategy"
+    ):
+        return "does not implement _check_specific_signal_logic"
+
+    # 2. It must be constructible the way the engine constructs it.
+    #    create_strategy_instance() calls cls(params=..., contract_id=...); a
+    #    class whose __init__ takes neither raises TypeError there and every
+    #    client pick of it dies with "Could not create instance".
+    try:
+        instance = cls(params=None, contract_id=None)
+    except Exception as exc:
+        return f"cannot be constructed as cls(params=..., contract_id=...): {exc}"
+
+    # 3. It must say what market data it needs, and the answer must be usable.
+    try:
+        required = instance.required_data_types
+    except Exception as exc:
+        return f"required_data_types raised {type(exc).__name__}: {exc}"
+    if not required:
+        return "declares no required data types"
+    if not all(isinstance(item, str) for item in required):
+        return "required_data_types contains non-string entries"
+    return None
+
+
+def _build_strategy_registry() -> Dict[str, Type[BaseStrategy]]:
+    """Build the classic strategy registry, verifying every candidate.
+
+    The registry is filled IN PLACE into the module-level STRATEGIES dict.
+    That matters: the two "Reverse*" strategies look their dependency up
+    through get_strategy_instance() while they are being verified, so the
+    dependency has to be visible in the registry before the dependent is
+    verified.
+    """
+    subclasses = {
+        cls.NAME: cls
+        for cls in BaseStrategy.__subclasses__()
+        if hasattr(cls, "NAME") and cls is not ML_STRATEGY_CLASS
+    }
+    for name in ALLOWED_DEFAULT_STRATEGIES:
+        cls = subclasses.get(name)
+        if cls is None:
+            # NOT a silent drop: this name is advertised, so say where it
+            # lives. CompassStrategy is defined in its own module (which
+            # imports xgboost) and is registered by bot_runner.py at process
+            # start; it is deliberately not imported from here.
+            logger.info(
+                f"Strategy '{name}' is not a direct BaseStrategy subclass at "
+                f"import time; it is not registered here."
+            )
+            continue
+        reason = _verify_registry_candidate(cls)
+        if reason:
+            logger.error(
+                f"Strategy '{name}' REJECTED from the registry: {reason}. "
+                f"A client that picks it would get a strategy that cannot start."
+            )
+            continue
+        STRATEGIES[name] = cls
+        logger.debug(
+            f"Strategy '{name}' registered ({cls.__module__}.{cls.__name__})."
+        )
+    return STRATEGIES
+
+
+STRATEGIES: Dict[str, Type[BaseStrategy]] = _build_strategy_registry()
 
 if (
     ML_STRATEGY_CLASS
@@ -12536,32 +12755,6 @@ try:
     )
 except ImportError as e:
     logger.warning(f"Could not import GeneticCompatibleStrategy: {e}")
-
-_strategy_instances: Dict[str, BaseStrategy] = {}
-
-
-def get_strategy_instance(strategy_name: str) -> Optional[BaseStrategy]:
-    instance = _strategy_instances.get(strategy_name)
-    if instance:
-        return instance
-    strategy_class = STRATEGIES.get(strategy_name)
-    if strategy_class:
-        logger.debug(f"Instantiating shared strategy '{strategy_name}'...")
-        try:
-            instance = strategy_class()
-            _strategy_instances[strategy_name] = instance
-            logger.info(f"Shared instance created for '{strategy_name}'.")
-            return instance
-        except Exception as e:
-            logger.error(
-                f"Error instantiating shared strategy '{strategy_name}': {e}",
-                exc_info=True,
-            )
-    else:
-        logger.warning(
-            f"Strategy class '{strategy_name}' not found in STRATEGIES registry for shared instance. Available: {list(STRATEGIES.keys())}"
-        )
-    return None
 
 
 def create_strategy_instance(
