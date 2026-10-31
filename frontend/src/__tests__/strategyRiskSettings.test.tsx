@@ -140,9 +140,27 @@ vi.mock("@/context/AuthContext", () => ({
 import { ConfigAndLaunchPanel } from "@/components/strategy-editor/ConfigAndLaunchPanel";
 import {
 	SERVER_RISK_FLOOR_PCT,
+	applyStrategyRegistry,
 	validateStrategyRiskSettings,
 } from "@/components/strategies/strategyEditorSettings";
 import { useStrategyEditorStore } from "@/stores/strategyEditorStore";
+
+/**
+ * The floor the CLIENT is enforcing for a field.
+ *
+ * The client's copy of the server's floors comes from the server's registry
+ * (`applyStrategyRegistry`) and is empty until it arrives, so this throws
+ * instead of comparing against nothing when it has not.
+ */
+const floorOf = (
+	field: keyof typeof registryMock.server_floor,
+): number => {
+	const value = SERVER_RISK_FLOOR_PCT[field];
+	if (typeof value !== "number") {
+		throw new Error(`the server's floor for ${field} has not been applied`);
+	}
+	return value;
+};
 
 const wrapper = ({ children }: { children: React.ReactNode }) => (
 	<QueryClientProvider client={new QueryClient()}>
@@ -192,6 +210,10 @@ beforeEach(() => {
 	updateStrategyConfigMock.mockReset();
 	startStrategyMock.mockReset();
 	runBacktestMock.mockReset();
+	// The client's copy of the server's floors comes from the server's own
+	// registry, so it is applied here: these tests must not depend on
+	// another test having rendered the panel first.
+	applyStrategyRegistry(registryMock);
 	// The editor store's default name comes from i18n at module load time, which
 	// is not initialised yet when the store module is evaluated. Pin it so the
 	// deploy button is reachable.
@@ -228,7 +250,7 @@ describe("the risk limits the client types (GATE 4)", () => {
 
 		setNumber(
 			"Daily Loss Limit (%)",
-			String(SERVER_RISK_FLOOR_PCT.daily_loss_limit_pct + 1),
+			String(floorOf("daily_loss_limit_pct") + 1),
 		);
 
 		clickDeploy();
@@ -244,7 +266,7 @@ describe("the risk limits the client types (GATE 4)", () => {
 
 		setNumber(
 			"Risk Per Trade (%)",
-			String(SERVER_RISK_FLOOR_PCT.risk_per_trade_pct + 1),
+			String(floorOf("risk_per_trade_pct") + 1),
 		);
 
 		clickDeploy();
@@ -302,7 +324,7 @@ describe("the client-side risk validation mirrors the server floor", () => {
 			validateStrategyRiskSettings({
 				risk_per_trade_pct: 0.5,
 				max_drawdown_pct: 10,
-				daily_loss_limit_pct: SERVER_RISK_FLOOR_PCT.daily_loss_limit_pct,
+				daily_loss_limit_pct: floorOf("daily_loss_limit_pct"),
 				position_size_pct: 0.5,
 			}),
 		).toEqual({});
@@ -314,7 +336,7 @@ describe("the client-side risk validation mirrors the server floor", () => {
 				risk_per_trade_pct: 0.5,
 				max_drawdown_pct: 10,
 				daily_loss_limit_pct:
-					SERVER_RISK_FLOOR_PCT.daily_loss_limit_pct + 0.1,
+					floorOf("daily_loss_limit_pct") + 0.1,
 				position_size_pct: 0.5,
 			}),
 		).toEqual({ daily_loss_limit_pct: "aboveFloor" });
@@ -323,7 +345,7 @@ describe("the client-side risk validation mirrors the server floor", () => {
 	it("rejects a risk per trade looser than the server floor", () => {
 		expect(
 			validateStrategyRiskSettings({
-				risk_per_trade_pct: SERVER_RISK_FLOOR_PCT.risk_per_trade_pct + 0.1,
+				risk_per_trade_pct: floorOf("risk_per_trade_pct") + 0.1,
 				max_drawdown_pct: 10,
 				daily_loss_limit_pct: 5,
 				position_size_pct: 0.5,
@@ -335,7 +357,7 @@ describe("the client-side risk validation mirrors the server floor", () => {
 		expect(
 			validateStrategyRiskSettings({
 				risk_per_trade_pct: 0.5,
-				max_drawdown_pct: SERVER_RISK_FLOOR_PCT.max_drawdown_pct + 0.1,
+				max_drawdown_pct: floorOf("max_drawdown_pct") + 0.1,
 				daily_loss_limit_pct: 5,
 				position_size_pct: 0.5,
 			}),
@@ -348,7 +370,7 @@ describe("the client-side risk validation mirrors the server floor", () => {
 				risk_per_trade_pct: 1,
 				max_drawdown_pct: 10,
 				daily_loss_limit_pct: 5,
-				position_size_pct: SERVER_RISK_FLOOR_PCT.position_size_pct + 0.1,
+				position_size_pct: floorOf("position_size_pct") + 0.1,
 			}),
 		).toEqual({ position_size_pct: "aboveFloor" });
 	});

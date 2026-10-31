@@ -254,6 +254,29 @@ export interface StrategyRegistryContract {
 		required: boolean;
 		allowed: string[];
 	};
+	/**
+	 * The per-trade risk, in every place a strategy may read it from.
+	 *
+	 * UNITS: the `risk_settings` block is in PERCENT (1.0 means 1%), this
+	 * parameter is a FRACTION of the balance (0.01 means 1%). A value looser
+	 * than the server's floor is REFUSED, not clamped.
+	 *
+	 * Optional so the client still works against a server that does not
+	 * publish it yet.
+	 */
+	per_trade_risk?: {
+		/** The strategy parameter that carries the per-trade risk. */
+		parameter: string;
+		unit: string;
+		unit_note?: string;
+		/** The floor, in the unit above (a fraction). */
+		server_floor: number;
+		/** The same floor in PERCENT, for display. */
+		server_floor_percent: number;
+		/** Every place in `config_data` the value may hide. */
+		paths: string[];
+		description?: string;
+	};
 	/** The risk floor per field. A client may tighten, never loosen. */
 	server_floor: Record<string, number>;
 	rules: string[];

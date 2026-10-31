@@ -23,9 +23,12 @@ import {
 	StrategyRiskSettingsSection,
 } from "@/components/strategies/StrategyEditorSettingsCards";
 import {
-	DEFAULT_STRATEGY_RISK_SETTINGS,
 	SERVER_RISK_FLOOR,
 	applyStrategyRegistry,
+	clampRiskDraftToFloors,
+	defaultStrategyRiskSettings,
+	hasServerRiskFloors,
+	isStrategyRegistryLoaded,
 	parseRiskDraft,
 	toRiskDraft,
 	toRiskSettingsFromAccount,
@@ -301,7 +304,7 @@ export const ConfigAndLaunchPanel = memo(
 		);
 
 		const [riskDraft, setRiskDraft] = useState<StrategyRiskDraft>(() =>
-			toRiskDraft(DEFAULT_STRATEGY_RISK_SETTINGS),
+			toRiskDraft(defaultStrategyRiskSettings()),
 		);
 		const riskSettings = useMemo(
 			() => parseRiskDraft(riskDraft),
@@ -341,7 +344,7 @@ export const ConfigAndLaunchPanel = memo(
 				toRiskDraft(
 					savedRisk ??
 						accountRiskSettings ??
-						DEFAULT_STRATEGY_RISK_SETTINGS,
+						defaultStrategyRiskSettings(),
 				),
 			);
 			setRiskErrors({});
@@ -351,6 +354,14 @@ export const ConfigAndLaunchPanel = memo(
 			);
 			setStrategyClassError(undefined);
 		}
+
+		// The server's floors arrived (or moved): a limit that is looser than
+		// the floor is pulled DOWN to it, because the server refuses a looser
+		// limit and the form must not keep showing one.
+		const serverFloorKey = JSON.stringify(SERVER_RISK_FLOOR);
+		useEffect(() => {
+			setRiskDraft((draft) => clampRiskDraftToFloors(draft));
+		}, [serverFloorKey]);
 
 		const handleCopy = async (label: string, text: string) => {
 			try {
@@ -446,6 +457,23 @@ export const ConfigAndLaunchPanel = memo(
 					variant: "destructive",
 					title: t("common:errorTitle"),
 					description: t("configPanel.toasts.nameRequired"),
+				});
+				return;
+			}
+
+			// Nothing can be checked until the server's contract has arrived:
+			// the risk floors and the list of runnable strategies live on the
+			// server (`GET /api/v1/strategies/registry`) and the client carries
+			// no copy of them. Sending before then would send a guess, and the
+			// server refuses the whole save when one of the numbers is wrong.
+			if (!isStrategyRegistryLoaded() || !hasServerRiskFloors()) {
+				toast({
+					variant: "destructive",
+					title: t("common:errorTitle"),
+					description: t(
+						"configPanel.strategyContractNotLoaded",
+						"The server's strategy and risk limits have not loaded yet, so nothing can be checked. Try again in a moment.",
+					),
 				});
 				return;
 			}
@@ -1082,7 +1110,10 @@ export const ConfigAndLaunchPanel = memo(
 												/>
 												<p id={`${inputId}-desc`} className="text-xs text-muted-foreground">
 													{t("configPanel.riskServerFloor", {
-														defaultValue: `Server floor: ${SERVER_RISK_FLOOR[field]}.`,
+														defaultValue:
+															typeof SERVER_RISK_FLOOR[field] === "number"
+																? `Server floor: ${SERVER_RISK_FLOOR[field]}.`
+																: "The server's limit for this field has not loaded yet.",
 														floor: SERVER_RISK_FLOOR[field],
 													})}
 												</p>
