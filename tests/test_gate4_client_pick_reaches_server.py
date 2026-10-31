@@ -145,7 +145,11 @@ def test_a_tighter_risk_block_is_applied_to_the_keys_the_bot_reads():
     assert risk_management["dailyMaxLossPercent"] == 1.5
     assert risk_management["maxStopDistancePct"] == 2.0
     assert risk_management["maxConsecutiveLosses"] == 3
-    assert applied["strategy_params"]["risk_pct_per_trade"] == 0.4
+    # UNITS: the account block is in PERCENT (0.4 == 0.4% of the balance);
+    # the strategy parameter is a FRACTION (0.004 == 0.4% of the balance).
+    # This used to assert 0.4 -- a budget of 0.4 in the fraction unit is 40%
+    # of the balance, fifty times looser than the 0.01 default it replaced.
+    assert applied["strategy_params"]["risk_pct_per_trade"] == 0.004
 
 
 def test_a_tighter_limit_never_makes_the_server_looser_than_the_account():
@@ -168,7 +172,9 @@ def test_the_position_size_is_capped_by_the_account_risk_per_trade():
     applied = apply_client_risk_config(
         config, account_risk_settings={"riskPerTradePercent": 0.25}
     )
-    assert applied["strategy_params"]["risk_pct_per_trade"] == 0.25
+    # UNITS: the account's risk per trade is a PERCENT (0.25 == 0.25%); the
+    # strategy parameter is a FRACTION, so the same budget is 0.0025.
+    assert applied["strategy_params"]["risk_pct_per_trade"] == 0.0025
 
 
 def test_an_unknown_risk_setting_is_refused_rather_than_ignored():
