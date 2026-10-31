@@ -160,6 +160,30 @@ export interface StrategyConfigData {
 	natr_settings?: Record<string, unknown> | null;
 	oracle_settings?: Record<string, unknown> | null;
 	max_concurrent_symbols?: number | null;
+
+	// Risk limits typed by the client in the strategy editor.
+	// Units are PERCENT (not fractions): the bot converts percent -> fraction
+	// server-side (e.g. DEFAULT_DAILY_MAX_LOSS_PERCENT / 100.0).
+	risk_settings?: StrategyRiskSettings;
+}
+
+/**
+ * Per-strategy risk limits the client types in the strategy editor and the
+ * server stores inside `config_data`.
+ *
+ * Units: PERCENT. `daily_loss_limit_pct` mirrors the bot's daily-loss guard
+ * (`daily_max_loss_threshold` / `daily_max_loss_pct`) and may only TIGHTEN the
+ * server floor, never loosen it.
+ */
+export interface StrategyRiskSettings {
+	/** Percentage of account equity risked on a single trade. */
+	risk_per_trade_pct: number;
+	/** Largest peak-to-trough equity decline tolerated before the strategy stops. */
+	max_drawdown_pct: number;
+	/** Daily loss cap as a percentage of equity. Cannot exceed the server floor. */
+	daily_loss_limit_pct: number;
+	/** Percentage of account equity committed to each position. */
+	position_size_pct: number;
 }
 
 // Returning and correctly defining StrategyConfig

@@ -18,6 +18,22 @@ import { memo, useEffect, useMemo, useState } from "react";
 import type { DateRange } from "react-day-picker";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "react-router-dom";
+import {
+	StrategyEngineSection,
+	StrategyRiskSettingsSection,
+} from "@/components/strategies/StrategyEditorSettingsCards";
+import {
+	DEFAULT_STRATEGY_RISK_SETTINGS,
+	parseRiskDraft,
+	toRiskDraft,
+	validateStrategyClass,
+	validateStrategyRiskSettings,
+} from "@/components/strategies/strategyEditorSettings";
+import type {
+	StrategyClassErrorCode,
+	StrategyRiskDraft,
+	StrategyRiskErrors,
+} from "@/components/strategies/strategyEditorSettings";
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 
@@ -57,6 +73,7 @@ import {
 	useSaveStrategyConfig,
 	useSendTradingViewTestSignal,
 	useStartStrategy,
+	useStrategyConfigsList,
 	useTradingViewWebhookInfo,
 	useTradingViewWebhookStatus,
 	useUpdateStrategyConfig,
@@ -131,6 +148,7 @@ export const ConfigAndLaunchPanel = memo(
 		const { mutate: updateStrategy, isPending: isUpdating } =
 			useUpdateStrategyConfig();
 		const { data: config } = useConfig();
+		const { data: savedStrategyConfigs } = useStrategyConfigsList();
 		const [selectedApiKeyId, setSelectedApiKeyId] = useState<number | null>(
 			null,
 		);
@@ -255,6 +273,55 @@ export const ConfigAndLaunchPanel = memo(
 			return { ...base, enabled: true };
 		};
 
+		// --- Settings the client types and the server has to store ---
+		// The risk limits and the picked strategy class live in `config_data`,
+		// but the editor store drops config_data keys it does not know about, so
+		// the saved values are read back from the server copy of the strategy.
+		const savedStrategyConfig = useMemo(
+			() =>
+				savedStrategyConfigs?.find(
+					(savedConfig) => savedConfig.id === strategyIdFromParams,
+				),
+			[savedStrategyConfigs, strategyIdFromParams],
+		);
+
+		const [riskDraft, setRiskDraft] = useState<StrategyRiskDraft>(() =>
+			toRiskDraft(DEFAULT_STRATEGY_RISK_SETTINGS),
+		);
+		const riskSettings = useMemo(
+			() => parseRiskDraft(riskDraft),
+			[riskDraft],
+		);
+		const [riskErrors, setRiskErrors] = useState<StrategyRiskErrors>({});
+		const [strategyClass, setStrategyClass] = useState<string>(
+			() => getStrategyPayload().strategy_name,
+		);
+		const [strategyClassError, setStrategyClassError] = useState<
+			StrategyClassErrorCode | undefined
+		>(undefined);
+
+		// Render-phase sync of the client-typed settings with the saved strategy.
+		const savedSettingsSeed = JSON.stringify({
+			risk: savedStrategyConfig?.config_data?.risk_settings ?? null,
+			class: savedStrategyConfig?.config_data?.strategy_name ?? null,
+		});
+		const [lastSavedSettingsSeed, setLastSavedSettingsSeed] = useState<
+			string | null
+		>(null);
+		if (savedSettingsSeed !== lastSavedSettingsSeed) {
+			setLastSavedSettingsSeed(savedSettingsSeed);
+			const savedRisk = savedStrategyConfig?.config_data?.risk_settings;
+			setRiskDraft(
+				toRiskDraft(savedRisk ?? DEFAULT_STRATEGY_RISK_SETTINGS),
+			);
+			setRiskErrors({});
+			setStrategyClass(
+				savedStrategyConfig?.config_data?.strategy_name ??
+					getStrategyPayload().strategy_name,
+			);
+			setStrategyClassError(undefined);
+		}
+
 		const handleCopy = async (label: string, text: string) => {
 			try {
 				await navigator.clipboard.writeText(text);
@@ -353,6 +420,53 @@ export const ConfigAndLaunchPanel = memo(
 				return;
 			}
 
+			// The risk limits the client typed have to be valid BEFORE anything is
+			// sent: the server enforces the same floors and rejects a looser
+			// limit, so the client must not offer one either.
+			const nextRiskErrors = validateStrategyRiskSettings(riskSettings);
+			setRiskErrors(nextRiskErrors);
+			if (Object.keys(nextRiskErrors).length > 0) {
+				toast({
+					variant: "destructive",
+					title: t(
+						"configPanel.riskSettingsInvalidTitle",
+						"Risk settings are invalid",
+					),
+					description: t(
+						"configPanel.riskSettingsInvalidDescription",
+						"Fix the highlighted risk limits before deploying.",
+					),
+				});
+				return;
+			}
+
+			// The strategy class has to be picked. The picker only offers classes
+			// the trading bot registers, so an unknown class can only come back
+			// from the server: that is surfaced as a warning, and the server
+			// stays the authority on what it can instantiate.
+			const nextClassError = validateStrategyClass(strategyClass);
+			setStrategyClassError(nextClassError.className);
+			if (nextClassError.className === "empty") {
+				toast({
+					variant: "destructive",
+					title: t("common:errorTitle"),
+					description: t(
+						"configPanel.strategyEngineRequiredTitle",
+						"Pick a strategy class before deploying.",
+					),
+				});
+				return;
+			}
+			if (nextClassError.className === "notRegistered") {
+				toast({
+					title: t("common:successTitle"),
+					description: t(
+						"configPanel.strategyEngineUnregisteredWarning",
+						"This strategy class is not in the trading bot's known list, so it may not start.",
+					),
+				});
+			}
+
 			try {
 				await updateSymbolSelectionSettingsApi({
 					mode: symbol_selection_mode,
@@ -377,6 +491,11 @@ export const ConfigAndLaunchPanel = memo(
 
 			if (symbol_selection_mode !== "STATIC")
 				configData.max_concurrent_symbols = max_concurrent_symbols;
+
+			// The client's pick and the client's risk limits travel to the server
+			// inside `config_data`, so the saved strategy reflects what was typed.
+			configData.strategy_name = strategyClass;
+			configData.risk_settings = { ...riskSettings };
 
 			const getPaymode = (): "STATIC" | "DYNAMIC" =>
 				isTradingViewWebhookMode || symbol_selection_mode === "STATIC"
@@ -841,6 +960,31 @@ export const ConfigAndLaunchPanel = memo(
 								)}
 							</CardContent>
 						</Card>
+
+						<StrategyEngineSection
+							value={strategyClass}
+							onChange={(nextClass) => {
+								setStrategyClass(nextClass);
+								setStrategyClassError(validateStrategyClass(nextClass).className);
+							}}
+							error={strategyClassError}
+							disabled={isAnythingLoading}
+						/>
+
+						<StrategyRiskSettingsSection
+							value={riskDraft}
+							errors={riskErrors}
+							onChange={(field, raw) => {
+								const nextDraft = { ...riskDraft, [field]: raw };
+								setRiskDraft(nextDraft);
+								setRiskErrors(
+									validateStrategyRiskSettings(
+										parseRiskDraft(nextDraft),
+									),
+								);
+							}}
+							disabled={isAnythingLoading}
+						/>
 
 						<Card>
 							<CardHeader>

@@ -34,6 +34,7 @@ import {
 	LaunchStrategyModal,
 } from "@/components/strategies/LaunchStrategyModal";
 import { StrategyDetailsPanel } from "@/components/strategies/StrategyDetailsPanel";
+import { isStrategyClassRegistered } from "@/components/strategies/strategyEditorSettings";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -62,9 +63,15 @@ import {
 	useStopStrategy,
 	useStrategies,
 	useStrategyConfigsList,
+	useUpdateStrategyConfig,
 } from "@/lib/api";
 import { useAccountStore } from "@/stores/accountStore";
-import type { StrategyConfig, StrategyData } from "@/types/api";
+import type {
+	StrategyConfig,
+	StrategyConfigCreatePayload,
+	StrategyConfigData,
+	StrategyData,
+} from "@/types/api";
 
 // --- Helper Functions ---
 const calculateRuntime = (startTime: string | undefined): string => {
@@ -111,6 +118,11 @@ const StrategyCard = forwardRef<
 	) => {
 		const { t } = useTranslation(["strategies", "common"]);
 		const isRunning = strategy.status?.toUpperCase() !== "STOPPED";
+		// The strategy class the client picked. It is saved on the strategy and
+		// is what the trading bot has to instantiate.
+		const strategyClass =
+			strategy.strategy_name || strategy.config_data?.strategy_name || null;
+		const riskSettings = strategy.config_data?.risk_settings;
 
 		return (
 			<TooltipProvider>
@@ -161,11 +173,32 @@ const StrategyCard = forwardRef<
 									{t("colStrategy")}:
 								</span>
 								<span className="font-medium">
-									{strategy.strategy_name ||
-										strategy.config_data?.strategy_name ||
-										"N/A"}
+									{strategyClass || "N/A"}
 								</span>
 							</div>
+
+							{/* A class the trading bot does not register cannot start. */}
+							{strategyClass && !isStrategyClassRegistered(strategyClass) && (
+								<p className="text-xs text-destructive">
+									{t(
+										"strategyClassNotRegistered",
+										"This strategy class is not registered by the trading bot, so it may not start.",
+									)}
+								</p>
+							)}
+
+							{/* Risk limits saved with the strategy */}
+							{riskSettings && (
+								<div className="flex items-center justify-between text-sm">
+									<span className="text-muted-foreground">
+										{t("colRiskLimits", "Risk Limits")}:
+									</span>
+									<span className="font-medium text-xs">
+										{riskSettings.daily_loss_limit_pct}% daily /{" "}
+										{riskSettings.risk_per_trade_pct}% per trade
+									</span>
+								</div>
+							)}
 
 							{/* Symbols */}
 							<div className="flex items-center justify-between text-sm">
@@ -317,6 +350,7 @@ const StrategyCard = forwardRef<
 											size="icon"
 											onClick={onStart}
 											disabled={isPending}
+											aria-label={t("startTooltip", "Start")}
 											className="bg-emerald-500/80 hover:bg-emerald-600 text-white"
 										>
 											{isPending ? (
@@ -443,6 +477,8 @@ export default function Strategies() {
 	const isLoadingRunning = isLoadingLive || isLoadingPaper;
 	const { mutate: stopStrategy, isPending: isStopping } = useStopStrategy();
 	const { mutate: startStrategy, isPending: isStarting } = useStartStrategy();
+	const { mutate: updateStrategyConfig, isPending: isUpdatingConfig } =
+		useUpdateStrategyConfig();
 	const { mutate: deleteStrategyConfig, isPending: isDeleting } =
 		useDeleteStrategyConfig();
 
@@ -650,21 +686,71 @@ export default function Strategies() {
 		configDataOverrides.breakeven_on_regime_change =
 			formData.breakevenOnRegimeChange ?? false;
 
-		startStrategy(
+		// Persist the client's launch settings on the saved strategy BEFORE it
+		// starts. `startStrategy` only merges the overrides into the RUNNING
+		// instance (the backend never writes them back to the saved config), so
+		// without this the client's pick would never be recorded.
+		const savedStrategy = launchConfig.strategy;
+		const persistedConfigData = {
+			...(savedStrategy?.config_data ?? {}),
+			...configDataOverrides,
+		} as StrategyConfigData;
+
+		const persistPayload: StrategyConfigCreatePayload = {
+			name: savedStrategy?.name ?? "",
+			description: savedStrategy?.description ?? "",
+			config_data: persistedConfigData,
+			symbol_selection_mode:
+				formData.symbolSelectionMode === "DYNAMIC" ? "DYNAMIC" : "STATIC",
+			symbols: symbolsArray ?? [],
+			use_ml_confirmation: persistedConfigData.use_ml_confirmation ?? false,
+			foundation_weights: persistedConfigData.foundation_weights ?? null,
+			oracle_regime: persistedConfigData.oracle_regime ?? null,
+			oracle_confidence: persistedConfigData.oracle_confidence ?? undefined,
+		};
+
+		updateStrategyConfig(
+			{ id: launchConfig.configId, payload: persistPayload },
 			{
-				configId: launchConfig.configId,
-				mode: formData.mode,
-				symbol_selection_mode: formData.symbolSelectionMode,
-				symbols: symbolsArray,
-				// Pass overrides as part of params (which merges into config_data on backend)
-				params: configDataOverrides,
-				apiKeyId:
-					typeof selectedApiKeyId === "number" ? selectedApiKeyId : undefined,
-			},
-			{
-				onSettled: () => {
+				onSuccess: () => {
+					startStrategy(
+						{
+							configId: launchConfig.configId as string,
+							mode: formData.mode,
+							symbol_selection_mode: formData.symbolSelectionMode,
+							symbols: symbolsArray,
+							// Pass overrides as part of params (which merges into config_data on backend)
+							params: configDataOverrides,
+							apiKeyId:
+								typeof selectedApiKeyId === "number"
+									? selectedApiKeyId
+									: undefined,
+						},
+						{
+							onSettled: () => {
+								setPendingActionId(null);
+								setLaunchConfig({
+									open: false,
+									configId: null,
+									strategy: null,
+								});
+							},
+						},
+					);
+				},
+				onError: () => {
+					// The strategy was not started: the client's settings could not
+					// be saved, so starting now would run settings that are not
+					// recorded anywhere.
 					setPendingActionId(null);
-					setLaunchConfig({ open: false, configId: null, strategy: null });
+					toast({
+						variant: "destructive",
+						title: t("common:errorTitle"),
+						description: t(
+							"launchSettingsNotSaved",
+							"The launch settings could not be saved, so the strategy was not started.",
+						),
+					});
 				},
 			},
 		);
@@ -831,7 +917,7 @@ export default function Strategies() {
 				}
 				onConfirm={handleConfirmStart}
 				strategyName={launchConfig.strategy?.name}
-				isLoading={isStarting}
+				isLoading={isStarting || isUpdatingConfig}
 				currentSymbols={launchConfig.strategy?.symbols || []}
 				currentMode={launchConfig.strategy?.symbol_selection_mode}
 			/>
