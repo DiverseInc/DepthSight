@@ -353,8 +353,13 @@ class RiskManagementSettings(BaseModel):
     maxConcurrentTrades: int
     stopLossEnabled: bool
     defaultStopLossPercent: Optional[float] = None
+    # The stop distance a NEW account is handed. The owner's decision of
+    # 2026-11-01: 5% everywhere -- the same as the declared server floor
+    # (``SERVER_MAX_STOP_DISTANCE_PCT``). This is the value a new client
+    # is given; it is NOT a sweep of the accounts that already exist, and
+    # an account that already holds a looser value keeps it.
     maxStopDistancePct: float = Field(
-        default=10.0,
+        default=5.0,
         description="Maximum allowed distance to stop-loss in % of entry price",
     )
     riskPerTradePercent: Optional[float] = Field(
@@ -406,8 +411,13 @@ class BacktestRiskManagementSettings(BaseModel):
     maxConcurrentTrades: int
     stopLossEnabled: bool
     defaultStopLossPercent: Optional[float] = None
+    # The stop distance a NEW account is handed. The owner's decision of
+    # 2026-11-01: 5% everywhere -- the same as the declared server floor
+    # (``SERVER_MAX_STOP_DISTANCE_PCT``). This is the value a new client
+    # is given; it is NOT a sweep of the accounts that already exist, and
+    # an account that already holds a looser value keeps it.
     maxStopDistancePct: float = Field(
-        default=10.0,
+        default=5.0,
         description="Maximum allowed distance to stop-loss in % of entry price",
     )
     riskPerTradePercent: Optional[float] = Field(
