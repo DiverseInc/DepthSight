@@ -130,6 +130,82 @@ def _refuse_a_risk_per_trade_above_the_floor(
         )
 
 
+# A limit of 0 is not a TIGHTER limit -- it is a BRICK.
+#
+# MEASURED 2026-10-31 in the code that ENFORCES these limits: every one of
+# them is compared with ">=" against the live value, so a stored 0 is true
+# BEFORE the first trade is ever placed:
+#
+#   maxDrawdown           drawdown_pct >= max_drawdown_threshold
+#                         (bot_module/risk_manager.py:2238)
+#   dailyMaxLossPercent   daily_loss_pct >= daily_max_loss_threshold
+#                         (bot_module/risk_manager.py:2246)
+#   maxConsecutiveLosses  consecutive_losses >= max_consecutive_losses
+#                         (bot_module/risk_manager.py:2249)
+#   maxConcurrentTrades   active_count >= max_concurrent_trades
+#                         (bot_module/controller.py:8848)
+#   maxStopDistancePct    stop distance > entry_price * max_stop_distance
+#                         (bot_module/risk_manager.py:2679) -- every stop is
+#                         "too far", so every signal is refused
+#
+# The account then stops trading with nothing to explain why, and nothing in
+# the settings says that 0 was unusual.
+#
+# ``riskPerTradePercent`` is NOT in this set: a 0 there means "risk off".
+# The RiskManager reads it with ``or 0.0``
+# (bot_module/risk_manager.py:181-183) and the strategy contract says the
+# same (bot_module/strategy_registry.py: "0 is a REAL setting for the risk
+# per trade, not an unset one").
+_ZERO_IS_A_BRICK = frozenset(
+    {
+        "maxDrawdown",
+        "dailyMaxLossPercent",
+        "maxConsecutiveLosses",
+        "maxConcurrentTrades",
+        "maxStopDistancePct",
+    }
+)
+
+
+def _refuse_a_limit_that_would_stop_every_trade(
+    payload: Dict[str, Any], section: str
+) -> None:
+    """Refuse a limit of 0 (or less) where 0 stops every trade.
+
+    HOW A 0 GOT THERE: the Risk Settings page used to turn an EMPTY field
+    into 0 -- ``parseFloat(x) || 0`` in
+    ``frontend/src/pages/Settings.tsx`` -- and the server stored it. Clearing
+    a field in the form was enough to stop the account trading, silently.
+
+    The strategy contract already refuses a 0 for every risk setting it
+    validates (``bot_module/strategy_registry.py``: "must be greater than 0").
+    This brings the ACCOUNT boundary in line with it.
+
+    REFUSED, not clamped: a silently clamped number is a number the client
+    did not ask for and does not see, and the page would keep showing the
+    value it sent. The client is told the limit instead.
+    """
+    for rm_key in sorted(_ZERO_IS_A_BRICK):
+        value = payload.get(rm_key)
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue  # a non-number is reported by the other guard
+        if number <= 0.0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"{section}.{rm_key}={number} is not a valid risk limit: it "
+                    "must be greater than 0. A limit of 0 would stop every "
+                    "trade -- the RiskManager compares the live value with "
+                    "'>=', so the limit is true before the first trade is "
+                    "placed."
+                ),
+            )
+
+
 def _the_fields_the_client_actually_sent(section_model: Any) -> Dict[str, Any]:
     """The fields the client actually sent -- and ONLY those.
 
@@ -284,6 +360,22 @@ def _refuse_a_risk_limit_looser_than_its_ceiling(
                 # Three numbers for one limit. The DECLARED floor is left
                 # alone here -- changing a risk limit is the owner's call --
                 # and the question is recorded in the vault.
+                #
+                # CORRECTION (2026-10-31, round 24): the THIRD number above is
+                # wrong, and the correction is about a DEAD attribute, not
+                # about a limit. MEASURED across bot_module/risk_manager.py:
+                # `RISK_MANAGER_MAX_STOP_DISTANCE_PCT` (2.0) is assigned to
+                # `self.max_stop_distance_pct` (:250-257 and :588-596) and
+                # that attribute is never READ anywhere -- the stop-distance
+                # gate uses `max_stop_distance_pct_to_use` (:2675-2683), which
+                # is the live or paper value, and those fall back to 5.0
+                # (:184-186 and :197-199). So the EFFECTIVE fallback is 5.0,
+                # the same number as the declared floor, and the 2.0 is dead
+                # code. The effective numbers for one limit are therefore
+                # 5.0 (the declared floor, which also governs an account
+                # that holds none) and 10.0 (the account default the account
+                # HOLDS, which this rule lets win). The original text is kept
+                # above, unaltered.
                 ceiling = held
         if number > ceiling:
             raise HTTPException(
@@ -338,6 +430,9 @@ async def update_config_endpoint(
         # The per-trade risk is bounded by the server's floor: the page may
         # not display a limit the server will not honour.
         _refuse_a_risk_per_trade_above_the_floor(risk_payload, "risk_management")
+        # A limit of 0 would stop every trade, and the page used to send one
+        # whenever a field was cleared. Refused, and nothing is written.
+        _refuse_a_limit_that_would_stop_every_trade(risk_payload, "risk_management")
         # And every account-level limit is bounded by the account's own
         # current value, or by the server floor where the account holds none:
         # a client may tighten a limit and never loosen one.
@@ -381,6 +476,10 @@ async def update_config_endpoint(
         # The paper account is the one the bot sizes its paper trades with
         # (bot_module/risk_manager.py:188-195), so it is bounded the same way.
         _refuse_a_risk_per_trade_above_the_floor(
+            backtest_risk_payload, "backtest_risk_management"
+        )
+        # A limit of 0 would stop every paper trade too.
+        _refuse_a_limit_that_would_stop_every_trade(
             backtest_risk_payload, "backtest_risk_management"
         )
         _refuse_a_risk_limit_looser_than_its_ceiling(
