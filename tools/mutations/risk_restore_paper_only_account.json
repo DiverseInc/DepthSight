@@ -1,0 +1,87 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the RISK-STATE RESTORE fix",
+    "for an account with NO live sandbox behind it (a keyless paper-only",
+    "account, built by `bot_runner.py` with `api_key_id=None`).",
+    "",
+    "A is the legacy projection removed: before the paper/live split there was",
+    "ONE sandbox of counters, persisted at the TOP LEVEL of the payload. For an",
+    "account that cannot trade live at all, that top level WAS its own paper",
+    "loss streak -- so it is restored into the PAPER sandbox. Without the",
+    "projection the paper counters start at zero, the PAPER gate opens on them,",
+    "and the next `save_state()` writes the zeros back: the streak that was",
+    "blocking the account is lost, which is the production incident the whole",
+    "restore exists to prevent.",
+    "",
+    "B is the early return no longer applying the PAPER state. The live section",
+    "carries its own day stamp and the paper section carries its own, so a live",
+    "section belonging to another UTC day says NOTHING about the paper section.",
+    "The early return used to only scope-CHECK the paper sub-payload: a paper",
+    "section stamped TODAY was never applied and never latched, so the paper",
+    "counters restarted at zero and the PAPER gate opened on them.",
+    "",
+    "C is the unreadable-VALUE latch removed. 'Keep the in-memory value' is",
+    "only fail-closed if the in-memory value is a MEASUREMENT, and at start-up",
+    "it is the process-born zero. So an unreadable persisted value is UNKNOWN,",
+    "and unknown must never be more permissive than known: the gate fails",
+    "closed and the state is not re-persisted (writing the zeros would LAUNDER",
+    "the unknown state into the payload).",
+    "",
+    "D is the calendar-day check removed. A non-blank day stamp that is not a",
+    "calendar day ('unknown', '2026-13-45') cannot be compared with today's",
+    "stamp, so it is UNREADABLE -- not 'another day'. Reading it as 'another",
+    "day' discards the counters, restores them as ZEROS and re-opens a gate",
+    "that was closed.",
+    "",
+    "E is the RESERVING placeholder no longer carrying the signal's own mode.",
+    "`_process_signal` inserts the placeholder before it knows the mode, so the",
+    "placeholder carried `LivePosition`'s default of 'live'. A close is booked",
+    "into the sandbox its POSITION names, and the emergency stop flattens",
+    "RESERVING positions too -- so a PAPER signal's placeholder moved the LIVE",
+    "loss streak and could close the LIVE gate on a simulated loss.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/risk_restore_paper_only_account.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_risk_restore_paper_only_account.py tests/test_risk_restore_missing_field_fails_closed.py tests/test_risk_restore_unknown_day_scope_fails_closed.py tests/test_per_mode_risk_gating.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the legacy top level is no longer projected onto the PAPER section",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        if not self._is_paper_only_account():\n            return None\n        return {\n            \"day_str\": payload.get(\"day_str\"),\n            \"consecutive_losses\": payload.get(\"consecutive_losses\"),\n            \"today_pnl\": payload.get(\"today_pnl\"),\n            \"start_of_day_balance\": payload.get(\"start_of_day_balance\"),\n            \"start_of_day_day_str\": payload.get(\"start_of_day_day_str\"),\n        }\n",
+      "replace": "        return None\n"
+    },
+    {
+      "label": "B: the early return discards the PAPER state instead of applying it",
+      "file": "bot_module/risk_manager.py",
+      "needle": "            self._apply_persisted_paper_guard_state(paper_payload, current_day_str)\n",
+      "replace": "            pass  # MUTATION: the paper state is not applied on its own scope\n"
+    },
+    {
+      "label": "C: an unreadable persisted VALUE no longer fails closed",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        self._mark_guard_state_scope_unknown(scope)\n        logger.critical(\n            \"[RiskGuard] The persisted %s could NOT be read, so that sandbox's \"\n",
+      "replace": "        logger.critical(\n            \"[RiskGuard] The persisted %s could NOT be read, so that sandbox's \"\n"
+    },
+    {
+      "label": "D: a day stamp that is not a calendar day is read as readable",
+      "file": "bot_module/risk_manager.py",
+      "needle": "    try:\n        datetime.strptime(text, \"%Y-%m-%d\")\n    except (TypeError, ValueError):\n        return False\n    return True\n",
+      "replace": "    return True\n"
+    },
+    {
+      "label": "E: the RESERVING placeholder is no longer stamped with the signal's mode",
+      "file": "bot_module/controller.py",
+      "needle": "            placeholder = self._active_position_get(\n                signal.symbol, initial_market_type\n            )\n            if (\n                placeholder is not None\n                and getattr(placeholder, \"status\", None) == \"RESERVING\"\n            ):\n                placeholder.mode = mode\n",
+      "replace": "            placeholder = self._active_position_get(\n                signal.symbol, initial_market_type\n            )\n"
+    },
+    {
+      "label": "F: a null PAPER section is read as a legacy payload instead of as corruption",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        if \"paper\" in payload:\n",
+      "replace": "        if False:\n"
+    }
+  ]
+}

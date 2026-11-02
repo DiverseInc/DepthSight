@@ -8994,6 +8994,34 @@ class TradingController:
                 "mode", "live"
             )  # Default to 'live' for safety
 
+            # STAMP THE RESERVING PLACEHOLDER WITH THE MODE, NOW THAT IT
+            # IS KNOWN.
+            #
+            # The placeholder is created BEFORE the mode is known -- it
+            # reserves the symbol slot against a second signal racing in --
+            # so it carries `LivePosition`'s default of "live". A close is
+            # booked into the sandbox its POSITION names
+            # (`_handle_final_exit`), so an unstamped placeholder books a
+            # PAPER signal's close into the LIVE counters: the live loss
+            # streak moves on a paper position, and the LIVE gate can close
+            # on it -- real money blocked by a simulated loss, which is the
+            # defect the per-mode split exists to remove.
+            #
+            # The placeholder is stamped with the signal's OWN mode, so it
+            # names the sandbox that was actually traded. An unrecognised
+            # mode still resolves to "live" in `_normalize_mode`, which is
+            # the TIGHT side: an unknown mode must never become the loose
+            # one (AGENTS.md, "Guards on real-money paths must fail in the
+            # same direction as the thing they guard").
+            placeholder = self._active_position_get(
+                signal.symbol, initial_market_type
+            )
+            if (
+                placeholder is not None
+                and getattr(placeholder, "status", None) == "RESERVING"
+            ):
+                placeholder.mode = mode
+
             # THE RISK GATE IS CONSULTED FOR THIS SIGNAL'S OWN SANDBOX.
             #
             # The live sandbox and the paper sandbox have separate counters,

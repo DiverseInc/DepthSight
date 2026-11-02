@@ -192,6 +192,40 @@ def _read_persisted_number(
         return None
 
 
+def _day_str_is_a_calendar_day(day_str: Any) -> bool:
+    """Is this day stamp a day the guard can BELIEVE?
+
+    The guard writes its day stamp as `YYYY-MM-DD` (`_current_utc_day_str`),
+    and it compares day stamps as STRINGS, because `YYYY-MM-DD` sorts
+    chronologically. So a stamp that is not a calendar day cannot be compared
+    with today's stamp, and it cannot be ordered against the day the latch
+    was raised on either.
+
+    A stamp that is a non-blank string but NOT a calendar day -- "unknown",
+    "2026-13-45", "yesterday" -- is therefore UNREADABLE, and unreadable must
+    never be read as "another day". Reading it as "another day" silently
+    DISCARDS the persisted counters, restores them as ZEROS and re-opens a
+    gate that was closed: the same fail-open the missing/null stamp was fixed
+    for, reached through a third door.
+
+    An EMPTY stamp is not a calendar day either, but it is handled by the
+    caller: for the LIVE section an empty stamp means "there is no stamp at
+    all" (unreadable), while for the PAPER section it is the "the paper
+    sandbox was never persisted" marker -- a FACT, not a corruption -- and is
+    decided by `_paper_payload_scope_is_readable`.
+    """
+    if not isinstance(day_str, str):
+        return False
+    text = day_str.strip()
+    if not text:
+        return False
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 class RiskManager:
     def __init__(
         self,
@@ -4158,12 +4192,53 @@ class RiskManager:
         if not self._emergency_stop_active:
             self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
 
-    def _mark_guard_state_scope_unknown(self, scope: str = "live") -> None:
-        """Latch the fail-closed state for a persisted state whose SCOPE is unknown.
+    def _mark_persisted_value_unknown(self, scope: str, what: str) -> None:
+        """Fail closed on a persisted guard VALUE that could not be read.
 
-        The state was READ, but the day stamp it carries cannot be: the field
-        is missing, null, or not a readable string. So it is not known whether
-        the payload holds today's numbers or yesterday's.
+        "KEEP THE IN-MEMORY VALUE" IS ONLY FAIL-CLOSED IF THE IN-MEMORY VALUE
+        IS A MEASUREMENT. At start-up it is not: the counters are the ZEROS
+        this process was born with, so "keep them" means "the loss streak is
+        zero" -- and the streak guard and the daily-loss guard then measure
+        NOTHING and `_check_risk_limits()` re-opens the gate on them. That is
+        the fail-open this whole restore exists to prevent, reached through
+        the one path that looked like the careful one.
+
+        So an unreadable persisted value is UNKNOWN, and unknown must never be
+        more permissive than known. The gate fails CLOSED, the state is NOT
+        re-persisted (writing the in-memory counters would LAUNDER an unknown
+        state into a payload -- see `save_state`), and the operator is told
+        WHY at CRITICAL, because a guard that silently refuses to trade is
+        itself a fault.
+
+        The latch is the SAME one the unreadable-SCOPE case uses, and it is
+        released at the UTC day rollover of the sandbox that raised it --
+        which is the one moment the day's counters restart at zero by
+        definition, so whatever the unreadable payload held belonged to the
+        day that just ended. `scope` says which sandbox's numbers are
+        unknown: "live" or "paper".
+        """
+        self._mark_guard_state_scope_unknown(scope)
+        logger.critical(
+            "[RiskGuard] The persisted %s could NOT be read, so that sandbox's "
+            "loss streak and day's PnL are UNKNOWN, not zero. The gate fails "
+            "CLOSED and the state is NOT re-persisted until the UTC day rolls "
+            "over, which is the one moment the day's counters restart at zero "
+            "by definition.",
+            what,
+        )
+
+    def _mark_guard_state_scope_unknown(self, scope: str = "live") -> None:
+        """Latch the fail-closed state for a persisted state that CANNOT BE
+        BELIEVED.
+
+        The state was READ, but it cannot be trusted: either the day stamp it
+        carries cannot be read (the field is missing, null, or not a readable
+        string), so it is not known whether the payload holds today's numbers
+        or yesterday's; OR one of its VALUES cannot be read, so the number the
+        guard would measure is not known at all (see
+        `_mark_persisted_value_unknown`). Both are the same fact for the
+        gate: today's PnL and the loss streak cannot be shown to be within
+        limits.
 
         "Unknown day" is NOT "another day". Yesterday's numbers must not be
         resurrected, and today's must not be assumed, so the counters cannot be
@@ -4280,6 +4355,85 @@ class RiskManager:
             return None, "the persisted payload is not a JSON object"
         return payload, None
 
+    def _is_paper_only_account(self) -> bool:
+        """Is this controller an account with NO live account behind it?
+
+        TWO independent facts must BOTH say so, and each of them is already
+        used elsewhere in this file:
+
+        * `api_key_id is None` -- the controller was built without an API key
+          (`bot_runner.py` builds the paper-only controller with
+          `api_key_id=None`, and the controller copies it onto the risk
+          manager), so `published_account_snapshot()` publishes the PAPER
+          sandbox's numbers for it, and the guard state it persists belongs
+          to that account alone.
+        * `self.executor is None` -- there is no live exchange executor, so
+          this controller cannot have made a LIVE trade at all.
+          `initialize_balance()` uses the same fact to decide that the LIVE
+          start-up machinery does not apply to it.
+
+        When the two disagree the answer is "there might be a live account",
+        so the conservative answer -- NOT paper-only -- is used.
+        """
+        return self.api_key_id is None and getattr(self, "executor", None) is None
+
+    def _paper_payload_for_restore(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """The PAPER section of a payload, or the LEGACY top level for a
+        paper-only account.
+
+        A payload written BEFORE the paper/live split has no "paper" key: it
+        carried ONE sandbox of counters, at the TOP LEVEL. For a LIVE
+        account those top-level counters are (at worst) a mix of the live and
+        the paper counters, and they stay in the LIVE sandbox -- that is the
+        safe direction for real money.
+
+        For a KEYLESS PAPER-ONLY account they are something else entirely:
+        the account cannot make a LIVE trade, so the shared counters it
+        persisted were ITS OWN counters -- its paper loss streak and its
+        paper day's PnL. Restoring them into the LIVE sandbox put them where
+        nothing reads them: the PAPER sandbox started at zero,
+        `_initialize_paper_balance()` opened the PAPER gate on those zeros,
+        and the next `save_state()` wrote the zeros back -- so the loss
+        streak that was blocking the account was lost.
+
+        That is the production incident this whole restore exists to
+        prevent (`controller.py`: "a routine deploy moved consecutive_losses
+        from 10 to 0 and the gate from blocked to allowed"), reproduced by
+        the deploy that carried the split -- for exactly the account class
+        that has no live sandbox to hold the streak.
+
+        So for a paper-only account the legacy top level IS the paper
+        section, and it is restored into the sandbox that account trades.
+        """
+        paper_payload = payload.get("paper")
+        if isinstance(paper_payload, dict):
+            return paper_payload
+        if "paper" in payload:
+            # THE KEY IS THERE, BUT IT DOES NOT CARRY A SECTION: null, a list,
+            # a string. `payload.get("paper")` cannot tell that apart from an
+            # ABSENT key, and the difference matters: an absent key is a
+            # payload written before the split, while a key that is present
+            # and unreadable is CORRUPTION -- the paper section existed and
+            # its contents cannot be read, so the paper scope is UNKNOWN and
+            # the paper gate must fail CLOSED. Reading it as "the paper
+            # sandbox was never persisted" would restore the paper counters as
+            # ZEROS and re-open a gate that was closed.
+            #
+            # An empty section is returned so that the scope check -- the ONE
+            # place that decides "readable" -- sees it and fails closed.
+            return {"day_str": None}
+        if not self._is_paper_only_account():
+            return None
+        return {
+            "day_str": payload.get("day_str"),
+            "consecutive_losses": payload.get("consecutive_losses"),
+            "today_pnl": payload.get("today_pnl"),
+            "start_of_day_balance": payload.get("start_of_day_balance"),
+            "start_of_day_day_str": payload.get("start_of_day_day_str"),
+        }
+
     def _paper_payload_scope_is_readable(self, paper_payload: Dict[str, Any]) -> bool:
         """Can the PERSISTED PAPER section's scope be read?
 
@@ -4310,146 +4464,25 @@ class RiskManager:
         paper_counters_are_zero = all(
             value is not None and value == 0 for value in paper_counters.values()
         )
-        return isinstance(raw_paper_day_str, str) and (
-            raw_paper_day_str.strip() != "" or paper_counters_are_zero
-        )
+        if not isinstance(raw_paper_day_str, str):
+            return False
+        if raw_paper_day_str.strip() == "":
+            return paper_counters_are_zero
+        # A non-blank stamp that is NOT a calendar day cannot be compared with
+        # today's stamp, so it is UNREADABLE -- not "another day". Reading it
+        # as "another day" would discard the paper counters, restore them as
+        # ZEROS and re-open the PAPER gate on them.
+        return _day_str_is_a_calendar_day(raw_paper_day_str)
 
-    def _apply_persisted_guard_state(self, payload: Dict[str, Any]) -> bool:
-        """Apply a persisted guard state to this RiskManager.
+    def _apply_persisted_live_guard_state(
+        self, payload: Dict[str, Any], current_day_str: str
+    ) -> None:
+        """Restore the LIVE sandbox's counters from the payload's live section.
 
-        Returns True when a state was applied, False when it was discarded
-        because it belongs to a previous UTC day.
+        The live section is the TOP LEVEL of the payload, so a payload written
+        before the paper/live split still restores the live state correctly --
+        there is NO guard reset on deploy.
         """
-        current_day_str = self._current_utc_day_str()
-        raw_day_str = payload.get("day_str")
-        persisted_day_str = str(raw_day_str) if raw_day_str is not None else ""
-        # "ANOTHER DAY" AND "UNKNOWN DAY" ARE DIFFERENT FACTS.
-        #
-        # A day stamp that reads as a PREVIOUS day means the payload holds
-        # yesterday's numbers: they must be discarded, because the daily
-        # rollover legitimately cleared the streak and the day's PnL.
-        #
-        # A day stamp that CANNOT BE READ -- missing, null, or not a readable
-        # string -- means something else entirely: it is NOT known whether the
-        # payload holds today's numbers or yesterday's. The `or ""` idiom
-        # below cannot tell the two apart (a missing field yields None, and
-        # `None or ""` is ""), so an unreadable stamp was silently read as
-        # "belongs to another day": the WHOLE persisted state was discarded,
-        # the counters restored as ZEROS, and a gate that was CLOSED re-opened
-        # -- at INFO level, so the operator never saw it happen. That is the
-        # same fail-open this whole change exists to kill: the guard state
-        # says one thing and the money says another.
-        #
-        # So an unreadable scope is an UNKNOWN state, and unknown must never
-        # be more permissive than known. The state is not applied at all (we
-        # cannot tell which day's numbers these are), the gate fails CLOSED,
-        # and the operator is told WHY at CRITICAL.
-        day_scope_is_readable = (
-            isinstance(raw_day_str, str) and raw_day_str.strip() != ""
-        )
-        if not day_scope_is_readable:
-            self._mark_guard_state_scope_unknown("live")
-            logger.critical(
-                "[RiskGuard] The persisted trading-guard state has an UNREADABLE "
-                "day stamp (present=%s, value=%r), so it is NOT known whether it "
-                "holds today's numbers or yesterday's. 'Unknown day' is NOT "
-                "'another day': discarding it would restore the loss streak and "
-                "the day's PnL as ZEROS and re-open a gate that was closed. "
-                "Today's PnL and the loss streak cannot be shown to be within "
-                "limits, so trading stays DISABLED (fail-closed) until the UTC "
-                "day rolls over.",
-                "day_str" in payload,
-                raw_day_str,
-            )
-            # Re-evaluate both gates against the unknown state, so neither is
-            # left open on the process-born zero counters.
-            self._check_risk_limits()
-            self._check_risk_limits(mode="paper")
-            return False
-        if persisted_day_str != current_day_str:
-            # The daily rollover resets the loss streak and the day's PnL at
-            # the UTC day boundary. A previous day's numbers must not be
-            # resurrected: doing so would re-block an account whose streak
-            # was legitimately cleared, and would carry a stale PnL into a
-            # new day.
-            logger.info(
-                "[RiskGuard] Discarding the persisted trading-guard state: it "
-                "belongs to UTC day %r and today is %r. The daily rollover "
-                "clears the loss streak and the day's PnL at the UTC day "
-                "boundary.",
-                persisted_day_str,
-                current_day_str,
-            )
-            # A previous-day payload PROVES this account has traded, so its
-            # live balance is a MID-DAY balance and cannot be today's opening
-            # balance. Any base already stamped with TODAY's day key that is
-            # UNBACKED is therefore invalidated here -- otherwise this early
-            # return leaves a mid-day base in force with the gate open on it.
-            # The review panel measured exactly that: base=865.23,
-            # usable=True, trading ALLOWED=True, the gate reading 0.0000%
-            # against a true 4.4188% loss.
-            #
-            # A base this process VOUCHED for is kept: one captured at a
-            # genuine UTC rollover, one captured for an account that had never
-            # traded, and one restored from a payload that says it belongs to
-            # today. Those ARE the day's opening balance, and dropping them
-            # would leave the account with no denominator at all. An UNBACKED
-            # base -- a capture made while the persisted state could not be
-            # read -- is a GUESS and is dropped.
-            if (
-                getattr(self.stats, "start_of_day_day_str", None) == current_day_str
-                and self._opening_base_is_unbacked()
-            ):
-                logger.critical(
-                    "[RiskGuard] Invalidating the opening balance: the "
-                    "persisted state belongs to UTC day %r, so it proves this "
-                    "account has traded and today's opening balance is "
-                    "UNKNOWN. The base stamped with today's day key ($%.8f) "
-                    "is unbacked -- it was not captured at a UTC rollover, not "
-                    "restored from a payload that says it belongs to today, "
-                    "and not captured for an account that has never traded -- "
-                    "so it is dropped and the daily-loss gate fails CLOSED.",
-                    persisted_day_str,
-                    float(self.stats.start_of_day_balance or 0.0),
-                )
-                self.stats.start_of_day_balance = 0.0
-                self.stats.start_of_day_day_str = ""
-                self._start_of_day_base_provenance = None
-                # Re-evaluate the gate: it must not stay OPEN on a base that
-                # has just been invalidated.
-                self._check_risk_limits()
-            # The account has traded, so its live balance is a mid-day balance
-            # and must never be installed as today's opening balance.
-            self._account_has_traded_before = True
-            self._account_history_resolved = True
-            # The PAPER sandbox's scope is a SEPARATE question, and this early
-            # return must not hide it.
-            #
-            # The paper section carries its OWN day stamp, so it can be
-            # UNREADABLE even when the live section says "another day" -- and
-            # an unreadable paper scope is unknown, not another day. Skipping
-            # it left the paper counters at the process-born zeros, and the
-            # PAPER gate then re-opened on them at the next paper balance
-            # update. A readable paper stamp still means what it always
-            # meant: another day, discarded.
-            paper_payload = payload.get("paper")
-            if isinstance(paper_payload, dict) and not (
-                self._paper_payload_scope_is_readable(paper_payload)
-            ):
-                self._mark_guard_state_scope_unknown("paper")
-                logger.critical(
-                    "[RiskGuard] The persisted PAPER sandbox state has an "
-                    "UNREADABLE day stamp (present=%s, value=%r), so it is NOT "
-                    "known whether it holds today's numbers or yesterday's. "
-                    "The live section belongs to another UTC day, but that "
-                    "says nothing about the paper section's own day stamp, so "
-                    "the paper scope is UNKNOWN and the paper gate fails "
-                    "CLOSED.",
-                    "day_str" in paper_payload,
-                    paper_payload.get("day_str"),
-                )
-            return False
-
         # A PERSISTED VALUE THAT IS MISSING, NULL OR NOT A NUMBER IS NOT A
         # ZERO.
         #
@@ -4488,6 +4521,7 @@ class RiskManager:
                 current_day_str,
                 int(self.stats.consecutive_losses or 0),
             )
+            self._mark_persisted_value_unknown("live", "the LIVE loss streak")
         else:
             # The streak only ever grows within a UTC day (it is reset by a win
             # or by the daily rollover), so the higher of the persisted and the
@@ -4510,6 +4544,7 @@ class RiskManager:
                 current_day_str,
                 float(self.stats.today_pnl or 0.0),
             )
+            self._mark_persisted_value_unknown("live", "the LIVE day's PnL")
         else:
             self.stats.today_pnl = persisted_today_pnl
 
@@ -4595,6 +4630,382 @@ class RiskManager:
         self.stats.last_known_day_str = current_day_str
         self._guard_state_restored = True
 
+    def _apply_persisted_paper_guard_state(
+        self, paper_payload: Optional[Dict[str, Any]], current_day_str: str
+    ) -> None:
+        """Restore the PAPER sandbox's counters from the payload's paper section.
+
+        The paper section carries its OWN day stamp, so its scope is a SEPARATE
+        question from the live section's -- and it must stay answerable even
+        when the live section short-circuits the restore (see
+        `_apply_persisted_guard_state`).
+        """
+        if paper_payload is None:
+            # Nothing was ever persisted for the PAPER sandbox (a payload written
+            # before the paper/live split), so there is nothing to restore. The
+            # paper counters stay at the process-born zeros, which is CORRECT for
+            # a LIVE account -- and, for a KEYLESS PAPER-ONLY account, the legacy
+            # top level is projected onto the paper section by
+            # `_paper_payload_for_restore` instead.
+            return
+        raw_paper_day_str = paper_payload.get("day_str")
+        paper_day_str = (
+            str(raw_paper_day_str) if raw_paper_day_str is not None else ""
+        )
+        # THE PAPER TWIN OF THE LIVE SCOPE CHECK ABOVE.
+        #
+        # "Unknown day" is NOT "another day": a paper day stamp that
+        # cannot be read leaves it unknown whether the paper counters are
+        # today's or yesterday's. Discarding them silently restores the
+        # paper streak and the paper day's PnL as ZEROS and re-opens the
+        # PAPER gate on them -- at INFO level, so nobody sees it. The
+        # PAPER path must fail closed here exactly as the LIVE path does.
+        #
+        # ONE EXCEPTION, and it is a FACT rather than a corruption:
+        # `save_state` writes the PAPER day stamp as "" when the paper
+        # sandbox has never been persisted (`self.paper_stats
+        # .last_known_day_str or ""`), so an EMPTY paper day stamp on a
+        # section that carries NO state at all is the "the paper sandbox
+        # was never persisted" marker, and the paper counters really are
+        # zero. That is not an unknown scope and it must not be treated as
+        # one -- it would block every account that never paper-traded.
+        #
+        # Anything else -- a missing stamp, a null stamp, a stamp that is
+        # not a string, or an EMPTY stamp on a section that DOES carry
+        # state -- leaves the scope UNKNOWN.
+        paper_scope_is_readable = self._paper_payload_scope_is_readable(
+            paper_payload
+        )
+        if not paper_scope_is_readable:
+            self._mark_guard_state_scope_unknown("paper")
+            logger.critical(
+                "[RiskGuard] The persisted PAPER sandbox state has an "
+                "UNREADABLE day stamp (present=%s, value=%r), so it is NOT "
+                "known whether it holds today's numbers or yesterday's. "
+                "'Unknown day' is NOT 'another day': discarding it would "
+                "restore the paper loss streak and the paper day's PnL as "
+                "ZEROS and re-open a gate that was closed. The PAPER "
+                "counters cannot be shown to be within limits, so paper "
+                "trading stays DISABLED (fail-closed) until the UTC day "
+                "rolls over.",
+                "day_str" in paper_payload,
+                raw_paper_day_str,
+            )
+            self._check_risk_limits(mode="paper")
+        elif paper_day_str == current_day_str:
+            raw_paper_consecutive_losses = paper_payload.get("consecutive_losses")
+            raw_paper_today_pnl = paper_payload.get("today_pnl")
+            # A MISSING or NULL field is UNREADABLE, not a zero -- the same
+            # rule the LIVE path above uses, and for the same reason:
+            # `int(None or 0)` is 0, so a partial payload would silently
+            # restore as "no loss today" and "no loss streak".
+            paper_consecutive_losses = _read_persisted_number(
+                paper_payload, "consecutive_losses", int
+            )
+            paper_today_pnl = _read_persisted_number(
+                paper_payload, "today_pnl", float
+            )
+            try:
+                paper_start_of_day_balance = float(
+                    paper_payload.get("start_of_day_balance") or 0.0
+                )
+            except (TypeError, ValueError):
+                paper_start_of_day_balance = 0.0
+
+            # A PERSISTED VALUE THAT CANNOT BE READ IS NOT A ZERO.
+            #
+            # The LIVE path above already decided what a corrupt persisted
+            # value means, and it decided it in the CONSERVATIVE
+            # direction: the streak keeps the higher of the persisted and
+            # the in-memory value, and a day's PnL that cannot be read
+            # must not become "no loss today". The PAPER path must not
+            # decide it differently -- a corrupt payload that silently
+            # restores as zero DISCARDS the in-memory streak and the day's
+            # PnL, and a streak-triggered paper block is LOST with it.
+            # That is the defect class this whole change exists to kill:
+            # the guard state says one thing and the money says another.
+            #
+            # A value that is MISSING or NULL is unreadable in exactly the
+            # same way a value that is not a number is: the payload does
+            # not say what the day's PnL or the streak was, so it cannot
+            # be read as "no loss today" either.
+            #
+            # So an unreadable value leaves the in-memory value IN FORCE,
+            # and it is logged at CRITICAL: an unreadable persisted paper
+            # state is an OPERATIONAL event, not a debug line.
+            if paper_consecutive_losses is None:
+                logger.critical(
+                    "[RiskGuard] The persisted PAPER loss streak could NOT be "
+                    "read (present=%s, value=%r, UTC day %s). The in-memory "
+                    "PAPER streak (%d) stays IN FORCE, so a streak-triggered "
+                    "paper block is not lost.",
+                    "consecutive_losses" in paper_payload,
+                    raw_paper_consecutive_losses,
+                    current_day_str,
+                    int(self.paper_stats.consecutive_losses or 0),
+                )
+                self._mark_persisted_value_unknown(
+                    "paper", "the PAPER loss streak"
+                )
+            else:
+                # The streak only ever grows within a UTC day (it is reset
+                # by a win or by the daily rollover), so the higher of the
+                # persisted and the in-memory value is the conservative --
+                # and, after a failed restore, the more likely correct --
+                # one. Exactly the rule the LIVE path uses.
+                self.paper_stats.consecutive_losses = max(
+                    0,
+                    paper_consecutive_losses,
+                    int(self.paper_stats.consecutive_losses or 0),
+                )
+
+            if paper_today_pnl is None:
+                logger.critical(
+                    "[RiskGuard] The persisted PAPER day's PnL could NOT be "
+                    "read (present=%s, value=%r, UTC day %s). The in-memory "
+                    "PAPER day's PnL (%.2f) stays IN FORCE: discarding it "
+                    "would measure nothing at all and open the gate wider.",
+                    "today_pnl" in paper_payload,
+                    raw_paper_today_pnl,
+                    current_day_str,
+                    float(self.paper_stats.today_pnl or 0.0),
+                )
+                self._mark_persisted_value_unknown("paper", "the PAPER day's PnL")
+            else:
+                self.paper_stats.today_pnl = paper_today_pnl
+            # THE PAPER OPENING BALANCE MUST CARRY ITS OWN DAY, exactly
+            # like the LIVE one.
+            #
+            # `paper_payload.get("start_of_day_day_str") or current_day_str`
+            # reads an ABSENT stamp as "today" -- and a base with no day
+            # of its own is UNKNOWN, not today's. A base that may already
+            # contain today's PnL becomes the DENOMINATOR of today's loss
+            # ratio, and the ratio then reads LOW and UNDER-TRIPS: the
+            # denominator already contains the loss it is supposed to
+            # measure. The LIVE path refuses exactly this (it restores the
+            # base only when the payload says which day the base belongs
+            # to and that day is today), so the PAPER path must not
+            # decide it differently.
+            #
+            # So the persisted PAPER base is installed ONLY when its own
+            # day stamp says today. Otherwise it is refused AND the one in
+            # force is dropped, because neither can be shown to be today's
+            # opening balance: the PAPER opening balance is UNKNOWN, and
+            # the PAPER daily-loss gate fails CLOSED until the paper
+            # wallet's own balance establishes one.
+            persisted_paper_base_day_str = str(
+                paper_payload.get("start_of_day_day_str") or ""
+            )
+            paper_base_is_from_today = (
+                persisted_paper_base_day_str == current_day_str
+                and paper_start_of_day_balance > 1e-9
+            )
+            if paper_base_is_from_today:
+                self.paper_stats.start_of_day_balance = paper_start_of_day_balance
+                self.paper_stats.start_of_day_day_str = current_day_str
+            else:
+                logger.critical(
+                    "[RiskGuard] NOT restoring the persisted PAPER start-of-day "
+                    "balance ($%.2f): it belongs to UTC day %r and today is %s. "
+                    "A base with no day stamp of its own is UNKNOWN, not "
+                    "today's: it may already contain today's PnL, and "
+                    "measuring the day's loss against a denominator that "
+                    "contains it reads LOW and under-trips. The PAPER opening "
+                    "balance stays UNKNOWN and the PAPER daily-loss gate "
+                    "fails CLOSED until the paper wallet's own balance "
+                    "establishes one.",
+                    paper_start_of_day_balance,
+                    persisted_paper_base_day_str or "UNKNOWN (no day stamp)",
+                    current_day_str,
+                )
+                self.paper_stats.start_of_day_balance = 0.0
+                self.paper_stats.start_of_day_day_str = ""
+            self.paper_stats.last_known_day_str = current_day_str
+            # The guard state WAS read and applied, so the operator's "clear the
+            # emergency stop" path must re-judge the gates against it instead of
+            # re-enabling them unconditionally.
+            self._guard_state_restored = True
+        else:
+            logger.info(
+                "[RiskGuard] Discarding the persisted PAPER sandbox state: it "
+                "belongs to UTC day %r and today is %r. The paper counters "
+                "restart at zero, exactly like the live ones.",
+                paper_day_str,
+                current_day_str,
+            )
+
+
+    def _apply_persisted_guard_state(self, payload: Dict[str, Any]) -> bool:
+        """Apply a persisted guard state to this RiskManager.
+
+        Returns True when a state was applied, False when it was discarded
+        because it belongs to a previous UTC day.
+        """
+        current_day_str = self._current_utc_day_str()
+        raw_day_str = payload.get("day_str")
+        persisted_day_str = str(raw_day_str) if raw_day_str is not None else ""
+        # "ANOTHER DAY" AND "UNKNOWN DAY" ARE DIFFERENT FACTS.
+        #
+        # A day stamp that reads as a PREVIOUS day means the payload holds
+        # yesterday's numbers: they must be discarded, because the daily
+        # rollover legitimately cleared the streak and the day's PnL.
+        #
+        # A day stamp that CANNOT BE READ -- missing, null, or not a readable
+        # string -- means something else entirely: it is NOT known whether the
+        # payload holds today's numbers or yesterday's. The `or ""` idiom
+        # below cannot tell the two apart (a missing field yields None, and
+        # `None or ""` is ""), so an unreadable stamp was silently read as
+        # "belongs to another day": the WHOLE persisted state was discarded,
+        # the counters restored as ZEROS, and a gate that was CLOSED re-opened
+        # -- at INFO level, so the operator never saw it happen. That is the
+        # same fail-open this whole change exists to kill: the guard state
+        # says one thing and the money says another.
+        #
+        # So an unreadable scope is an UNKNOWN state, and unknown must never
+        # be more permissive than known. The state is not applied at all (we
+        # cannot tell which day's numbers these are), the gate fails CLOSED,
+        # and the operator is told WHY at CRITICAL.
+        # A day stamp that is a NON-BLANK string but NOT a calendar day --
+        # "unknown", "2026-13-45", "yesterday" -- is unreadable too, and for
+        # the same reason: it cannot be compared with today's stamp, so it is
+        # not known which day's numbers the payload holds. Reading it as
+        # "another day" would discard the persisted counters, restore them as
+        # ZEROS and re-open a gate that was closed -- the same fail-open the
+        # missing/null stamp was fixed for, reached through a third door.
+        day_scope_is_readable = _day_str_is_a_calendar_day(raw_day_str)
+        if not day_scope_is_readable:
+            self._mark_guard_state_scope_unknown("live")
+            logger.critical(
+                "[RiskGuard] The persisted trading-guard state has an UNREADABLE "
+                "day stamp (present=%s, value=%r), so it is NOT known whether it "
+                "holds today's numbers or yesterday's. 'Unknown day' is NOT "
+                "'another day': discarding it would restore the loss streak and "
+                "the day's PnL as ZEROS and re-open a gate that was closed. "
+                "Today's PnL and the loss streak cannot be shown to be within "
+                "limits, so trading stays DISABLED (fail-closed) until the UTC "
+                "day rolls over.",
+                "day_str" in payload,
+                raw_day_str,
+            )
+            # Re-evaluate both gates against the unknown state, so neither is
+            # left open on the process-born zero counters.
+            self._check_risk_limits()
+            self._check_risk_limits(mode="paper")
+            return False
+        # THE PAPER SECTION OF THE PAYLOAD. For an account with no live
+        # sandbox behind it, a payload WITHOUT a "paper" key is a LEGACY
+        # payload whose top level WAS that account's own state -- see
+        # `_paper_payload_for_restore`.
+        paper_payload = self._paper_payload_for_restore(payload)
+        if persisted_day_str != current_day_str:
+            # The daily rollover resets the loss streak and the day's PnL at
+            # the UTC day boundary. A previous day's numbers must not be
+            # resurrected: doing so would re-block an account whose streak
+            # was legitimately cleared, and would carry a stale PnL into a
+            # new day.
+            logger.info(
+                "[RiskGuard] Discarding the persisted trading-guard state: it "
+                "belongs to UTC day %r and today is %r. The daily rollover "
+                "clears the loss streak and the day's PnL at the UTC day "
+                "boundary.",
+                persisted_day_str,
+                current_day_str,
+            )
+            # A previous-day payload PROVES this account has traded, so its
+            # live balance is a MID-DAY balance and cannot be today's opening
+            # balance. Any base already stamped with TODAY's day key that is
+            # UNBACKED is therefore invalidated here -- otherwise this early
+            # return leaves a mid-day base in force with the gate open on it.
+            # The review panel measured exactly that: base=865.23,
+            # usable=True, trading ALLOWED=True, the gate reading 0.0000%
+            # against a true 4.4188% loss.
+            #
+            # A base this process VOUCHED for is kept: one captured at a
+            # genuine UTC rollover, one captured for an account that had never
+            # traded, and one restored from a payload that says it belongs to
+            # today. Those ARE the day's opening balance, and dropping them
+            # would leave the account with no denominator at all. An UNBACKED
+            # base -- a capture made while the persisted state could not be
+            # read -- is a GUESS and is dropped.
+            if (
+                getattr(self.stats, "start_of_day_day_str", None) == current_day_str
+                and self._opening_base_is_unbacked()
+            ):
+                logger.critical(
+                    "[RiskGuard] Invalidating the opening balance: the "
+                    "persisted state belongs to UTC day %r, so it proves this "
+                    "account has traded and today's opening balance is "
+                    "UNKNOWN. The base stamped with today's day key ($%.8f) "
+                    "is unbacked -- it was not captured at a UTC rollover, not "
+                    "restored from a payload that says it belongs to today, "
+                    "and not captured for an account that has never traded -- "
+                    "so it is dropped and the daily-loss gate fails CLOSED.",
+                    persisted_day_str,
+                    float(self.stats.start_of_day_balance or 0.0),
+                )
+                self.stats.start_of_day_balance = 0.0
+                self.stats.start_of_day_day_str = ""
+                self._start_of_day_base_provenance = None
+                # Re-evaluate the gate: it must not stay OPEN on a base that
+                # has just been invalidated.
+                self._check_risk_limits()
+            # The account has traded, so its live balance is a mid-day balance
+            # and must never be installed as today's opening balance.
+            self._account_has_traded_before = True
+            self._account_history_resolved = True
+            # The PAPER sandbox's scope is a SEPARATE question, and this early
+            # return must not hide it.
+            #
+            # The paper section carries its OWN day stamp, so it can be
+            # UNREADABLE even when the live section says "another day" -- and
+            # an unreadable paper scope is unknown, not another day. Skipping
+            # it left the paper counters at the process-born zeros, and the
+            # PAPER gate then re-opened on them at the next paper balance
+            # update. A readable paper stamp still means what it always
+            # meant: another day, discarded.
+            # THE PAPER SANDBOX'S OWN STATE IS RESTORED ON ITS OWN SCOPE.
+            #
+            # The paper section carries its OWN day stamp, so the live
+            # section belonging to another UTC day says NOTHING about it. The
+            # early return above used to only SCOPE-CHECK the paper
+            # sub-payload and then return: a paper section stamped TODAY was
+            # never applied and never latched, so the paper counters
+            # restarted at zero, the PAPER gate opened on them, and the next
+            # `save_state()` wrote the zeros back -- the paper block was
+            # lost.
+            #
+            # So the paper state is applied HERE, by the same rules as in the
+            # main path below: its own day stamp decides whether it is
+            # applied, and an unreadable one fails closed.
+            self._apply_persisted_paper_guard_state(paper_payload, current_day_str)
+            # The PAPER gate is re-evaluated against the paper counters that
+            # were just restored. Without this the early return left the
+            # PAPER gate on whatever it was, so a paper streak that breaches
+            # the limit would not close it until the next balance refresh.
+            self._check_risk_limits(mode="paper")
+            return False
+
+        # THE LIVE COUNTERS.
+        #
+        # An account with NO live sandbox behind it has no live counters to
+        # restore: for it the payload's live section is a PLACEHOLDER (and, in
+        # a payload written before the paper/live split, it holds that
+        # account's PAPER numbers -- see `_paper_payload_for_restore`). The
+        # account's own guard state is the PAPER section, restored below.
+        if self._is_paper_only_account():
+            logger.critical(
+                "[RiskGuard] This account has NO live sandbox behind it "
+                "(api_key_id=%r, live executor present=%s), so the persisted "
+                "LIVE section is NOT restored into the LIVE sandbox: it is a "
+                "placeholder for an account that cannot trade live. This "
+                "account's own guard state is the PAPER section.",
+                self.api_key_id,
+                getattr(self, "executor", None) is not None,
+            )
+        else:
+            self._apply_persisted_live_guard_state(payload, current_day_str)
+
+
         # THE PAPER SANDBOX'S OWN STATE, restored from the SAME payload.
         # It lives under the "paper" key, so the LIVE counters above keep
         # their existing top-level names and a payload written before this
@@ -4602,185 +5013,21 @@ class RiskManager:
         # guard reset on deploy. A payload without a "paper" key simply
         # leaves the paper counters at zero, which is correct: the paper
         # sandbox was never persisted before.
-        paper_payload = payload.get("paper")
-        if isinstance(paper_payload, dict):
-            raw_paper_day_str = paper_payload.get("day_str")
-            paper_day_str = (
-                str(raw_paper_day_str) if raw_paper_day_str is not None else ""
-            )
-            # THE PAPER TWIN OF THE LIVE SCOPE CHECK ABOVE.
-            #
-            # "Unknown day" is NOT "another day": a paper day stamp that
-            # cannot be read leaves it unknown whether the paper counters are
-            # today's or yesterday's. Discarding them silently restores the
-            # paper streak and the paper day's PnL as ZEROS and re-opens the
-            # PAPER gate on them -- at INFO level, so nobody sees it. The
-            # PAPER path must fail closed here exactly as the LIVE path does.
-            #
-            # ONE EXCEPTION, and it is a FACT rather than a corruption:
-            # `save_state` writes the PAPER day stamp as "" when the paper
-            # sandbox has never been persisted (`self.paper_stats
-            # .last_known_day_str or ""`), so an EMPTY paper day stamp on a
-            # section that carries NO state at all is the "the paper sandbox
-            # was never persisted" marker, and the paper counters really are
-            # zero. That is not an unknown scope and it must not be treated as
-            # one -- it would block every account that never paper-traded.
-            #
-            # Anything else -- a missing stamp, a null stamp, a stamp that is
-            # not a string, or an EMPTY stamp on a section that DOES carry
-            # state -- leaves the scope UNKNOWN.
-            paper_scope_is_readable = self._paper_payload_scope_is_readable(
-                paper_payload
-            )
-            if not paper_scope_is_readable:
-                self._mark_guard_state_scope_unknown("paper")
-                logger.critical(
-                    "[RiskGuard] The persisted PAPER sandbox state has an "
-                    "UNREADABLE day stamp (present=%s, value=%r), so it is NOT "
-                    "known whether it holds today's numbers or yesterday's. "
-                    "'Unknown day' is NOT 'another day': discarding it would "
-                    "restore the paper loss streak and the paper day's PnL as "
-                    "ZEROS and re-open a gate that was closed. The PAPER "
-                    "counters cannot be shown to be within limits, so paper "
-                    "trading stays DISABLED (fail-closed) until the UTC day "
-                    "rolls over.",
-                    "day_str" in paper_payload,
-                    raw_paper_day_str,
-                )
-                self._check_risk_limits(mode="paper")
-            elif paper_day_str == current_day_str:
-                raw_paper_consecutive_losses = paper_payload.get("consecutive_losses")
-                raw_paper_today_pnl = paper_payload.get("today_pnl")
-                # A MISSING or NULL field is UNREADABLE, not a zero -- the same
-                # rule the LIVE path above uses, and for the same reason:
-                # `int(None or 0)` is 0, so a partial payload would silently
-                # restore as "no loss today" and "no loss streak".
-                paper_consecutive_losses = _read_persisted_number(
-                    paper_payload, "consecutive_losses", int
-                )
-                paper_today_pnl = _read_persisted_number(
-                    paper_payload, "today_pnl", float
-                )
-                try:
-                    paper_start_of_day_balance = float(
-                        paper_payload.get("start_of_day_balance") or 0.0
-                    )
-                except (TypeError, ValueError):
-                    paper_start_of_day_balance = 0.0
-
-                # A PERSISTED VALUE THAT CANNOT BE READ IS NOT A ZERO.
-                #
-                # The LIVE path above already decided what a corrupt persisted
-                # value means, and it decided it in the CONSERVATIVE
-                # direction: the streak keeps the higher of the persisted and
-                # the in-memory value, and a day's PnL that cannot be read
-                # must not become "no loss today". The PAPER path must not
-                # decide it differently -- a corrupt payload that silently
-                # restores as zero DISCARDS the in-memory streak and the day's
-                # PnL, and a streak-triggered paper block is LOST with it.
-                # That is the defect class this whole change exists to kill:
-                # the guard state says one thing and the money says another.
-                #
-                # A value that is MISSING or NULL is unreadable in exactly the
-                # same way a value that is not a number is: the payload does
-                # not say what the day's PnL or the streak was, so it cannot
-                # be read as "no loss today" either.
-                #
-                # So an unreadable value leaves the in-memory value IN FORCE,
-                # and it is logged at CRITICAL: an unreadable persisted paper
-                # state is an OPERATIONAL event, not a debug line.
-                if paper_consecutive_losses is None:
-                    logger.critical(
-                        "[RiskGuard] The persisted PAPER loss streak could NOT be "
-                        "read (present=%s, value=%r, UTC day %s). The in-memory "
-                        "PAPER streak (%d) stays IN FORCE, so a streak-triggered "
-                        "paper block is not lost.",
-                        "consecutive_losses" in paper_payload,
-                        raw_paper_consecutive_losses,
-                        current_day_str,
-                        int(self.paper_stats.consecutive_losses or 0),
-                    )
-                else:
-                    # The streak only ever grows within a UTC day (it is reset
-                    # by a win or by the daily rollover), so the higher of the
-                    # persisted and the in-memory value is the conservative --
-                    # and, after a failed restore, the more likely correct --
-                    # one. Exactly the rule the LIVE path uses.
-                    self.paper_stats.consecutive_losses = max(
-                        0,
-                        paper_consecutive_losses,
-                        int(self.paper_stats.consecutive_losses or 0),
-                    )
-
-                if paper_today_pnl is None:
-                    logger.critical(
-                        "[RiskGuard] The persisted PAPER day's PnL could NOT be "
-                        "read (present=%s, value=%r, UTC day %s). The in-memory "
-                        "PAPER day's PnL (%.2f) stays IN FORCE: discarding it "
-                        "would measure nothing at all and open the gate wider.",
-                        "today_pnl" in paper_payload,
-                        raw_paper_today_pnl,
-                        current_day_str,
-                        float(self.paper_stats.today_pnl or 0.0),
-                    )
-                else:
-                    self.paper_stats.today_pnl = paper_today_pnl
-                # THE PAPER OPENING BALANCE MUST CARRY ITS OWN DAY, exactly
-                # like the LIVE one.
-                #
-                # `paper_payload.get("start_of_day_day_str") or current_day_str`
-                # reads an ABSENT stamp as "today" -- and a base with no day
-                # of its own is UNKNOWN, not today's. A base that may already
-                # contain today's PnL becomes the DENOMINATOR of today's loss
-                # ratio, and the ratio then reads LOW and UNDER-TRIPS: the
-                # denominator already contains the loss it is supposed to
-                # measure. The LIVE path refuses exactly this (it restores the
-                # base only when the payload says which day the base belongs
-                # to and that day is today), so the PAPER path must not
-                # decide it differently.
-                #
-                # So the persisted PAPER base is installed ONLY when its own
-                # day stamp says today. Otherwise it is refused AND the one in
-                # force is dropped, because neither can be shown to be today's
-                # opening balance: the PAPER opening balance is UNKNOWN, and
-                # the PAPER daily-loss gate fails CLOSED until the paper
-                # wallet's own balance establishes one.
-                persisted_paper_base_day_str = str(
-                    paper_payload.get("start_of_day_day_str") or ""
-                )
-                paper_base_is_from_today = (
-                    persisted_paper_base_day_str == current_day_str
-                    and paper_start_of_day_balance > 1e-9
-                )
-                if paper_base_is_from_today:
-                    self.paper_stats.start_of_day_balance = paper_start_of_day_balance
-                    self.paper_stats.start_of_day_day_str = current_day_str
-                else:
-                    logger.critical(
-                        "[RiskGuard] NOT restoring the persisted PAPER start-of-day "
-                        "balance ($%.2f): it belongs to UTC day %r and today is %s. "
-                        "A base with no day stamp of its own is UNKNOWN, not "
-                        "today's: it may already contain today's PnL, and "
-                        "measuring the day's loss against a denominator that "
-                        "contains it reads LOW and under-trips. The PAPER opening "
-                        "balance stays UNKNOWN and the PAPER daily-loss gate "
-                        "fails CLOSED until the paper wallet's own balance "
-                        "establishes one.",
-                        paper_start_of_day_balance,
-                        persisted_paper_base_day_str or "UNKNOWN (no day stamp)",
-                        current_day_str,
-                    )
-                    self.paper_stats.start_of_day_balance = 0.0
-                    self.paper_stats.start_of_day_day_str = ""
-                self.paper_stats.last_known_day_str = current_day_str
-            else:
-                logger.info(
-                    "[RiskGuard] Discarding the persisted PAPER sandbox state: it "
-                    "belongs to UTC day %r and today is %r. The paper counters "
-                    "restart at zero, exactly like the live ones.",
-                    paper_day_str,
-                    current_day_str,
-                )
+        # THE PAPER SANDBOX'S OWN STATE, restored from the SAME payload.
+        #
+        # CORRECTION (2026-11-02): the comment this replaces ended "A payload
+        # without a 'paper' key simply leaves the paper counters at zero, which
+        # is correct: the paper sandbox was never persisted before." That was
+        # FALSE for exactly one account class -- a KEYLESS PAPER-ONLY
+        # account. Before this change there was ONE sandbox of counters and it
+        # was persisted at the TOP LEVEL of the payload, so for such an
+        # account the top-level counters WERE its paper loss streak and its
+        # paper day's PnL. Leaving the paper counters at zero therefore
+        # DISCARDED the streak that was blocking the account: the PAPER gate
+        # opened on the zeros and the next `save_state()` wrote them back.
+        # `_paper_payload_for_restore()` now reads the legacy top level as the
+        # paper section for that account class.
+        self._apply_persisted_paper_guard_state(paper_payload, current_day_str)
 
         # Re-evaluate the gate against the restored numbers. The start-up
         # path re-opened the gate on the way in (initialize_balance resets
