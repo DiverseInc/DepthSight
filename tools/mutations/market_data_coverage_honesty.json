@@ -47,7 +47,7 @@
     {
       "label": "E1-B: the loader never reports what the frame actually covers",
       "file": "bot_module/data_loader.py",
-      "needle": "    if trailing_short <= 0 and leading_gap <= 0 and not remote_failed:\n        return None\n",
+      "needle": "    if (\n        trailing_short <= 0\n        and leading_gap <= 0\n        and not remote_failed\n        and not missing_buckets\n    ):\n        return None\n",
       "replace": "    if True:  # MUTANT: the coverage is never reported\n        return None\n"
     },
     {
