@@ -148,6 +148,21 @@ def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, 
     )
     if trailing_short <= 0 and leading_gap <= 0 and not remote_failed:
         return None
+    # THE REASON NAMES THE HOLDER OF THE MISSING DAYS, AND THE HOLDER
+    # DEPENDS ON THE SOURCE.  The archive is NOT the holder of every gap:
+    # a REST frame that starts late is Binance's OWN answer (a symbol
+    # listed after the window that was asked for, for instance), and a
+    # cached frame's gap belongs to the cache.  Blaming the archive for a
+    # gap the archive never saw was a false statement in the note the
+    # caller carries -- and this note is what the user is shown.
+    if provenance.get("source") == "bulk_archive":
+        holder = "the archive"
+    elif provenance.get("source") == "rest_api":
+        holder = "the Binance REST API"
+    elif provenance.get("source") == "local_cache":
+        holder = "the local cache"
+    else:
+        holder = "the source"
     if remote_failed:
         reason = (
             "the remote source failed and this frame is the cached history "
@@ -156,12 +171,12 @@ def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, 
     elif leading_gap > 0:
         reason = (
             f"the frame starts {leading_gap:.0f}s after the requested start; "
-            "the archive does not hold the days in between"
+            f"{holder} has no candles for the days in between"
         )
     else:
         reason = (
             f"the frame ends {trailing_short:.0f}s before the requested end; "
-            "the archive does not hold the days in between"
+            f"{holder} has no candles for the days in between"
         )
     return {
         "source": provenance.get("source"),
@@ -333,6 +348,21 @@ def get_local_path(
     # and "spot_usdtm" went to the SPOT folder while the REST path queried
     # the USDT-M host.  A venue predicate that is duplicated must handle the
     # same special cases in every copy (see AGENTS.md).
+    #
+    # CORRECTION (2026-11-02): "the cache can never be filed under a
+    # folder that belongs to another venue" is true at the granularity of
+    # the FOLDER, which separates SPOT from FUTURES, and it was wrong at
+    # the granularity of the VENUE.  The two futures venues share the
+    # "futures" folder, because their SYMBOLS differ: USDT-M is BTCUSDT
+    # and COIN-M is BTCUSD_PERP.  So a COIN-M request for a USDT-quoted
+    # symbol still finds the USDT-M cache entry and is answered from it,
+    # with no API call at all.  That is PRE-EXISTING behaviour, unchanged
+    # by this branch, and it needs a COIN-M request with a USDT-quoted
+    # symbol to reach it -- a request that is itself a mistake, and that
+    # the API path refuses loudly (dapi answers 400 for BTCUSDT, which is
+    # not a 451, so it is re-raised).  The two paths therefore disagree
+    # about that one mistake: the cold path fails loud, the warm path
+    # answers from the cache.
     venue = config.resolve_market_venue(market_type)
     market_folder = "spot" if venue == "spot" else "futures"
 
@@ -372,7 +402,31 @@ def get_local_path(
 # Binance.  A proxy-451 answered with archive data would swap the source
 # of the candles without anybody knowing, so the fallback only runs when
 # the body says the block is Binance's.
-_BINANCE_GEO_BLOCK_MARKERS = ("restricted location", "b. eligibility")
+# THE PHRASE THAT IDENTIFIES BINANCE.
+#
+# MEASURED 2026-11-02 against the live blocked endpoints (api, fapi and
+# dapi all answer 451 with the SAME body):
+#
+#   {"code": 0, "msg": "Service unavailable from a restricted location
+#    according to 'b. Eligibility' in https://www.binance.com/en/terms.
+#    Please contact customer service if you believe you received this
+#    message in error."}
+#
+# "restricted location" is the GENERIC half of that sentence: it says the
+# request was blocked because of where it came from, and a corporate proxy
+# or a WAF can write exactly that.  "binance" is no better: a proxy's
+# error page quotes the URL it blocked, and that URL says binance.
+# "b. eligibility" is the half that says WHO refused -- it is Binance
+# citing its own Terms of Use, and no proxy writes it.
+#
+# The check used to accept EITHER half, so a proxy whose body happened to
+# say "restricted location" was answered from the archive: the candles
+# came from a different source, and the fallback had not been armed by
+# Binance at all.  Only Binance's own phrase arms it now.  A body that
+# stops carrying it fails the check, and that fails LOUD (the REST error
+# is re-raised unchanged, and the log says why) instead of quietly
+# swapping the source of the candles.
+_BINANCE_GEO_BLOCK_MARKER = "b. eligibility"
 
 
 def _is_binance_geo_block_body(response: Any) -> bool:
@@ -382,6 +436,11 @@ def _is_binance_geo_block_body(response: Any) -> bool:
     "Unavailable For Legal Reasons" a status a corporate proxy or a WAF
     answers with.  Only the body tells the two apart, so the body is
     what the fallback checks.
+
+    AND THE BODY HAS TO NAME BINANCE.  The generic phrase on its own does
+    not: "access denied from a restricted location" is a sentence every
+    proxy can write, and a proxy's block must not be answered with archive
+    data.  So the body must carry Binance's own phrase.
     """
     try:
         text = response.text
@@ -389,8 +448,7 @@ def _is_binance_geo_block_body(response: Any) -> bool:
         return False
     if not text:
         return False
-    lowered = text.lower()
-    return any(marker in lowered for marker in _BINANCE_GEO_BLOCK_MARKERS)
+    return _BINANCE_GEO_BLOCK_MARKER in text.lower()
 
 
 def _is_binance_location_block(error: Exception) -> bool:
@@ -574,6 +632,16 @@ def _download_klines_from_api_with_archive_fallback(
     produced no candles at all, and it is ``None`` -- the failure the
     callers' hard stops exist for.  Neither path ever serves a frame with
     a hole in it.
+
+    CORRECTION (2026-11-02): the last sentence above is WRONG and is kept
+    as it was written.  The ARCHIVE path DOES serve a frame with a hole in
+    it: a day the archive does not hold, inside the range the symbol
+    demonstrably traded through, is a hole, and that frame is SERVED with
+    the gap RECORDED on it (the "MISSING N bucket(s) inside the traded
+    range" path in ``bot_module/bulk_archive.py``).  The REST path has no
+    hole to serve, because Binance's own klines answer for every bar it
+    has.  What this paragraph is about is the "NO DATA" case, and THAT
+    part was, and is, correct.
     """
     try:
         frame = _download_klines_from_api(
@@ -950,6 +1018,21 @@ async def download_klines(
         # frame it travels with, is refused: a frame nobody can tell apart
         # from a REST frame is exactly the failure this fallback must not
         # have.
+        #
+        # CORRECTION (2026-11-02): the wording above is kept as it was
+        # written, and "the frame it travels with" needs one sentence of
+        # precision.  The record describes THE ARCHIVE'S CONTRIBUTION --
+        # it is enforced against ``df_api``, the frame the archive
+        # produced, which is exactly the frame it describes.  It then
+        # travels on the MERGED frame, and the merged frame can be WIDER
+        # than the archive's: the local cache covers the part of the
+        # window the archive was not asked for (``api_start_dt`` starts
+        # after the cache's last bar).  So the record's own
+        # ``actual_start``/``actual_end`` are the ARCHIVE's, not the
+        # delivered frame's.  The delivered frame's range is recorded
+        # truthfully, by the provenance record below and by the coverage
+        # note the caller carries; nothing reports the archive's range as
+        # the delivered one.
         if source == "bulk_archive" and not _difference_is_truthful(df_api, difference):
             logger.error(
                 f"Klines for {symbol} ({timeframe}): the bulk archive returned a "

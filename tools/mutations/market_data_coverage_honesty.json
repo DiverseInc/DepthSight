@@ -14,6 +14,10 @@
     "    so a single unlucky request destroyed a load that could have finished.",
     "    A TIMEOUT still collapses the budget (the host is not there); a RESET",
     "    does not (it is evidence about one request).",
+    "E5: the 451 body check accepted EITHER of Binance's phrases, so a proxy",
+    "    whose body merely said 'restricted location' armed the archive.",
+    "E6: the coverage note blamed the ARCHIVE for every gap, including the",
+    "    ones the archive never saw (a REST frame that starts late).",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/market_data_coverage_honesty.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -25,7 +29,7 @@
     "calls is covered by E1-A below.  A mutation of that one line would",
     "SURVIVE, which is why it is not in this spec."
   ],
-  "pytest_target": "tests/test_data_loader_bulk_archive_coverage.py tests/test_data_loader_bulk_archive.py",
+  "pytest_target": "tests/test_data_loader_bulk_archive_coverage.py tests/test_data_loader_bulk_archive.py tests/test_data_loader_bulk_archive_honesty.py",
   "timeout_s": 1800,
   "mutations": [
     {
@@ -81,6 +85,18 @@
       "file": "bot_module/bulk_archive.py",
       "needle": "    _FAILED_SINCE_SUCCESS.set(failed)\n    _note_unfetchable_file(url)\n",
       "replace": "    _FAILED_SINCE_SUCCESS.set(failed)\n"
+    },
+    {
+      "label": "E5: a 451 body that does not name Binance arms the archive again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    return _BINANCE_GEO_BLOCK_MARKER in text.lower()\n",
+      "replace": "    return \"restricted location\" in text.lower()  # MUTANT: the generic phrase is accepted as Binance's\n"
+    },
+    {
+      "label": "E6: every gap is blamed on the archive again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    if provenance.get(\"source\") == \"bulk_archive\":\n        holder = \"the archive\"\n",
+      "replace": "    holder = \"the archive\"  # MUTANT: the archive is blamed for every gap\n"
     }
   ]
 }

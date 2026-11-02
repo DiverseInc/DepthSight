@@ -301,6 +301,50 @@ def test_a_frame_that_starts_later_than_the_window_is_reported():
     assert "after the requested start" in coverage["reason"]
 
 
+def test_a_gap_the_archive_never_saw_is_not_blamed_on_the_archive():
+    """The note names the HOLDER of the missing days, and the holder is the source.
+
+    A REST frame that starts late is BINANCE's own answer -- a symbol that
+    was listed after the window that was asked for, for instance -- and the
+    archive was never consulted for it.  Blaming the archive for those days
+    was a false statement in the note the caller carries, and the note is
+    what the user is shown.
+    """
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    rows = _make_rows(start + timedelta(days=3), 24, 60)
+    frame = pd.DataFrame(
+        [row[1:6] for row in rows],
+        columns=["open", "high", "low", "close", "volume"],
+    ).astype("float64")
+    frame.index = pd.DatetimeIndex(
+        [pd.Timestamp(row[0], unit="ms", tz="UTC") for row in rows],
+        name="open_time",
+    )
+    # A REST frame carries NO difference record: the archive was not asked.
+    frame.attrs[data_loader.PROVENANCE_ATTR] = {
+        "source": "rest_api",
+        "requested_start": start.isoformat(),
+        "requested_end": "2024-01-31T23:59:59.999999+00:00",
+        "actual_start": (start + timedelta(days=3)).isoformat(),
+        "actual_end": "2024-01-04T23:00:00+00:00",
+        "rows": 24,
+        "differs_from_rest": False,
+    }
+
+    coverage = data_loader.klines_window_coverage(frame)
+
+    assert coverage is not None
+    assert coverage["source"] == "rest_api"
+    assert coverage["leading_gap_seconds"] == 3 * 24 * 3600
+    assert "the archive" not in coverage["reason"], coverage["reason"]
+    assert "the Binance REST API" in coverage["reason"], coverage["reason"]
+
+    # And the archive IS the holder when the archive is the source.
+    archive_note = data_loader.klines_window_coverage(_frame_with_a_short_coverage())
+    assert archive_note["source"] == "bulk_archive"
+    assert "the archive" in archive_note["reason"], archive_note["reason"]
+
+
 def test_the_coverage_is_put_on_the_kpis_the_run_saves():
     """The note the loader keeps ends up on the KPI dict."""
     frame = _frame_with_a_short_coverage()

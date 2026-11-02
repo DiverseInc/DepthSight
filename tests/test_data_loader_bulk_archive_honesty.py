@@ -777,6 +777,66 @@ async def test_a_451_that_is_not_binance_does_not_trigger_the_archive_fallback(
     assert archive_server.requested == [], "the archive must not answer a proxy's block"
 
 
+# A body that says the request came from a restricted location and says
+# NOTHING else.  "restricted location" is the GENERIC half of Binance's own
+# answer -- it says the request was blocked because of where it came from,
+# and a corporate proxy or a WAF can write exactly that sentence -- so a
+# body that carries it ALONE does not identify Binance.
+GENERIC_LOCATION_BLOCK_BODY = (
+    "<html><head><title>451 Unavailable For Legal Reasons</title></head>"
+    "<body>Access to this host from a restricted location has been denied. "
+    "Contact helpdesk@example.com for an exception.</body></html>"
+)
+
+
+def _generic_location_blocked_rest_api(*args, **kwargs):
+    """A 451 that says 'restricted location' and does NOT name Binance."""
+    raise _http_error_with_body(
+        451,
+        GENERIC_LOCATION_BLOCK_BODY,
+        "https://api.binance.com/api/v3/klines",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_451_that_only_says_restricted_location_is_not_binance(
+    archive_server, monkeypatch, tmp_path
+):
+    """The generic half of Binance's phrase is not enough to arm the fallback.
+
+    Binance's own body is "Service unavailable from a restricted location
+    according to 'b. Eligibility' in https://www.binance.com/en/terms", and
+    BOTH halves of it identify Binance: the first one only says the request
+    was blocked because of where it came from, which a proxy can say too.
+    A body that carries the generic phrase and nothing else must not arm
+    the archive, or the candles are swapped for archive data over a block
+    that Binance never issued.
+    """
+    monkeypatch.setattr(config, "LOCAL_DATA_STORAGE_PATH", str(tmp_path))
+    monkeypatch.setattr(data_loader, "_make_api_request", _generic_location_blocked_rest_api)
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    rows = _make_rows(start, 24, 60)
+    archive_server.add(
+        _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1),
+        _make_zip(_rows_to_csv(rows), "BTCUSDT-1h-2024-01.csv"),
+    )
+
+    result = await data_loader.download_klines(
+        symbol="BTCUSDT",
+        timeframe="1h",
+        start_dt=start,
+        end_dt=end,
+        market_type=FUTURES,
+    )
+
+    assert result is None
+    assert archive_server.requested == [], (
+        "the archive must not answer a block that does not name Binance"
+    )
+
+
 @pytest.mark.asyncio
 async def test_a_coinm_request_is_never_answered_with_usdtm_archive_data(
     archive_server, monkeypatch
