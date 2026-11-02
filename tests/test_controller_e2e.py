@@ -302,6 +302,16 @@ async def trading_components(
     risk_manager.daily_max_loss_threshold = 0.05
     risk_manager.min_balance_threshold = 100.0
     risk_manager.max_consecutive_losses = 10
+    # 2026-11-01: `maxDrawdown` is now a PEAK-TO-TROUGH limit -- the distance
+    # from the account's HIGH-WATER MARK down to the balance now, exactly as
+    # the backtesters measure it (`depthsight_backtester.py`: `drawdown =
+    # (peak_equity - current_balance) / peak_equity`). The high-water mark is
+    # server-owned state, established by the balance read and only ever
+    # RISING, and an account whose mark is unknown fails CLOSED. This fixture
+    # freezes the balance updates, so it sets the mark by hand: the account
+    # has not been higher than the balance it is given below.
+    risk_manager._peak_equity = 1000.0
+    risk_manager._peak_equity_set_at = time.time()
     risk_manager.live_max_stop_distance_pct = 0.05  # 5%
     risk_manager.max_stop_distance_pct = 0.05  # 5%
 

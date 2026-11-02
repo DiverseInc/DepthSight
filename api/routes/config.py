@@ -137,15 +137,17 @@ def _refuse_a_risk_per_trade_above_the_floor(
 # BEFORE the first trade is ever placed:
 #
 #   maxDrawdown           drawdown_pct >= max_drawdown_threshold
-#                         (bot_module/risk_manager.py:2238)
+#                         (bot_module/risk_manager.py:2573) -- the
+#                         PEAK-TO-TROUGH drawdown: the distance from the
+#                         account's high-water mark down to the balance now
 #   dailyMaxLossPercent   daily_loss_pct >= daily_max_loss_threshold
-#                         (bot_module/risk_manager.py:2246)
+#                         (bot_module/risk_manager.py:2585)
 #   maxConsecutiveLosses  consecutive_losses >= max_consecutive_losses
-#                         (bot_module/risk_manager.py:2249)
+#                         (bot_module/risk_manager.py:2588)
 #   maxConcurrentTrades   active_count >= max_concurrent_trades
 #                         (bot_module/controller.py:8848)
 #   maxStopDistancePct    stop distance > entry_price * max_stop_distance
-#                         (bot_module/risk_manager.py:2679) -- every stop is
+#                         (bot_module/risk_manager.py:3030) -- every stop is
 #                         "too far", so every signal is refused
 #
 # The account then stops trading with nothing to explain why, and nothing in
