@@ -32,6 +32,7 @@ RiskManager, and they assert OUTCOMES rather than the shape of the fix.
 import ast
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -282,6 +283,16 @@ def _risk_manager_blocked_at_the_loss_limit():
     rm.stats.today_pnl = 0.0
     rm.stats.consecutive_losses = 10
     rm.max_consecutive_losses = 10
+    # 2026-11-01: `maxDrawdown` is now a PEAK-TO-TROUGH limit -- the distance
+    # from the account's HIGH-WATER MARK down to the balance now, exactly as
+    # the backtesters measure it (`depthsight_backtester.py`: `drawdown =
+    # (peak_equity - current_balance) / peak_equity`). The high-water mark is
+    # server-owned state and an account whose mark is unknown fails CLOSED,
+    # so this fixture sets it to the balance it already has: this account has
+    # not been higher. 0.99 keeps the drawdown out of the way so the fixture
+    # still exercises the consecutive-loss limit it is about.
+    rm._peak_equity = 1000.0
+    rm._peak_equity_set_at = time.time()
     rm.max_drawdown_threshold = 0.99
     rm.daily_max_loss_threshold = 0.99
     rm.min_balance_threshold = 5.0

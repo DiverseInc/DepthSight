@@ -61,6 +61,7 @@ denominator it cannot vouch for.
 """
 
 import json
+import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -163,6 +164,10 @@ def _risk_manager(redis_client, day, balance=10000.0, user_id=1, api_key_id=None
         datetime(2026, 10, 1, tzinfo=timezone.utc).timestamp(),
         rm._fake_day,
     )
+    # The balance this RiskManager's executor reports. The seeded payloads
+    # below are written by hand, and they carry the account's high-water
+    # mark, so they need to know it.
+    rm._test_balance = float(balance)
     return rm
 
 
@@ -177,15 +182,25 @@ def _seed_payload(rm, store, *, day_str, base, base_day_str, today_pnl=-73.03):
     defect is that the READER cannot tell which day the base belongs to, so the
     test must hand the reader exactly that ambiguity. The extra field is ignored
     by the unfixed code, which is what makes this test go red there.
+
+    2026-11-01: the payload shape grew the account's HIGH-WATER MARK in v3
+    (``RISK_STATE_VERSION``). The peak written here is the balance the
+    account actually has, so this file keeps testing the day-scoped BASE and
+    does not ALSO breach the peak-to-trough limit. A payload with NO peak at
+    all is the "unknown peak" state, and it fails CLOSED -- that is covered
+    in ``tests/test_peak_to_trough_drawdown.py``.
     """
+    peak = float(getattr(rm, "_test_balance", 0.0) or base)
     store[_guard_key(rm)] = json.dumps(
         {
-            "version": 2,
+            "version": 3,
             "day_str": day_str,
             "consecutive_losses": 0,
             "today_pnl": today_pnl,
             "start_of_day_balance": base,
             "start_of_day_day_str": base_day_str,
+            "peak_equity": peak,
+            "peak_equity_set_at": time.time(),
         }
     )
     assert _guard_key(rm) in store, "the seeded payload must actually be present"
