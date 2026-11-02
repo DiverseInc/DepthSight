@@ -269,6 +269,11 @@ async def test_active_pairs_update_from_main_app_ws(
     data_consumer_instance, simple_main_app_ws_server, monkeypatch
 ):
     monkeypatch.setattr(global_config, "SYMBOL_SOURCE_MODE", "MAIN_APP")
+    # This test exercises the main_app WebSocket, so the feed must be ON.
+    # It used to rely on MAIN_APP_WS_ENABLED defaulting to true; this branch
+    # flips that default to false (the upstream's safe default), so the
+    # precondition is stated explicitly here.
+    monkeypatch.setattr(global_config, "MAIN_APP_WS_ENABLED", True)
     monkeypatch.setattr(data_consumer, "BINANCE_WS_RECONNECT_DELAY_BASE", 0.1)
     data_consumer_instance._main_app_ws_url = simple_main_app_ws_server
 

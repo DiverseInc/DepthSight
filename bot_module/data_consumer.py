@@ -22,6 +22,7 @@ import math
 import uuid
 
 from bot_module import config
+from bot_module.screener_feed import describe_ws_url_problem
 from .data_loader import download_klines, download_open_interest  # Ensure imported
 from .utils import (
     calculate_scalper_natr,
@@ -454,13 +455,45 @@ class DataConsumer:
         logger.info(f"Symbol source mode: {source_mode}")
 
         if source_mode == "MAIN_APP":
+            # --- THE FEED'S OWN CONFIGURATION IS CHECKED FIRST ---
+            #
+            # This fork ships NO default MAIN_APP_WS_URL (see config.py), so
+            # an empty value means "the operator has not configured the feed",
+            # and the upstream's reserved hostname means "this deployment is
+            # pointed at someone else's deployment". Neither may be discovered
+            # by a reconnect storm, and neither may reach a DYNAMIC strategy
+            # as a silent zero-symbol start.
+            #
+            # The rules live in bot_module/screener_feed.py and are asked HERE,
+            # at the point where the feed is actually started, so the
+            # consumer, the API route and the bot's command channel cannot
+            # drift apart.
+            _ws_enabled = bool(getattr(config, "MAIN_APP_WS_ENABLED", False))
+            _ws_url_problem = describe_ws_url_problem(self._main_app_ws_url)
+
+            if _ws_enabled and _ws_url_problem is not None:
+                # The feed is supposed to run and it CANNOT. Refuse loudly:
+                # the DataConsumer does not start, so the deployment says so
+                # instead of reconnecting forever against a host that can
+                # never answer.
+                logger.critical(
+                    "REFUSING TO START the screener WebSocket consumer. %s "
+                    "The DataConsumer will NOT start: a symbol source that "
+                    "cannot work must fail loudly here, not look healthy "
+                    "while every DYNAMIC-mode strategy runs with zero "
+                    "symbols and never trades.",
+                    _ws_url_problem,
+                )
+                self._running = False
+                return
+
             # The screener loop can be switched off entirely. When nothing can
             # consume its output (SYMBOL_SELECTION_ALLOW_DYNAMIC is false, so
             # DYNAMIC strategies are refused at start), reconnecting to an
             # unreachable host forever is pure cost and floods the logs with a
             # warning that masks real problems. Pinned-symbol and STATIC/FIXED
             # strategies do not use this feed at all.
-            if not getattr(config, "MAIN_APP_WS_ENABLED", True):
+            if not _ws_enabled:
                 # The feed is off BY CONFIGURATION, not by outage -- and that
                 # makes the alarm WORSE, not better.
                 #
@@ -516,6 +549,26 @@ class DataConsumer:
                         "is disabled. DYNAMIC symbol selection will not work. "
                         "Pinned-symbol and STATIC/FIXED strategies are unaffected."
                     )
+                if _ws_url_problem is not None:
+                    # The feed is OFF, so this is not what stopped it -- but a
+                    # URL that is missing or points at the upstream deployment
+                    # will be the cause the moment the feed is switched on.
+                    # Say so now, while the operator is reading this line.
+                    #
+                    # WARNING, not CRITICAL, on purpose. The established rule
+                    # in this branch is that the outage alarm fires ONLY when
+                    # something would actually be unprotected
+                    # (`dynamic_possible or regime_at_risk`) -- making it
+                    # louder than that trains operators to ignore it
+                    # (tests/test_disabled_ws_feed_raises_risk_alarm.py).
+                    # This line is a configuration note, not an outage alarm.
+                    logger.warning(
+                        "MAIN_APP_WS_URL is not usable either: %s The screener "
+                        "loop is disabled by MAIN_APP_WS_ENABLED=false, so this "
+                        "is NOT what stopped it -- but it becomes the cause the "
+                        "moment the loop is switched on.",
+                        _ws_url_problem,
+                    )
             elif (
                 websockets
                 and self._main_app_ws_url
@@ -525,8 +578,12 @@ class DataConsumer:
                     self._main_app_ws_loop(), name="MainAppWSLoop"
                 )
             else:
+                # The URL was already checked above, so the only way to get
+                # here with a usable URL is a missing `websockets` package.
+                # The feed still cannot run: refuse, and say why.
                 logger.critical(
-                    f"SYMBOL_SOURCE_MODE is 'MAIN_APP', but MAIN_APP_WS_URL ('{self._main_app_ws_url}') is not configured or invalid. DataConsumer cannot get symbols."
+                    f"SYMBOL_SOURCE_MODE is 'MAIN_APP' and MAIN_APP_WS_URL ('{self._main_app_ws_url}') is a WebSocket URL, but the 'websockets' package is not available in this process. "
+                    "The screener feed cannot run and DataConsumer cannot get symbols."
                 )
                 self._running = False
                 return

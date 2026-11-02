@@ -29,6 +29,9 @@ from bot_module.regime_feed import (
     arms_breakeven_on_regime_change as _arms_breakeven_on_regime_change,
     screener_feed_can_deliver_regime_data as _screener_feed_can_deliver_regime_data,
 )
+from bot_module.screener_feed import (
+    screener_feed_misconfigured as _screener_feed_misconfigured,
+)
 
 try:
     from bot_module import config as bot_config
@@ -594,6 +597,39 @@ async def start_strategy_instance(
                 "screener running."
             ),
         )
+
+    # Refuse DYNAMIC when THIS deployment's screener feed is MISCONFIGURED.
+    #
+    # The guard above asks whether DYNAMIC is ENABLED on this deployment. This
+    # one asks whether the feed's CONFIGURATION is wrong: the feed may be
+    # switched on but its URL missing or unusable (the consumer then refuses
+    # to start, so nothing would ever deliver symbols), or the URL may name
+    # the UPSTREAM DepthSight-Pro deployment's reserved hostname
+    # (screener.depthsight.pro), which is not this fork and answers HTTP 525.
+    #
+    # In both cases a dynamic strategy started here would have zero symbols:
+    # it reports "running", and never trades. Refusing here turns that into an
+    # error the operator can act on.
+    #
+    # The SAFE pairing -- the feed switched OFF with an empty URL -- is NOT
+    # refused here. Whether DYNAMIC may be used at all is decided by
+    # SYMBOL_SELECTION_ALLOW_DYNAMIC (the guard above) and by the consumer's
+    # CRITICAL outage alarm.
+    if _resolved_mode == "DYNAMIC":
+        _dynamic_problem = _screener_feed_misconfigured(
+            getattr(bot_config, "SYMBOL_SOURCE_MODE", "MAIN_APP"),
+            getattr(bot_config, "MAIN_APP_WS_URL", ""),
+            getattr(bot_config, "MAIN_APP_WS_ENABLED", False),
+        )
+        if _dynamic_problem:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Dynamic symbol selection cannot work on this deployment. "
+                    + _dynamic_problem
+                    + " Choose an explicit symbol instead (STATIC/FIXED)."
+                ),
+            )
 
     # Refuse to ARM a regime-change stop that this deployment cannot deliver.
     #
