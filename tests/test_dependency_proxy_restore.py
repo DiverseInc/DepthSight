@@ -34,6 +34,13 @@ write, that change is not the proxy's to revert, so the undo leaves it
 alone. And a snapshot of a previous target is meaningless once `configure()`
 swaps the target, so it is dropped then.
 
+A name the proxied object no longer has AT ALL is a third case, and it is
+not the same as "the object holds a different value": there is no out-of-band
+value there to protect, only a missing attribute. So the undo puts the
+ORIGINAL back. Forgetting the name instead would discard the proxy's only
+reference to the original and leave the module without the function for the
+rest of the session - the exact harm this proxy exists to prevent.
+
 The rule the undo follows is OWNERSHIP. The proxy only ever reverts a name
 it wrote to the proxied object ITSELF, and it never removes a name it
 cannot prove it still owns: a name the proxy never wrote is left alone, an
@@ -965,3 +972,176 @@ def test_the_pytest_undo_path_leaves_no_bookkeeping_behind():
         "the undo deleted the name the proxy created; a leftover stub is the "
         "safe direction, a deleted attribute is not"
     )
+
+
+def test_the_undo_restores_the_original_that_is_gone_from_the_target():
+    """An attribute that is GONE from the target must be restored, not forgotten.
+
+    The proxy displaced a REAL function on the proxied module, and the
+    attribute is then deleted out of band. The module now holds NOTHING for
+    that name: there is no out-of-band value to protect and nothing the undo
+    could clobber - the attribute is simply missing.
+
+    The undo must put the ORIGINAL function back. Forgetting the name instead
+    would discard the proxy's only reference to the original and leave the
+    module without the function for the rest of the session - the exact harm
+    this proxy exists to prevent (the original incident took a real function
+    out of a process-wide module).
+
+    The target and the proxy are the product's own: the real `api.crud`
+    module, and the `crud` proxy that `configure_runtime_dependencies` points
+    at it (see tests/conftest.py).
+    """
+
+    from api import crud as crud_module
+    from bot_module.runtime_dependencies import crud
+
+    name = "get_config_model"
+    original = getattr(crud_module, name)
+
+    async def _stub(db, user_id):  # type: ignore[no-untyped-def]
+        return None
+
+    try:
+        # The proxy displaces a REAL function on the module.
+        setattr(crud, name, _stub)
+        assert getattr(crud_module, name) is _stub
+
+        # The proxy's snapshot of the original is the only reference to it.
+        snapshot = crud._restore[name]
+        assert snapshot is original
+
+        # The attribute is deleted out of band: the module holds NOTHING for
+        # that name any more - no proxy write, no out-of-band value.
+        delattr(crud_module, name)
+        assert not hasattr(crud_module, name)
+
+        # The undo.
+        delattr(crud, name)
+
+        assert hasattr(crud_module, name), (
+            "the undo left the module WITHOUT the attribute: the proxy "
+            "forgot its snapshot of the original instead of putting it back, "
+            "so the module is left without the function for the rest of the "
+            "session"
+        )
+        assert getattr(crud_module, name) is original, (
+            "the undo did not put the ORIGINAL function back"
+        )
+        assert getattr(crud_module, name) is snapshot, (
+            "the proxy discarded its snapshot of the original instead of "
+            "applying it"
+        )
+        assert getattr(crud, name) is original, (
+            "the original is not reachable through the proxy any more"
+        )
+        # The undo is complete for this name, exactly as in the normal
+        # restore path: the proxy does not own the name any more.
+        assert name not in crud._restore, (
+            "the proxy still remembers the original value for a name it has "
+            "already reverted"
+        )
+        assert name not in crud._written, (
+            "the proxy still remembers what it wrote for a name it has "
+            "already reverted"
+        )
+        assert name not in crud._touched, (
+            "the proxy still claims a name it has already reverted"
+        )
+    finally:
+        # The module is a process-wide singleton. If this test failed, put
+        # the original back by hand, so the rest of the session is not
+        # damaged by the very incident this proxy exists to prevent.
+        setattr(crud_module, name, original)
+        delattr(crud, name)
+
+
+def test_the_undo_branches_around_a_missing_attribute_are_unchanged():
+    """The branches next to the missing-attribute case must not move.
+
+    The undo has three neighbours, and the fix for the missing-attribute case
+    must not disturb any of them:
+
+    - a name the proxy CREATED stays in place;
+    - a name the target holds a DIFFERENT value for is left alone, and the
+      proxy forgets it;
+    - a name the target still holds what the proxy wrote for is restored the
+      normal way.
+
+    The target and the proxy are the product's own: the real `api.crud`
+    module, and the `crud` proxy that `configure_runtime_dependencies` points
+    at it (see tests/conftest.py).
+    """
+
+    from api import crud as crud_module
+    from bot_module.runtime_dependencies import crud
+
+    async def _stub(db, user_id):  # type: ignore[no-untyped-def]
+        return None
+
+    # (1) A name the proxy CREATED stays in place after the undo.
+    created = "proxy_created_name_check"
+    assert not hasattr(crud_module, created)
+    try:
+        setattr(crud, created, "stub")
+        assert getattr(crud_module, created) == "stub"
+
+        delattr(crud, created)
+
+        assert hasattr(crud_module, created), (
+            "the undo deleted a name the proxy created. The proxy may only "
+            "revert what it put there, and it cannot prove it still owns it."
+        )
+        assert getattr(crud_module, created) == "stub"
+    finally:
+        # The proxy deliberately leaves a created name in place; this test
+        # leaves the module exactly as it found it.
+        if hasattr(crud_module, created):
+            delattr(crud_module, created)
+
+    # (2) A name the target holds a DIFFERENT value for is left alone, and
+    #     the proxy forgets it.
+    changed_name = "get_active_api_key_for_user"
+    original_changed = getattr(crud_module, changed_name)
+    changed_elsewhere = _Value("changed-elsewhere")
+    try:
+        setattr(crud, changed_name, _stub)
+        assert getattr(crud_module, changed_name) is _stub
+
+        # Out of band, bypassing the proxy.
+        setattr(crud_module, changed_name, changed_elsewhere)
+
+        delattr(crud, changed_name)
+
+        assert getattr(crud_module, changed_name) is changed_elsewhere, (
+            "the undo clobbered a change that was made on the module directly "
+            "- that change is not the proxy's to revert"
+        )
+        assert changed_name not in crud._restore, (
+            "the proxy kept the out-of-band value for a name it gave up"
+        )
+        assert changed_name not in crud._written, (
+            "the proxy still remembers what it wrote for a name it gave up"
+        )
+        assert changed_name not in crud._touched, (
+            "the proxy still claims a name it gave up"
+        )
+    finally:
+        setattr(crud_module, changed_name, original_changed)
+        delattr(crud, changed_name)
+
+    # (3) The normal restore path still works.
+    restored_name = "get_strategy_config_by_id"
+    original_restored = getattr(crud_module, restored_name)
+    try:
+        setattr(crud, restored_name, _stub)
+        assert getattr(crud_module, restored_name) is _stub
+
+        delattr(crud, restored_name)
+
+        assert getattr(crud_module, restored_name) is original_restored, (
+            "the undo did not put the original back"
+        )
+    finally:
+        setattr(crud_module, restored_name, original_restored)
+        delattr(crud, restored_name)

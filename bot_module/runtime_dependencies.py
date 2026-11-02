@@ -124,6 +124,30 @@ class DependencyProxy:
         written = self._written.get(name, _MISSING)
         if (
             written is not _MISSING
+            and saved is not _MISSING
+            and getattr(self._target, name, _MISSING) is _MISSING
+        ):
+            # The proxied object's attribute is GONE ENTIRELY. That is NOT the
+            # same situation as "the target holds a DIFFERENT value": there is
+            # no out-of-band value here to protect and nothing the undo could
+            # clobber - the attribute is simply missing.
+            #
+            # The proxy knows it displaced a real original for this name
+            # (saved is not _MISSING), so it PUTS THAT ORIGINAL BACK. Forgetting
+            # the name instead would throw away the only reference the proxy
+            # had to the original and leave the proxied module without the
+            # function for the rest of the session - the exact harm this
+            # proxy exists to prevent (a real function taken out of a
+            # process-wide module).
+            setattr(self._target, name, saved)
+            # The undo is complete for this name: the original is back, so the
+            # proxy does not own the name any more and must not keep
+            # remembering it. This is the same bookkeeping the normal restore
+            # path leaves behind (see _forget).
+            self._forget(name)
+            return
+        if (
+            written is not _MISSING
             and getattr(self._target, name, _MISSING) is not written
         ):
             # The proxied object no longer holds what this proxy put there: it
