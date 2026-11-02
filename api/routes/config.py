@@ -276,6 +276,28 @@ def _refuse_a_risk_limit_looser_than_its_ceiling(
     owner rather than silently resolved here: changing a risk limit is the
     owner's decision, not this route's.
 
+    CORRECTION (2026-11-01, round 25): the owner's decision has now settled
+    the stop distance, so TWO statements in the block above are superseded.
+    The original text is kept above, unaltered.
+    1. The table row ``| max_stop_distance_pct | 5.0 % | 10.0 % | the
+       account is LOOSER than the floor |`` is no longer true. The owner
+       decided that the maximum stop distance is 5.0% EVERYWHERE, and
+       ``api/schemas.py`` now hands a NEW account 5.0%
+       (``RiskManagementSettings.maxStopDistancePct`` and
+       ``BacktestRiskManagementSettings.maxStopDistancePct``), so the
+       account is handed the SAME number as the declared floor.
+    2. "true for two of the five, and FALSE for the other three" is now
+       "true for THREE of the five, and FALSE for the other two". The three
+       that agree are ``risk_per_trade_pct``, ``max_consecutive_losses`` and
+       ``max_stop_distance_pct``. The two that still disagree are
+       ``daily_loss_limit_pct`` (the account is handed NOTHING, so the floor
+       fills in) and ``max_drawdown_pct`` (the account is handed 10.0%
+       against a 20.0% floor, so the account is TIGHTER than the floor).
+    ⚠️ AND WHAT THIS DOES NOT CHANGE: an account that ALREADY holds a
+    looser stop distance keeps exactly the value it holds -- the ceiling
+    below is the account's OWN held value, not the schema default. The
+    change is to the value a NEW client is HANDED.
+
     The strategy route already refuses a limit looser than its floor. THIS
     route did not, so a client could raise four of the five through the Risk
     Settings page -- and the RiskManager enforces the ACCOUNT's stored value
@@ -378,6 +400,26 @@ def _refuse_a_risk_limit_looser_than_its_ceiling(
                 # that holds none) and 10.0 (the account default the account
                 # HOLDS, which this rule lets win). The original text is kept
                 # above, unaltered.
+                #
+                # CORRECTION (2026-11-01, round 25): the 10.0 in the
+                # paragraph above was the ACCOUNT DEFAULT, and the owner has
+                # now changed that default. The owner decided that the
+                # maximum stop distance is 5.0% EVERYWHERE, and
+                # ``api/schemas.py`` now hands a NEW account 5.0% for both
+                # ``RiskManagementSettings.maxStopDistancePct`` and
+                # ``BacktestRiskManagementSettings.maxStopDistancePct``.
+                # MEASURED after the change: the DECLARED floor is 5.0
+                # (``bot_module/strategy_registry.py:230``), the value a NEW
+                # account is HANDED is 5.0 (the schema default), and the
+                # RiskManager's own fallback is 5.0 (``risk_manager.py:184-186``
+                # and :197-199). ==> THREE numbers for one limit, and ALL
+                # THREE NOW AGREE. The effective numbers for one limit are
+                # 5.0 and 5.0.
+                # ⚠️ WHAT THIS DOES NOT CHANGE: the ceiling below is still
+                # the account's OWN held value. An account created before
+                # this change holds 10.0 and keeps exactly 10.0, and this
+                # rule lets that held value win -- unchanged. The original
+                # text is kept above, unaltered.
                 ceiling = held
         if number > ceiling:
             raise HTTPException(
