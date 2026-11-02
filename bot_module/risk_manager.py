@@ -2602,7 +2602,6 @@ class RiskManager:
             if self._is_trading_allowed:
                 logger.critical(f"Trading disabled globally! Reason: {disable_reason}")
                 self._is_trading_allowed = False
-                self._trading_disabled_reason = breach_reason
                 # Added check for self.loop_from_controller
                 if self.telegram_notifier and self.loop_from_controller:
                     try:
@@ -2619,6 +2618,27 @@ class RiskManager:
                         )
                     except Exception as e:
                         logger.error(f"Failed to schedule Telegram notification: {e}")
+            # THE OPERATOR-FACING REASON MUST BE THE CURRENT ONE.
+            #
+            # This block only rewrote `_trading_disabled_reason` when THIS
+            # evaluation CLOSED the gate. Once the gate was already closed the
+            # published reason stayed frozen on the FIRST breach that ever
+            # tripped, while `_global_gate_disable_reason` (refreshed on every
+            # evaluation) moved on. The two fields then disagreed: the operator
+            # was told "Max drawdown (30.63%) >= limit (20.00%)" while the
+            # limit actually in force was "Daily loss (11.53%) >= limit (5.00%)",
+            # measured against a base that had since moved.
+            #
+            # The published reason is now refreshed with the CURRENT breach on
+            # every evaluation, exactly like the sibling paths in this file: the
+            # guard-state latches above, `restore_state()`, and the
+            # re-verification path -- all of which already refresh it from
+            # `_global_gate_disable_reason` for this same reason.
+            #
+            # The emergency-stop latch OWNS the published reason while it is
+            # engaged: its message must NOT be overwritten by a limit reason.
+            if not getattr(self, "_emergency_stop_active", False):
+                self._trading_disabled_reason = breach_reason
             self._global_gate_disable_reason = breach_reason
         elif should_be_allowed:
             # The limits are within range again.
