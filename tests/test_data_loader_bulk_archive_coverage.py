@@ -345,6 +345,43 @@ def test_a_gap_the_archive_never_saw_is_not_blamed_on_the_archive():
     assert "the archive" in archive_note["reason"], archive_note["reason"]
 
 
+def test_an_interior_hole_travels_with_the_note():
+    """A hole INSIDE the window the frame covers is named in the note.
+
+    The archive serves a frame with a hole in it and records the missing
+    days on the frame ("missing_buckets"), because the data that exists is
+    worth more than no data.  The note is what reaches the KPI payload, so
+    the note has to carry the hole: the note used to return None for a
+    frame whose ONLY gap was an interior one, and kpis["data_window"] was
+    then ABSENT for exactly the backtests that need it.
+    """
+    frame = _frame_with_a_short_coverage()
+    difference = frame.attrs[data_loader.DIFFERENCE_ATTR]
+    difference["missing_buckets"] = [
+        {"start": "2024-01-10T00:00:00+00:00", "end": "2024-01-11T00:00:00+00:00"},
+        {"start": "2024-01-17T00:00:00+00:00", "end": "2024-01-18T00:00:00+00:00"},
+    ]
+    # The trailing edge is covered and the leading edge is covered, so the
+    # interior hole is the ONLY gap there is.
+    difference["trailing_edge_short_by_seconds"] = 0.0
+    frame.attrs[data_loader.PROVENANCE_ATTR]["difference"] = difference
+
+    coverage = data_loader.klines_window_coverage(frame)
+
+    assert coverage is not None, (
+        "a frame whose only gap is an interior hole must still be reported"
+    )
+    assert coverage["missing_buckets"] == difference["missing_buckets"]
+    assert "2 day(s)" in coverage["reason"], coverage["reason"]
+    assert "the archive" in coverage["reason"], coverage["reason"]
+
+    # And the hole reaches the KPI payload the run saves.
+    kpis = {}
+    notes = data_loader.attach_klines_window_coverage(kpis, {"kline_1h": frame})
+    assert notes
+    assert kpis["data_window"][0]["missing_buckets"] == difference["missing_buckets"]
+
+
 def test_the_coverage_is_put_on_the_kpis_the_run_saves():
     """The note the loader keeps ends up on the KPI dict."""
     frame = _frame_with_a_short_coverage()

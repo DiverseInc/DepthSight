@@ -18,6 +18,9 @@
     "    whose body merely said 'restricted location' armed the archive.",
     "E6: the coverage note blamed the ARCHIVE for every gap, including the",
     "    ones the archive never saw (a REST frame that starts late).",
+    "E7: the interior holes the archive records on the frame were dropped from",
+    "    the note, so the note returned None and the KPI payload carried",
+    "    nothing for a backtest whose only gap was a hole in the middle.",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/market_data_coverage_honesty.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -97,6 +100,12 @@
       "file": "bot_module/data_loader.py",
       "needle": "    if provenance.get(\"source\") == \"bulk_archive\":\n        holder = \"the archive\"\n",
       "replace": "    holder = \"the archive\"  # MUTANT: the archive is blamed for every gap\n"
+    },
+    {
+      "label": "E7: the interior holes are dropped from the note again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    missing_buckets = difference.get(\"missing_buckets\")\n",
+      "replace": "    missing_buckets = []  # MUTANT: the interior holes are dropped again\n"
     }
   ]
 }

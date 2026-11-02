@@ -136,6 +136,17 @@ def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, 
     trailing_short = float(difference.get("trailing_edge_short_by_seconds") or 0.0)
     leading_shortfall = difference.get("leading_shortfall")
     remote_failed = bool(provenance.get("remote_failed"))
+    # THE INTERIOR HOLES TRAVEL WITH THE NOTE.  The archive names the days
+    # it does not hold on the frame itself ("missing_buckets") and SERVES
+    # the frame with them, because the data that exists is worth more than
+    # no data.  A note that said nothing about them would leave the caller
+    # -- and the KPI payload the caller saves -- with no sign of a hole the
+    # data really has.  The note used to return None for a frame whose ONLY
+    # gap was an interior one, so kpis["data_window"] was ABSENT for
+    # exactly the backtests that need it.
+    missing_buckets = difference.get("missing_buckets")
+    if not isinstance(missing_buckets, list):
+        missing_buckets = []
     # THE LEADING EDGE IS MEASURED HERE, NOT TAKEN FROM THE RECORD.  The
     # archive only records a leading shortfall when it can PROVE the symbol
     # was listed later than the window asks for; a leading month whose
@@ -146,7 +157,12 @@ def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, 
     leading_gap = _seconds_between(
         provenance.get("actual_start"), provenance.get("requested_start")
     )
-    if trailing_short <= 0 and leading_gap <= 0 and not remote_failed:
+    if (
+        trailing_short <= 0
+        and leading_gap <= 0
+        and not remote_failed
+        and not missing_buckets
+    ):
         return None
     # THE REASON NAMES THE HOLDER OF THE MISSING DAYS, AND THE HOLDER
     # DEPENDS ON THE SOURCE.  The archive is NOT the holder of every gap:
@@ -173,10 +189,22 @@ def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, 
             f"the frame starts {leading_gap:.0f}s after the requested start; "
             f"{holder} has no candles for the days in between"
         )
-    else:
+    elif trailing_short > 0:
         reason = (
             f"the frame ends {trailing_short:.0f}s before the requested end; "
             f"{holder} has no candles for the days in between"
+        )
+    else:
+        reason = (
+            f"the frame covers the window it was asked for, but {holder} "
+            "does not hold every day in between"
+        )
+    if missing_buckets:
+        # The holes are named on the frame, and they are named HERE too:
+        # the note is what reaches the KPI payload.
+        reason = (
+            f"{reason}; {len(missing_buckets)} day(s) inside the window the "
+            "frame covers are missing from it"
         )
     return {
         "source": provenance.get("source"),
@@ -189,6 +217,7 @@ def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, 
         "trailing_edge_short_by_seconds": trailing_short,
         "leading_gap_seconds": leading_gap,
         "leading_shortfall": leading_shortfall,
+        "missing_buckets": missing_buckets,
         "remote_failed": remote_failed,
         "reason": reason,
     }
