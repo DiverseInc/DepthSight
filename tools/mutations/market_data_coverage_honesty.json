@@ -77,8 +77,8 @@
     {
       "label": "E3-B: a host that does not answer no longer ends the load fast",
       "file": "bot_module/bulk_archive.py",
-      "needle": "        if _is_host_not_answering(error):\n",
-      "replace": "        if False and _is_host_not_answering(error):  # MUTANT: the timeout does not collapse\n"
+      "needle": "        if _is_host_not_answering(error):\n            # The host did not answer inside the timeout it was given: it is\n",
+      "replace": "        if False and _is_host_not_answering(error):  # MUTANT: the timeout does not collapse\n            # The host did not answer inside the timeout it was given: it is\n"
     },
     {
       "label": "E3-C: the second file that cannot be fetched no longer ends the load",
@@ -101,7 +101,7 @@
     {
       "label": "E6: every gap is blamed on the archive again",
       "file": "bot_module/data_loader.py",
-      "needle": "    if provenance.get(\"source\") == \"bulk_archive\":\n        holder = \"the archive\"\n",
+      "needle": "    if provenance.get(\"source\") == \"bulk_archive\":\n        holder = \"the archive\"\n    elif provenance.get(\"source\") == \"rest_api\":\n        holder = \"the Binance REST API\"\n    elif provenance.get(\"source\") == \"local_cache\":\n        holder = \"the local cache\"\n    else:\n        holder = \"the source\"\n",
       "replace": "    holder = \"the archive\"  # MUTANT: the archive is blamed for every gap\n"
     },
     {
