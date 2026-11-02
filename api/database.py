@@ -20,6 +20,30 @@ if not all([DB_USER, DB_PASS, DB_HOST, DB_NAME]):
 # 3. Assemble connection string from retrieved variables
 DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
+
+def alembic_database_url(database_url: str = DATABASE_URL) -> str:
+    """The database URL Alembic must use: the same database, SYNC driver.
+
+    WHY THIS EXISTS
+    ---------------
+    The application talks to PostgreSQL over the ASYNC driver (asyncpg), so
+    ``DATABASE_URL`` is ``postgresql+asyncpg://...``.  Alembic runs
+    SYNCHRONOUSLY and cannot use asyncpg; it needs psycopg2, which
+    ``requirements.txt`` ships (``psycopg2-binary>=2.9,<3.0``).
+
+    The bug this replaces: ``DATABASE_URL.replace("+asyncpg", "")`` strips the
+    driver name entirely and leaves the BARE ``postgresql://`` scheme.  On
+    SQLAlchemy 2.x a bare ``postgresql://`` is not "no driver" -- it is
+    "pick one", and it picks PSYCOPG3, which is not installed.  The result was
+    ``ModuleNotFoundError: No module named 'psycopg'`` from
+    ``alembic upgrade head``, which ``docker-startup.sh`` swallowed, so the
+    API came up serving traffic while the schema never advanced.
+
+    So: name the driver explicitly.  Do not strip it.
+    """
+    return database_url.replace("+asyncpg", "+psycopg2")
+
+
 engine = create_async_engine(DATABASE_URL)
 AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
