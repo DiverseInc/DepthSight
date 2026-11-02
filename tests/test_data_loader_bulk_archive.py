@@ -137,12 +137,26 @@ def archive_server(monkeypatch):
     return server
 
 
+# The REAL body Binance answers a geo-blocked request with.  MEASURED on
+# 2026-11-02 against the live blocked endpoint (api.binance.com answers
+# 451 with this JSON).  The loader checks it, because HTTP 451 is also
+# emitted by corporate proxies and WAFs (RFC 7725) and only the body tells
+# the two apart.
+BINANCE_GEO_BLOCK_BODY = (
+    '{"code":0,"msg":"Service unavailable from a restricted location according '
+    "to 'b. Eligibility' in https://www.binance.com/en/terms. Please contact "
+    'customer service if you believe you received this message in error."}'
+)
+
+
 def _blocked_rest_api(*args, **kwargs):
     """Simulates the measured HTTP 451 from the Binance REST endpoints."""
     response = requests.Response()
     response.status_code = 451
     response.reason = "Unavailable For Legal Reasons"
     response.url = "https://api.binance.com/api/v3/klines"
+    response._content = BINANCE_GEO_BLOCK_BODY.encode("utf-8")
+    response.encoding = "utf-8"
     raise requests.exceptions.HTTPError(
         "451 Client Error: Unavailable For Legal Reasons For url: "
         "https://api.binance.com/api/v3/klines",
@@ -166,7 +180,11 @@ def _working_rest_api(rows):
 
 
 def _monthly_url(symbol, interval, market_type, year, month):
-    market = "spot" if "spot" in market_type else "futures/um"
+    # The URL is built with the PRODUCT's own venue routing, so the fixture
+    # always asks for the file the archive really requests.  A fixture that
+    # carried its own copy of the routing would hide a mismatch between the
+    # two -- which is exactly the bug this file's venue tests are for.
+    market = bulk_archive._archive_market_path(market_type)
     period = f"{year:04d}-{month:02d}"
     return (
         f"{config.BINANCE_BULK_ARCHIVE_DATA_URL}/{market}/monthly/klines/"
@@ -175,7 +193,7 @@ def _monthly_url(symbol, interval, market_type, year, month):
 
 
 def _daily_url(symbol, interval, market_type, year, month, day):
-    market = "spot" if "spot" in market_type else "futures/um"
+    market = bulk_archive._archive_market_path(market_type)
     period = f"{year:04d}-{month:02d}-{day:02d}"
     return (
         f"{config.BINANCE_BULK_ARCHIVE_DATA_URL}/{market}/daily/klines/"
@@ -436,8 +454,8 @@ async def test_archive_output_matches_rest_api_output_without_header(
 async def test_two_month_window_concatenates_in_time_order(archive_server):
     """Both months are pulled and concatenated in order, without duplicates."""
     # COMPLETE months: a monthly archive that is missing days of its own
-    # month is a hole and is refused (see
-    # test_a_truncated_monthly_archive_is_refused_instead_of_returning_a_gap).
+    # month has a hole in it, and the hole is RECORDED on the frame (see
+    # test_a_truncated_monthly_archive_is_served_and_the_gap_is_named).
     jan_rows = _make_rows(datetime(2024, 1, 1, tzinfo=timezone.utc), 24 * 31, 60)
     feb_rows = _make_rows(datetime(2024, 2, 1, tzinfo=timezone.utc), 24 * 29, 60)
     archive_server.add(
@@ -547,15 +565,20 @@ async def test_rows_outside_the_window_are_excluded(archive_server):
 
 
 # ==============================================================================
-# (d) Coverage: a hole must fail loudly, a publication lag must not
+# (d) Coverage: a hole is served and NAMED, a publication lag is not a hole
 # ==============================================================================
 
 
 @pytest.mark.asyncio
-async def test_missing_past_day_fails_loudly_instead_of_returning_a_gap(
+async def test_missing_past_day_is_served_and_the_gap_is_named(
     archive_server, monkeypatch
 ):
-    """A day that should be published but is not is a HOLE: fail, do not ship it."""
+    """A day that should be published but is not is a REAL GAP.
+
+    The data that exists is worth more than no data, so the load does not
+    die -- but the gap is RECORDED on the frame and named in the log, so
+    the caller is not left trading a hole blind.
+    """
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
 
     # Every day of the window except the 19th.
@@ -569,13 +592,20 @@ async def test_missing_past_day_fails_loudly_instead_of_returning_a_gap(
     start = datetime(2024, 1, 15, tzinfo=timezone.utc)
     end = datetime(2024, 1, 20, 12, tzinfo=timezone.utc)
 
-    # The archive refuses to return a gapped frame.
-    with pytest.raises(bulk_archive.BulkArchiveCoverageError):
-        bulk_archive.fetch_klines_from_bulk_archive(
-            "BTCUSDT", "1h", start, end, FUTURES
-        )
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
 
-    # And the loader reports "no data", not a frame with a hole in it.
+    # The candles that exist are served.
+    assert frame is not None
+    assert len(frame) == 4 * 24 + 13
+
+    # And the hole is named, so the caller can refuse the frame itself.
+    difference = bulk_archive.frame_difference(frame)
+    missing = difference["missing_buckets"]
+    assert len(missing) == 1, missing
+    assert missing[0]["start"].startswith("2024-01-19")
+
     result = await data_loader.download_klines(
         symbol="BTCUSDT",
         timeframe="1h",
@@ -583,7 +613,8 @@ async def test_missing_past_day_fails_loudly_instead_of_returning_a_gap(
         end_dt=end,
         market_type=FUTURES,
     )
-    assert result is None
+    assert result is not None
+    assert bulk_archive.frame_difference(result) is not None
 
 
 @pytest.mark.asyncio
@@ -963,7 +994,7 @@ async def test_spot_archive_without_header_and_microsecond_timestamps(
 
 
 # ==============================================================================
-# R1: "not listed yet" is not a hole; a mid-range hole still is
+# R1: "not listed yet" is not a hole; a mid-range hole is served and named
 # ==============================================================================
 
 
@@ -999,18 +1030,22 @@ async def test_window_starting_before_the_listing_loads_the_shorter_history(
 
 
 @pytest.mark.asyncio
-async def test_a_mid_range_hole_still_fails_loudly(archive_server, monkeypatch):
+async def test_a_mid_range_hole_is_served_and_named(archive_server, monkeypatch):
     """The symbol traded on BOTH sides of 19 January: its archive is missing.
 
-    That IS a hole, and the load must fail rather than ship a gapped frame.
-    This is the guard on the R1 relaxation: it must not let real holes
-    through.
+    That IS a real hole.  The data that exists is served -- the candles
+    before and after the hole are worth more than no data -- and the hole
+    is RECORDED on the frame, so the caller can see it and refuse the
+    frame itself.
     """
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
 
     # January has no monthly archive; its daily files are used instead, and
-    # the 19th is missing.
-    for day in (15, 16, 17, 18, 20):
+    # the 19th is missing.  Every OTHER day of January is published, so the
+    # 19th is the ONLY hole.
+    for day in range(15, 32):
+        if day == 19:
+            continue
         rows = _make_rows(datetime(2024, 1, day, tzinfo=timezone.utc), 24, 60)
         archive_server.add(
             _daily_url("BTCUSDT", "1h", FUTURES, 2024, 1, day),
@@ -1026,10 +1061,15 @@ async def test_a_mid_range_hole_still_fails_loudly(archive_server, monkeypatch):
     start = datetime(2024, 1, 15, tzinfo=timezone.utc)
     end = datetime(2024, 2, 29, 23, tzinfo=timezone.utc)
 
-    with pytest.raises(bulk_archive.BulkArchiveCoverageError):
-        bulk_archive.fetch_klines_from_bulk_archive(
-            "BTCUSDT", "1h", start, end, FUTURES
-        )
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
+
+    assert frame is not None
+    difference = bulk_archive.frame_difference(frame)
+    missing = difference["missing_buckets"]
+    assert len(missing) == 1, missing
+    assert missing[0]["start"].startswith("2024-01-19")
 
     result = await data_loader.download_klines(
         symbol="BTCUSDT",
@@ -1038,7 +1078,8 @@ async def test_a_mid_range_hole_still_fails_loudly(archive_server, monkeypatch):
         end_dt=end,
         market_type=FUTURES,
     )
-    assert result is None
+    assert result is not None
+    assert bulk_archive.frame_difference(result) is not None
 
 
 @pytest.mark.asyncio
@@ -1101,8 +1142,14 @@ async def test_archive_with_no_candles_yields_none_not_an_empty_frame(
 
 
 @pytest.mark.asyncio
-async def test_archive_coverage_failure_also_yields_none(archive_server, monkeypatch):
-    """REST 451 + an archive that cannot cover the window => None."""
+async def test_an_archive_with_a_gap_yields_the_frame_with_the_gap_named(
+    archive_server, monkeypatch
+):
+    """REST 451 + an archive with a gap in it => the frame, gap named.
+
+    A gap inside the traded range is no longer fatal: the data that exists
+    is served and the gap is recorded on it, so the caller can see it.
+    """
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
 
     start = datetime(2024, 1, 15, tzinfo=timezone.utc)
@@ -1122,7 +1169,10 @@ async def test_archive_coverage_failure_also_yields_none(archive_server, monkeyp
         market_type=FUTURES,
     )
 
-    assert result is None
+    assert result is not None
+    difference = bulk_archive.frame_difference(result)
+    assert difference is not None
+    assert len(difference["missing_buckets"]) == 1
 
 
 # ==============================================================================
@@ -1131,15 +1181,15 @@ async def test_archive_coverage_failure_also_yields_none(archive_server, monkeyp
 
 
 def test_archive_market_path_uses_the_rest_path_comparison():
-    """Exactly the comparison the REST path uses (market_type == "spot")."""
+    """The archive folder follows the venue the REST path would use."""
     assert bulk_archive._archive_market_path("spot") == "spot"
     assert bulk_archive._archive_market_path("futures_usdtm") == "futures/um"
-    # The REST path sends EVERY non-spot market type to the USDT-M host, so
-    # the archive must answer a COIN-M request with USDT-M candles.  Serving
-    # COIN-M candles here would swap the venue under the caller.
-    assert bulk_archive._archive_market_path("futures_coinm") == "futures/um"
-    assert bulk_archive._archive_market_path("futures_cm") == "futures/um"
-    assert bulk_archive._archive_market_path("coinm") == "futures/um"
+    # A COIN-M request goes to the COIN-M venue on both paths.  Before,
+    # COIN-M was answered with USDT-M candles by the REST path AND by the
+    # archive, so a COIN-M request was silently a USDT-M request.
+    assert bulk_archive._archive_market_path("futures_coinm") == "futures/cm"
+    assert bulk_archive._archive_market_path("futures_cm") == "futures/cm"
+    assert bulk_archive._archive_market_path("coinm") == "futures/cm"
     # A market type that merely CONTAINS "spot" must NOT get spot candles:
     # the REST path would have queried the futures host.
     assert bulk_archive._archive_market_path("spot_usdtm") == "futures/um"
@@ -1211,6 +1261,8 @@ def test_archive_venue_matches_the_rest_host_for_every_market_type(monkeypatch):
 
         if rest_uses_spot:
             assert archive_folder == "spot", market_type
+        elif rest_host.startswith(config.BINANCE_FUTURES_COINM_DATA_API_URL_FOR_LOADER):
+            assert archive_folder == "futures/cm", market_type
         else:
             assert archive_folder == "futures/um", market_type
 
@@ -1372,16 +1424,16 @@ async def test_real_spot_archive_values_differ_from_futures(archive_server):
 
 
 @pytest.mark.asyncio
-async def test_a_truncated_monthly_archive_is_refused_instead_of_returning_a_gap(
+async def test_a_truncated_monthly_archive_is_served_and_the_gap_is_named(
     archive_server, monkeypatch
 ):
-    """A PUBLISHED monthly archive that misses days of its own month is a HOLE.
+    """A PUBLISHED monthly archive that misses days of its own month has a HOLE.
 
     The daily path catches an absent daily FILE.  Nothing caught a day
     missing from INSIDE a monthly archive: the frame was handed back with
     the gap in it, and the backtest traded it as if it were complete -- a
-    P&L that looks valid and is not.  A wrong number is worse than no
-    number, so the load must fail.
+    P&L that looks valid and is not.  The gap is now RECORDED on the
+    frame, so the caller sees it instead of trading it blind.
     """
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
 
@@ -1399,13 +1451,18 @@ async def test_a_truncated_monthly_archive_is_refused_instead_of_returning_a_gap
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
 
-    # The archive refuses to return a gapped frame.
-    with pytest.raises(bulk_archive.BulkArchiveCoverageError):
-        bulk_archive.fetch_klines_from_bulk_archive(
-            "BTCUSDT", "1h", start, end, FUTURES
-        )
+    frame = bulk_archive.fetch_klines_from_bulk_archive(
+        "BTCUSDT", "1h", start, end, FUTURES
+    )
 
-    # And the loader reports "no data", not a frame with a hole in it.
+    assert frame is not None
+    assert len(frame) == 744 - 24
+
+    difference = bulk_archive.frame_difference(frame)
+    missing = difference["missing_buckets"]
+    assert len(missing) == 1, missing
+    assert missing[0]["start"].startswith("2024-01-19")
+
     result = await data_loader.download_klines(
         symbol="BTCUSDT",
         timeframe="1h",
@@ -1413,7 +1470,8 @@ async def test_a_truncated_monthly_archive_is_refused_instead_of_returning_a_gap
         end_dt=end,
         market_type=FUTURES,
     )
-    assert result is None
+    assert result is not None
+    assert bulk_archive.frame_difference(result) is not None
 
 
 @pytest.mark.asyncio
@@ -1467,9 +1525,15 @@ async def test_an_unreachable_archive_fails_fast_instead_of_stalling(monkeypatch
     deadline the fallback stalls for minutes before it gives up.  With the
     deadline the whole load gives up inside its budget -- and it gives up
     LOUDLY: None, not a half-filled frame.
+
+    The budget is scaled to the window, so the bound comes from the
+    COLLAPSE on a transport failure: a host that does not answer gets the
+    rest of the budget taken away, instead of the load waiting for a
+    window-sized budget on a host that is not there.
     """
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
     monkeypatch.setattr(config, "BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS", 0.5)
+    monkeypatch.setattr(config, "BULK_ARCHIVE_REQUEST_TIMEOUT_SECONDS", 0.1)
 
     session = _NeverAnswersSession()
     monkeypatch.setattr(bulk_archive, "http_session", session)
@@ -1489,7 +1553,7 @@ async def test_an_unreachable_archive_fails_fast_instead_of_stalling(monkeypatch
 
     # It failed LOUDLY: None, not a frame with a hole in it.
     assert result is None
-    # And it failed FAST: the whole budget, not one timeout per file.
+    # And it failed FAST: the transport failure collapsed the budget.
     assert elapsed < 10, f"the fallback took {elapsed:.1f}s"
     assert len(session.requests) <= 3, session.requests
 
@@ -1502,7 +1566,11 @@ async def test_the_deadline_never_serves_the_candles_it_collected_first(monkeypa
     that happened to arrive: a half-covered window is a wrong number.
     """
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
+    # A budget that is only the base one, so the deadline itself is what
+    # stops the load.
     monkeypatch.setattr(config, "BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(config, "BULK_ARCHIVE_PER_REQUEST_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(config, "BULK_ARCHIVE_REQUEST_TIMEOUT_SECONDS", 0.1)
 
     january_url = _monthly_url("BTCUSDT", "1h", FUTURES, 2024, 1)
     session = _NeverAnswersSession(
@@ -1546,7 +1614,9 @@ async def test_the_two_paths_report_no_data_as_the_contract_says(
       (HTTP 451).  An archive with nothing in it means the load produced no
       candles at all -> ``None``, so the hard stops fire.
 
-    Neither path ever hands back a frame with a hole in it.
+    Neither path ever hands back a frame with a hole in it WITHOUT saying
+    so: a hole inside the traded range is recorded on the frame and named
+    in the log, and a leading edge the archive cannot prove is refused.
     """
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
     end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
@@ -1581,17 +1651,21 @@ async def test_the_two_paths_report_no_data_as_the_contract_says(
 
 
 @pytest.mark.asyncio
-async def test_a_leading_month_with_no_archive_is_reported_as_a_coverage_gap(
+async def test_a_leading_month_with_no_archive_is_a_proven_leading_shortfall(
     archive_server, monkeypatch, caplog
 ):
     """The leading month was NEVER published: the frame starts later.
 
-    This is the case a reviewer found: a window asked for from January
-    came back starting in February, with nothing but an INFO line to say
-    so.  The load must still SUCCEED -- the symbol may simply have been
-    listed later, and failing here would fire a false alarm for every
-    newly-listed symbol -- but the gap must be REPORTED, at WARNING level
-    with the exact numbers, and be visible to the caller.
+    The load SUCCEEDS -- the symbol may simply have been listed later, and
+    failing here would fire a false alarm for every newly-listed symbol.
+    What makes that legitimate is EVIDENCE: every leading day the archive
+    holds nothing for is older than the publication lag, so Binance would
+    have published those files if the symbol had traded.  Their absence
+    PROVES it did not trade then, which means the REST path would have
+    returned the same shorter frame.
+
+    The shortfall is still REPORTED, at WARNING level with the exact
+    numbers, and it is visible to the caller.
     """
     monkeypatch.setattr(data_loader, "_make_api_request", _blocked_rest_api)
 
@@ -1623,7 +1697,7 @@ async def test_a_leading_month_with_no_archive_is_reported_as_a_coverage_gap(
         if record.levelno == logging.WARNING
         and record.name == "bot_module.bulk_archive"
     ]
-    assert any("coverage gap" in message for message in warnings), warnings
+    assert any("leading shortfall" in message for message in warnings), warnings
     assert any(
         "requested_start=2024-01-01T00:00:00+00:00" in message for message in warnings
     ), warnings
@@ -1635,11 +1709,15 @@ async def test_a_leading_month_with_no_archive_is_reported_as_a_coverage_gap(
     # And MACHINE-READABLE, so a caller that must not trade a shorter
     # window than it asked for can refuse it.
     gap = bulk_archive.coverage_gap(frame)
-    assert gap is not None, "the gap must be visible to the caller"
+    assert gap is not None, "the shortfall must be visible to the caller"
     assert gap["requested_start"] == "2024-01-01T00:00:00+00:00"
     assert gap["first_bar"] == "2024-02-01T00:00:00+00:00"
     assert gap["gap_days"] == 31
     assert gap["leading_month"] == "2024-01"
+    assert gap["proven"] is True, (
+        "the leading days are older than the publication lag, so their "
+        "absence proves the symbol did not trade then"
+    )
     assert gap["leading_month_published"] is False
     assert "reason" in gap
 
@@ -1921,9 +1999,15 @@ async def test_a_multi_day_interval_loads_without_a_false_coverage_error(
 class _StatusResponse:
     """A response that answers with a given HTTP status."""
 
-    def __init__(self, status_code):
+    def __init__(self, status_code, body=""):
         self.status_code = status_code
         self.reason = "stubbed"
+        self._content = body.encode("utf-8")
+        self.encoding = "utf-8"
+
+    @property
+    def text(self):
+        return self._content.decode("utf-8", errors="replace")
 
     def raise_for_status(self):
         raise requests.exceptions.HTTPError(
@@ -1934,13 +2018,14 @@ class _StatusResponse:
 class _CountingSession:
     """Counts the requests a session makes."""
 
-    def __init__(self, status_code):
+    def __init__(self, status_code, body=""):
         self.status_code = status_code
+        self.body = body
         self.calls = 0
 
     def get(self, url, params=None, timeout=None):
         self.calls += 1
-        return _StatusResponse(self.status_code)
+        return _StatusResponse(self.status_code, self.body)
 
 
 def test_a_451_is_not_retried_but_another_status_still_is(monkeypatch):
@@ -1953,7 +2038,9 @@ def test_a_451_is_not_retried_but_another_status_still_is(monkeypatch):
     those four extra attempts were wasted time.  EVERY other status keeps
     the retry behaviour it has always had.
     """
-    blocked = _CountingSession(451)
+    # A Binance 451: its body says the block is Binance's, so it is a
+    # location block and it is not retried.
+    blocked = _CountingSession(451, BINANCE_GEO_BLOCK_BODY)
     monkeypatch.setattr(data_loader, "http_session", blocked)
 
     with pytest.raises(requests.exceptions.HTTPError):

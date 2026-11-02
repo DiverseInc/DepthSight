@@ -225,6 +225,39 @@ BINANCE_SPOT_DATA_API_URL_FOR_LOADER = "https://api.binance.com/api/v3"
 BINANCE_FUTURES_USDTM_DATA_API_URL_FOR_LOADER = "https://fapi.binance.com/fapi/v1"
 BINANCE_FUTURES_COINM_DATA_API_URL_FOR_LOADER = "https://dapi.binance.com/dapi/v1"
 
+
+def resolve_market_venue(market_type: str) -> str:
+    """Which Binance venue a loader ``market_type`` refers to.
+
+    ONE function, used by BOTH the REST market-data path and the bulk-archive
+    fallback, so the two can never answer for different venues.  Before this
+    existed the REST path compared ``market_type == "spot"`` and sent EVERY
+    other value -- including the COIN-M ones -- to the USDT-M host, while the
+    archive mirrored that by sending them to the USDT-M archive folder.  A
+    COIN-M request was therefore answered with USDT-M candles, which is the
+    same market under a different name: the numbers would change and nobody
+    would know why.
+
+    The venue is decided by the market type ALONE:
+
+    * ``spot`` -> the spot venue;
+    * ``futures_coinm`` / ``futures_cm`` / ``coinm`` -> the COIN-M futures
+      venue, which Binance serves from ``dapi.binance.com`` and publishes to
+      the ``futures/cm`` archive folder (measured: the folder answers 200 for
+      ``data/futures/cm/monthly/klines/BTCUSD_PERP/1h/...``);
+    * everything else -> the USDT-M futures venue.
+
+    A market type that merely CONTAINS "spot" ("spot_usdtm", "spot_perp") is
+    NOT the spot venue: it is an unknown type, and the unknown falls back to
+    the USDT-M venue, exactly as it did before.
+    """
+    mt = (market_type or "").strip().lower()
+    if mt == "spot":
+        return "spot"
+    if mt in ("futures_coinm", "futures_cm", "coinm"):
+        return "futures_coinm"
+    return "futures_usdtm"
+
 # Binance's public bulk-archive host. It serves the SAME klines as the REST
 # market-data endpoints above, but on a different host that stays reachable
 # when those are geo/IP-blocked (they answer HTTP 451 from some networks).
@@ -240,10 +273,39 @@ BINANCE_BULK_ARCHIVE_DATA_URL = "https://data.binance.vision/data"
 # failure predictable and bounded: the fallback gives up, the load fails
 # loudly, and nothing partial is ever served.
 #
-# 120s covers a legitimate long window (a year of months plus a trailing
-# month is ~43 requests) even on a slow link, while bounding an unreachable
-# host to about two minutes instead of half an hour.
+# This is the BASE budget.  It is NOT the whole budget: a load also gets one
+# slice per request it makes (see
+# ``BULK_ARCHIVE_PER_REQUEST_BUDGET_SECONDS``), because a fixed budget
+# cannot serve a fixed-size window.  A two-year window is 24 monthly
+# archives plus up to 31 daily files, and on a normal link that is well
+# over the base budget -- so a fixed budget killed legitimate windows.
 BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS = 120.0
+
+# The slice of the budget ONE archive request is allowed to cost.  The
+# budget of a load is the base budget PLUS this slice for every request the
+# window can need, so a bigger window gets a bigger budget and a load is
+# never killed by its own size.  It is also granted again for every request
+# that is actually made, up to the ceiling below.
+#
+# 10s is the time one archive file costs on a normal link (the CDN answers
+# a monthly zip in one or two seconds); it is generous enough for a slow
+# link and small enough that an unreachable host is given up on quickly.
+BULK_ARCHIVE_PER_REQUEST_BUDGET_SECONDS = 10.0
+
+# The ceiling of the budget of ONE load, however big the window is.  It
+# bounds the worst case: a window that needs thousands of requests cannot
+# stall the loader for hours.
+BULK_ARCHIVE_MAX_TOTAL_TIMEOUT_SECONDS = 1800.0
+
+# How long Binance takes to PUBLISH an archive.  MEASURED on 2026-11-02
+# against the live archives: the newest published USDT-M 1d daily file was
+# 2026-10-31 (one day old) and the newest published monthly was 2026-09
+# (the month before, two days old).  Two days is the safe value for both.
+#
+# It decides what the absence of a file PROVES: a day that is older than
+# this lag would have a file if the symbol had traded, so its absence is
+# evidence that it did not trade.  A day inside the lag proves nothing.
+BULK_ARCHIVE_PUBLICATION_LAG_DAYS = 2
 
 # The cap on ONE archive request.  It is the same value the REST path uses
 # for its own requests (data_loader.py), and it is further bounded by the

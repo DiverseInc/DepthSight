@@ -102,16 +102,20 @@ _MICROSECOND_THRESHOLD = 10**14
 
 # Binance publishes the daily klines archives with roughly a one day of lag
 # and the monthly ones with roughly two days, so the trailing edge of a window
-# that runs up to "now" legitimately has no file yet.  A missing daily file is
-# only a genuine HOLE once it is older than this lag.
-_PUBLICATION_LAG = timedelta(days=2)
+# that runs up to "now" legitimately has no file yet.  A missing daily file
+# only PROVES anything once it is older than that lag -- see
+# ``config.BULK_ARCHIVE_PUBLICATION_LAG_DAYS`` for the MEASURED values.
+def _publication_lag() -> timedelta:
+    """How long Binance takes to publish an archive, read from the config."""
+    return timedelta(days=float(config.BULK_ARCHIVE_PUBLICATION_LAG_DAYS))
 
-# The key under which the loader records a LEADING-EDGE COVERAGE GAP on the
+
+# The key under which the loader records the LEADING-EDGE COVERAGE GAP on the
 # frame's ``attrs``.  The frame may cover a SHORTER period than the one that
 # was asked for -- the archive holds only what Binance published -- so a
 # caller that must not trade a shorter window than it requested needs to be
 # able to SEE that it happened.  The value is a dict; see
-# ``_leading_coverage_gap`` for its keys.
+# ``_leading_shortfall`` for its keys.
 #
 # ``DataFrame.attrs`` is used because it does not change the frame's shape,
 # its columns or its values: the existing callers keep indexing the frame
@@ -121,6 +125,28 @@ _PUBLICATION_LAG = timedelta(days=2)
 # carry the same ones.
 COVERAGE_GAP_ATTR = "bulk_archive_coverage_gap"
 
+# The key under which the loader records the DIFFERENCE between the frame
+# the archive produced and the frame the REST path would have produced for
+# the same request.
+#
+# The two are NOT the same frame, and the difference is not a curiosity:
+#
+# * the archive holds only CLOSED bars -- the REST path also returns the
+#   bar that is still forming, so the archive's frame can be one bar
+#   shorter at the trailing edge;
+# * the archive's trailing edge LAGS the REST path's by the publication
+#   lag, because Binance has not published the last days yet;
+# * the archive's bars sit on Binance's own grid, which is not always the
+#   grid the REST path uses (the offset is MEASURED from the delivered
+#   bars, not assumed -- see ``_bar_grid_phase_hours``).
+#
+# A caller that asks for a window and receives archive data must be able to
+# tell, from the API it is given, exactly what it got and what is missing.
+# That is what this record is for, and the loader ENFORCES it: an
+# archive-sourced frame that arrives without a truthful record never
+# reaches a caller.
+DIFFERENCE_ATTR = "bulk_archive_frame_difference"
+
 # Binance's kline intervals are a COUNT and a UNIT.  The unit is CASE
 # SENSITIVE: "m" is minutes and "M" is months, and the archive keeps that
 # distinction.
@@ -128,13 +154,23 @@ _INTERVAL_UNITS = ("s", "m", "h", "d", "w", "M")
 
 
 class BulkArchiveCoverageError(RuntimeError):
-    """The archives cannot cover the requested window.
+    """The archives cannot PROVE they cover the requested window.
 
-    Raised when a daily file for a day that should already be published is
-    missing and no monthly archive can complete that month.  Returning a
-    gapped frame would silently change the meaning of a backtest: the P&L
-    would look valid while trading a hole.  A wrong number is worse than no
-    number, so the load fails instead.
+    Raised when the frame the archive produced starts LATER than the
+    requested window and the archive cannot prove that the symbol simply
+    did not trade in the missing period -- the leading days it holds
+    nothing for are still inside the publication lag, so their absence
+    proves nothing at all.
+
+    Returning such a frame would silently change the meaning of a
+    backtest: the P&L would look valid while trading a window the caller
+    never asked for.  A wrong number is worse than no number, so the load
+    fails instead.
+
+    It is NOT raised for a gap INSIDE the traded range any more: the data
+    that exists is served with the gap recorded on the frame, because the
+    caller can then see exactly what is missing and refuse the frame
+    itself.
     """
 
 
@@ -162,6 +198,116 @@ _DEADLINE: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
     "bulk_archive_deadline", default=None
 )
 
+# The ``time.monotonic()`` value at which the CURRENT fallback load started.
+# The ceiling of the budget is measured from it, so a load that buys itself
+# more time cannot buy more than the ceiling allows.
+_LOAD_START: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "bulk_archive_load_start", default=None
+)
+
+# Set when a transport failure has collapsed the budget of the running
+# load.  Once it is set the load no longer BUYS budget: the host has been
+# found not to answer, and every further request would be another wait on
+# a host that is not there.
+_COLLAPSED: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "bulk_archive_collapsed", default=False
+)
+
+# How many requests the running load has made, and how many its window was
+# EXPECTED to need.  The budget covers the expected ones; every request
+# BEYOND the estimate buys one more slice (see ``_extend_deadline``).
+_REQUESTS_MADE: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "bulk_archive_requests_made", default=0
+)
+_EXPECTED_REQUESTS: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "bulk_archive_requests_expected", default=0
+)
+
+
+def _expected_request_count(months: int) -> int:
+    """How many archive requests a window of ``months`` months can need.
+
+    One monthly archive per month, plus the daily files of the trailing
+    month -- the month Binance has not published a monthly archive for yet.
+    It is an ESTIMATE, and the load grants itself more budget for every
+    request it actually makes (see ``_extend_deadline``), so an estimate
+    that is too small cannot kill a legitimate window.
+    """
+    return months + 31
+
+
+def _archive_budget_seconds(months: int) -> float:
+    """The budget of ONE fallback load, SCALED to the size of the window.
+
+    A FIXED budget cannot serve windows of every size: a two-year window is
+    24 monthly archives plus up to 31 daily files, and on a normal link
+    that is comfortably over a fixed two minutes.  The budget of a load is
+    therefore the base budget PLUS one slice per request the window can
+    need, capped by the ceiling from the configuration.
+    """
+    scaled = float(config.BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS) + (
+        _expected_request_count(months)
+        * float(config.BULK_ARCHIVE_PER_REQUEST_BUDGET_SECONDS)
+    )
+    return min(scaled, float(config.BULK_ARCHIVE_MAX_TOTAL_TIMEOUT_SECONDS))
+
+
+def _extend_deadline() -> None:
+    """Buys ONE more request's worth of budget, but only past the estimate.
+
+    The budget is scaled to the window up front, and that scale covers the
+    requests the window is EXPECTED to need (one monthly archive per month
+    plus the daily files of the trailing month).  A window can need MORE
+    than that: a symbol that was listed halfway through it has no monthly
+    archive for any of the months before its listing, and every one of
+    those months falls back to its daily files.
+
+    Only the requests BEYOND the estimate buy budget.  If every request
+    bought a slice, the budget would grow with the work and would never
+    bind -- and the budget is what keeps a load from waiting for minutes
+    on a host that is not answering.
+
+    A load whose budget has been COLLAPSED (see ``_collapse_deadline``)
+    buys nothing more: the host has been found not to answer.
+    """
+    if _COLLAPSED.get():
+        return
+    deadline = _DEADLINE.get()
+    if deadline is None:
+        return
+    start = _LOAD_START.get()
+    if start is None:
+        return
+    made = _REQUESTS_MADE.get() + 1
+    _REQUESTS_MADE.set(made)
+    if made <= _EXPECTED_REQUESTS.get():
+        # The scaled budget already covers this one.
+        return
+    allowance = float(config.BULK_ARCHIVE_PER_REQUEST_BUDGET_SECONDS)
+    ceiling = start + float(config.BULK_ARCHIVE_MAX_TOTAL_TIMEOUT_SECONDS)
+    _DEADLINE.set(min(deadline + allowance, ceiling))
+
+
+def _collapse_deadline() -> None:
+    """Gives up on the archive host after a TRANSPORT failure.
+
+    A transport failure -- a timeout, a reset connection, a dead host --
+    is not "this one file is slow": the host is gone.  Without this the
+    load would spend its whole (scaled) budget on a host that cannot
+    answer, which is exactly the stall the deadline exists to prevent.
+
+    The grace left is ONE REQUEST TIMEOUT, so the retry of a flaky file
+    still gets its chance; after that the budget is spent and the load
+    fails.  The budget is only ever SHRUNK here, and a collapsed load
+    buys no more of it.
+    """
+    deadline = _DEADLINE.get()
+    if deadline is None:
+        return
+    grace = float(config.BULK_ARCHIVE_REQUEST_TIMEOUT_SECONDS)
+    _DEADLINE.set(min(deadline, time.monotonic() + grace))
+    _COLLAPSED.set(True)
+
 # Binance's REST API accepts a couple of aliases the archive folders do not
 # use.  The interval is never lower-cased: "1m" is one minute and "1M" is one
 # month, and the archive keeps that distinction.
@@ -185,25 +331,29 @@ def _archive_market_path(market_type: str) -> str:
 
     This MUST mirror ``data_loader._make_api_request`` exactly, because the
     archive is a FALLBACK for that REST path: for one request the two must
-    answer with the same venue.
-
-    The REST path sends ``market_type == "spot"`` to the spot host and EVERY
-    other market type -- including ``futures_coinm`` -- to the USDT-M
-    futures host (``data_loader._make_api_request``).  So the archive maps
-    exactly one value to spot and EVERY other value to futures/um.
+    answer with the same venue.  Both of them ask
+    ``config.resolve_market_venue`` for the venue, so they cannot drift
+    apart the way two hand-written lists can.
 
     Two things must never happen here:
 
     * a market type that merely CONTAINS "spot" must not get spot candles,
       because the REST path would have queried the futures host;
-    * a COIN-M market type must not get COIN-M candles, because the REST
-      path never asked Binance for COIN-M candles.  Serving them would swap
-      the venue under the caller and change the numbers it gets back.
+    * a COIN-M market type must not get USDT-M candles, and must not get
+      COIN-M candles for a request the REST path answered with USDT-M
+      ones either.  The venue is decided ONCE, by the market type, and
+      both paths follow it.
+
+    The venue names are the archive's own folders, MEASURED against the live
+    archive host: ``spot``, ``futures/um`` and ``futures/cm`` all answer
+    200 for a monthly archive.
     """
-    mt = (market_type or "").strip()
-    if mt == "spot":
-        return "spot"
-    return "futures/um"
+    venue = config.resolve_market_venue(market_type)
+    return {
+        "spot": "spot",
+        "futures_coinm": "futures/cm",
+        "futures_usdtm": "futures/um",
+    }[venue]
 
 
 def _normalise_interval(timeframe: str) -> str:
@@ -288,12 +438,23 @@ def fetch_archive_bytes(url: str) -> Optional[bytes]:
     (see ``_DEADLINE``): a request that cannot finish inside the remaining
     budget is not started, and a load that is out of time raises
     :class:`BulkArchiveDeadlineExceeded`, which ``backoff`` does not retry.
+
+    Every request that is ACTUALLY MADE buys the load one more slice of
+    budget (``_extend_deadline``), so a window that needs more requests
+    than the estimate gets them.  A transport failure collapses the budget
+    (``_collapse_deadline``), because a host that does not answer must not
+    be waited on for the whole budget.
     """
-    response = http_session.get(url, timeout=_request_timeout())
-    if response.status_code == 404:
-        logger.debug(f"Bulk archive not published: {url}")
-        return None
-    response.raise_for_status()
+    _extend_deadline()
+    try:
+        response = http_session.get(url, timeout=_request_timeout())
+        if response.status_code == 404:
+            logger.debug(f"Bulk archive not published: {url}")
+            return None
+        response.raise_for_status()
+    except requests.exceptions.RequestException:
+        _collapse_deadline()
+        raise
     return response.content
 
 
@@ -489,6 +650,23 @@ def _iter_months(start_dt: datetime, end_dt: datetime) -> Iterator[datetime]:
         month = _add_month(month)
 
 
+def _absence_is_provable(day: datetime, now: datetime) -> bool:
+    """True when the ABSENCE of ``day``'s file PROVES there was no trading.
+
+    Binance publishes a daily archive for every day a symbol traded, with a
+    lag of about a day (MEASURED: see
+    ``config.BULK_ARCHIVE_PUBLICATION_LAG_DAYS``).  Once a day is older than
+    that lag, its file would exist if the symbol had traded, so its absence
+    is evidence that the symbol did not trade that day.
+
+    A day that is still INSIDE the lag proves nothing: the file may simply
+    not be published yet.  That distinction is what separates a trailing
+    edge that is short for a good reason from a leading edge that is short
+    for an unknown one.
+    """
+    return (day + timedelta(days=1)) <= (now - _publication_lag())
+
+
 def _is_missing_day_a_hole(day: datetime, now: datetime) -> bool:
     """True when a missing daily file for ``day`` is a genuine HOLE.
 
@@ -496,7 +674,7 @@ def _is_missing_day_a_hole(day: datetime, now: datetime) -> bool:
     yet, because Binance publishes the daily archives with about a day of
     lag.  A day that ended well before that lag window must have a file.
     """
-    return (day + timedelta(days=1)) <= (now - _PUBLICATION_LAG)
+    return _absence_is_provable(day, now)
 
 
 def _is_missing_bucket_a_hole(
@@ -570,9 +748,17 @@ def _previous_bar_open(first_bar: datetime, interval: str) -> datetime:
     """The bar-open IMMEDIATELY BEFORE ``first_bar`` on the interval's grid.
 
     The grid is the one the ARCHIVE itself uses, so the answer is right
-    whatever phase Binance aligns its bars to: a spot daily bar opens at
-    00:00 UTC+08:00, not at midnight UTC.  For a calendar-month interval
-    the previous bar is the first of the previous month.
+    whatever phase Binance aligns its bars to.  For a calendar-month
+    interval the previous bar is the first of the previous month.
+
+    MEASURED on the live archives on 2026-11-02, the spot and the USDT-M
+    daily, weekly and three-day bars all open on the UTC grid (00:00 UTC,
+    Monday 00:00 UTC and the epoch-aligned three-day grid), so the phase
+    of the real archives is 0.  An earlier version of this comment claimed
+    that a spot daily bar opens at 00:00 UTC+08:00: that was an ASSUMPTION
+    about Binance's data that nobody had checked, and the live archives do
+    not bear it out.  The phase that actually matters is measured from the
+    delivered bars instead (see ``_bar_grid_phase_hours``).
     """
     count, unit = _parse_interval(interval)
     if unit == "M":
@@ -583,14 +769,16 @@ def _previous_bar_open(first_bar: datetime, interval: str) -> datetime:
     return first_bar - _interval_duration(interval)
 
 
-def _leading_coverage_gap(
+def _leading_shortfall(
     requested_start: datetime,
     first_bar: datetime,
     interval: str,
+    absent_days: List[datetime],
     leading_month_published: Optional[bool],
     leading_month: Optional[datetime],
+    now: datetime,
 ) -> Optional[Dict[str, Any]]:
-    """The COVERAGE GAP at the leading edge of the window, or ``None``.
+    """The SHORTFALL at the leading edge of the window, or ``None``.
 
     A frame may cover a SHORTER period than the one that was asked for.
     That is normal and legitimate in one case: the symbol was listed
@@ -600,13 +788,23 @@ def _leading_coverage_gap(
     trade then -- it might be that the data for that month is missing
     altogether, and the frame would silently start later than the window.
 
-    The two are told apart by ``leading_month_published``:
+    The two are told apart by EVIDENCE, and the evidence is the publication
+    lag:
 
     * the leading month's monthly archive WAS published -> Binance's own
-      answer for that month, so the frame starts where the symbol started
-      and there is NO gap;
-    * it was NOT published -> the coverage of the leading edge is
-      UNKNOWN, and the gap is reported.
+      answer for that month.  The frame starts where the symbol started
+      trading, which is exactly where the REST path would have started it.
+      The shortfall is PROVEN to be a listing;
+    * the archive holds no file for the leading days, and every one of
+      those days is OLDER than the publication lag -> Binance would have
+      published those files if the symbol had traded, so their absence
+      PROVES it did not trade then.  The shortfall is PROVEN to be a
+      listing as well;
+    * the archive holds no file for the leading days and some of them are
+      still INSIDE the publication lag -> their absence proves NOTHING.
+      The frame would silently start later than the window, and that is
+      UNPROVEN.  The load must not serve it: the shortfall is returned
+      with ``proven`` False and the caller refuses it.
 
     The gap itself is measured on the archive's own bar grid: the bar
     that would come immediately before ``first_bar`` decides it.  If that
@@ -615,9 +813,11 @@ def _leading_coverage_gap(
     the window, the frame starts exactly where the REST path would have
     started it, and there is nothing to report.
     """
-    if leading_month_published is not False:
-        # The leading month was published: the archive holds Binance's own
-        # answer for it, so a shorter history is a LISTING, not a gap.
+    if leading_month_published:
+        # Binance's own answer for the leading month.  The frame starts
+        # where the symbol started trading, which is exactly where the REST
+        # path would have started it too, so there is no coverage question
+        # here: the REST frame would be short in the same way.
         return None
 
     previous_bar = _previous_bar_open(first_bar, interval)
@@ -626,19 +826,191 @@ def _leading_coverage_gap(
         # so the frame starts exactly where the REST path starts it.
         return None
 
+    first_day = first_bar.replace(hour=0, minute=0, second=0, microsecond=0)
+    # The days inside the requested window that the archive holds nothing
+    # for.  The daily path only ever asks for the days that OVERLAP the
+    # window, so an absent day before the first bar is a day of the window
+    # the archive is missing.
+    missing_leading_days = [
+        day
+        for day in absent_days
+        if day < first_day and (day + timedelta(days=1)) > requested_start
+    ]
+    unprovable = [
+        day for day in missing_leading_days if not _absence_is_provable(day, now)
+    ]
+
+    if not missing_leading_days:
+        proven = True
+        reason = (
+            "the archive holds published files for the leading period, so it is "
+            "Binance's own answer for it"
+        )
+    elif unprovable:
+        proven = False
+        reason = (
+            f"{len(unprovable)} of the leading days the archive holds nothing "
+            "for are still inside the publication lag, so the archive cannot "
+            "prove that the symbol did not trade then; the frame would start "
+            "later than the requested window"
+        )
+    else:
+        proven = True
+        reason = (
+            "the archive holds no file for the leading days, and every one of "
+            "them is older than the publication lag, so their absence proves "
+            "the symbol did not trade then"
+        )
+
     gap = first_bar - requested_start
     return {
         "requested_start": requested_start.isoformat(),
         "first_bar": first_bar.isoformat(),
         "gap_days": gap.days,
+        "gap_seconds": gap.total_seconds(),
         "leading_month": (
             leading_month.strftime("%Y-%m") if leading_month is not None else None
         ),
-        "leading_month_published": False,
+        "leading_month_published": leading_month_published,
+        "missing_leading_days": [
+            day.strftime("%Y-%m-%d") for day in missing_leading_days
+        ],
+        "proven": proven,
+        "reason": reason,
+    }
+
+
+def frame_difference(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+    """The record of HOW the archive's frame differs from the REST frame.
+
+    ``None`` means "this frame did not come from the archive".  The record
+    is attached to the frame the archive returns (see ``DIFFERENCE_ATTR``),
+    so it travels with the data instead of living in a log line a caller
+    may never read.
+    """
+    if frame is None:
+        return None
+    difference = frame.attrs.get(DIFFERENCE_ATTR)
+    if isinstance(difference, dict):
+        return dict(difference)
+    return None
+
+
+def _rest_grid_open(moment: datetime, interval: str) -> datetime:
+    """The bar open the REST path's grid gives for ``moment``.
+
+    The REST path's grid is the one Binance's klines API uses: the calendar
+    day for "1d", the Monday for "1w", the calendar month for "1M", an
+    epoch-aligned multi-day grid for "3d", and an epoch-aligned multiple of
+    the interval for everything shorter.
+    """
+    count, unit = _parse_interval(interval)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    if unit == "M":
+        return moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if unit == "w":
+        return (moment - timedelta(days=moment.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+    if unit == "d":
+        if count > 1:
+            epoch_day = (moment - epoch).days
+            return epoch + timedelta(days=epoch_day - (epoch_day % count))
+        return moment.replace(hour=0, minute=0, second=0, microsecond=0)
+    seconds = count * {"s": 1, "m": 60, "h": 3600}.get(unit, 60)
+    steps = int((moment - epoch).total_seconds()) // seconds
+    return epoch + timedelta(seconds=steps * seconds)
+
+
+def _bar_grid_phase_hours(frame: pd.DataFrame, interval: str) -> float:
+    """The offset, in hours, between the ARCHIVE's bar grid and the REST one.
+
+    MEASURED from the bars that were actually delivered, never assumed.
+    The archives put their bars on Binance's own grid and that grid is not
+    guaranteed to be the one the REST path uses, so a non-zero phase means
+    the archive's bars open at a different moment than the REST path's and
+    the two frames do not line up bar for bar.
+
+    (MEASURED on the live archives on 2026-11-02: the spot and the USDT-M
+    1d, 1w and 3d bars all open on the UTC grid -- 00:00 UTC, Monday
+    00:00 UTC, and the epoch-aligned three-day grid -- so the phase of the
+    real archives is 0.0 hours.  It is measured rather than assumed anyway,
+    because an assumption here would be a claim about Binance's data that
+    nobody checked.)
+    """
+    if frame.empty:
+        return 0.0
+    first = frame.index[0].to_pydatetime()
+    expected = _rest_grid_open(first, interval)
+    return (first - expected).total_seconds() / 3600.0
+
+
+def _difference_record(
+    symbol: str,
+    timeframe: str,
+    market_type: str,
+    interval: str,
+    requested_start: datetime,
+    requested_end: datetime,
+    frame: pd.DataFrame,
+    shortfall: Optional[Dict[str, Any]],
+    missing_buckets: List[Tuple[datetime, datetime]],
+) -> Dict[str, Any]:
+    """The record of HOW the archive's frame differs from the REST frame.
+
+    It is attached to the frame the archive returns, and the loader ENFORCES
+    it: an archive-sourced frame that arrives without a truthful record
+    never reaches a caller.  A difference that only lives in a log line
+    cannot be enforced, and one that a caller can forget to read is not a
+    difference the caller was told about.
+
+    The numbers in it are MEASURED from the frame that was delivered, not
+    asserted: the trailing edge is the difference between the window that
+    was asked for and the end of the LAST CLOSED BAR the archive could
+    supply, and the grid phase is read off the bars themselves.
+    """
+    last_bar = frame.index[-1].to_pydatetime()
+    # The window the frame covers ends with the last bar's CLOSE, not with
+    # its open.
+    covered_end = last_bar + _interval_duration(interval)
+    trailing_short = max(0.0, (requested_end - covered_end).total_seconds())
+    phase = _bar_grid_phase_hours(frame, interval)
+    shift = None
+    if phase:
+        shift = {
+            "shift_hours": phase,
+            "description": (
+                f"the archive's bars open {phase:+.1f}h off the grid the REST "
+                "path uses, so the two frames do not line up bar for bar"
+            ),
+        }
+    return {
+        "source": "bulk_archive",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "market_type": market_type,
+        "interval": interval,
+        "requested_start": requested_start.isoformat(),
+        "requested_end": requested_end.isoformat(),
+        "actual_start": frame.index[0].isoformat(),
+        "actual_end": last_bar.isoformat(),
+        "rows": int(len(frame)),
+        "closed_bars_only": True,
+        "trailing_edge_short_by_seconds": trailing_short,
+        "publication_lag_days": float(config.BULK_ARCHIVE_PUBLICATION_LAG_DAYS),
+        "bar_grid_phase_hours": phase,
+        "day_boundary_shift": shift,
+        "leading_shortfall": shortfall,
+        "missing_buckets": [
+            {"start": bucket[0].isoformat(), "end": bucket[1].isoformat()}
+            for bucket in missing_buckets
+        ],
+        "differs_from_rest": True,
         "reason": (
-            "the leading month's monthly archive is not published, so the "
-            "archive cannot prove that the symbol was not listed yet; the "
-            "frame starts later than the requested window"
+            "the archive holds only CLOSED bars (the REST path also returns the "
+            "bar that is still forming), its trailing edge lags the REST path's "
+            "by the publication lag, and it can be missing days the REST path "
+            "has; the numbers above say by how much"
         ),
     }
 
@@ -649,6 +1021,11 @@ def coverage_gap(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
     ``None`` means "no leading-edge coverage gap was detected".  The
     returned dict carries the requested start, the first bar the archive
     could supply, the size of the gap in days and why it was reported.
+
+    ``proven`` says whether the archive could PROVE that the symbol simply
+    did not trade in the missing period (a listing) or not (the coverage of
+    the leading edge is unknown).  An unproven gap never reaches a caller:
+    the load fails instead.
     """
     if frame is None:
         return None
@@ -803,37 +1180,46 @@ def fetch_klines_from_bulk_archive(
     month, while Binance is still publishing -- are the DAILY archives of the
     overlapping days used instead.
 
-    COVERAGE IS FAIL-CLOSED, BUT ONLY WHERE THERE IS A HOLE.  An absent
-    daily file is a hole when the symbol demonstrably existed on that day:
-    the day falls after the first bar observed for this window and before
-    the last one, and it is older than the publication lag.  Then
-    :class:`BulkArchiveCoverageError` is raised rather than a gapped frame
-    being returned -- a backtest that silently trades a hole produces a P&L
-    that looks valid and is not, and a wrong number is worse than no number.
+    MISSING DATA IS SERVED AND NAMED, NOT FATAL.  A day the archive holds
+    nothing for, inside the range the symbol demonstrably traded through,
+    is a real gap -- but it is not a reason to throw away the candles that
+    DO exist.  The gap is reported at ERROR level and RECORDED on the
+    frame, so the caller is told exactly which buckets are missing and can
+    refuse the frame itself.
 
     A PUBLISHED MONTHLY ARCHIVE IS HELD TO THE SAME RULE.  Binance can
     publish a monthly archive that is missing whole days of its own month,
     and no absent daily file would ever report that: the monthly archive is
     used as it is.  A calendar bucket the window touches that holds no bar at
-    all is therefore a hole too, and the load fails the same way.
+    all is therefore reported the same way.
 
-    A day before the first observed bar is NOT a hole: the symbol was not
+    A day before the first observed bar is NOT a gap: the symbol was not
     listed yet, and the window simply carries the shorter history the
-    archive holds.  A day after the last observed bar is not a hole either
+    archive holds.  A day after the last observed bar is not a gap either
     (delisted, or the trailing publication lag).
 
-    THE WHOLE FALLBACK RUNS UNDER A DEADLINE.  One archive request can burn
-    a whole request timeout and the trailing month of a window can need 31
-    daily files, so an unreachable archive host would stall the loader for
-    MINUTES.  The load therefore gets a fixed budget
-    (``config.BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS``); when it is spent the
-    load fails loudly with :class:`BulkArchiveDeadlineExceeded` and NOTHING
-    is served -- never the candles collected before the deadline.
+    THE WHOLE FALLBACK RUNS UNDER A DEADLINE THAT IS SCALED TO THE WINDOW.
+    One archive request can burn a whole request timeout and the trailing
+    month of a window can need 31 daily files, so an unreachable archive
+    host would stall the loader for MINUTES.  The load therefore gets a
+    budget (``_archive_budget_seconds``) that is the base budget PLUS one
+    slice per request the window can need, so a two-year window is never
+    killed by its own size.  Every request that is actually made buys one
+    more slice, up to the ceiling; a host that stops answering gets the
+    budget collapsed instead.  When the budget is spent the load fails
+    loudly with :class:`BulkArchiveDeadlineExceeded` and NOTHING is served
+    -- never the candles collected before the deadline.
 
-    KNOWN DIFFERENCES FROM THE REST PATH, both inherent to the source and
-    reported in the log line below: the archive holds only CLOSED bars (REST
-    also returns the still-forming one), and the trailing edge of a window
-    that runs to "now" is short by the publication lag.
+    THE FRAME DIFFERS FROM THE REST FRAME, AND THE DIFFERENCE IS PART OF
+    THE FRAME.  The archive holds only CLOSED bars (the REST path also
+    returns the still-forming one), its trailing edge lags the REST path's
+    by the publication lag, and it can be missing days the REST path has.
+    Every one of those differences is MEASURED and recorded on the frame's
+    ``attrs`` under the key ``DIFFERENCE_ATTR``
+    ("bulk_archive_frame_difference"), and the loader ENFORCES the record:
+    an archive-sourced frame that arrives without a truthful record never
+    reaches a caller.  Read it with ``bulk_archive.frame_difference(frame)``,
+    which returns ``None`` for a frame that did not come from the archive.
 
     THE FRAME MAY COVER A SHORTER PERIOD THAN THE ONE REQUESTED.  The
     archive holds what Binance published, and Binance publishes nothing
@@ -844,36 +1230,58 @@ def fetch_klines_from_bulk_archive(
     frame starting 2024-02-01 reports the KPIs of the shorter window as if
     they were the requested ones.
 
-    So the loader MEASURES the leading edge and REPORTS it:
+    So the loader MEASURES the leading edge and PROVES it:
 
     * when the leading month's monthly archive WAS published, the frame
-      starts wherever the symbol started trading and there is no gap --
-      nothing is reported;
-    * when it was NOT published, the coverage of the leading edge is
-      UNKNOWN (the archives for that month cannot prove that the symbol
-      did not trade then), and the gap is reported at WARNING level with
-      the numbers, and recorded on the frame.
+      starts wherever the symbol started trading -- that is Binance's own
+      answer for the month, and the REST path would have returned the same
+      shorter frame;
+    * when it was NOT published, the archive looks at the daily files of
+      the leading period.  A leading day that is OLDER than the publication
+      lag would have a file if the symbol had traded, so its absence PROVES
+      the symbol did not trade then, and the shorter frame is correct;
+    * when some leading day is still INSIDE the publication lag, its
+      absence proves NOTHING.  The frame would silently start later than
+      the window, so the load FAILS with :class:`BulkArchiveCoverageError`
+      instead of serving it.
 
-    THE CALLER CAN SEE IT.  The gap is recorded on the frame's ``attrs``
-    under the key ``COVERAGE_GAP_ATTR`` ("bulk_archive_coverage_gap"), as
-    a dict with ``requested_start``, ``first_bar``, ``gap_days``,
-    ``leading_month``, ``leading_month_published`` and ``reason``.  The
-    ``attrs`` do not change the frame's shape, its columns or its values,
-    so every existing caller keeps using the frame exactly as it does
-    today.  Read it with ``bulk_archive.coverage_gap(frame)``, which
-    returns ``None`` when there is no gap.
+    THE CALLER CAN SEE IT.  The shortfall is recorded on the frame's
+    ``attrs`` under the key ``COVERAGE_GAP_ATTR`` ("bulk_archive_coverage_gap"),
+    as a dict with ``requested_start``, ``first_bar``, ``gap_days``,
+    ``leading_month``, ``leading_month_published``, ``proven`` and
+    ``reason``.  The ``attrs`` do not change the frame's shape, its columns
+    or its values, so every existing caller keeps using the frame exactly
+    as it does today.  Read it with ``bulk_archive.coverage_gap(frame)``,
+    which returns ``None`` when there is no shortfall.
 
     Returns a DataFrame shaped exactly like the REST path's output, or an
     empty DataFrame when Binance has no archive for the window at all.
     """
-    deadline = time.monotonic() + float(config.BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS)
+    # The budget is SCALED to the window: a fixed budget cannot serve a
+    # fixed-size window, and a two-year window needs 24 monthly archives
+    # plus up to 31 daily files.  It is also bought up as the load goes
+    # (see ``_extend_deadline``) and given up at once when the archive host
+    # stops answering (see ``_collapse_deadline``).
+    start_utc = _as_utc(start_dt)
+    end_utc = _as_utc(end_dt)
+    months = len(list(_iter_months(start_utc, end_utc))) if start_utc <= end_utc else 0
+    began = time.monotonic()
+    deadline = began + _archive_budget_seconds(months)
     token = _DEADLINE.set(deadline)
+    start_token = _LOAD_START.set(began)
+    collapsed_token = _COLLAPSED.set(False)
+    made_token = _REQUESTS_MADE.set(0)
+    expected_token = _EXPECTED_REQUESTS.set(_expected_request_count(months))
     try:
         return _fetch_klines_from_bulk_archive(
             symbol, timeframe, start_dt, end_dt, market_type
         )
     finally:
         _DEADLINE.reset(token)
+        _LOAD_START.reset(start_token)
+        _COLLAPSED.reset(collapsed_token)
+        _REQUESTS_MADE.reset(made_token)
+        _EXPECTED_REQUESTS.reset(expected_token)
 
 
 def _fetch_klines_from_bulk_archive(
@@ -968,46 +1376,78 @@ def _fetch_klines_from_bulk_archive(
         hole_text = ", ".join(bucket[0].strftime("%Y-%m-%d") for bucket in holes[:5])
         if len(holes) > 5:
             hole_text += f", ... (+{len(holes) - 5} more)"
-        raise BulkArchiveCoverageError(
-            f"Bulk archive cannot cover {symbol} ({timeframe}): "
-            f"{len(holes)} bucket(s) inside the traded range "
-            f"{first_bar.isoformat()}..{last_bar.isoformat()} have no published "
-            f"archive ({hole_text}). Refusing to return a gapped frame."
+        # The data that EXISTS is worth more than no data, so the frame is
+        # served -- but the gap is named in the log and RECORDED on the
+        # frame, so the caller is told exactly what is missing instead of
+        # being handed a window it cannot see the hole in.
+        logger.error(
+            f"Bulk archive is MISSING {len(holes)} bucket(s) inside the traded "
+            f"range {first_bar.isoformat()}..{last_bar.isoformat()} for {symbol} "
+            f"({timeframe}) ({hole_text}). The frame is served with the gap "
+            "RECORDED on it."
         )
 
-    # THE LEADING EDGE.  A hole inside the traded range fails the load, but a
-    # window that simply starts LATER than it was asked to cannot: the
-    # symbol may simply have been listed later, and that is not a fault.
-    # What must never happen is that it happens UNSEEN, so the gap is
-    # measured here, reported at WARNING level with the numbers, and
-    # recorded on the frame so a caller can refuse to trade it.
-    gap = _leading_coverage_gap(
+    # THE LEADING EDGE.  A frame that starts LATER than the window it was
+    # asked for is only legitimate when the archive can PROVE that the
+    # symbol did not trade in the missing period -- that is a listing, and
+    # the REST path would have returned the same shorter frame.  When the
+    # archive CANNOT prove it, the shortfall is UNPROVEN, and the load
+    # fails: a caller that cannot tell is left trading a window it did not
+    # ask for, and reporting the KPIs of that window as the requested ones
+    # is a wrong number.
+    shortfall = _leading_shortfall(
         start_dt,
         first_bar.to_pydatetime(),
         interval,
+        absent_days,
         leading_month_published,
         leading_month,
+        now,
     )
-    if gap is not None:
+    if shortfall is not None and not shortfall["proven"]:
+        raise BulkArchiveCoverageError(
+            f"Bulk archive cannot prove it covers {symbol} ({timeframe}) from "
+            f"{shortfall['requested_start']}: the frame starts at "
+            f"{shortfall['first_bar']} and {shortfall['reason']}. Refusing to "
+            "return a frame that is shorter than the requested window."
+        )
+    if shortfall is not None:
         logger.warning(
-            f"Bulk archive coverage gap: symbol={symbol} timeframe={timeframe} "
-            f"requested_start={gap['requested_start']} "
-            f"first_bar={gap['first_bar']} gap_days={gap['gap_days']} "
-            f"leading_month={gap['leading_month']} "
-            f"leading_month_published=False -- {gap['reason']}. "
+            f"Bulk archive leading shortfall: symbol={symbol} "
+            f"timeframe={timeframe} "
+            f"requested_start={shortfall['requested_start']} "
+            f"first_bar={shortfall['first_bar']} gap_days={shortfall['gap_days']} "
+            f"leading_month={shortfall['leading_month']} "
+            f"proven={shortfall['proven']} -- {shortfall['reason']}. "
             f"The frame does not cover the requested start."
         )
-        result.attrs[COVERAGE_GAP_ATTR] = gap
+        result.attrs[COVERAGE_GAP_ATTR] = shortfall
+
+    # THE DIFFERENCE FROM THE REST PATH, measured and attached to the frame.
+    # This is what makes the difference something a caller can be TOLD
+    # about instead of something that only exists in a log line.
+    result.attrs[DIFFERENCE_ATTR] = _difference_record(
+        symbol,
+        timeframe,
+        market_type,
+        interval,
+        start_dt,
+        end_dt,
+        result,
+        shortfall,
+        holes,
+    )
 
     trailing_absent = [day for day in absent_days if day > last_bar]
     logger.info(
         f"Bulk archive coverage: symbol={symbol} timeframe={timeframe} "
         f"months={months} days_absent={len(absent_days)} "
         f"month_buckets_missing={len(missing_month_buckets)} "
+        f"holes={len(holes)} "
         f"trailing_days_absent={len(trailing_absent)} "
         f"first_bar={first_bar.isoformat()} last_bar={last_bar.isoformat()} "
         f"rows={len(result)} "
         f"window={start_dt.isoformat()}..{end_dt.isoformat()} "
-        f"leading_coverage_gap={'yes' if gap is not None else 'no'}"
+        f"leading_shortfall={'yes' if shortfall is not None else 'no'}"
     )
     return result

@@ -12,6 +12,7 @@ from requests.adapters import HTTPAdapter, Retry
 from . import config
 from .bulk_archive import (
     COVERAGE_GAP_ATTR,
+    DIFFERENCE_ATTR,
     BulkArchiveCoverageError,
     fetch_klines_from_bulk_archive,
 )
@@ -69,6 +70,100 @@ AGGTRADE_COLUMNS = [
     "is_buyer_maker",
 ]
 
+# The key under which the loader records WHICH source produced a frame
+# ("rest_api", "bulk_archive" or "local_cache").
+SOURCE_ATTR = "klines_source"
+
+# The key under which the loader records the PROVENANCE of a frame: where
+# it came from, which window was asked for, which window was delivered and
+# whether the frame differs from what the REST path would have returned.
+#
+# Every frame the loader returns carries one, so a caller that asks for a
+# window can always tell what it got -- and a frame that came from the
+# bulk archive also carries the DIFFERENCE record (``DIFFERENCE_ATTR``),
+# which says exactly HOW it differs.
+PROVENANCE_ATTR = "klines_provenance"
+
+
+def klines_provenance(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+    """The provenance of ``frame``: where it came from and what it covers.
+
+    ``None`` for a frame that carries no provenance.  The dict holds
+    ``source`` ("rest_api", "bulk_archive" or "local_cache"),
+    ``requested_start``, ``requested_end``, ``actual_start``,
+    ``actual_end``, ``rows`` and ``differs_from_rest``.  A frame that came
+    from the bulk archive also holds its ``difference`` record, which names
+    every way in which it differs from the frame the REST path would have
+    returned.
+    """
+    if frame is None:
+        return None
+    provenance = frame.attrs.get(PROVENANCE_ATTR)
+    if isinstance(provenance, dict):
+        return dict(provenance)
+    return None
+
+
+def _provenance_record(
+    source: str,
+    requested_start: datetime,
+    requested_end: datetime,
+    frame: pd.DataFrame,
+    differs_from_rest: bool = False,
+    difference: Optional[Dict[str, Any]] = None,
+    remote_failed: bool = False,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Builds the provenance record the loader attaches to every frame."""
+    record = {
+        "source": source,
+        "requested_start": requested_start.isoformat(),
+        "requested_end": requested_end.isoformat(),
+        "actual_start": frame.index[0].isoformat() if not frame.empty else None,
+        "actual_end": frame.index[-1].isoformat() if not frame.empty else None,
+        "rows": int(len(frame)),
+        "differs_from_rest": differs_from_rest,
+    }
+    if difference is not None:
+        record["difference"] = difference
+    if remote_failed:
+        record["remote_failed"] = True
+    if note:
+        record["note"] = note
+    return record
+
+
+def _difference_is_truthful(frame: pd.DataFrame, difference: Any) -> bool:
+    """True when the difference record matches the frame it describes.
+
+    The record is the only thing that tells a caller that the frame it
+    holds is not the frame the REST path would have returned.  A record
+    that does not describe the frame it travels with is worse than no
+    record at all: it is a false statement about the data.
+    """
+    if not isinstance(difference, dict):
+        return False
+    if difference.get("source") != "bulk_archive":
+        return False
+    if frame.empty:
+        return False
+    if difference.get("actual_start") != frame.index[0].isoformat():
+        return False
+    if difference.get("actual_end") != frame.index[-1].isoformat():
+        return False
+    return True
+
+
+def _process_indicators_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds the indicator columns the strategies need to a klines frame."""
+    df_processed = df.copy()
+    df_processed = add_relative_volume(df_processed, period=200)
+    df_processed = calculate_scalper_natr(df_processed, period=30)
+    df_processed = add_volume_percentile_rank(
+        df_processed, period=1000, percentile=90
+    )
+    return df_processed
+
 
 # ==============================================================================
 # Helper functions
@@ -104,6 +199,40 @@ def get_local_path(
     )
 
 
+# The phrases Binance's OWN geo-block answer carries.  MEASURED on
+# 2026-11-02 against the live blocked endpoint:
+#
+#   {"code": 0, "msg": "Service unavailable from a restricted location
+#    according to 'b. Eligibility' in https://www.binance.com/en/terms.
+#    Please contact customer service if you believe you received this
+#    message in error."}
+#
+# HTTP 451 is ALSO emitted by corporate proxies and web application
+# firewalls (RFC 7725), and a proxy's 451 body says NOTHING about
+# Binance.  A proxy-451 answered with archive data would swap the source
+# of the candles without anybody knowing, so the fallback only runs when
+# the body says the block is Binance's.
+_BINANCE_GEO_BLOCK_MARKERS = ("restricted location", "b. eligibility")
+
+
+def _is_binance_geo_block_body(response: Any) -> bool:
+    """True when a 451 body is Binance's own geo-block answer.
+
+    The status code alone does not say WHO refused: RFC 7725 makes 451
+    "Unavailable For Legal Reasons" a status a corporate proxy or a WAF
+    answers with.  Only the body tells the two apart, so the body is
+    what the fallback checks.
+    """
+    try:
+        text = response.text
+    except Exception:  # pragma: no cover - a body that cannot be read
+        return False
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _BINANCE_GEO_BLOCK_MARKERS)
+
+
 def _is_binance_location_block(error: Exception) -> bool:
     """True when the REST endpoint refused us because of where we are.
 
@@ -122,10 +251,27 @@ def _is_binance_location_block(error: Exception) -> bool:
     archive holds only closed bars and its trailing edge is short by the
     publication lag, so serving it in place of a fault could quietly shorten
     a backtest window and change the number it reports.
+
+    AND THE 451 MUST BE BINANCE'S.  A 451 from a corporate proxy or a WAF
+    is answered with the proxy's own body, which says nothing about
+    Binance.  The fallback is only allowed to answer a request Binance
+    itself refused, so the body is checked as well as the status code: a
+    451 whose body is not Binance's geo-block answer is NOT a location
+    block, and the error is re-raised unchanged.
     """
     if isinstance(error, requests.exceptions.HTTPError):
         response = getattr(error, "response", None)
-        return response is not None and response.status_code == 451
+        if response is None or response.status_code != 451:
+            return False
+        if _is_binance_geo_block_body(response):
+            return True
+        logger.error(
+            "A 451 came from something other than Binance: the response body "
+            "is not Binance's geo-block answer. The bulk-archive fallback is "
+            "NOT used for it, because a proxy's block must not be answered "
+            "with archive data."
+        )
+        return False
     return False
 
 
@@ -155,19 +301,29 @@ def _make_api_request(
     the same request from the same address gets the same answer a second
     later -- so those four extra attempts could not succeed and only
     delayed the fallback that does work.
+
+    THE VENUE IS DECIDED IN ONE PLACE.  ``config.resolve_market_venue``
+    maps the market type onto the venue, and the bulk-archive fallback asks
+    the same function, so the two can never answer for different markets.
+    A COIN-M request therefore goes to the COIN-M host and to the COIN-M
+    archive folder, instead of both of them being answered with USDT-M
+    candles.
     """
+    venue = config.resolve_market_venue(market_type)
     if config.ACTIVE_TRADING_ENVIRONMENT == "testnet":
+        # Binance has no COIN-M testnet of its own, so the futures testnet
+        # host answers every futures venue.
         base_url = (
             config.BINANCE_SPOT_TESTNET_API_URL_FOR_LOADER
-            if market_type == "spot"
+            if venue == "spot"
             else config.BINANCE_FUTURES_TESTNET_API_URL_FOR_LOADER
         )
     else:  # mainnet
-        base_url = (
-            config.BINANCE_SPOT_DATA_API_URL_FOR_LOADER
-            if market_type == "spot"
-            else config.BINANCE_FUTURES_USDTM_DATA_API_URL_FOR_LOADER
-        )
+        base_url = {
+            "spot": config.BINANCE_SPOT_DATA_API_URL_FOR_LOADER,
+            "futures_usdtm": config.BINANCE_FUTURES_USDTM_DATA_API_URL_FOR_LOADER,
+            "futures_coinm": config.BINANCE_FUTURES_COINM_DATA_API_URL_FOR_LOADER,
+        }[venue]
 
     url = f"{base_url}/{endpoint}"
 
@@ -267,6 +423,8 @@ def _download_klines_from_api_with_archive_fallback(
             f"klines_source=rest_api symbol={symbol} timeframe={timeframe} "
             f"rows={0 if frame is None else len(frame)}"
         )
+        if frame is not None:
+            frame.attrs[SOURCE_ATTR] = "rest_api"
         return frame
     except Exception as api_error:
         if not _is_binance_location_block(api_error):
@@ -307,6 +465,10 @@ def _download_klines_from_api_with_archive_fallback(
             f"klines_source=bulk_archive symbol={symbol} timeframe={timeframe} "
             f"rows={len(frame)}"
         )
+        # The SOURCE is stated on the frame, so the loader can tell an
+        # archive frame from a REST frame and ENFORCE the difference record
+        # that has to travel with it.
+        frame.attrs[SOURCE_ATTR] = "bulk_archive"
         return frame
     except BulkArchiveCoverageError as coverage_error:
         logger.error(
@@ -457,26 +619,44 @@ async def download_klines(
     (ASYNCHRONOUS) Hybrid klines loader.
     All blocking operations (file reading, HTTP requests) are executed in separate threads.
 
+    THE FRAME ALWAYS SAYS WHERE IT CAME FROM.  Every frame this loader
+    returns carries a PROVENANCE record in its ``attrs`` under the key
+    ``PROVENANCE_ATTR`` ("klines_provenance"): the source ("rest_api",
+    "bulk_archive" or "local_cache"), the window that was asked for, the
+    window that was delivered, and whether the frame differs from what the
+    REST path would have returned.  Read it with
+    ``data_loader.klines_provenance(frame)``.
+
+    A FRAME FROM THE BULK ARCHIVE IS NOT THE REST FRAME, AND THE LOADER
+    ENFORCES THAT IT SAYS SO.  The archive holds only CLOSED bars, its
+    trailing edge lags the REST path's by the publication lag, and it can
+    be missing days the REST path has.  Those differences are MEASURED and
+    recorded on the frame under ``DIFFERENCE_ATTR``
+    ("bulk_archive_frame_difference"), and the loader checks that the
+    record describes the frame it travels with: an archive-sourced frame
+    whose record is missing or does not match it is REFUSED, because a
+    frame nobody can tell apart from a REST frame is exactly the failure
+    this fallback must not have.  Read the record with
+    ``bulk_archive.frame_difference(frame)``.
+
     THE FRAME MAY COVER A SHORTER PERIOD THAN THE ONE REQUESTED.  When
     the REST API is geo-blocked (HTTP 451) the loader falls back to
     Binance's bulk archives, and the archives hold only what Binance
     published.  A symbol that was listed later than the requested window
-    therefore comes back starting later.  That is NOT a failure -- but it
-    must never be silent, so the loader measures the leading edge and
-    reports it.
+    therefore comes back starting later.  That is NOT a failure when the
+    archive can PROVE it (the symbol demonstrably did not trade then) --
+    but when it cannot prove it, the load FAILS rather than serve a frame
+    that is shorter than the window that was asked for.
 
     A caller that must not trade a shorter window than it asked for can
-    see the gap on the returned frame: it is recorded in the frame's
+    see the shortfall on the returned frame: it is recorded in the frame's
     ``attrs`` under the key ``COVERAGE_GAP_ATTR``
     ("bulk_archive_coverage_gap"), as a dict with ``requested_start``,
     ``first_bar``, ``gap_days``, ``leading_month``,
-    ``leading_month_published`` and ``reason``.  Read it with
+    ``leading_month_published``, ``proven`` and ``reason``.  Read it with
     ``bulk_archive.coverage_gap(frame)``, which returns ``None`` when
-    there is no gap.  The ``attrs`` do not change the frame's shape, its
-    columns or its values, so the existing callers are unaffected.
-
-    The gap is reported at WARNING level in the log as well, with the
-    exact numbers.
+    there is no shortfall.  The ``attrs`` do not change the frame's shape,
+    its columns or its values, so the existing callers are unaffected.
     """
     try:
         if isinstance(start_dt, str):
@@ -522,6 +702,10 @@ async def download_klines(
                     f"klines_source=local_cache symbol={symbol} timeframe={timeframe} "
                     f"rows={len(df_local)}"
                 )
+                df_local.attrs[SOURCE_ATTR] = "local_cache"
+                df_local.attrs[PROVENANCE_ATTR] = _provenance_record(
+                    "local_cache", start_dt_utc, end_dt_utc, df_local
+                )
                 return df_local
 
         api_start_dt = start_dt_utc
@@ -539,44 +723,80 @@ async def download_klines(
         )
 
         if df_api is None:
-            # The remote source failed. Before the bulk-archive fallback this
-            # branch read ``if df_api is None and (df_local is None or
-            # df_local.empty)``, so a PARTIAL local cache was shipped on its
-            # own whenever the API helper RETURNED None while the local
-            # cache was not empty: pandas' ``concat`` SKIPS a None element
-            # (``pd.concat([df_local, None])`` returns df_local's rows), so
-            # the merge silently succeeded and the truncated window was
-            # handed back as if it were the requested one.
+            # The remote source failed.  A usable LOCAL CACHE is still
+            # served: it was served before the bulk-archive fallback
+            # existed, and throwing it away turns a partial load into no
+            # load at all -- a NEW hard failure where candles used to load.
+            # (Before the fallback, this branch read ``if df_api is None and
+            # (df_local is None or df_local.empty)``, and pandas' ``concat``
+            # skips a None element, so the cache was merged and returned.)
             #
-            # That only ever happened when the helper returned None rather
-            # than raising: an exception propagated out of this function and
-            # failed the load loudly instead.  The backtest then ran on a
-            # window shorter than the one that was asked for, reporting the
-            # KPIs of that shorter window as if they were the requested ones.
-            # A truncated window is a wrong number, so this now fails the
-            # WHOLE load instead: callers distinguish "no data loaded" (None)
-            # from "loaded, but empty", and only None fails the hard stops.
+            # What must NOT happen is the caller believing it got the
+            # window it asked for, so the cache-only frame carries a
+            # provenance record that says the remote failed and that the
+            # frame covers the CACHED period only.
             #
             # The REST path's own "no klines in this window" answer is a
             # DIFFERENT thing and is deliberately left alone: it is an EMPTY
             # frame (see ``_download_klines_from_api``), so the source
             # answered, and the merge below keeps the local cache, which is
             # the history that exists for the window.
+            if df_local is not None and not df_local.empty:
+                logger.warning(
+                    f"Klines for {symbol} ({timeframe}): no data from the REST "
+                    "API or the bulk archive. Serving the LOCAL CACHE only: the "
+                    "frame does NOT cover the whole requested window."
+                )
+                df_cached = await loop.run_in_executor(
+                    None, _process_indicators_frame, df_local
+                )
+                df_cached.attrs[SOURCE_ATTR] = "local_cache"
+                df_cached.attrs[PROVENANCE_ATTR] = _provenance_record(
+                    "local_cache",
+                    start_dt_utc,
+                    end_dt_utc,
+                    df_cached,
+                    remote_failed=True,
+                    note=(
+                        "the remote source failed; this frame is the cached "
+                        "history only and does not cover the whole window"
+                    ),
+                )
+                return df_cached
             logger.error(
                 f"Klines unavailable for {symbol} ({timeframe}): no data from "
                 "the REST API or the bulk archive."
             )
             return None
 
-        # The leading-edge coverage gap the archive recorded on its frame.
-        # It is captured HERE because the operations below do not all carry
-        # it over: ``pandas.concat`` DROPS the ``attrs`` when the frames it
-        # merges do not all have the same ones, and the local cache (read
-        # from parquet) has none.  It is put back on the frame that is
-        # returned, so the caller can always see it.
-        coverage_gap = (
-            df_api.attrs.get(COVERAGE_GAP_ATTR) if df_api is not None else None
-        )
+        # THE SOURCE, THE DIFFERENCE AND THE LEADING-EDGE SHORTFALL the
+        # remote frame carries.  They are captured HERE because the
+        # operations below do not all carry them over: ``pandas.concat``
+        # DROPS the ``attrs`` when the frames it merges do not all have the
+        # same ones, and the local cache (read from parquet) has none.
+        source = df_api.attrs.get(SOURCE_ATTR)
+        difference = df_api.attrs.get(DIFFERENCE_ATTR)
+        coverage_gap = df_api.attrs.get(COVERAGE_GAP_ATTR)
+        if df_api.empty and df_local is not None and not df_local.empty:
+            # The remote source ANSWERED, with nothing: the candles in the
+            # frame that is about to be returned are the CACHE's, and the
+            # provenance must say so.
+            source = "local_cache"
+
+        # THE DIFFERENCE IS ENFORCED, NOT TRUSTED.  A frame the archive
+        # produced is NOT the frame the REST path would have returned, and
+        # the record that says so has to travel with it.  An archive
+        # frame whose record is missing, or that does not describe the
+        # frame it travels with, is refused: a frame nobody can tell apart
+        # from a REST frame is exactly the failure this fallback must not
+        # have.
+        if source == "bulk_archive" and not _difference_is_truthful(df_api, difference):
+            logger.error(
+                f"Klines for {symbol} ({timeframe}): the bulk archive returned a "
+                "frame whose difference record does not describe it. Refusing to "
+                "serve a frame the caller cannot tell apart from a REST frame."
+            )
+            return None
 
         df_final = pd.concat([df_local, df_api]) if df_local is not None else df_api
         if df_final.empty:
@@ -584,19 +804,23 @@ async def download_klines(
 
         df_final = df_final[~df_final.index.duplicated(keep="last")].sort_index()
 
-        def _process_indicators(df: pd.DataFrame) -> pd.DataFrame:
-            df_processed = df.copy()
-            df_processed = add_relative_volume(df_processed, period=200)
-            df_processed = calculate_scalper_natr(df_processed, period=30)
-            df_processed = add_volume_percentile_rank(
-                df_processed, period=1000, percentile=90
-            )
-            return df_processed
+        df_processed = await loop.run_in_executor(None, _process_indicators_frame, df_final)
 
-        df_processed = await loop.run_in_executor(None, _process_indicators, df_final)
-
+        # The records the caller needs are put back on the frame that is
+        # returned: ``pandas.concat`` dropped them.
         if coverage_gap is not None:
             df_processed.attrs[COVERAGE_GAP_ATTR] = coverage_gap
+        if difference is not None:
+            df_processed.attrs[DIFFERENCE_ATTR] = difference
+        df_processed.attrs[SOURCE_ATTR] = source or "unknown"
+        df_processed.attrs[PROVENANCE_ATTR] = _provenance_record(
+            source or "unknown",
+            start_dt_utc,
+            end_dt_utc,
+            df_processed,
+            differs_from_rest=bool(difference),
+            difference=difference,
+        )
 
         logger.info(f"Loaded/merged and processed {len(df_final)} candles.")
         return df_processed
