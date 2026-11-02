@@ -1,0 +1,86 @@
+{
+  "_comment": [
+    "Mutations that reintroduce the market-data coverage defects this branch fixed.",
+    "",
+    "E1: the loader's records of WHAT it delivered were read by NOBODY outside",
+    "    the archive module, so a backtest reported the KPIs of a shorter",
+    "    window as the KPIs of the window that was asked for.  The coverage is",
+    "    now delivered ON the KPI dict the run saves.",
+    "E2: the local cache was filed by a SECOND, hand-written copy of the venue",
+    "    predicate, and the two copies disagreed: the 'coinm' alias was filed",
+    "    under the SPOT folder while the REST path and the archive answered it",
+    "    with COIN-M candles.",
+    "E3: ONE archive file that could not be fetched collapsed the whole budget,",
+    "    so a single unlucky request destroyed a load that could have finished.",
+    "    A TIMEOUT still collapses the budget (the host is not there); a RESET",
+    "    does not (it is evidence about one request).",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/market_data_coverage_honesty.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "",
+    "NOT MUTATION-COVERED, ON PURPOSE: the celery task in tasks.py cannot be",
+    "imported without a live database (it raises at import time), so its",
+    "wiring is checked in the SOURCE by the test file and the function it",
+    "calls is covered by E1-A below.  A mutation of that one line would",
+    "SURVIVE, which is why it is not in this spec."
+  ],
+  "pytest_target": "tests/test_data_loader_bulk_archive_coverage.py tests/test_data_loader_bulk_archive.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "E1-A: the coverage is never put on the KPI dict the run saves",
+      "file": "bot_module/data_loader.py",
+      "needle": "    if isinstance(kpis, dict):\n        kpis[\"data_window\"] = list(notes)\n",
+      "replace": "    if isinstance(kpis, dict):\n        pass  # MUTANT: the coverage is dropped\n"
+    },
+    {
+      "label": "E1-B: the loader never reports what the frame actually covers",
+      "file": "bot_module/data_loader.py",
+      "needle": "    if trailing_short <= 0 and leading_gap <= 0 and not remote_failed:\n        return None\n",
+      "replace": "    if True:  # MUTANT: the coverage is never reported\n        return None\n"
+    },
+    {
+      "label": "E1-B2: the leading gap is not measured, so a truncated leading month is not reported",
+      "file": "bot_module/data_loader.py",
+      "needle": "    leading_gap = _seconds_between(\n        provenance.get(\"actual_start\"), provenance.get(\"requested_start\")\n    )\n",
+      "replace": "    leading_gap = 0.0  # MUTANT: the leading edge is never measured\n"
+    },
+    {
+      "label": "E1-C: the portfolio backtest stops carrying the coverage",
+      "file": "bot_module/portfolio_backtester.py",
+      "needle": "        attach_klines_window_coverage(\n            kpi_results,\n            frames_by_key,\n            log_prefix=\"Portfolio data: \",\n        )\n",
+      "replace": "        pass  # MUTANT: the coverage is dropped\n"
+    },
+    {
+      "label": "E2: the cache is filed by the hand-written venue predicate again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    venue = config.resolve_market_venue(market_type)\n    market_folder = \"spot\" if venue == \"spot\" else \"futures\"\n",
+      "replace": "    market_folder = \"futures\" if \"futures\" in market_type else \"spot\"  # MUTANT: a second venue predicate\n"
+    },
+    {
+      "label": "E3-A: one lost request collapses the budget again",
+      "file": "bot_module/bulk_archive.py",
+      "needle": "_TRANSPORT_FAILURE_COLLAPSE_THRESHOLD = 2\n",
+      "replace": "_TRANSPORT_FAILURE_COLLAPSE_THRESHOLD = 1  # MUTANT: one failure is enough\n"
+    },
+    {
+      "label": "E3-B: a host that does not answer no longer ends the load fast",
+      "file": "bot_module/bulk_archive.py",
+      "needle": "        if _is_host_not_answering(error):\n",
+      "replace": "        if False and _is_host_not_answering(error):  # MUTANT: the timeout does not collapse\n"
+    },
+    {
+      "label": "E3-C: the second file that cannot be fetched no longer ends the load",
+      "file": "bot_module/bulk_archive.py",
+      "needle": "                failures = _note_transport_failure(url)\n                if failures >= _TRANSPORT_FAILURE_COLLAPSE_THRESHOLD:\n                    _collapse_deadline()\n                    raise\n                logger.warning(\n                    f\"Bulk archive: the daily file {url} could not be fetched. \"\n",
+      "replace": "                failures = _note_transport_failure(url)\n                logger.warning(\n                    f\"Bulk archive: the daily file {url} could not be fetched. \"\n"
+    },
+    {
+      "label": "E3-D: the file that could not be fetched is not recorded",
+      "file": "bot_module/bulk_archive.py",
+      "needle": "    _FAILED_SINCE_SUCCESS.set(failed)\n    _note_unfetchable_file(url)\n",
+      "replace": "    _FAILED_SINCE_SUCCESS.set(failed)\n"
+    }
+  ]
+}

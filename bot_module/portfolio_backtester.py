@@ -8,7 +8,10 @@ import numpy as np  # For NaN
 import asyncio
 import math  # For math.isinf
 
-from .data_loader import download_klines
+from .data_loader import (
+    attach_klines_window_coverage,
+    download_klines,
+)
 from .depthsight_backtester import L2HistoricalDataReader
 from .execution_simulator import (
     simulate_market_order_execution,
@@ -1201,6 +1204,19 @@ class PortfolioBacktester:
         logger.info(f"Final Balance: ${self.current_balance:,.2f}")
 
         kpi_results = self._calculate_kpis()
+        # THE KPIs SAY WHICH WINDOW THEY ARE ABOUT.  A frame that came from
+        # the bulk archive can cover a SHORTER window than the one that was
+        # asked for; the coverage travels with the KPIs so nobody has to
+        # guess which window the numbers describe.
+        frames_by_key = {
+            f"{symbol}_{timeframe}": df
+            for (symbol, timeframe), df in self.market_data.items()
+        }
+        attach_klines_window_coverage(
+            kpi_results,
+            frames_by_key,
+            log_prefix="Portfolio data: ",
+        )
         logger.info(f"KPIs: {kpi_results}")
         return kpi_results
 

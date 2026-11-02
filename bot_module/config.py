@@ -238,6 +238,23 @@ def resolve_market_venue(market_type: str) -> str:
     same market under a different name: the numbers would change and nobody
     would know why.
 
+    CORRECTION (2026-11-02): the sentence above is FACTUALLY WRONG, and its
+    wrongness is the whole reason this function exists.  USDT-M and COIN-M
+    are NOT "the same market under a different name" -- they are DIFFERENT
+    markets: BTCUSDT is USDT-margined and linear, BTCUSD_PERP is
+    coin-margined and inverse, they are quoted in different units, they carry
+    a different basis and a different funding rate, and their volume is
+    counted in different things.  MEASURED on 2026-11-02 against the live
+    Binance archives, the same hour of 2024-01-01 closed at 42503.50 on
+    futures/um/BTCUSDT and 42494.90 on futures/cm/BTCUSD_PERP, and the
+    volumes were 8459.477 (BTC) against 501936 (contracts).  The COIN-M
+    symbol is also a different STRING: the COIN-M archive folder answers 200
+    for BTCUSD_PERP and 404 for BTCUSDT.  The original wording is kept above
+    so the correction can be read against the words it corrects.  So the
+    numbers DO change when the venue changes -- that is the point: they change
+    because the MARKET changes, and before this function existed they changed
+    without anybody knowing why.
+
     The venue is decided by the market type ALONE:
 
     * ``spot`` -> the spot venue;

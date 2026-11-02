@@ -104,6 +104,154 @@ def klines_provenance(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]
     return None
 
 
+def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+    """The window ``frame`` ACTUALLY covers, when it is not the one asked for.
+
+    The loader already records WHAT it delivered (``klines_provenance``) and
+    HOW it differs from the frame the REST path would have returned (the
+    difference record).  Those two records used to be read by NOBODY outside
+    this module, so a backtest could report the KPIs of a SHORTER window as
+    if they were the KPIs of the window that was asked for.
+
+    This helper is the ONE place that turns those records into the sentence a
+    caller can act on, so every caller asks the same question the same way
+    (see AGENTS.md: a predicate that is duplicated must handle the same
+    special cases in every copy).
+
+    ``None`` when the frame covers the whole window that was requested -- the
+    ordinary case, and the case where there is nothing to say.  Otherwise a
+    dict holding ``source``, ``requested_start``, ``requested_end``,
+    ``actual_start``, ``actual_end``, ``rows``, ``differs_from_rest``,
+    ``trailing_edge_short_by_seconds``, ``leading_shortfall``,
+    ``remote_failed`` and a ``reason`` written in words.
+    """
+    if frame is None:
+        return None
+    provenance = klines_provenance(frame)
+    if provenance is None:
+        return None
+    difference = provenance.get("difference")
+    if not isinstance(difference, dict):
+        difference = {}
+    trailing_short = float(difference.get("trailing_edge_short_by_seconds") or 0.0)
+    leading_shortfall = difference.get("leading_shortfall")
+    remote_failed = bool(provenance.get("remote_failed"))
+    # THE LEADING EDGE IS MEASURED HERE, NOT TAKEN FROM THE RECORD.  The
+    # archive only records a leading shortfall when it can PROVE the symbol
+    # was listed later than the window asks for; a leading month whose
+    # monthly archive is PUBLISHED but TRUNCATED leaves no record at all,
+    # and the frame then starts later than the window without anybody
+    # saying so.  The delivered window and the requested one are compared
+    # directly, so that case is reported too.
+    leading_gap = _seconds_between(
+        provenance.get("actual_start"), provenance.get("requested_start")
+    )
+    if trailing_short <= 0 and leading_gap <= 0 and not remote_failed:
+        return None
+    if remote_failed:
+        reason = (
+            "the remote source failed and this frame is the cached history "
+            "only, so it does not cover the whole window"
+        )
+    elif leading_gap > 0:
+        reason = (
+            f"the frame starts {leading_gap:.0f}s after the requested start; "
+            "the archive does not hold the days in between"
+        )
+    else:
+        reason = (
+            f"the frame ends {trailing_short:.0f}s before the requested end; "
+            "the archive does not hold the days in between"
+        )
+    return {
+        "source": provenance.get("source"),
+        "requested_start": provenance.get("requested_start"),
+        "requested_end": provenance.get("requested_end"),
+        "actual_start": provenance.get("actual_start"),
+        "actual_end": provenance.get("actual_end"),
+        "rows": provenance.get("rows"),
+        "differs_from_rest": bool(provenance.get("differs_from_rest")),
+        "trailing_edge_short_by_seconds": trailing_short,
+        "leading_gap_seconds": leading_gap,
+        "leading_shortfall": leading_shortfall,
+        "remote_failed": remote_failed,
+        "reason": reason,
+    }
+
+
+def _seconds_between(later: Optional[str], earlier: Optional[str]) -> float:
+    """The seconds between two ISO timestamps, or 0.0 when it cannot be said.
+
+    ``later`` and ``earlier`` are the ISO strings the provenance record
+    holds.  A record that does not carry both of them says nothing, and a
+    coverage note that guesses would be worse than no note at all.
+    """
+    if not later or not earlier:
+        return 0.0
+    try:
+        later_dt = datetime.fromisoformat(later)
+        earlier_dt = datetime.fromisoformat(earlier)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, (later_dt - earlier_dt).total_seconds())
+
+
+def klines_window_coverages(frames: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The coverage of every loaded frame that does not cover its window.
+
+    ``frames`` maps a data key to the frame that was loaded ("kline_1h" ->
+    the hourly frame, and so on).  The result is a LIST, because every frame
+    has its own window and its own coverage, and a caller that has to be
+    told about the window its numbers were computed over needs all of them.
+
+    This is the ONE place that turns the records the loader keeps into the
+    note a caller carries, so every caller asks the same question the same
+    way (see AGENTS.md: a predicate that is duplicated must handle the same
+    special cases in every copy).
+    """
+    notes: List[Dict[str, Any]] = []
+    if not frames:
+        return notes
+    for key, frame in frames.items():
+        coverage = klines_window_coverage(frame)
+        if coverage:
+            coverage = dict(coverage)
+            coverage["data_key"] = str(key)
+            notes.append(coverage)
+    return notes
+
+
+def attach_klines_window_coverage(
+    kpis: Optional[Dict[str, Any]],
+    frames: Optional[Dict[str, Any]],
+    log_prefix: str = "",
+) -> Optional[List[Dict[str, Any]]]:
+    """Puts the coverage of the loaded frames ON the KPI dict a run saves.
+
+    The loader keeps the records; this is what puts them where the user can
+    see them.  A record that nobody reads is a record that does not happen,
+    and the KPIs of a shorter window would be reported as the KPIs of the
+    window that was asked for.
+
+    ONE place does it, so every caller carries the coverage the same way
+    (see AGENTS.md: a predicate that is duplicated must handle the same
+    special cases in every copy).
+    """
+    notes = klines_window_coverages(frames)
+    if not notes:
+        return None
+    if isinstance(kpis, dict):
+        kpis["data_window"] = list(notes)
+    for note in notes:
+        logger.warning(
+            f"{log_prefix}The data covers a window that is NOT the one that was "
+            f"requested: {note.get('reason')} (requested "
+            f"{note.get('requested_start')} .. {note.get('requested_end')}, "
+            f"delivered {note.get('actual_start')} .. {note.get('actual_end')})."
+        )
+    return list(notes)
+
+
 def _provenance_record(
     source: str,
     requested_start: datetime,
@@ -174,7 +322,19 @@ def get_local_path(
     symbol: str, data_type: str, market_type: str, timeframe: Optional[str] = None
 ) -> Path:
     """Determines the path to the local Parquet file for a given data type."""
-    market_folder = "futures" if "futures" in market_type else "spot"
+    # THE VENUE IS DECIDED IN ONE PLACE.  ``config.resolve_market_venue`` is
+    # the SAME function the REST path and the bulk archive ask, so the cache
+    # can never be filed under a folder that belongs to another venue.
+    #
+    # It used to be ``"futures" if "futures" in market_type else "spot"``,
+    # which was a SECOND, hand-written copy of the venue predicate and it
+    # disagreed with the real one: the "coinm" alias went to the SPOT folder
+    # while the REST path and the archive answered it with COIN-M candles,
+    # and "spot_usdtm" went to the SPOT folder while the REST path queried
+    # the USDT-M host.  A venue predicate that is duplicated must handle the
+    # same special cases in every copy (see AGENTS.md).
+    venue = config.resolve_market_venue(market_type)
+    market_folder = "spot" if venue == "spot" else "futures"
 
     filename = ""
     if data_type == "klines":
@@ -803,6 +963,26 @@ async def download_klines(
             return df_final
 
         df_final = df_final[~df_final.index.duplicated(keep="last")].sort_index()
+
+        # THE COVERAGE IS RECORDED AND DELIVERED, NOT ASSUMED.  A frame from
+        # the bulk archive can be SHORTER than the window that was asked for
+        # -- the archive holds closed bars only, it lags the REST path by the
+        # publication lag, and it can be missing days the REST path has.
+        # That frame is SERVED (the data that exists is worth more than no
+        # data, and the REST path's own window is short in exactly the same
+        # ways), but the difference record NAMES the gap, and the caller is
+        # given that record so the KPIs of the run say which window they
+        # were actually computed over.
+        #
+        # CORRECTION (2026-11-02): the loader REFUSED such a frame at first,
+        # on the grounds that a shortfall nothing explains must not be
+        # served.  The original wording of that rule is kept below, and it
+        # was withdrawn: it contradicts the contract this loader already has
+        # and already tests -- a genuinely missing daily file is SERVED and
+        # NAMED, not fatal -- and a refusal would have turned a partial load
+        # into NO load, which is the one outcome the fallback exists to
+        # prevent.  The gap is named on the frame and the note travels with
+        # the KPIs instead.
 
         df_processed = await loop.run_in_executor(None, _process_indicators_frame, df_final)
 

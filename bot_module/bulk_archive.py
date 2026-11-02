@@ -223,6 +223,37 @@ _EXPECTED_REQUESTS: contextvars.ContextVar[int] = contextvars.ContextVar(
     "bulk_archive_requests_expected", default=0
 )
 
+# How many files have failed IN A ROW during the running load, with nothing
+# in between that answered.  ONE file that was lost on the way is not proof
+# that the host is gone -- a CDN edge that resets a single connection, a
+# network that changes, or a proxy that drops one request all look the same
+# from here -- but TWO in a row is.
+#
+# CORRECTION (2026-11-02): this used to be a plain counter of ATTEMPTS, and
+# the word "IN A ROW" is doing the work now: a file is counted once however
+# many times ``backoff`` retried it, and the count is of the files that
+# failed since the last file that ANSWERED.
+
+# How many CONSECUTIVE transport failures collapse the budget of a load.
+# The second one: the first costs one file, the second ends the load.
+_TRANSPORT_FAILURE_COLLAPSE_THRESHOLD = 2
+
+# The files that could not be FETCHED since the last file that ANSWERED.
+# Two different files in a row, with nothing in between that answered, is
+# the host not serving -- which is what ends the load.  One file that was
+# lost on the way is not.
+_FAILED_SINCE_SUCCESS: contextvars.ContextVar[List[str]] = contextvars.ContextVar(
+    "bulk_archive_failed_since_success", default=[]
+)
+
+# The archive files that could not be FETCHED during the running load, as
+# opposed to the ones Binance has not published.  The difference record
+# carries them, because "we could not read this day" is a different fact
+# from "Binance did not trade this day".
+_UNFETCHABLE_FILES: contextvars.ContextVar[List[str]] = contextvars.ContextVar(
+    "bulk_archive_unfetchable_files", default=[]
+)
+
 
 def _expected_request_count(months: int) -> int:
     """How many archive requests a window of ``months`` months can need.
@@ -300,6 +331,25 @@ def _collapse_deadline() -> None:
     still gets its chance; after that the budget is spent and the load
     fails.  The budget is only ever SHRUNK here, and a collapsed load
     buys no more of it.
+
+    CORRECTION (2026-11-02): the sentence above is the PREMISE this
+    function was built on, and the premise is too strong.  "A transport
+    failure ... is not 'this one file is slow': the host is gone" is not
+    true of ONE failure: a CDN edge that resets a single connection, a
+    laptop that changes network, or a proxy that drops one request all
+    look exactly like a dead host from here.  One failure collapsing the
+    WHOLE budget threw away every byte already downloaded because one
+    file was unlucky.  The original wording is kept above so the
+    correction can be read against the words it corrects.
+
+    The fix keeps the protection the collapse exists for -- a host that
+    really is gone must not be waited on for the whole budget -- while
+    surviving the case it was throwing away.  A TIMEOUT still collapses the
+    budget at once, because a host that did not answer inside its timeout
+    is not there.  A connection that was RESET does not: it is evidence
+    about one request, so the file is recorded as one that could not be
+    fetched, the load keeps its budget, and the budget is collapsed only
+    when a SECOND file fails as well (see ``_FAILED_SINCE_SUCCESS``).
     """
     deadline = _DEADLINE.get()
     if deadline is None:
@@ -307,6 +357,57 @@ def _collapse_deadline() -> None:
     grace = float(config.BULK_ARCHIVE_REQUEST_TIMEOUT_SECONDS)
     _DEADLINE.set(min(deadline, time.monotonic() + grace))
     _COLLAPSED.set(True)
+
+
+def _note_transport_failure(url: str) -> int:
+    """Records a file that could not be FETCHED, and says how many there are.
+
+    A file is counted ONCE, however many times ``backoff`` retried it: the
+    retries of one file are one failure, not several.
+
+    The count is of the files that have failed SINCE THE LAST FILE THAT
+    ANSWERED, because that is the question the count answers: two different
+    files in a row, with nothing in between that answered, is the host not
+    serving.  One file that was lost on the way is not.
+    """
+    failed = list(_FAILED_SINCE_SUCCESS.get())
+    if url not in failed:
+        failed.append(url)
+    _FAILED_SINCE_SUCCESS.set(failed)
+    _note_unfetchable_file(url)
+    return len(failed)
+
+
+def _note_transport_success(url: str) -> None:
+    """Forgets the failures: the host answered, so it is alive."""
+    _FAILED_SINCE_SUCCESS.set([])
+
+
+def _note_unfetchable_file(url: str) -> None:
+    """Records a file that could not be FETCHED, as opposed to one that is
+    not published.
+
+    These are two different facts and the difference record has to tell them
+    apart: "Binance has not published this day" and "we could not read this
+    day" are not the same thing, and a caller that is told the first when
+    the second happened has been told a falsehood.
+    """
+    files = list(_UNFETCHABLE_FILES.get())
+    if url not in files:
+        files.append(url)
+    _UNFETCHABLE_FILES.set(files)
+
+
+def _is_host_not_answering(error: BaseException) -> bool:
+    """True when the failure says the HOST is not answering.
+
+    A TIMEOUT is evidence about the host: it did not answer inside the
+    timeout it was given, so the host is not there and the load must not
+    wait for it.  A connection that was RESET is evidence about ONE request
+    -- a CDN edge that drops a connection, a network that changes, a proxy
+    that refuses one request -- and says nothing about the next file.
+    """
+    return isinstance(error, requests.exceptions.Timeout)
 
 # Binance's REST API accepts a couple of aliases the archive folders do not
 # use.  The interval is never lower-cased: "1m" is one minute and "1M" is one
@@ -444,6 +545,24 @@ def fetch_archive_bytes(url: str) -> Optional[bytes]:
     than the estimate gets them.  A transport failure collapses the budget
     (``_collapse_deadline``), because a host that does not answer must not
     be waited on for the whole budget.
+
+    CORRECTION (2026-11-02): the collapse does NOT happen on every failure.
+    The sentence above is kept so the correction can be read against the
+    words it corrects, and it is too strong in two ways.  First, ONE failed
+    request is not proof that the host is gone: a CDN edge that resets one
+    connection, a network that changes, or a proxy that drops one request
+    all look the same from here, and collapsing the budget on one of them
+    threw away every byte the load had already downloaded because one file
+    was unlucky.  Second, this function is what ``backoff`` RETRIES, so a
+    collapse here fired on the FIRST ATTEMPT.
+
+    The failure now says WHICH it is.  A TIMEOUT is evidence about the
+    HOST -- it did not answer inside its timeout, so it is not there -- and
+    it collapses the budget, which is what stops the retry chain and ends
+    the load fast.  A connection that was RESET is evidence about ONE
+    request: the file is recorded as one that could not be fetched, the
+    load keeps its budget and carries on, and the budget is collapsed only
+    when a SECOND file fails as well.
     """
     _extend_deadline()
     try:
@@ -452,8 +571,13 @@ def fetch_archive_bytes(url: str) -> Optional[bytes]:
             logger.debug(f"Bulk archive not published: {url}")
             return None
         response.raise_for_status()
-    except requests.exceptions.RequestException:
-        _collapse_deadline()
+    except requests.exceptions.RequestException as error:
+        if _is_host_not_answering(error):
+            # The host did not answer inside the timeout it was given: it is
+            # not there.  The budget is collapsed HERE, inside the function
+            # ``backoff`` retries, so the retry chain stops at once instead
+            # of burning the whole budget on a host that is gone.
+            _collapse_deadline()
         raise
     return response.content
 
@@ -1005,6 +1129,7 @@ def _difference_record(
             {"start": bucket[0].isoformat(), "end": bucket[1].isoformat()}
             for bucket in missing_buckets
         ],
+        "unfetchable_files": list(_UNFETCHABLE_FILES.get()),
         "differs_from_rest": True,
         "reason": (
             "the archive holds only CLOSED bars (the REST path also returns the "
@@ -1067,7 +1192,29 @@ def _load_monthly_archive(
     all; ``frame`` holds its candles (``None`` when it holds none).
     """
     url = _monthly_url(symbol, interval, market_type, month_start)
-    payload = fetch_archive_bytes(url)
+    try:
+        payload = fetch_archive_bytes(url)
+    except requests.exceptions.RequestException as error:
+        if _is_host_not_answering(error):
+            # The host is not there: the budget is already collapsed and the
+            # load ends here.
+            raise
+        # ONE file that could not be fetched is not the host being gone: the
+        # budget is kept, the month is served from its DAILY files instead,
+        # and the file is RECORDED as one that could not be fetched (which is
+        # a different fact from a month Binance has not published).  A
+        # SECOND file that fails as well, with nothing in between that
+        # answered, is the host not serving, and the load ends.
+        failures = _note_transport_failure(url)
+        if failures >= _TRANSPORT_FAILURE_COLLAPSE_THRESHOLD:
+            _collapse_deadline()
+            raise
+        logger.warning(
+            f"Bulk archive: the monthly archive {url} could not be fetched. "
+            "The budget is kept and the month is served from its daily files."
+        )
+        return _MonthlyArchive(None, False)
+    _note_transport_success(url)
     if payload is None:
         # NOT PUBLISHED: this month is simply unknown.
         return _MonthlyArchive(None, False)
@@ -1105,7 +1252,31 @@ def _load_daily_archives(
     while day < next_month:
         if day <= end_dt and (day + timedelta(days=1)) > start_dt:
             url = _daily_url(symbol, interval, market_type, day)
-            payload = fetch_archive_bytes(url)
+            try:
+                payload = fetch_archive_bytes(url)
+            except requests.exceptions.RequestException as error:
+                if _is_host_not_answering(error):
+                    # The host is not there: the budget is already collapsed
+                    # and the load ends here.
+                    raise
+                # ONE file that could not be fetched is not the host being
+                # gone.  The day is counted as ABSENT -- the frame has a
+                # hole there, and the hole is named on the frame -- and the
+                # load keeps its budget and carries on.  A SECOND file that
+                # fails as well, with nothing in between that answered, is
+                # the host not serving, and the load ends.
+                failures = _note_transport_failure(url)
+                if failures >= _TRANSPORT_FAILURE_COLLAPSE_THRESHOLD:
+                    _collapse_deadline()
+                    raise
+                logger.warning(
+                    f"Bulk archive: the daily file {url} could not be fetched. "
+                    "The budget is kept and the day is counted as absent."
+                )
+                absent_days.append(day)
+                day += timedelta(days=1)
+                continue
+            _note_transport_success(url)
             if payload is None:
                 absent_days.append(day)
                 logger.debug(f"Bulk archive: daily file not published {url}")
@@ -1272,6 +1443,8 @@ def fetch_klines_from_bulk_archive(
     collapsed_token = _COLLAPSED.set(False)
     made_token = _REQUESTS_MADE.set(0)
     expected_token = _EXPECTED_REQUESTS.set(_expected_request_count(months))
+    failures_token = _FAILED_SINCE_SUCCESS.set([])
+    unfetchable_token = _UNFETCHABLE_FILES.set([])
     try:
         return _fetch_klines_from_bulk_archive(
             symbol, timeframe, start_dt, end_dt, market_type
@@ -1282,6 +1455,8 @@ def fetch_klines_from_bulk_archive(
         _COLLAPSED.reset(collapsed_token)
         _REQUESTS_MADE.reset(made_token)
         _EXPECTED_REQUESTS.reset(expected_token)
+        _FAILED_SINCE_SUCCESS.reset(failures_token)
+        _UNFETCHABLE_FILES.reset(unfetchable_token)
 
 
 def _fetch_klines_from_bulk_archive(

@@ -45,7 +45,10 @@ from bot_module import config
 from bot_module.trainer import Trainer
 from bot_module.depthsight_backtester import DepthSightBacktester
 from bot_module.portfolio_backtester import PortfolioBacktester
-from bot_module.data_loader import download_klines
+from bot_module.data_loader import (
+    attach_klines_window_coverage,
+    download_klines,
+)
 from bot_module.genetic_strategy_finder import (
     GeneticStrategyFinder,
     resample_to_timeframes,
@@ -1038,6 +1041,19 @@ async def _single_symbol_backtest_body(
                     )
 
         kpi_results_to_save = results if isinstance(results, dict) else {}
+
+        # THE KPIs SAY WHICH WINDOW THEY ARE ABOUT.  A frame that came from
+        # the bulk archive can cover a SHORTER window than the one that was
+        # asked for, and the loader records that -- but a record nobody reads
+        # is a record that does not happen, and the KPIs of a shorter window
+        # would be reported as the KPIs of the window that was asked for.
+        # The coverage is therefore carried by the KPIs the run saves.
+        attach_klines_window_coverage(
+            kpi_results_to_save,
+            historical_data,
+            log_prefix=f"Task {task_id} (Symbol: {symbol}): ",
+        )
+
         await crud.update_backtest_run_results(
             db=session,
             run_id=run_id,
