@@ -384,8 +384,9 @@ def _has_bybit_live_exception(raw_plan: dict) -> bool:
       * api/depthsight_api.py:634-640 caps that tier at
         `max_free_bybit_live_strategies` live strategies.
 
-    The catalog's derived label ("Live trading", excluded) cannot express
-    that exception, so the card has to say it in words.
+    The catalog's derived labels state the exception in their own words
+    (api/plans.py: "Live trading on Bybit" / "<N> live trading strategies on
+    Bybit"), so the card's bullet is the same fact in one sentence.
     """
     limits = raw_plan.get("limits", {}) or {}
     permissions = raw_plan.get("permissions", []) or []
@@ -461,7 +462,15 @@ def _expected_included_labels(plan: dict, raw_plan: dict) -> set:
                 labels.add(f"{allowance} fast backtests per day")
 
     if _has_bybit_live_exception(raw_plan):
-        labels.add(BYBIT_LIVE_LABEL.format(n=_bybit_live_allowance(raw_plan)))
+        # The catalog states the Bybit-only exception in its own derived
+        # labels now ("Live trading on Bybit" and "<N> live trading
+        # strategies on Bybit", api/plans.py), and the static card says the
+        # same thing in ONE bullet -- so the two catalog labels are folded
+        # back into that single sentence here.
+        allowance = _bybit_live_allowance(raw_plan)
+        labels.discard("Live trading on Bybit")
+        labels.discard(f"{allowance} live trading strategies on Bybit")
+        labels.add(BYBIT_LIVE_LABEL.format(n=allowance))
 
     if _allows_every_venue(raw_plan):
         # The catalog's label names three of the six venues

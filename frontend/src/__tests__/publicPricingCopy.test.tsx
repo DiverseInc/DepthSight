@@ -47,6 +47,17 @@ const catalog: PublicPlanCatalog = {
 				{ code: "use_ai_assistant_day", label: "10 AI Assistant queries per day", included: true },
 				{ code: "permission_run_backtest", label: "Strategy backtesting", included: true },
 				{ code: "paper_trading", label: "Paper trading", included: true },
+				// The Free tier DOES trade live -- on Bybit only. The catalog
+				// publishes it as included (api/plans.py derives it from
+				// `allow_free_bybit_trading` / `max_free_bybit_live_strategies`),
+				// so the fixture carries it too. Without these two entries the
+				// fixture HID the whole class of defect: a catalog that
+				// published live trading as excluded would have looked
+				// identical to this one.
+				{ code: "live_trading", label: "Live trading on Bybit", included: true },
+				{ code: "live_strategies", label: "5 live trading strategies on Bybit", included: true },
+				{ code: "run_kline_backtest_day", label: "Kline backtests", included: false },
+				{ code: "pro_blocks", label: "PRO blocks (Tape, Book, Open Interest)", included: false },
 			],
 		},
 		{
@@ -97,7 +108,7 @@ vi.mock("react-router-dom", () => ({
 }));
 
 import { Pricing } from "@/components/marketing/Pricing";
-import { buildSignupNote, lifetimePriceFor } from "@/lib/pricing";
+import { buildPricingCards, buildSignupNote, lifetimePriceFor } from "@/lib/pricing";
 
 const html = renderToStaticMarkup(<Pricing />);
 const note = buildSignupNote(catalog);
@@ -136,6 +147,44 @@ describe("the public pricing copy", () => {
 
 	it("keeps the free tier's promise that no card is needed", () => {
 		expect(html).toContain("No credit card to start");
+	});
+});
+
+describe("the Free tier's live trading", () => {
+	// The backend really does let the Free tier trade live -- on Bybit only:
+	// api/routes/strategies.py:541-549 refuses every other venue with a 403,
+	// and api/plans_config.yml:87-88 grants the tier the Bybit exception
+	// with its cap. The public catalog therefore publishes live trading for
+	// Free as INCLUDED, and the page must show it that way: the pricing
+	// section renders every excluded entitlement under the literal heading
+	// "Not included" (frontend/src/components/marketing/Pricing.tsx:104-119)
+	// from the catalog's own labels (frontend/src/lib/pricing.ts:121-126).
+	//
+	// The fixture above used to give Free NO live-trading entitlement at
+	// all, so this class of defect -- the catalog publishing live trading
+	// as excluded -- could not show up here. The REAL catalog is pinned by
+	// tests/test_public_pricing_live_trading_labels.py; this pins the
+	// RENDERING of what the catalog says.
+	const freeCard = buildPricingCards(catalog).find((card) => card.key === "free");
+
+	it("shows the Free tier's Bybit live trading as INCLUDED", () => {
+		expect(freeCard).toBeDefined();
+		expect(freeCard?.included).toContain("Live trading on Bybit");
+		expect(html).toContain("Live trading on Bybit");
+	});
+
+	it("shows the Free tier's live-strategy cap as INCLUDED", () => {
+		const cap = freeCard?.included.find((label) =>
+			/\blive trading strategies on Bybit\b/i.test(label),
+		);
+		expect(cap).toBeDefined();
+		expect(cap).toMatch(/\b[1-9]\d* live trading strategies on Bybit\b/i);
+	});
+
+	it("never tells the Free tier that live trading is NOT included", () => {
+		expect(freeCard?.excluded).not.toContain("Live trading");
+		expect(freeCard?.excluded).not.toContain("Live trading strategies");
+		expect(freeCard?.excluded.filter((label) => /^live trading/i.test(label))).toEqual([]);
 	});
 });
 
