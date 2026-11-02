@@ -15,6 +15,7 @@ from .bulk_archive import (
     DIFFERENCE_ATTR,
     BulkArchiveCoverageError,
     fetch_klines_from_bulk_archive,
+    interval_duration,
 )
 from .utils import (
     add_relative_volume,
@@ -91,10 +92,12 @@ def klines_provenance(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]
     ``None`` for a frame that carries no provenance.  The dict holds
     ``source`` ("rest_api", "bulk_archive" or "local_cache"),
     ``requested_start``, ``requested_end``, ``actual_start``,
-    ``actual_end``, ``rows`` and ``differs_from_rest``.  A frame that came
-    from the bulk archive also holds its ``difference`` record, which names
-    every way in which it differs from the frame the REST path would have
-    returned.
+    ``actual_end``, ``rows`` and ``differs_from_rest``, and the
+    ``interval`` the frame's bars are on (which says how long the last
+    bar covers, and so where the frame's coverage ends).  A frame that
+    came from the bulk archive also holds its ``difference`` record, which
+    names every way in which it differs from the frame the REST path would
+    have returned.
     """
     if frame is None:
         return None
@@ -157,6 +160,18 @@ def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, 
     leading_gap = _seconds_between(
         provenance.get("actual_start"), provenance.get("requested_start")
     )
+    # THE TRAILING EDGE IS MEASURED HERE WHEN THE RECORD DOES NOT CARRY IT.
+    # The archive's own record measures ITS trailing edge; a REST or a
+    # cached frame has no difference record at all, so nothing measured
+    # its trailing edge: a frame that ends BEFORE the window that was asked
+    # for (a symbol whose data stops there) got no note at all, and the
+    # KPIs of that shorter window were reported as the KPIs of the window
+    # that was asked for -- the one thing this note exists to stop.  The
+    # frame carries the bars' OPEN times, so the window it COVERS ends
+    # with the last bar's CLOSE, and the interval says how long that bar
+    # covers: the same arithmetic the archive's own record uses.
+    if trailing_short <= 0:
+        trailing_short = _delivered_trailing_short(provenance)
     if (
         trailing_short <= 0
         and leading_gap <= 0
@@ -221,6 +236,28 @@ def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, 
         "remote_failed": remote_failed,
         "reason": reason,
     }
+
+
+def _delivered_trailing_short(provenance: Dict[str, Any]) -> float:
+    """The seconds between the requested end and the DELIVERED frame's end.
+
+    The frame carries the bars' OPEN times, so the window it covers ends
+    with the last bar's CLOSE, and the interval says how long one bar
+    covers.  ``0.0`` when it cannot be said: a record without an interval,
+    or without both ends, says nothing, and a coverage note that guesses
+    would be worse than no note at all.
+    """
+    interval = provenance.get("interval")
+    actual_end = provenance.get("actual_end")
+    requested_end = provenance.get("requested_end")
+    if not interval or not actual_end or not requested_end:
+        return 0.0
+    try:
+        covered_end = datetime.fromisoformat(actual_end) + interval_duration(interval)
+        wanted_end = datetime.fromisoformat(requested_end)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, (wanted_end - covered_end).total_seconds())
 
 
 def _seconds_between(later: Optional[str], earlier: Optional[str]) -> float:
@@ -305,6 +342,7 @@ def _provenance_record(
     difference: Optional[Dict[str, Any]] = None,
     remote_failed: bool = False,
     note: Optional[str] = None,
+    interval: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Builds the provenance record the loader attaches to every frame."""
     record = {
@@ -316,6 +354,13 @@ def _provenance_record(
         "rows": int(len(frame)),
         "differs_from_rest": differs_from_rest,
     }
+    # THE INTERVAL TRAVELS WITH THE RECORD.  The frame carries the bars'
+    # OPEN times, so the window it COVERS ends with the last bar's CLOSE,
+    # and only the interval says how long that bar covers.  Without it the
+    # trailing edge of a frame that is not from the archive cannot be
+    # measured at all.
+    if interval:
+        record["interval"] = interval
     if difference is not None:
         record["difference"] = difference
     if remote_failed:
@@ -961,7 +1006,7 @@ async def download_klines(
                 )
                 df_local.attrs[SOURCE_ATTR] = "local_cache"
                 df_local.attrs[PROVENANCE_ATTR] = _provenance_record(
-                    "local_cache", start_dt_utc, end_dt_utc, df_local
+                    "local_cache", start_dt_utc, end_dt_utc, df_local, interval=timeframe
                 )
                 return df_local
 
@@ -1018,6 +1063,7 @@ async def download_klines(
                         "the remote source failed; this frame is the cached "
                         "history only and does not cover the whole window"
                     ),
+                    interval=timeframe,
                 )
                 return df_cached
             logger.error(
@@ -1112,6 +1158,7 @@ async def download_klines(
             df_processed,
             differs_from_rest=bool(difference),
             difference=difference,
+            interval=timeframe,
         )
 
         logger.info(f"Loaded/merged and processed {len(df_final)} candles.")

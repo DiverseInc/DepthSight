@@ -21,6 +21,9 @@
     "E7: the interior holes the archive records on the frame were dropped from",
     "    the note, so the note returned None and the KPI payload carried",
     "    nothing for a backtest whose only gap was a hole in the middle.",
+    "E8: the trailing edge of a frame that is not from the archive was never",
+    "    measured, so a REST or cached frame that ends before the window it",
+    "    was asked for was reported as if it covered it.",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/market_data_coverage_honesty.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -106,6 +109,12 @@
       "file": "bot_module/data_loader.py",
       "needle": "    missing_buckets = difference.get(\"missing_buckets\")\n",
       "replace": "    missing_buckets = []  # MUTANT: the interior holes are dropped again\n"
+    },
+    {
+      "label": "E8: the delivered trailing edge is not measured again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    if trailing_short <= 0:\n        trailing_short = _delivered_trailing_short(provenance)\n",
+      "replace": "    if trailing_short <= 0:\n        trailing_short = 0.0  # MUTANT: the delivered trailing edge is not measured\n"
     }
   ]
 }

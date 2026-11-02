@@ -705,12 +705,15 @@ def _parse_interval(interval: str) -> Tuple[int, str]:
     return count, unit
 
 
-def _interval_duration(interval: str) -> timedelta:
+def interval_duration(interval: str) -> timedelta:
     """The nominal duration of ONE bar of ``interval``.
 
     A calendar month has no fixed length, so "1M" uses the SHORTEST
     month (28 days): that is the smallest duration a monthly bar can
     cover, and using it keeps the leading-edge rule conservative.
+
+    The loader measures a frame's trailing edge with the SAME arithmetic,
+    so the two can never disagree about how long a bar covers.
     """
     count, unit = _parse_interval(interval)
     if unit == "M":
@@ -890,7 +893,7 @@ def _previous_bar_open(first_bar: datetime, interval: str) -> datetime:
             day=1, hour=0, minute=0, second=0, microsecond=0
         )
         return _add_month(month_start, -count)
-    return first_bar - _interval_duration(interval)
+    return first_bar - interval_duration(interval)
 
 
 def _leading_shortfall(
@@ -1096,7 +1099,7 @@ def _difference_record(
     last_bar = frame.index[-1].to_pydatetime()
     # The window the frame covers ends with the last bar's CLOSE, not with
     # its open.
-    covered_end = last_bar + _interval_duration(interval)
+    covered_end = last_bar + interval_duration(interval)
     trailing_short = max(0.0, (requested_end - covered_end).total_seconds())
     phase = _bar_grid_phase_hours(frame, interval)
     shift = None

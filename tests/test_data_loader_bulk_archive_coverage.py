@@ -382,6 +382,64 @@ def test_an_interior_hole_travels_with_the_note():
     assert kpis["data_window"][0]["missing_buckets"] == difference["missing_buckets"]
 
 
+def test_a_rest_frame_that_ends_early_is_reported():
+    """A frame that ends BEFORE the window that was asked for is reported.
+
+    The archive's own record measures ITS trailing edge; a REST or a
+    cached frame has no difference record, so nothing measured theirs: a
+    frame whose data stops before the requested end (a symbol whose
+    history ends there) got no note at all, and the KPIs of that shorter
+    window were reported as the KPIs of the window that was asked for --
+    the one thing this note exists to stop.
+    """
+    requested_start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    requested_end = datetime(2024, 1, 31, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    rows = _make_rows(requested_start, 24 * 29, 60)
+    frame = pd.DataFrame(
+        [row[1:6] for row in rows],
+        columns=["open", "high", "low", "close", "volume"],
+    ).astype("float64")
+    frame.index = pd.DatetimeIndex(
+        [pd.Timestamp(row[0], unit="ms", tz="UTC") for row in rows],
+        name="open_time",
+    )
+    # The frame's last bar OPENS two days before the requested end.
+    frame.attrs[data_loader.PROVENANCE_ATTR] = {
+        "source": "rest_api",
+        "requested_start": requested_start.isoformat(),
+        "requested_end": requested_end.isoformat(),
+        "actual_start": frame.index[0].isoformat(),
+        "actual_end": frame.index[-1].isoformat(),
+        "rows": len(frame),
+        "differs_from_rest": False,
+        "interval": "1h",
+    }
+
+    coverage = data_loader.klines_window_coverage(frame)
+
+    assert coverage is not None, "a frame that ends early must be reported"
+    # The last bar OPENS at 23:00 and covers until midnight, so the frame
+    # ends a hair under two days before the requested end.
+    assert coverage["trailing_edge_short_by_seconds"] == pytest.approx(
+        2 * 24 * 3600, abs=1
+    )
+    assert "the Binance REST API" in coverage["reason"], coverage["reason"]
+
+    # A frame that DOES cover its window still says nothing.
+    covered = pd.DataFrame(frame.to_numpy(), columns=frame.columns, index=frame.index)
+    covered.attrs[data_loader.PROVENANCE_ATTR] = {
+        "source": "rest_api",
+        "requested_start": requested_start.isoformat(),
+        "requested_end": frame.index[-1].isoformat(),
+        "actual_start": frame.index[0].isoformat(),
+        "actual_end": frame.index[-1].isoformat(),
+        "rows": len(frame),
+        "differs_from_rest": False,
+        "interval": "1h",
+    }
+    assert data_loader.klines_window_coverage(covered) is None
+
+
 def test_the_coverage_is_put_on_the_kpis_the_run_saves():
     """The note the loader keeps ends up on the KPI dict."""
     frame = _frame_with_a_short_coverage()
