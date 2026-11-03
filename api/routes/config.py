@@ -776,6 +776,15 @@ async def add_to_blacklist(
             coin["until"] = until.isoformat() if until else None
             coin["reason"] = payload.reason
             coin["addedAt"] = datetime.now(timezone.utc).isoformat()
+            # AN OPERATOR BLACKLIST IS AN ACCOUNT-LEVEL CONTROL.
+            #
+            # The auto-blacklist may have scoped this entry to ONE sandbox
+            # (`mode`), and an operator who blacklists a symbol means it for
+            # EVERY sandbox -- so the scope is dropped here and the entry
+            # applies to both, exactly as it always did. Without this an
+            # operator could black-list a symbol, see it in the list, and
+            # still have real-money trading open on it.
+            coin.pop("mode", None)
             logger.info(f"Updated existing blacklist entry for {symbol}")
             break
     else:

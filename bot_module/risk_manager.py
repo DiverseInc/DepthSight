@@ -351,6 +351,25 @@ class RiskManager:
     # drawdown cannot be measured against it.
     _balance_read_rejected: bool = False
 
+    # THE PAPER SANDBOX'S OWN HIGH-WATER MARK.
+    #
+    # The PAPER sandbox now measures its drawdown with the SAME
+    # peak-to-trough measure the LIVE sandbox uses (see
+    # `_check_paper_risk_limits`), so it needs its own peak, its own PnL
+    # baseline and its own "this read was rejected" flag. They live in
+    # their own attributes -- NOT in the LIVE ones -- because the paper
+    # wallet is a different wallet: a paper balance must never raise the
+    # live high-water mark, and the live one must never be measured
+    # against the paper wallet.
+    #
+    # The PAPER peak is NOT persisted and NOT restored: it is established
+    # from the paper wallet's own balance reads, so it can never be
+    # inherited from the live sandbox, and a restore can never wipe it.
+    _paper_peak_equity: float = 0.0
+    _paper_peak_equity_set_at: float = 0.0
+    _paper_balance_pnl_baseline: float = 0.0
+    _paper_balance_read_rejected: bool = False
+
     def __init__(
         self,
         executor: ExchangeExecutor,
@@ -734,7 +753,18 @@ class RiskManager:
 
         # AUTO-BLACKLIST: Tracking consecutive stops by symbols
         # Store a list of stop timestamps (to support within_period)
+        #
+        # PER SANDBOX. The stop history is what the auto-blacklist rules
+        # COUNT, and the rules write the symbol into the user's
+        # ACCOUNT-LEVEL blacklist -- which the LIVE gate consults. So one
+        # shared dict let a PAPER stop-loss push the LIVE account's stop
+        # count up (a simulated loss could blacklist a real-money symbol)
+        # and let a PAPER win ERASE the LIVE stop history (which weakens a
+        # live risk control). `_symbol_stop_timestamps` stays the LIVE
+        # dict -- existing code reads it directly -- and the PAPER sandbox
+        # has its own.
         self._symbol_stop_timestamps: Dict[str, List[float]] = {}
+        self._paper_symbol_stop_timestamps: Dict[str, List[float]] = {}
 
         # Caching auto-blacklist rules from settings
         rm_settings = user_settings.get("risk_management", {}) if user_settings else {}
@@ -828,6 +858,85 @@ class RiskManager:
         if self._normalize_mode(mode) == "paper":
             return self._paper_global_gate_disable_reason
         return self._global_gate_disable_reason
+
+    def _stop_timestamps_for(self, mode: Optional[str]) -> Dict[str, List[float]]:
+        """The auto-blacklist stop history that owns THIS sandbox's stops.
+
+        The stop history is what the auto-blacklist rules COUNT, and a rule
+        that fires writes the symbol into the account-level blacklist --
+        which the LIVE gate consults. So the two sandboxes must not share
+        one history: a PAPER stop-loss must not push the LIVE account's
+        stop count up (a simulated loss could blacklist a real-money
+        symbol), and a PAPER win must not ERASE the live stop history
+        (which would reset the live auto-blacklist counter with simulated
+        money -- a weakening of a live risk control).
+        """
+        if self._normalize_mode(mode) == "paper":
+            return self._paper_symbol_stop_timestamps
+        return self._symbol_stop_timestamps
+
+    @staticmethod
+    def _blacklist_entry_applies_to_mode(coin: Any, mode: str) -> bool:
+        """Does this blacklist entry apply to the sandbox being asked about?
+
+        An entry that CARRIES a mode applies to THAT sandbox only: an entry
+        written for the PAPER sandbox must never block a LIVE signal, or a
+        paper loss would close the live gate.
+
+        An entry with NO mode is a LEGACY entry -- written before the
+        split, or added by the OPERATOR through the API -- and it applies
+        to BOTH sandboxes. That is the behaviour such an entry always had,
+        and an operator's manual blacklist is an account-level control, so
+        it keeps working for the paper sandbox too (including for the
+        keyless paper accounts, which have no other way to be stopped).
+        """
+        entry_mode = (
+            coin.get("mode")
+            if isinstance(coin, dict)
+            else getattr(coin, "mode", None)
+        )
+        if not entry_mode:
+            return True
+        return str(entry_mode).strip().lower() == str(mode or "live").strip().lower()
+
+    def _peak_state_attrs(self, mode: Optional[str] = "live") -> Tuple[str, str, str, str]:
+        """The attribute names that hold THIS sandbox's peak state.
+
+        (peak, peak_set_at, pnl_baseline, balance_read_rejected)
+
+        The LIVE names are the ones `main` shipped and the ones the
+        existing tests read and write directly, so they are NOT renamed:
+        the peak subsystem is made mode-aware by LOOKING UP the names
+        instead, which keeps ONE implementation serving both sandboxes
+        rather than two copies that can drift apart.
+        """
+        if self._normalize_mode(mode) == "paper":
+            return (
+                "_paper_peak_equity",
+                "_paper_peak_equity_set_at",
+                "_paper_balance_pnl_baseline",
+                "_paper_balance_read_rejected",
+            )
+        return (
+            "_peak_equity",
+            "_peak_equity_set_at",
+            "_balance_pnl_baseline",
+            "_balance_read_rejected",
+        )
+
+    @staticmethod
+    def _guard_state_scope_unknown_affects_live(scope: str) -> bool:
+        """Does an UNKNOWN-SCOPE latch close the LIVE gate?
+
+        A latch whose scope is "live" (or "both") does: the LIVE sandbox's
+        own numbers could not be read, so the LIVE gate fails closed.
+
+        A latch whose scope is "paper" does NOT: a corrupt PAPER payload
+        says nothing about the LIVE sandbox's numbers, and halting REAL
+        trading because a paper day's stamp was unreadable is exactly the
+        cross-sandbox leak this branch exists to close.
+        """
+        return str(scope or "").strip().lower() in ("live", "both")
 
     def published_account_snapshot(self) -> Dict[str, Any]:
         """The account-level numbers the controller publishes.
@@ -1452,22 +1561,25 @@ class RiskManager:
                         # drawdown check fails CLOSED until a credible balance
                         # is read. The latch clears itself on the next
                         # credible read.
-                        # LIVE ONLY: the flag records that the LIVE balance
-                        # is not one the server trusts, and the LIVE drawdown
-                        # is measured against it. A PAPER read must never make
-                        # the LIVE gate fail closed -- a paper wallet's bad
-                        # read says nothing about the live account's money.
-                        if mode != "paper":
-                            self._balance_read_rejected = True
+                        # The flag records that THIS sandbox's balance is
+                        # not one the server trusts, and THAT sandbox's
+                        # drawdown is measured against it. A PAPER read must
+                        # never make the LIVE gate fail closed -- a paper
+                        # wallet's bad read says nothing about the live
+                        # account's money.
+                        _, _, _, rejected_attr = self._peak_state_attrs(mode)
+                        setattr(self, rejected_attr, True)
                         # Retry logic can be added here or the update can simply be skipped
                         return False  # Return False to signal a possible data issue
 
-                    # This read was accepted, so the balance is credible again.
-                    # LIVE ONLY, for the same reason as above: a credible
-                    # PAPER read must not re-open a LIVE gate that a refused
-                    # LIVE read closed.
-                    if mode != "paper":
-                        self._balance_read_rejected = False
+                    # This read was accepted, so THIS sandbox's balance is
+                    # credible again. For the same reason as above, each
+                    # sandbox's flag is its OWN: a credible PAPER read must
+                    # not re-open a LIVE gate that a refused LIVE read
+                    # closed, and a credible LIVE read must not re-open a
+                    # PAPER gate that a refused PAPER read closed.
+                    _, _, _, rejected_attr = self._peak_state_attrs(mode)
+                    setattr(self, rejected_attr, False)
 
                     if (
                         abs(current_total_usdt - stats.current_balance) > 1e-9
@@ -1484,33 +1596,29 @@ class RiskManager:
                             # `bot_module/risk_manager.py:1698`).
                             self._paper_balance_known = True
                             self._anchor_paper_start_of_day_base(current_total_usdt)
-                        else:
-                            # The balance now reflects the day's realised PnL as it
-                            # stands, so that is what the PnL baseline is.
-                            #
-                            # LIVE ONLY: the baseline belongs to the LIVE
-                            # sandbox's peak-to-trough measurement. Setting it
-                            # from a PAPER balance would put a paper wallet's
-                            # PnL into the live drawdown's arithmetic -- the
-                            # very thing this branch exists to prevent.
-                            self._set_balance_pnl_baseline()
+                        # The balance now reflects the day's realised PnL as
+                        # it stands, so that is what the PnL baseline is --
+                        # for THIS sandbox. The paper wallet's realised PnL
+                        # is not the live wallet's, so each sandbox keeps its
+                        # own baseline.
+                        self._set_balance_pnl_baseline(mode=mode)
                     else:
                         logger.debug(
                             f"{log_prefix} Balance unchanged: ${stats.current_balance:.2f}"
                         )
 
                     # A balance the server has just read is the only evidence it
-                    # has about the account's high-water mark -- and an
+                    # has about THAT sandbox's high-water mark -- and an
                     # UNCHANGED balance is still an observation of it. The peak
                     # only ever rises, so observing it again can never lower
                     # the limit.
-                    # LIVE ONLY: the high-water mark belongs to the LIVE
-                    # sandbox. A PAPER balance is a different wallet, and
+                    #
+                    # The high-water mark belongs to the sandbox the balance
+                    # came from. A PAPER balance is a different wallet, and
                     # folding it into the live peak would let paper money
                     # move the live drawdown limit -- the very thing this
                     # branch exists to prevent.
-                    if mode != "paper":
-                        self._observe_balance_for_peak(current_total_usdt)
+                    self._observe_balance_for_peak(current_total_usdt, mode=mode)
 
                     # A successful balance read is the only trustworthy evidence
                     # available about whether the global gate should be open, so
@@ -2053,21 +2161,28 @@ class RiskManager:
             exit_reason is not None and "stop" in exit_reason.lower() and not is_be
         )
 
+        # THE STOP HISTORY BELONGS TO THE SANDBOX THAT TOOK THE LOSS.
+        # The auto-blacklist rules count these stops and write the symbol
+        # into the account-level blacklist, which the LIVE gate consults:
+        # one shared history let a PAPER stop-loss blacklist a real-money
+        # symbol, and a PAPER win ERASE the live stop history (which
+        # resets the live auto-blacklist counter with simulated money).
+        stop_timestamps = self._stop_timestamps_for(mode)
         if is_stop_loss:
             # Adding stop timestamp
-            if symbol not in self._symbol_stop_timestamps:
-                self._symbol_stop_timestamps[symbol] = []
-            self._symbol_stop_timestamps[symbol].append(time.time())
+            if symbol not in stop_timestamps:
+                stop_timestamps[symbol] = []
+            stop_timestamps[symbol].append(time.time())
             logger.debug(
-                f"[AutoBlacklist:{symbol}] Stop recorded. Total stops: {len(self._symbol_stop_timestamps[symbol])}"
+                f"[AutoBlacklist:{symbol}] Stop recorded. Total stops: {len(stop_timestamps[symbol])}"
             )
         elif pnl > 0 or is_be:
             # On a PROFITABLE trade or BE (break-even), clear the stop history
-            if symbol in self._symbol_stop_timestamps:
-                self._symbol_stop_timestamps[symbol] = []
+            if symbol in stop_timestamps:
+                stop_timestamps[symbol] = []
 
         # Checking auto-blocking rules
-        await self._check_and_apply_auto_blacklist_rules(symbol)
+        await self._check_and_apply_auto_blacklist_rules(symbol, mode=mode)
 
     async def update_symbol_strategy_performance(
         self,
@@ -2490,6 +2605,18 @@ class RiskManager:
                             coin_symbol = coin.get("symbol", "").upper()
 
                             if coin_symbol == symbol.upper():
+                                # An entry that CARRIES a mode applies to
+                                # that sandbox only: an entry written for
+                                # the PAPER sandbox must not block a LIVE
+                                # signal, or a paper loss would close the
+                                # live gate. A mode-LESS entry (legacy, or
+                                # added by the operator through the API)
+                                # applies to BOTH sandboxes, exactly as it
+                                # always did.
+                                if not self._blacklist_entry_applies_to_mode(
+                                    coin, mode
+                                ):
+                                    continue
                                 until_val = (
                                     coin.get("until")
                                     if isinstance(coin, dict)
@@ -2632,9 +2759,17 @@ class RiskManager:
                         f"[AutoBlacklist:{symbol}] Failed to send notification: {e}"
                     )
 
-    async def _check_and_apply_auto_blacklist_rules(self, symbol: str):
-        """Checks auto-blacklist rules and adds the symbol to the blacklist when triggered."""
-        stop_timestamps = self._symbol_stop_timestamps.get(symbol, [])
+    async def _check_and_apply_auto_blacklist_rules(self, symbol: str, mode: str = "live"):
+        """Checks auto-blacklist rules and adds the symbol to the blacklist when triggered.
+
+        `mode` says WHICH sandbox's stop history is counted: the LIVE one
+        or the PAPER one. The rule writes into the account-level
+        blacklist, which the LIVE gate consults, so a PAPER stop must
+        never count towards the LIVE account's auto-blacklist -- a
+        simulated loss could otherwise blacklist a real-money symbol.
+        """
+        stop_map = self._stop_timestamps_for(mode)
+        stop_timestamps = stop_map.get(symbol, [])
         if not stop_timestamps:
             return  # No stops - nothing to check
 
@@ -2691,10 +2826,14 @@ class RiskManager:
                         f"[AutoBlacklist:{symbol}] Rule triggered! {stops_count} stops within {within_period or 'all time'} >= {rule_consecutive_stops}. Duration: {duration}"
                     )
                     await self._auto_add_to_blacklist(
-                        symbol, duration, stops_count, within_period=within_period
+                        symbol,
+                        duration,
+                        stops_count,
+                        within_period=within_period,
+                        mode=mode,
                     )
                     # After adding, clear the stop history
-                    self._symbol_stop_timestamps[symbol] = []
+                    stop_map[symbol] = []
                     break  # Applying only the first triggered rule
         except Exception as e:
             logger.error(
@@ -2708,8 +2847,16 @@ class RiskManager:
         duration: str,
         consecutive_stops: int,
         within_period: Optional[str] = None,
+        mode: str = "live",
     ):
-        """Adds a symbol to the blacklist automatically based on a rule."""
+        """Adds a symbol to the blacklist automatically based on a rule.
+
+        `mode` says WHICH sandbox's stops triggered the rule. The blacklist
+        is ONE account-level list, so the entry needs a mode dimension:
+        an entry written for the PAPER sandbox must not block a LIVE
+        signal, or a paper loss would close the live gate.
+        """
+        mode = self._normalize_mode(mode)
         if not self.db_session or not crud or not self.user_id:
             logger.error(
                 f"[AutoBlacklist:{symbol}] Cannot add to blacklist: DB session or user_id missing"
@@ -2755,11 +2902,36 @@ class RiskManager:
             blacklist_data = ensure_dict(rm_settings.get("blacklist", {}))
             coins = blacklist_data.get("coins", [])
 
-            # Checking if the symbol has already been added
+            # WHICH SANDBOX THIS ENTRY IS FOR.
+            #
+            # A LIVE auto-blacklist entry keeps NO mode key, exactly as it
+            # has always been written: a mode-less entry applies to BOTH
+            # sandboxes, so the LIVE behaviour -- and the shape of the
+            # record the operator sees -- does not change.
+            #
+            # A PAPER auto-blacklist entry carries `"mode": "paper"`, so it
+            # applies to the PAPER sandbox ONLY.
+            entry_mode = "paper" if mode == "paper" else None
+
+            # Checking if the symbol has already been added FOR THIS SANDBOX.
+            #
+            # An existing entry is only REPLACED when its scope is the SAME
+            # scope. Replacing a mode-less (legacy or operator-added) entry
+            # with a PAPER-scoped one would stop it from blocking LIVE --
+            # a weakening of a live control -- and replacing a PAPER-scoped
+            # entry with a LIVE one would stop it from blocking PAPER. So a
+            # differently-scoped entry is left ALONE and the new one is
+            # APPENDED beside it.
             existing_idx = None
             for i, coin in enumerate(coins):
                 coin = ensure_dict(coin)
-                if coin.get("symbol", "").upper() == symbol.upper():
+                if coin.get("symbol", "").upper() != symbol.upper():
+                    continue
+                coin_mode = coin.get("mode")
+                coin_scope = (
+                    str(coin_mode).strip().lower() if coin_mode else None
+                )
+                if coin_scope == entry_mode:
                     existing_idx = i
                     break
 
@@ -2769,6 +2941,8 @@ class RiskManager:
                 "reason": reason,
                 "addedAt": now.isoformat(),
             }
+            if entry_mode:
+                new_coin["mode"] = entry_mode
 
             if existing_idx is not None:
                 coins[existing_idx] = new_coin
@@ -2777,7 +2951,10 @@ class RiskManager:
                 )
             else:
                 coins.append(new_coin)
-                logger.info(f"[AutoBlacklist:{symbol}] Added new blacklist entry")
+                logger.info(
+                    f"[AutoBlacklist:{symbol}] Added new blacklist entry"
+                    + (f" (mode: {entry_mode})" if entry_mode else "")
+                )
 
             # Save back
             blacklist_data["coins"] = coins
@@ -2888,30 +3065,47 @@ class RiskManager:
     # A peak that is UNKNOWN is never read as "no drawdown": it fails CLOSED,
     # exactly like the unknown opening balance.
 
-    def _set_balance_pnl_baseline(self) -> None:
-        """Remember the `today_pnl` that `stats.current_balance` reflects.
+    def _set_balance_pnl_baseline(self, mode: str = "live") -> None:
+        """Remember the `today_pnl` that THIS sandbox's balance reflects.
 
         Set at every point where the balance and the day's PnL are known to
         describe the same instant: a balance read, a restore of the persisted
         state, and the UTC rollover (where the day's PnL restarts at zero).
-        """
-        self._balance_pnl_baseline = float(getattr(self.stats, "today_pnl", 0.0) or 0.0)
 
-    def _known_peak_candidates(self, observed_balance: float) -> float:
+        The baseline belongs to ONE sandbox: the paper wallet's realised PnL
+        is not the live wallet's, so the two baselines are separate state.
+        """
+        stats = self._mode_stats(mode)
+        _, _, baseline_attr, _ = self._peak_state_attrs(mode)
+        setattr(
+            self,
+            baseline_attr,
+            float(getattr(stats, "today_pnl", 0.0) or 0.0),
+        )
+
+    def _known_peak_candidates(
+        self, observed_balance: float, mode: str = "live"
+    ) -> float:
         """The highest balance the server can VOUCH for right now.
 
         That is the balance that was just read, plus today's opening balance
         when it is usable -- it is a real balance the server observed, and a
         higher high-water mark is a tighter limit, never a looser one.
+
+        The opening balance is the one of THIS sandbox: the paper wallet's
+        opening balance is not evidence about the live account's money.
         """
         candidates = [float(observed_balance)]
-        base = float(getattr(self.stats, "start_of_day_balance", 0.0) or 0.0)
-        stamp = getattr(self.stats, "start_of_day_day_str", None)
+        stats = self._mode_stats(mode)
+        base = float(getattr(stats, "start_of_day_balance", 0.0) or 0.0)
+        stamp = getattr(stats, "start_of_day_day_str", None)
         if base > 1e-9 and stamp and stamp == self._current_utc_day_str():
             candidates.append(base)
         return max(candidates)
 
-    def _expire_stale_peak(self, replacement: Optional[float] = None) -> bool:
+    def _expire_stale_peak(
+        self, replacement: Optional[float] = None, mode: str = "live"
+    ) -> bool:
         """Expire a high-water mark that has outlived the window.
 
         The peak expires `DRAWDOWN_PEAK_WINDOW_DAYS` (7 days, the owner's
@@ -2924,8 +3118,9 @@ class RiskManager:
         Returns True when a stale peak was expired.
         """
         now = time.time()
-        peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
-        peak_at = float(getattr(self, "_peak_equity_set_at", 0.0) or 0.0)
+        peak_attr, peak_at_attr, _, _ = self._peak_state_attrs(mode)
+        peak = float(getattr(self, peak_attr, 0.0) or 0.0)
+        peak_at = float(getattr(self, peak_at_attr, 0.0) or 0.0)
         if peak <= 1e-9 or peak_at <= 0:
             return False
         age_seconds = now - peak_at
@@ -2939,10 +3134,10 @@ class RiskManager:
             "no longer counted."
         )
         if replacement is None:
-            replacement = self._drawdown_trough_balance()
+            replacement = self._drawdown_trough_balance(mode=mode)
         if replacement is not None and float(replacement) > 1e-9:
-            self._peak_equity = float(replacement)
-            self._peak_equity_set_at = now
+            setattr(self, peak_attr, float(replacement))
+            setattr(self, peak_at_attr, now)
             logger.info(
                 f"[RiskManager:Peak] The high-water mark for the new window is "
                 f"${float(replacement):.2f} (the balance as it stands now)."
@@ -2950,11 +3145,11 @@ class RiskManager:
         else:
             # No credible balance to start the new window from: the peak is
             # UNKNOWN, and an unknown peak fails CLOSED.
-            self._peak_equity = 0.0
-            self._peak_equity_set_at = 0.0
+            setattr(self, peak_attr, 0.0)
+            setattr(self, peak_at_attr, 0.0)
         return True
 
-    def _observe_balance_for_peak(self, balance: float) -> bool:
+    def _observe_balance_for_peak(self, balance: float, mode: str = "live") -> bool:
         """Fold a freshly OBSERVED balance into the high-water mark.
 
         Returns True when the peak changed.
@@ -2963,6 +3158,11 @@ class RiskManager:
         not lower the high-water mark. It is lowered only by the window
         expiry, which is the one moment the account's high-water mark is
         allowed to be forgotten.
+
+        The balance observed is the one of THIS sandbox: a PAPER balance
+        must never raise the LIVE high-water mark, because the peak is the
+        denominator of the drawdown ratio and simulated money would move
+        the live drawdown limit.
         """
         try:
             balance = float(balance)
@@ -2972,46 +3172,50 @@ class RiskManager:
             return False
 
         now = time.time()
-        candidate = self._known_peak_candidates(balance)
+        peak_attr, peak_at_attr, _, _ = self._peak_state_attrs(mode)
+        candidate = self._known_peak_candidates(balance, mode=mode)
         # An expired peak is not a peak: the new window starts here.
-        expired = self._expire_stale_peak(replacement=candidate)
+        expired = self._expire_stale_peak(replacement=candidate, mode=mode)
 
-        peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
+        peak = float(getattr(self, peak_attr, 0.0) or 0.0)
         if peak <= 1e-9:
-            self._peak_equity = candidate
-            self._peak_equity_set_at = now
+            setattr(self, peak_attr, candidate)
+            setattr(self, peak_at_attr, now)
             logger.info(
                 f"[RiskManager:Peak] The account's high-water mark is "
                 f"${candidate:.2f} (it was not known before)."
             )
             return True
         if candidate > peak:
-            self._peak_equity = candidate
-            self._peak_equity_set_at = now
+            setattr(self, peak_attr, candidate)
+            setattr(self, peak_at_attr, now)
             return True
         return expired
 
-    def _usable_peak_equity(self) -> Optional[float]:
+    def _usable_peak_equity(self, mode: str = "live") -> Optional[float]:
         """The account's high-water mark, or None when there is not one.
 
         None means UNKNOWN, and an unknown peak must never be read as a
         zero drawdown.
         """
-        peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
+        peak_attr, _, _, _ = self._peak_state_attrs(mode)
+        peak = float(getattr(self, peak_attr, 0.0) or 0.0)
         if not math.isfinite(peak) or peak <= 1e-9:
             return None
         return peak
 
-    def _drawdown_trough_balance(self) -> Optional[float]:
+    def _drawdown_trough_balance(self, mode: str = "live") -> Optional[float]:
         """The balance the drawdown is measured DOWN TO.
 
         None when the balance is not a number the server trusts: either no
         balance has been read yet, or the last read was REJECTED as a
         suspected bad API read.
         """
-        if getattr(self, "_balance_read_rejected", False):
+        _, _, baseline_attr, rejected_attr = self._peak_state_attrs(mode)
+        if getattr(self, rejected_attr, False):
             return None
-        balance = float(getattr(self.stats, "current_balance", 0.0) or 0.0)
+        stats = self._mode_stats(mode)
+        balance = float(getattr(stats, "current_balance", 0.0) or 0.0)
         if not math.isfinite(balance) or balance <= 1e-9:
             return None
         # THE BALANCE IS STALE EXACTLY WHEN A TRADE CLOSES.
@@ -3022,8 +3226,8 @@ class RiskManager:
         # closes. Without this the peak-to-trough limit would UNDER-TRIP at
         # precisely the moment the loss is realised, and would only catch up
         # at the next balance read.
-        unreflected = float(getattr(self.stats, "today_pnl", 0.0) or 0.0) - float(
-            getattr(self, "_balance_pnl_baseline", 0.0) or 0.0
+        unreflected = float(getattr(stats, "today_pnl", 0.0) or 0.0) - float(
+            getattr(self, baseline_attr, 0.0) or 0.0
         )
         trough = balance + unreflected
         if not math.isfinite(trough):
@@ -3086,17 +3290,32 @@ class RiskManager:
             # the gate stays closed. This heals itself at the UTC day rollover
             # (see `_check_and_reset_daily_stats`), which is the one moment
             # the day's counters restart at zero by definition.
-            self._is_trading_allowed = False
-            self._global_gate_disable_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
-            if not getattr(self, "_emergency_stop_active", False):
-                self._trading_disabled_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
-            # The persisted state carries the paper counters too, so its scope
-            # is unknown for the paper sandbox as well. The PAPER gate is
-            # closed on the same trigger -- this does not touch the live path.
+            #
+            # SCOPE-AWARE. A latch whose scope is "paper" says NOTHING about
+            # the LIVE sandbox's numbers -- those were read -- so it does NOT
+            # close the LIVE gate: halting REAL trading because a PAPER
+            # payload's day stamp was unreadable is the cross-sandbox leak
+            # this branch exists to close. The LIVE limits are still
+            # evaluated below, exactly as they are on any other evaluation.
+            scope = getattr(self, "_guard_state_scope_unknown_scope", "")
+            if self._guard_state_scope_unknown_affects_live(scope):
+                self._is_trading_allowed = False
+                self._global_gate_disable_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+                if not getattr(self, "_emergency_stop_active", False):
+                    self._trading_disabled_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+                # The persisted state carries the paper counters too, so its scope
+                # is unknown for the paper sandbox as well. The PAPER gate is
+                # closed on the same trigger -- this does not touch the live path.
+                self._close_paper_gate_for_unknown_guard_state(
+                    RISK_GUARD_SCOPE_UNKNOWN_REASON
+                )
+                return
+            # A PAPER-scoped fault: the PAPER gate closes, and the LIVE
+            # limits are evaluated below against the LIVE counters, which
+            # were read and are known.
             self._close_paper_gate_for_unknown_guard_state(
                 RISK_GUARD_SCOPE_UNKNOWN_REASON
             )
-            return
         should_be_allowed = True
         disable_reason = ""
         if self.stats.current_balance < self.min_balance_threshold:
@@ -3317,6 +3536,12 @@ class RiskManager:
             current_day_str_utc,
         )
         self.paper_stats.today_pnl = 0.0
+        # The day's PnL restarts at zero, so the paper balance now reflects
+        # zero of today's realised PnL. The PAPER high-water mark is NOT
+        # reset here: it is not a day quantity, and clearing it every
+        # midnight would collapse the paper peak-to-trough limit back into
+        # the paper daily-loss limit.
+        self._set_balance_pnl_baseline(mode="paper")
         self.paper_stats.consecutive_losses = 0
         self.paper_stats.last_known_day_str = current_day_str_utc
         # The paper wallet's balance at the rollover IS the day's opening
@@ -3444,19 +3669,18 @@ class RiskManager:
         stats = self.paper_stats
         max_dd, max_daily_loss, max_consec = self._mode_thresholds("paper")
 
-        if not getattr(self, "_paper_balance_known", False):
-            # The PAPER wallet's balance has not been read in this process
-            # yet. It is UNKNOWN, not zero, and the limits cannot be judged
-            # against an unknown number -- so they are NOT judged, and the
-            # gate is left exactly as it is. Judging them here would close
-            # the paper gate for the wrong reason ("balance $0.00 < min"),
-            # and the controller consults that gate before the balance is
-            # refreshed, which would stop paper trading until the next
-            # restart.
-            return
-
+        # THE LATCHES FIRST -- EXACTLY AS THE LIVE PATH CHECKS THEM.
+        #
         # The persisted guard state carries both sandboxes, so an unknown or
         # lost state is unknown for the paper counters too. Fail CLOSED.
+        #
+        # These checks used to come AFTER the "the paper balance is not known
+        # yet" early return below, so a lost or unverifiable guard state left
+        # the PAPER gate OPEN while the balance was still unknown -- the
+        # paper path failed OPEN where the live path fails closed, in the
+        # same function family. The order is now the live order: the
+        # latches decide, and only then is the balance's absence allowed to
+        # leave the gate exactly as it is.
         if getattr(self, "_guard_state_unverified", False):
             self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_UNVERIFIED_REASON)
             return
@@ -3469,6 +3693,17 @@ class RiskManager:
             self._close_paper_gate_for_unknown_guard_state(
                 RISK_GUARD_SCOPE_UNKNOWN_REASON
             )
+            return
+
+        if not getattr(self, "_paper_balance_known", False):
+            # The PAPER wallet's balance has not been read in this process
+            # yet. It is UNKNOWN, not zero, and the limits cannot be judged
+            # against an unknown number -- so they are NOT judged, and the
+            # gate is left exactly as it is. Judging them here would close
+            # the paper gate for the wrong reason ("balance $0.00 < min"),
+            # and the controller consults that gate before the balance is
+            # refreshed, which would stop paper trading until the next
+            # restart.
             return
 
         should_be_allowed = True
@@ -3484,17 +3719,48 @@ class RiskManager:
                 should_be_allowed = False
                 disable_reason = f"[PAPER] {RISK_GUARD_BASE_UNKNOWN_REASON}"
             else:
-                drawdown_pct = (
-                    abs(stats.today_pnl / stats.start_of_day_balance)
-                    if stats.today_pnl < 0
-                    else 0
-                )
-                if drawdown_pct >= max_dd:
+                # THE PEAK-TO-TROUGH DRAWDOWN -- THE SAME MEASURE THE LIVE
+                # GATE USES, against the PAPER wallet's OWN high-water mark.
+                #
+                # The paper `maxDrawdown` used to be computed with the SAME
+                # expression as the paper daily loss, so the daily-loss limit
+                # was always the tighter of the two and the drawdown limit
+                # could never be the limit that fired -- and it read 0%
+                # whenever the day was profitable, so a paper wallet 12%
+                # below its high-water mark went on trading. It is the very
+                # defect `main`'s peak-to-trough rewrite fixed for the LIVE
+                # gate.
+                #
+                # The peak is the PAPER wallet's own high-water mark, observed
+                # only from the PAPER balance read, so a paper balance can
+                # never move the LIVE limit and the live peak can never be
+                # inherited by the paper sandbox. It is in-process state: it
+                # is not persisted, so a restart re-establishes it from the
+                # paper wallet's own balance.
+                #
+                # An EXPIRED peak is not counted, and an UNKNOWN peak is
+                # never read as "no drawdown": it fails CLOSED, exactly like
+                # the live branch above.
+                self._expire_stale_peak(mode="paper")
+                peak = self._usable_peak_equity(mode="paper")
+                trough = self._drawdown_trough_balance(mode="paper")
+                if peak is None or trough is None:
                     should_be_allowed = False
-                    disable_reason = (
-                        f"[PAPER] Max drawdown ({drawdown_pct * 100:.2f}%) >= "
-                        f"limit ({max_dd * 100:.2f}%)"
-                    )
+                    if getattr(self, "_paper_balance_read_rejected", False):
+                        disable_reason = (
+                            f"[PAPER] {RISK_GUARD_BALANCE_REJECTED_REASON}"
+                        )
+                    else:
+                        disable_reason = f"[PAPER] {RISK_GUARD_PEAK_UNKNOWN_REASON}"
+                else:
+                    drawdown_pct = max(0.0, (peak - trough) / peak)
+                    if drawdown_pct >= max_dd:
+                        should_be_allowed = False
+                        disable_reason = (
+                            f"[PAPER] Max drawdown ({drawdown_pct * 100:.2f}%) >= "
+                            f"limit ({max_dd * 100:.2f}%) "
+                            f"[peak ${peak:.2f}, trough ${trough:.2f}]"
+                        )
                 daily_loss_pct = (
                     abs(stats.today_pnl / stats.start_of_day_balance)
                     if stats.today_pnl < 0
@@ -3600,6 +3866,15 @@ class RiskManager:
                 self._paper_balance_known = True
                 self._check_and_reset_paper_daily_stats()
                 self._anchor_paper_start_of_day_base(current_balance_val)
+                # The PAPER wallet's balance has just been read, so it is an
+                # OBSERVATION of the PAPER high-water mark, and this is the
+                # instant the paper day's PnL baseline is taken at -- the
+                # same treatment the LIVE branch below gives its balance.
+                # Without this the PAPER peak would stay UNKNOWN on this
+                # path and the paper drawdown would fail CLOSED on every
+                # signal.
+                self._set_balance_pnl_baseline(mode="paper")
+                self._observe_balance_for_peak(current_balance_val, mode="paper")
                 self._check_risk_limits(mode="paper")
                 logger.info(
                     f"{log_prefix} Using PAPER settings. Balance: ${current_balance_val:.2f}, Risk/Trade: {risk_per_trade_base * 100:.2f}%"
@@ -4811,10 +5086,22 @@ class RiskManager:
         PAPER rollover releases only a PAPER scope, and only for an account
         with no live executor.
 
+        SCOPE-AWARE. A PAPER-scoped fault closes the PAPER gate and NOT the
+        LIVE gate: the LIVE sandbox's own numbers were read, so they are
+        known, and halting REAL trading because a PAPER payload's day stamp
+        was unreadable is the cross-sandbox leak this branch exists to
+        close. A LIVE-scoped fault (and a "both" scope, which is what two
+        disagreeing scopes become) closes the LIVE gate exactly as before.
+
         This is the PAPER/LIVE-parity twin of `_mark_guard_state_lost`: both
         sandboxes must fail closed on an unreadable scope, and they must do it
         through the same mechanism, so the two cannot drift apart.
         """
+        scope = str(scope or "live").strip().lower()
+        if scope not in ("live", "paper", "both"):
+            # An unreadable scope is UNKNOWN, and unknown must never be more
+            # permissive than known: it closes BOTH gates.
+            scope = "both"
         self._guard_state_scope_unknown = True
         self._guard_state_scope_unknown_day_str = self._current_utc_day_str()
         # WHICH sandbox's scope could not be read. "both" is the conservative
@@ -4825,10 +5112,21 @@ class RiskManager:
             self._guard_state_scope_unknown_scope = "both"
         else:
             self._guard_state_scope_unknown_scope = scope
-        self._is_trading_allowed = False
-        self._global_gate_disable_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
-        if not self._emergency_stop_active:
-            self._trading_disabled_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+        if self._guard_state_scope_unknown_affects_live(
+            self._guard_state_scope_unknown_scope
+        ):
+            self._is_trading_allowed = False
+            self._global_gate_disable_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+            if not self._emergency_stop_active:
+                self._trading_disabled_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+        else:
+            logger.critical(
+                "[RiskGuard] The persisted PAPER sandbox state's scope could not "
+                "be read, so the PAPER counters are unknown and paper trading "
+                "stays DISABLED. The LIVE sandbox's own counters were read, so "
+                "the LIVE gate is NOT closed: a paper fault must never halt "
+                "real money."
+            )
         # The persisted guard state carries BOTH sandboxes, so an unreadable
         # scope is a fact about the PAPER counters too (see
         # `_close_paper_gate_for_unknown_guard_state`). The PAPER gate is

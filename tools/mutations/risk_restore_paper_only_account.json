@@ -65,11 +65,41 @@
     "live executor and to a STRICTLY later UTC day, so it can never open a",
     "LIVE gate.",
     "",
+    "J is the auto-blacklist stop history shared between the sandboxes again.",
+    "The stop history is what the auto-blacklist rules COUNT, and a rule that",
+    "fires writes the symbol into the account-level blacklist, which the LIVE",
+    "gate consults. So one shared history let a PAPER stop-loss push the LIVE",
+    "account's stop count up -- a simulated loss could blacklist a real-money",
+    "symbol -- and a PAPER win ERASE the live stop history, which resets the",
+    "live auto-blacklist counter with simulated money.",
+    "",
+    "K is the unknown-scope latch closing the LIVE gate whatever the scope.",
+    "A PAPER-scoped fault (an unreadable day stamp in the paper section of the",
+    "persisted payload) says NOTHING about the live sandbox's numbers, so it",
+    "must not halt REAL trading. A live-scoped fault, and the 'both' scope that",
+    "two disagreeing scopes become, still close the live gate exactly as before.",
+    "",
+    "L is the PAPER guard checking its latches only once the balance is known.",
+    "The latches (unverified / lost / scope-unknown) are the paper path's",
+    "fail-closed state, and the LIVE path checks them FIRST. Checking them",
+    "only when the balance is already known leaves the PAPER gate OPEN on an",
+    "unknown guard state -- the paper path fails open where the live path",
+    "fails closed.",
+    "",
+    "M is the PAPER drawdown measured against the day's opening balance again.",
+    "The paper maxDrawdown used the SAME expression as the paper daily loss, so",
+    "the daily-loss limit was always the tighter of the two and the drawdown",
+    "limit could never be the limit that fired -- and it read 0% on a",
+    "profitable day, so a paper wallet 12% below its high-water mark went on",
+    "trading. The LIVE gate was rewritten to the peak-to-trough measure; the",
+    "paper one must measure the same way, against the PAPER wallet's OWN",
+    "high-water mark.",
+    "",
     "Run with:  python tools/mutation_harness.py tools/mutations/risk_restore_paper_only_account.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
     "read a file that is mid-mutation and report on code that does not exist."
   ],
-  "pytest_target": "tests/test_risk_restore_paper_only_account.py tests/test_risk_restore_missing_field_fails_closed.py tests/test_risk_restore_unknown_day_scope_fails_closed.py tests/test_per_mode_risk_gating.py",
+  "pytest_target": "tests/test_risk_restore_paper_only_account.py tests/test_risk_restore_missing_field_fails_closed.py tests/test_risk_restore_unknown_day_scope_fails_closed.py tests/test_per_mode_risk_gating.py tests/test_paper_live_scope_correction.py",
   "timeout_s": 1800,
   "mutations": [
     {
@@ -125,6 +155,30 @@
       "file": "bot_module/risk_manager.py",
       "needle": "        self._release_paper_lost_latch_at_rollover(current_day_str_utc)\n",
       "replace": "        pass  # MUTATION: the LOST latch has no release site for a keyless account\n"
+    },
+    {
+      "label": "J: the auto-blacklist stop history is shared between the sandboxes again",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        if self._normalize_mode(mode) == \"paper\":\n            return self._paper_symbol_stop_timestamps\n        return self._symbol_stop_timestamps\n",
+      "replace": "        return self._symbol_stop_timestamps\n"
+    },
+    {
+      "label": "K: an unknown-scope latch closes the LIVE gate whatever the scope",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        if self._guard_state_scope_unknown_affects_live(\n            self._guard_state_scope_unknown_scope\n        ):\n",
+      "replace": "        if True:  # MUTATION: every scope closes the LIVE gate\n"
+    },
+    {
+      "label": "L: the PAPER guard checks the latches only once the balance is known",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        if getattr(self, \"_guard_state_lost\", False):\n            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_STATE_LOST_REASON)\n",
+      "replace": "        if getattr(self, \"_guard_state_lost\", False) and getattr(\n            self, \"_paper_balance_known\", False\n        ):\n            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_STATE_LOST_REASON)\n"
+    },
+    {
+      "label": "M: the PAPER drawdown is measured against the day's opening balance again",
+      "file": "bot_module/risk_manager.py",
+      "needle": "                    drawdown_pct = max(0.0, (peak - trough) / peak)\n                    if drawdown_pct >= max_dd:\n",
+      "replace": "                    drawdown_pct = (\n                        abs(stats.today_pnl / stats.start_of_day_balance)\n                        if stats.today_pnl < 0\n                        else 0\n                    )\n                    if drawdown_pct >= max_dd:\n"
     }
   ]
 }
