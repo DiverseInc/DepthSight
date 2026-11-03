@@ -2943,6 +2943,61 @@ class RiskManager:
         self.paper_stats.start_of_day_day_str = ""
         self._anchor_paper_start_of_day_base(self.paper_stats.current_balance)
         self._release_paper_scope_unknown_latch_at_rollover(current_day_str_utc)
+        self._release_paper_lost_latch_at_rollover(current_day_str_utc)
+
+    def _release_paper_lost_latch_at_rollover(self, current_day_str_utc) -> None:
+        """Release the LOST latch at the PAPER day rollover -- keyless accounts only.
+
+        THE SAME HOLE, ONE LATCH OVER. The LOST latch ("the persisted guard state
+        VANISHED for an account that has traded before") had ONE release site:
+        the LIVE rollover (`_check_and_reset_daily_stats`). A keyless PAPER
+        account has no live executor, so `initialize_balance` returns before the
+        live start-up machinery and EVERY rollover it ever runs is the PAPER one
+        -- it can never reach that release site.
+
+        Measured on the code before this fix: a keyless paper-only account whose
+        guard key vanished (a Redis outage) kept `_guard_state_lost = True` at
+        the UTC rollover, kept its PAPER gate closed, and `save_state` refused
+        to re-persist while the latch held -- so the guard key was NEVER
+        re-created and the account re-latched on every restart and never traded
+        again. A dual-mode account in the same state recovered at the live
+        rollover. Before the paper/live split there was ONE daily reset that
+        EVERY account ran, so the split introduced this.
+
+        The release rule is the one the live path already uses, for the same
+        reason: a new UTC day starts the day's PnL and the loss streak at zero
+        BY DEFINITION, so whatever was lost belonged to the day that just ended.
+        It is restricted to an account with NO live executor, so it can never
+        open a LIVE gate: such an account cannot trade live at all.
+
+        It is a STRICTLY later day only. A fresh process sees its first day-key
+        change on the very same start that set the latch, so releasing on any
+        day change would clear the latch on the start that set it.
+        """
+        if getattr(self, "executor", None) is not None:
+            # This account HAS a live sandbox: the live rollover owns the LOST
+            # latch, exactly as it did before the paper/live split.
+            return
+        if not getattr(self, "_guard_state_lost", False):
+            return
+        lost_day_str = getattr(self, "_guard_state_lost_day_str", "")
+        if not lost_day_str or current_day_str_utc <= lost_day_str:
+            logger.critical(
+                "[RiskGuard] The trading-guard state was lost on UTC day "
+                f"{lost_day_str or 'unknown'}, and the rollover to "
+                f"{current_day_str_utc} is not strictly past it, so today's PnL "
+                "and loss streak are still unknown. Paper trading stays DISABLED."
+            )
+            return
+        logger.critical(
+            "[RiskGuard] The trading-guard state was lost on UTC day "
+            f"{lost_day_str}; the rollover to {current_day_str_utc} resets the "
+            "day's PnL and the loss streak to zero, so this account is no longer "
+            "trading on unknown numbers. Paper trading is released for the new "
+            "day."
+        )
+        self._guard_state_lost = False
+        self._guard_state_lost_day_str = ""
 
     def _release_paper_scope_unknown_latch_at_rollover(self, current_day_str_utc) -> None:
         """Release a PAPER-scoped unknown-scope latch at the PAPER day rollover.

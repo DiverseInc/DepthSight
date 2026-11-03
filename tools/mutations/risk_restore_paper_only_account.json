@@ -54,6 +54,17 @@
     "streak escapes the reader as an exception instead of an unknown -- and an",
     "exception thrown out of the restore is not a fail-closed restore.",
     "",
+    "I is the PAPER rollover no longer releasing the LOST latch. The LOST",
+    "latch had ONE release site -- the LIVE rollover -- and a keyless paper",
+    "account has no live executor, so `initialize_balance` returns before the",
+    "live start-up and every rollover it ever runs is the PAPER one. Measured:",
+    "the latch stayed set at the UTC rollover, the PAPER gate stayed closed,",
+    "and `save_state` refused to re-persist while the latch held, so the guard",
+    "key was never re-created and the account re-latched on every restart and",
+    "never traded again. The PAPER release is restricted to an account with NO",
+    "live executor and to a STRICTLY later UTC day, so it can never open a",
+    "LIVE gate.",
+    "",
     "Run with:  python tools/mutation_harness.py tools/mutations/risk_restore_paper_only_account.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
     "read a file that is mid-mutation and report on code that does not exist."
@@ -108,6 +119,12 @@
       "file": "bot_module/risk_manager.py",
       "needle": "    except (TypeError, ValueError, OverflowError):\n",
       "replace": "    except (TypeError, ValueError):\n"
+    },
+    {
+      "label": "I: the PAPER rollover no longer releases the LOST latch",
+      "file": "bot_module/risk_manager.py",
+      "needle": "        self._release_paper_lost_latch_at_rollover(current_day_str_utc)\n",
+      "replace": "        pass  # MUTATION: the LOST latch has no release site for a keyless account\n"
     }
   ]
 }

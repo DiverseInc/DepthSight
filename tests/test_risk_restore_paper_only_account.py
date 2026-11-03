@@ -717,3 +717,140 @@ async def test_a_non_finite_persisted_live_day_pnl_fails_closed_at_start_up(
     assert rm._guard_state_is_unknown() is True, (
         "a non-finite persisted LIVE value must latch the fail-closed state"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. A LOST guard state must be RELEASABLE by a keyless account
+# ---------------------------------------------------------------------------
+
+
+def _lost_state(redis_store, rm):
+    """Make the account's guard state VANISH, but keep the "traded before" marker.
+
+    A missing guard key next to a PRESENT "has traded before" marker is a LOST
+    state, not a first boot: the loss streak and the day's PnL cannot be shown
+    to be zero, so the gate fails closed.
+    """
+    redis_store[rm._guard_seen_redis_key()] = "1"
+    redis_store.pop(_guard_key(rm), None)
+    return rm
+
+
+async def test_a_keyless_accounts_lost_guard_state_is_released_at_the_rollover(
+    redis_store,
+):
+    """The LOST latch must have a release site a keyless account can reach.
+
+    The LOST latch had ONE release site: the LIVE rollover. A keyless paper
+    account has no live executor, so `initialize_balance` returns before the
+    live start-up and EVERY rollover it ever runs is the PAPER one -- it could
+    never reach that release site.
+
+    Measured on the code before this fix: the latch stayed set at the UTC
+    rollover, the PAPER gate stayed closed, and `save_state` refused to
+    re-persist while the latch held -- so the guard key was never re-created
+    and the account re-latched on every restart and never traded again. A
+    dual-mode account in the same state recovered at the live rollover.
+    """
+    rm = _keyless_paper_account(redis_store)
+    _lost_state(redis_store, rm)
+
+    await rm.restore_state()
+    await rm.initialize_balance()
+
+    assert rm._guard_state_lost is True, (
+        "the LOST state was not latched: a missing guard key next to a "
+        "'has traded before' marker is a LOST state, not a first boot"
+    )
+    assert rm._paper_is_trading_allowed is False, (
+        "the PAPER gate is OPEN on a LOST state: today's PnL and the loss "
+        "streak cannot be shown to be zero"
+    )
+
+    # The UTC day rolls over.
+    rm._fake_day = "2026-10-28"
+    rm._check_and_reset_paper_daily_stats()
+    rm._check_risk_limits(mode="paper")
+
+    assert rm._guard_state_lost is False, (
+        "the LOST latch was NOT released at the UTC rollover: this account has "
+        "no live executor, so the LIVE rollover that owns that latch is "
+        "unreachable for it. The account is bricked -- it re-latches on every "
+        "restart and never trades again."
+    )
+    assert rm._paper_is_trading_allowed is True, (
+        "the PAPER gate is still closed after the UTC rollover released the "
+        "LOST latch: a new UTC day starts the day's PnL and the loss streak "
+        "at zero by definition, so this account is no longer trading on "
+        "unknown numbers"
+    )
+
+    await rm.save_state()
+    assert _guard_key(rm) in redis_store, (
+        "the guard key was never re-created: the account re-latches on every "
+        "restart and never trades again"
+    )
+
+
+async def test_a_lost_guard_state_is_not_released_on_the_same_day(redis_store):
+    """The release is on a STRICTLY later day only.
+
+    A fresh process sees its first day-key change on the very same start that
+    set the latch, so releasing on any day change would clear the latch on the
+    start that set it -- and the unknown state would be gone before it was
+    ever known.
+    """
+    rm = _keyless_paper_account(redis_store)
+    _lost_state(redis_store, rm)
+
+    await rm.restore_state()
+    await rm.initialize_balance()
+
+    assert rm._guard_state_lost is True
+    assert rm._paper_is_trading_allowed is False
+
+    # Same UTC day: the paper daily reset does not even run.
+    rm._check_and_reset_paper_daily_stats()
+    rm._check_risk_limits(mode="paper")
+
+    assert rm._guard_state_lost is True, (
+        "the LOST latch was released on the SAME UTC day: today's PnL and the "
+        "loss streak are still unknown"
+    )
+    assert rm._paper_is_trading_allowed is False, (
+        "the PAPER gate RE-OPENED on a LOST state on the same UTC day"
+    )
+
+
+async def test_a_dual_mode_accounts_lost_guard_state_is_released_by_the_live_rollover(
+    redis_store,
+):
+    """The counterweight: the LIVE release site is untouched.
+
+    An account that has a live sandbox keeps its single release site, exactly
+    as before the paper/live split. The new PAPER release site refuses to
+    touch such an account, so there is no second, looser path to opening a
+    live gate.
+    """
+    from tests.test_per_mode_risk_gating import _dual_mode_risk_manager
+
+    rm = _dual_mode_risk_manager(FakeRedis(redis_store))
+    _lost_state(redis_store, rm)
+
+    await rm.restore_state()
+    await rm.initialize_balance()
+
+    assert rm._guard_state_lost is True
+    assert rm._is_trading_allowed is False
+
+    rm._fake_day = "2026-10-28"
+    rm._check_and_reset_daily_stats()
+
+    assert rm._guard_state_lost is False, (
+        "the LIVE rollover no longer releases the LOST latch for an account "
+        "that has a live sandbox"
+    )
+    assert rm._is_trading_allowed is True, (
+        "the LIVE gate is still closed after the live rollover released the "
+        "LOST latch"
+    )
