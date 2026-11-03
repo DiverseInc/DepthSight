@@ -160,6 +160,126 @@ export interface StrategyConfigData {
 	natr_settings?: Record<string, unknown> | null;
 	oracle_settings?: Record<string, unknown> | null;
 	max_concurrent_symbols?: number | null;
+
+	// Risk limits typed by the client in the strategy editor.
+	// Units are PERCENT (not fractions): the bot converts percent -> fraction
+	// server-side (e.g. DEFAULT_DAILY_MAX_LOSS_PERCENT / 100.0).
+	risk_settings?: StrategyRiskSettings;
+
+	// Per-strategy parameters. The server merges these into the params the
+	// strategy instance is constructed with.
+	strategy_params?: Record<string, unknown>;
+}
+
+/**
+ * Per-strategy risk limits the client types in the strategy editor and the
+ * server stores inside `config_data`.
+ *
+ * Units: PERCENT. `daily_loss_limit_pct` mirrors the bot's daily-loss guard
+ * (`daily_max_loss_threshold` / `daily_max_loss_pct`) and may only TIGHTEN the
+ * server floor, never loosen it.
+ */
+export interface StrategyRiskSettings {
+	/** Percentage of account equity risked on a single trade. */
+	risk_per_trade_pct: number;
+	/** Largest peak-to-trough equity decline tolerated before the strategy stops. */
+	max_drawdown_pct: number;
+	/** Daily loss cap as a percentage of equity. Cannot exceed the server floor. */
+	daily_loss_limit_pct: number;
+	/** Percentage of account equity committed to each position. */
+	position_size_pct: number;
+	/**
+	 * Largest stop distance as a percentage of price. Optional: omitting it
+	 * means "leave the account's current value alone".
+	 */
+	max_stop_distance_pct?: number;
+	/**
+	 * Consecutive losing trades tolerated before the strategy stops. A COUNT,
+	 * not a percentage. Optional, for the same reason.
+	 */
+	max_consecutive_losses?: number;
+}
+
+/**
+ * The client contract the server publishes on
+ * `GET /api/v1/strategies/registry`.
+ *
+ * It is generated from the same constants the server's validator uses, so the
+ * client cannot drift away from it: there is no second, hand-written copy of
+ * the strategy list or of the risk floors.
+ */
+export interface StrategyRegistryContract {
+	strategy_pick: {
+		field: string;
+		type: string;
+		required: boolean;
+		/** The strategy names this server can actually run. */
+		available: string[];
+	};
+	strategy_params: {
+		field: string;
+		type: string;
+		required: boolean;
+		description?: string;
+	};
+	risk_settings: {
+		field: string;
+		type: string;
+		required: boolean;
+		fields: Record<
+			string,
+			{
+				type: string;
+				unit: string;
+				server_floor: number;
+				risk_manager_key: string;
+				applies_to: string;
+			}
+		>;
+	};
+	symbol_selection_mode: {
+		field: string;
+		type: string;
+		required: boolean;
+		allowed: string[];
+	};
+	symbols: {
+		field: string;
+		type: string;
+		required: string | boolean;
+	};
+	mode: {
+		field: string;
+		type: string;
+		required: boolean;
+		allowed: string[];
+	};
+	/**
+	 * The per-trade risk, in every place a strategy may read it from.
+	 *
+	 * UNITS: the `risk_settings` block is in PERCENT (1.0 means 1%), this
+	 * parameter is a FRACTION of the balance (0.01 means 1%). A value looser
+	 * than the server's floor is REFUSED, not clamped.
+	 *
+	 * Optional so the client still works against a server that does not
+	 * publish it yet.
+	 */
+	per_trade_risk?: {
+		/** The strategy parameter that carries the per-trade risk. */
+		parameter: string;
+		unit: string;
+		unit_note?: string;
+		/** The floor, in the unit above (a fraction). */
+		server_floor: number;
+		/** The same floor in PERCENT, for display. */
+		server_floor_percent: number;
+		/** Every place in `config_data` the value may hide. */
+		paths: string[];
+		description?: string;
+	};
+	/** The risk floor per field. A client may tighten, never loosen. */
+	server_floor: Record<string, number>;
+	rules: string[];
 }
 
 // Returning and correctly defining StrategyConfig

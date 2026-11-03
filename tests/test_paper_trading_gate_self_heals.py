@@ -86,6 +86,14 @@ def _make_rm(paper_executor, *, balance_threshold=5.0, trading_allowed=False):
     rm.stats.last_known_day_str = None
     rm.min_balance_threshold = balance_threshold
     rm.daily_max_loss_threshold = 0.99
+    # 2026-11-01: `maxDrawdown` is now a PEAK-TO-TROUGH limit -- the distance
+    # from the account's HIGH-WATER MARK down to the balance now, exactly as
+    # the backtesters measure it (`depthsight_backtester.py`: `drawdown =
+    # (peak_equity - current_balance) / peak_equity`). The high-water mark is
+    # server-owned state, established by the balance read below and only ever
+    # RISING; an account whose mark is unknown fails CLOSED. 0.99 keeps the
+    # drawdown out of the way so this fixture still exercises the limit it is
+    # about.
     rm.max_drawdown_threshold = 0.99
     rm.max_consecutive_losses = 5
     # The PAPER sandbox. For an account with no live account behind it, this

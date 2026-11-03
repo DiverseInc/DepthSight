@@ -384,6 +384,18 @@ async def _run_paper_close(
         _stats.start_of_day_balance = (
             1000.0 if start_of_day_balance is None else start_of_day_balance
         )
+    # 2026-11-01: `maxDrawdown` is a PEAK-TO-TROUGH limit, so the account's
+    # HIGH-WATER MARK is what the drawdown is measured against, and an
+    # account whose high-water mark is unknown fails CLOSED. A live
+    # RiskManager always has one -- the balance read establishes it -- so a
+    # test that sets the balance by hand has to set the high-water mark too,
+    # or it is modelling a state the product can never be in. The high-water
+    # mark is the balance: this account has not been higher.
+    #
+    # The high-water mark is the LIVE sandbox's. These are PAPER trades, so
+    # the paper balance must never raise it.
+    rm._peak_equity = 1000.0
+    rm._peak_equity_set_at = time.time()
 
     _rest_exit_order(
         paper_executor, qty=qty, price=exit_price, order_type=order_type

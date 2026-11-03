@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -168,7 +169,7 @@ async def test_emergency_stop_reason_is_reported_by_the_gate():
 async def test_risk_limit_reason_names_the_number_that_tripped():
     """A breached limit must be reported with the measurement and threshold."""
     rm = _real_risk_manager()
-    rm.stats.current_balance = 1000.0
+    rm.stats.current_balance = 800.0
     rm.stats.start_of_day_balance = 1000.0
     rm.stats.today_pnl = -200.0  # -20% of the day's balance
     rm.stats.consecutive_losses = 0
@@ -176,6 +177,16 @@ async def test_risk_limit_reason_names_the_number_that_tripped():
     rm.daily_max_loss_threshold = 0.99  # not the one that trips
     rm.min_balance_threshold = 5.0
     rm._is_trading_allowed = True
+    # 2026-11-01: `maxDrawdown` is a PEAK-TO-TROUGH limit. The drawdown is
+    # measured from the account's HIGH-WATER MARK ($1000) down to the balance
+    # now ($800) -- 20%. The old code measured the day's loss against the
+    # day's opening balance, which is the DAILY-LOSS limit wearing the
+    # drawdown's name, so the 10% drawdown limit could never be the limit
+    # that fired.
+    rm._peak_equity = 1000.0
+    rm._peak_equity_set_at = time.time()
+    # The balance was read after today's loss, so it already contains it.
+    rm._set_balance_pnl_baseline()
 
     rm._check_risk_limits()
     allowed = await rm.is_symbol_trading_allowed("BTCUSDT")
@@ -189,6 +200,10 @@ async def test_risk_limit_reason_names_the_number_that_tripped():
     )
     assert "10.00%" in reason, (
         f"the threshold must be reported, got: {reason!r}"
+    )
+    assert "1000.00" in reason and "800.00" in reason, (
+        "the reason must name BOTH the peak and the trough, so the operator "
+        f"can see what was measured against what, got: {reason!r}"
     )
 
 
@@ -542,13 +557,19 @@ async def test_self_heal_does_not_reopen_the_gate_past_a_tripped_risk_limit():
 
     # A drawdown limit trips while the start-up latch is engaged.
     rm = controller.rm
-    rm.stats.current_balance = 1000.0
+    rm.stats.current_balance = 500.0
     rm.stats.start_of_day_balance = 1000.0
     rm.stats.today_pnl = -500.0  # -50% drawdown
     rm.stats.consecutive_losses = 0
     rm.max_drawdown_threshold = 0.10
     rm.daily_max_loss_threshold = 0.99
     rm.min_balance_threshold = 5.0
+    # 2026-11-01: `maxDrawdown` is a PEAK-TO-TROUGH limit, so the breach is
+    # measured from the account's HIGH-WATER MARK ($1000) down to the balance
+    # now ($500) -- 50%.
+    rm._peak_equity = 1000.0
+    rm._peak_equity_set_at = time.time()
+    rm._set_balance_pnl_baseline()
     rm._check_risk_limits()
 
     redis_store.reads_raise = False

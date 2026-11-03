@@ -29,12 +29,18 @@ from bot_module.exchanges import create_exchange_executor
 from bot_module.risk_manager import RiskManager
 from bot_module.controller import TradingController
 from bot_module.telegram_notifier import TelegramNotifier
-from bot_module.compass_strategy import CompassStrategy
 from bot_module.strategy import STRATEGIES
+from bot_module.strategy_registry import register_external_strategies
 from bot_module.rehydrate import refresh_payload_config_from_db
 
-# Register CompassStrategy manually to avoid circular imports in strategy.py
-STRATEGIES["CompassStrategy"] = CompassStrategy
+# The strategies that live in their OWN module are registered through the
+# SAME verification every other candidate has to pass
+# (bot_module/strategy.py:_verify_registry_candidate), and in the module the
+# API imports too -- so the API and the bot agree on what can be run.
+#
+# It used to be registered HERE, by name, without that verification: a
+# strategy could be started by the bot and refused by the API.
+register_external_strategies()
 
 # --- API Imports for Multi-User Setup ---
 from api.database import get_db

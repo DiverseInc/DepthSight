@@ -74,13 +74,27 @@ class TestGeneralConfigEndpoints:
         assert config_data["userId"] == pro_user.id
 
     async def test_update_config_succeeds(self, authenticated_client: AsyncClient):
-        """Test for successful partial configuration update."""
+        """Test for successful partial configuration update.
+
+        CORRECTION (2026-10-31, round 22d): this test used to send
+        ``maxDrawdown = 15.5`` and expect it to be accepted. A new account is
+        handed ``maxDrawdown = 10.0`` (MEASURED, ``api/crud.py``
+        ``create_user``), so 15.5 was a LOOSENING of the account's own limit
+        -- and the Risk Settings route now refuses it, which is correct: a
+        client may tighten a risk limit and never loosen one.
+
+        The test's INTENT is "a successful partial configuration update", and
+        that intent is preserved by sending a value that really IS a
+        tightening. The refusal direction is asserted on its own, in
+        ``tests/test_gate4_client_contract_at_the_api_boundary.py``, so
+        nothing is lost by moving the number.
+        """
         update_payload = {
             "risk_management": {
                 "daily_max_loss_percent": 5.0,
                 "risk_per_trade_percent": 1.0,
                 "min_rr_ratio": 2.0,
-                "maxDrawdown": 15.5,
+                "maxDrawdown": 8.0,
                 "maxConcurrentTrades": 8,
                 "stopLossEnabled": False,
                 "defaultStopLossPercent": 2.0,
@@ -92,7 +106,7 @@ class TestGeneralConfigEndpoints:
         response = await authenticated_client.put("/api/v1/config", json=update_payload)
         assert response.status_code == 200, f"API returned error: {response.text}"
         data = response.json()["data"]
-        assert data["riskManagement"]["maxDrawdown"] == 15.5
+        assert data["riskManagement"]["maxDrawdown"] == 8.0
         assert data["riskManagement"]["maxConcurrentTrades"] == 8
 
     async def test_add_and_delete_symbol_succeeds(

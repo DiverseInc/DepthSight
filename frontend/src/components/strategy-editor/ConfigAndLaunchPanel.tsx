@@ -18,11 +18,33 @@ import { memo, useEffect, useMemo, useState } from "react";
 import type { DateRange } from "react-day-picker";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "react-router-dom";
+import {
+	StrategyEngineSection,
+	StrategyRiskSettingsSection,
+} from "@/components/strategies/StrategyEditorSettingsCards";
+import {
+	SERVER_RISK_FLOOR,
+	applyStrategyRegistry,
+	clampRiskDraftToFloors,
+	defaultStrategyRiskSettings,
+	hasServerRiskFloors,
+	isStrategyRegistryLoaded,
+	parseRiskDraft,
+	toRiskDraft,
+	toRiskSettingsFromAccount,
+	validateStrategyClass,
+	validateStrategyRiskSettings,
+} from "@/components/strategies/strategyEditorSettings";
+import type {
+	StrategyClassErrorCode,
+	StrategyRiskDraft,
+	StrategyRiskErrors,
+} from "@/components/strategies/strategyEditorSettings";
 import { Button } from "@/components/ui/button";
 import { Calendar } from "@/components/ui/calendar";
 
 // UI Components
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -57,6 +79,8 @@ import {
 	useSaveStrategyConfig,
 	useSendTradingViewTestSignal,
 	useStartStrategy,
+	useStrategyConfigsList,
+	useStrategyRegistry,
 	useTradingViewWebhookInfo,
 	useTradingViewWebhookStatus,
 	useUpdateStrategyConfig,
@@ -131,6 +155,18 @@ export const ConfigAndLaunchPanel = memo(
 		const { mutate: updateStrategy, isPending: isUpdating } =
 			useUpdateStrategyConfig();
 		const { data: config } = useConfig();
+		const { data: savedStrategyConfigs } = useStrategyConfigsList();
+		const { data: strategyRegistry } = useStrategyRegistry();
+
+		// The server's registry IS the list of strategy classes and the list of
+		// risk floors. It is applied before the picker renders, so the options
+		// on screen are the server's own and not a hand-written copy of them.
+		// (The module-level array is filled IN PLACE, so every component that
+		// reads it sees the server's answer.)
+		useMemo(() => {
+			applyStrategyRegistry(strategyRegistry);
+			return strategyRegistry;
+		}, [strategyRegistry]);
 		const [selectedApiKeyId, setSelectedApiKeyId] = useState<number | null>(
 			null,
 		);
@@ -255,6 +291,78 @@ export const ConfigAndLaunchPanel = memo(
 			return { ...base, enabled: true };
 		};
 
+		// --- Settings the client types and the server has to store ---
+		// The risk limits and the picked strategy class live in `config_data`,
+		// but the editor store drops config_data keys it does not know about, so
+		// the saved values are read back from the server copy of the strategy.
+		const savedStrategyConfig = useMemo(
+			() =>
+				savedStrategyConfigs?.find(
+					(savedConfig) => savedConfig.id === strategyIdFromParams,
+				),
+			[savedStrategyConfigs, strategyIdFromParams],
+		);
+
+		const [riskDraft, setRiskDraft] = useState<StrategyRiskDraft>(() =>
+			toRiskDraft(defaultStrategyRiskSettings()),
+		);
+		const riskSettings = useMemo(
+			() => parseRiskDraft(riskDraft),
+			[riskDraft],
+		);
+		const [riskErrors, setRiskErrors] = useState<StrategyRiskErrors>({});
+		const [strategyClass, setStrategyClass] = useState<string>(
+			() => getStrategyPayload().strategy_name,
+		);
+		const [strategyClassError, setStrategyClassError] = useState<
+			StrategyClassErrorCode | undefined
+		>(undefined);
+
+		// Render-phase sync of the client-typed settings with the saved strategy.
+		//
+		// The risk limits are seeded from the ACCOUNT's live `risk_management`
+		// -- the same block the bot reads its limits from
+		// (`bot_module/risk_manager.py:179`) -- so the editor shows the limits
+		// that are actually in force instead of a hardcoded guess. A limit
+		// saved with THIS strategy still wins over the account's default.
+		const accountRiskSettings = useMemo(
+			() => toRiskSettingsFromAccount(config?.riskManagement),
+			[config],
+		);
+		const savedSettingsSeed = JSON.stringify({
+			risk: savedStrategyConfig?.config_data?.risk_settings ?? null,
+			accountRisk: accountRiskSettings,
+			class: savedStrategyConfig?.config_data?.strategy_name ?? null,
+		});
+		const [lastSavedSettingsSeed, setLastSavedSettingsSeed] = useState<
+			string | null
+		>(null);
+		if (savedSettingsSeed !== lastSavedSettingsSeed) {
+			setLastSavedSettingsSeed(savedSettingsSeed);
+			const savedRisk = savedStrategyConfig?.config_data?.risk_settings;
+			setRiskDraft(
+				toRiskDraft(
+					savedRisk ??
+						accountRiskSettings ??
+						defaultStrategyRiskSettings(),
+				),
+			);
+			setRiskErrors({});
+			setStrategyClass(
+				savedStrategyConfig?.config_data?.strategy_name ??
+					getStrategyPayload().strategy_name,
+			);
+			setStrategyClassError(undefined);
+		}
+
+		// The server's floors arrived (or moved): a limit that is looser than
+		// the floor is pulled DOWN to it, because the server refuses a looser
+		// limit and the form must not keep showing one.
+		const serverFloorKey = JSON.stringify(SERVER_RISK_FLOOR);
+		useEffect(() => {
+			setRiskDraft((draft) => clampRiskDraftToFloors(draft));
+		}, [serverFloorKey]);
+
 		const handleCopy = async (label: string, text: string) => {
 			try {
 				await navigator.clipboard.writeText(text);
@@ -353,6 +461,73 @@ export const ConfigAndLaunchPanel = memo(
 				return;
 			}
 
+			// Nothing can be checked until the server's contract has arrived:
+			// the risk floors and the list of runnable strategies live on the
+			// server (`GET /api/v1/strategies/registry`) and the client carries
+			// no copy of them. Sending before then would send a guess, and the
+			// server refuses the whole save when one of the numbers is wrong.
+			if (!isStrategyRegistryLoaded() || !hasServerRiskFloors()) {
+				toast({
+					variant: "destructive",
+					title: t("common:errorTitle"),
+					description: t(
+						"configPanel.strategyContractNotLoaded",
+						"The server's strategy and risk limits have not loaded yet, so nothing can be checked. Try again in a moment.",
+					),
+				});
+				return;
+			}
+
+			// The risk limits the client typed have to be valid BEFORE anything is
+			// sent: the server enforces the same floors and rejects a looser
+			// limit, so the client must not offer one either.
+			const nextRiskErrors = validateStrategyRiskSettings(riskSettings);
+			setRiskErrors(nextRiskErrors);
+			if (Object.keys(nextRiskErrors).length > 0) {
+				toast({
+					variant: "destructive",
+					title: t(
+						"configPanel.riskSettingsInvalidTitle",
+						"Risk settings are invalid",
+					),
+					description: t(
+						"configPanel.riskSettingsInvalidDescription",
+						"Fix the highlighted risk limits before deploying.",
+					),
+				});
+				return;
+			}
+
+			// The strategy class has to be picked, and it has to be one the
+			// SERVER can run: the list the picker offers is the server's own
+			// registry, and the server refuses the save with 422 for a class it
+			// cannot instantiate. So an unknown class blocks the deploy here
+			// instead of only warning about it.
+			const nextClassError = validateStrategyClass(strategyClass);
+			setStrategyClassError(nextClassError.className);
+			if (nextClassError.className === "empty") {
+				toast({
+					variant: "destructive",
+					title: t("common:errorTitle"),
+					description: t(
+						"configPanel.strategyEngineRequiredTitle",
+						"Pick a strategy class before deploying.",
+					),
+				});
+				return;
+			}
+			if (nextClassError.className === "notRegistered") {
+				toast({
+					variant: "destructive",
+					title: t("common:errorTitle"),
+					description: t(
+						"configPanel.strategyEngineUnregisteredWarning",
+						"This strategy class is not registered by the trading bot, so it may not start.",
+					),
+				});
+				return;
+			}
+
 			try {
 				await updateSymbolSelectionSettingsApi({
 					mode: symbol_selection_mode,
@@ -377,6 +552,11 @@ export const ConfigAndLaunchPanel = memo(
 
 			if (symbol_selection_mode !== "STATIC")
 				configData.max_concurrent_symbols = max_concurrent_symbols;
+
+			// The client's pick and the client's risk limits travel to the server
+			// inside `config_data`, so the saved strategy reflects what was typed.
+			configData.strategy_name = strategyClass;
+			configData.risk_settings = { ...riskSettings };
 
 			const getPaymode = (): "STATIC" | "DYNAMIC" =>
 				isTradingViewWebhookMode || symbol_selection_mode === "STATIC"
@@ -838,6 +1018,126 @@ export const ConfigAndLaunchPanel = memo(
 											{t("configPanel.foundationWeightsButton")}
 										</Button>
 									</div>
+								)}
+							</CardContent>
+						</Card>
+
+						<StrategyEngineSection
+							value={strategyClass}
+							onChange={(nextClass) => {
+								setStrategyClass(nextClass);
+								setStrategyClassError(validateStrategyClass(nextClass).className);
+							}}
+							error={strategyClassError}
+							disabled={isAnythingLoading}
+						/>
+
+						<StrategyRiskSettingsSection
+							value={riskDraft}
+							errors={riskErrors}
+							onChange={(field, raw) => {
+								const nextDraft = { ...riskDraft, [field]: raw };
+								setRiskDraft(nextDraft);
+								setRiskErrors(
+									validateStrategyRiskSettings(
+										parseRiskDraft(nextDraft),
+									),
+								);
+							}}
+							disabled={isAnythingLoading}
+						/>
+
+						{/*
+						 * The two limits the server's floor also covers: the
+						 * largest stop distance and the number of consecutive
+						 * losses. They are optional -- an empty field means
+						 * "leave the account's own value alone" -- and they are
+						 * seeded from the account, so an untouched form never
+						 * sends anything looser than the account already has.
+						 */}
+						<Card>
+							<CardHeader>
+								<CardTitle>
+									{t("configPanel.riskLimitsExtraTitle", "Risk Limits (advanced)")}
+								</CardTitle>
+								<CardDescription>
+									{t(
+										"configPanel.riskLimitsExtraDescription",
+										"Leave a field empty to keep the account's current value.",
+									)}
+								</CardDescription>
+							</CardHeader>
+							<CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+								{(["max_stop_distance_pct", "max_consecutive_losses"] as const).map(
+									(field) => {
+										const inputId = `risk-${field}`;
+										const fieldError = riskErrors?.[field];
+										return (
+											<div key={field} className="space-y-1">
+												<Label htmlFor={inputId}>
+													{field === "max_stop_distance_pct"
+														? t(
+												"configPanel.maxStopDistanceLabel",
+												"Max Stop Distance (%)",
+											)
+														: t(
+												"configPanel.maxConsecutiveLossesLabel",
+												"Max Consecutive Losses",
+											)}
+												</Label>
+												<Input
+													id={inputId}
+													type="number"
+													inputMode="decimal"
+													step={field === "max_stop_distance_pct" ? "0.5" : "1"}
+													min="0"
+													value={riskDraft[field]}
+													disabled={isAnythingLoading}
+													aria-invalid={Boolean(fieldError)}
+													aria-describedby={`${inputId}-desc`}
+													onChange={(event) => {
+														const nextDraft = {
+															...riskDraft,
+															[field]: event.target.value,
+														};
+														setRiskDraft(nextDraft);
+														setRiskErrors(
+															validateStrategyRiskSettings(
+																parseRiskDraft(nextDraft),
+															),
+														);
+													}}
+												/>
+												<p id={`${inputId}-desc`} className="text-xs text-muted-foreground">
+													{t("configPanel.riskServerFloor", {
+														defaultValue:
+															typeof SERVER_RISK_FLOOR[field] === "number"
+																? `Server floor: ${SERVER_RISK_FLOOR[field]}.`
+																: "The server's limit for this field has not loaded yet.",
+														floor: SERVER_RISK_FLOOR[field],
+													})}
+												</p>
+												{fieldError ? (
+													<p role="alert" className="text-xs text-destructive">
+														{fieldError === "aboveFloor"
+															? t(
+																	"configPanel.riskErrorAboveFloor",
+																	`The server rejects a value above ${SERVER_RISK_FLOOR[field]}.`,
+																)
+															: fieldError === "notPositive"
+																? t(
+																	"configPanel.riskErrorNotPositive",
+																	"Must be greater than zero.",
+																)
+																: t(
+																	"configPanel.riskErrorNotANumber",
+																	"Enter a number.",
+																)}
+													</p>
+												) : null}
+											</div>
+										);
+									},
 								)}
 							</CardContent>
 						</Card>
