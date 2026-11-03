@@ -427,7 +427,61 @@ async def test_max_notional_cap_does_not_scale_with_risk_multiplier(
 
 
 @pytest.mark.asyncio
-async def test_assess_signal_uses_fixed_usd_budget_without_stop(risk_manager):
+async def test_assess_signal_uses_the_fixed_usd_budget_without_stop(risk_manager):
+    """A fixed-USD budget under the account's limit is used as asked.
+
+    This is the no-stop branch: there is no stop distance to size against, so
+    the planned first-entry budget IS the risk, and the position is sized from
+    it.
+    """
+    signal = StrategySignal(
+        strategy_name="TestStrat",
+        symbol="BTCUSDT",
+        direction=SignalDirection.LONG,
+        trigger_price=50000.0,
+        stop_loss=None,
+        take_profit=51000.0,
+        mode=OrderMode.MARKET,
+        risk_usd=50.0,
+    )
+    lot_params = {"minQty": 0.0001, "maxQty": 9000.0, "stepSize": 0.00001}
+    approved, quantity, initial_risk_planned, _ = await risk_manager.assess_signal(
+        signal, lot_params, 10.0
+    )
+
+    step_dec = Decimal(str(lot_params["stepSize"]))
+    expected_qty = float(
+        (Decimal(str(50.0 / 50000.0)) / step_dec).quantize(
+            Decimal("0"), rounding=ROUND_DOWN
+        )
+        * step_dec
+    )
+
+    assert approved is True
+    assert initial_risk_planned == pytest.approx(50.0)
+    assert quantity == pytest.approx(expected_qty, rel=1e-9)
+
+
+@pytest.mark.asyncio
+async def test_assess_signal_clamps_the_fixed_usd_budget_to_the_account_limit(
+    risk_manager,
+):
+    """A fixed-USD budget ABOVE the account's limit is clamped to it.
+
+    CORRECTION (2026-10-31, round 21): this assertion used to live in a test
+    called ``test_assess_signal_uses_fixed_usd_budget_without_stop``, which
+    asserted that a $300 request was honoured IN FULL on a $10,000 account
+    whose per-trade limit is 1% ($100). That was the D1 hole: ``signal.risk_usd``
+    is reachable from the CLIENT's own configuration -- the visual builder's
+    "risk_value"/"risk_type" action parameter
+    (bot_module/strategy.py:5004-5016) -- so without a ceiling on that channel
+    a client could ask for 99% of the balance in a single trade.
+
+    The budget is now clamped to the account's limit (capped by the server
+    floor), so the risk that can actually reach the market is the account's
+    own limit and not the strategy's request. The limit is 1% of $10,000, so
+    the $300 request becomes $100.
+    """
     signal = StrategySignal(
         strategy_name="TestStrat",
         symbol="BTCUSDT",
@@ -445,14 +499,16 @@ async def test_assess_signal_uses_fixed_usd_budget_without_stop(risk_manager):
 
     step_dec = Decimal(str(lot_params["stepSize"]))
     expected_qty = float(
-        (Decimal(str(300.0 / 50000.0)) / step_dec).quantize(
+        (Decimal(str(100.0 / 50000.0)) / step_dec).quantize(
             Decimal("0"), rounding=ROUND_DOWN
         )
         * step_dec
     )
 
     assert approved is True
-    assert initial_risk_planned == pytest.approx(300.0)
+    # The account's own limit wins over the strategy's request.
+    assert risk_manager.risk_per_trade == 0.01
+    assert initial_risk_planned == pytest.approx(100.0)
     assert quantity == pytest.approx(expected_qty, rel=1e-9)
 
 
