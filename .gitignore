@@ -35,6 +35,33 @@ performance_result/
 
 # Security and local configs
 gcp_key.json
+
+# A COPY of the live environment file.
+#
+# The live file itself is matched by the `*.env` rule above, but that rule
+# only matches a name ENDING in `.env`. Every other name that holds the same
+# plaintext secrets was therefore committable, and three of them were found
+# sitting in a working tree in 2026-11-03: `.env.save`, a stale credential
+# rotation copy, and a scratch file. `.env.*` closes the whole class rather
+# than the three names that happened to be observed.
+#
+# The tracked templates are negated so they stay addable: `.env.example` and
+# the public build values in `frontend/.env.production` and
+# `pwa/.env.production` are deliberately tracked and must not be ignored.
+# A tracked file is unaffected by an ignore rule either way, but a NEW file
+# with one of those names would be silently un-addable, so they are negated
+# explicitly.
+.env.*
+!.env.example
+!.env.production
+
+# The third untracked file found in the 2026-11-03 production checkout was a
+# scratch file of unknown content, at the root of the tree. Unlike the two
+# `.env` copies it matches no environment-file class, so it is named
+# explicitly. It is left unanchored so the rule also covers the file if it is
+# ever copied into a subdirectory; nothing tracked in this repository is named
+# `check.txt`, so the rule cannot un-track anything.
+check.txt
 .vscode/
 docker-compose.legacy.yml
 .agent/
