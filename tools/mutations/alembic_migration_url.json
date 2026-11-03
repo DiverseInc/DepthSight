@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Mutations that put the Alembic migration URL and the published",
+    "credential back the way they were.",
+    "",
+    "A1: alembic/env.py hands Alembic the BARE 'postgresql://' scheme again",
+    "    (the original defect). On SQLAlchemy 2.x a bare scheme resolves to",
+    "    psycopg3, which is not installed, so 'alembic upgrade head' died",
+    "    with ModuleNotFoundError: No module named 'psycopg' -- and",
+    "    docker-startup.sh swallowed it, so the API served traffic while the",
+    "    schema never advanced.",
+    "A2: api/database.py stops naming the sync driver (helper neutered).",
+    "A3: api/database.py strips the driver instead of naming it (the",
+    "    original bug, moved into the helper).",
+    "B1: alembic.ini carries a database password again. This repository is",
+    "    PUBLIC and the value is in the git history since 2026-06-08, so it",
+    "    must not come back.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/alembic_migration_url.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_alembic_migration_url.py",
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "A1: alembic/env.py hands Alembic the BARE 'postgresql://' scheme again (the original defect)",
+      "file": "alembic/env.py",
+      "needle": "config.set_main_option(\"sqlalchemy.url\", alembic_database_url())",
+      "replace": "config.set_main_option(\"sqlalchemy.url\", alembic_database_url().replace(\"+psycopg2\", \"\"))  # MUTANT: the bare scheme"
+    },
+    {
+      "label": "A2: the helper stops naming the sync driver",
+      "file": "api/database.py",
+      "needle": "    return database_url.replace(\"+asyncpg\", \"+psycopg2\")\n",
+      "replace": "    return database_url  # MUTANT: the driver is never named\n"
+    },
+    {
+      "label": "A3: the helper strips the driver instead of naming it (the original bug, moved into the helper)",
+      "file": "api/database.py",
+      "needle": "    return database_url.replace(\"+asyncpg\", \"+psycopg2\")\n",
+      "replace": "    return database_url.replace(\"+asyncpg\", \"\")  # MUTANT: the bare scheme\n"
+    },
+    {
+      "label": "B1: alembic.ini carries a database password again",
+      "file": "alembic.ini",
+      "needle": "sqlalchemy.url =\n",
+      "replace": "sqlalchemy.url = postgresql+psycopg2://someuser:somesyntheticpassword@localhost:5432/depthsight_db\n"
+    }
+  ]
+}
