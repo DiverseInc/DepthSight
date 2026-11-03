@@ -275,9 +275,28 @@ def derive_entitlements(
                 entries.append({"code": code, "label": label, "included": False})
 
     # Live trading + how many strategies it allows.
+    #
+    # A tier can be allowed to trade live in two different ways, and the
+    # catalog has to tell them apart:
+    #
+    #   * `allow_real_trading` -- live trading on every venue the platform
+    #     routes to;
+    #   * `allow_free_bybit_trading` -- live trading, but on Bybit ONLY. The
+    #     enforcement is real: api/routes/strategies.py:541-549 answers any
+    #     other venue with a 403, and api/depthsight_api.py:638-641 caps the
+    #     tier at `max_free_bybit_live_strategies` live strategies.
+    #
+    # Before this branch existed, a Bybit-only tier was published as "Live
+    # trading: not included", which is false -- and the public pricing page
+    # renders the not-included entries under the heading "Not included"
+    # (frontend/src/components/marketing/Pricing.tsx:104-119).
     if limits.get("allow_real_trading"):
         entries.append(
             {"code": "live_trading", "label": "Live trading on OKX, Binance, Bybit", "included": True}
+        )
+    elif limits.get("allow_free_bybit_trading"):
+        entries.append(
+            {"code": "live_trading", "label": "Live trading on Bybit", "included": True}
         )
     else:
         entries.append({"code": "live_trading", "label": "Live trading", "included": False})
@@ -291,6 +310,23 @@ def derive_entitlements(
                 "included": True,
             }
         )
+    elif limits.get("allow_free_bybit_trading"):
+        # The Bybit-only tier's own cap. The default is 1 because that is the
+        # cap the enforcement uses when the limit is absent
+        # (api/depthsight_api.py:641); the number is never written here.
+        bybit_max_live = int(limits.get("max_free_bybit_live_strategies", 1) or 0)
+        if bybit_max_live > 0:
+            entries.append(
+                {
+                    "code": "live_strategies",
+                    "label": f"{bybit_max_live} live trading strategies on Bybit",
+                    "included": True,
+                }
+            )
+        else:
+            entries.append(
+                {"code": "live_strategies", "label": "Live trading strategies", "included": False}
+            )
     else:
         entries.append(
             {"code": "live_strategies", "label": "Live trading strategies", "included": False}
