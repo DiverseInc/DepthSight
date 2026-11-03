@@ -161,9 +161,31 @@ describe("pricing page (FIX 1)", () => {
 		expect(pro.included).toContain("PRO blocks (Tape, Book, Open Interest)");
 	});
 
-	it("shows the lifetime prices that were hidden before", () => {
-		expect(standard.lifetimePrice).toBe("$99");
-		expect(pro.lifetimePrice).toBe("$299");
+	it("does NOT advertise a one-off price while the deployment bills monthly", () => {
+		// The catalog carries the lifetime block (enabled, $99 / $299) even
+		// while billing_mode is "monthly", but api/routes/payments.py only
+		// offers a lifetime purchase when the ACTIVE mode is "lifetime"
+		// and charges get_effective_plan_price() -- the monthly price.
+		// Advertising $99 would be a price the backend does not sell.
+		expect(standard.lifetimePrice).toBeNull();
+		expect(pro.lifetimePrice).toBeNull();
+	});
+
+	it("advertises the one-off price when the deployment actually sells one", () => {
+		const lifetimeCards = buildPricingCards({
+			plans: [freePlan, standardPlan, proPlan].map((p) => ({
+				...p,
+				billing_mode: "lifetime" as const,
+			})),
+			trial: { enabled: true, days: 0, plan: "standard", active: false },
+			billing_mode: "lifetime",
+		});
+		expect(
+			lifetimeCards.find((c) => c.key === "standard")!.lifetimePrice,
+		).toBe("$99");
+		expect(lifetimeCards.find((c) => c.key === "pro")!.lifetimePrice).toBe(
+			"$299",
+		);
 	});
 
 	it("advertises a trial only when the backend really grants one", () => {
