@@ -3,7 +3,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation } from "@tanstack/react-query";
 import { Eye, EyeOff, Loader2, Sparkles } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
@@ -33,7 +33,12 @@ import {
 	DEMO_CREDENTIALS,
 	isDemoCredentialsEnabled,
 } from "@/lib/demoAccess";
-import { GoogleLogin } from "@react-oauth/google";
+import {
+	clearPendingGoogleRequest,
+	createGoogleAuthorizeRequest,
+	getGoogleClientId,
+	rememberPendingGoogleRequest,
+} from "@/lib/googleOAuth";
 
 // Validation schema for the login form
 const loginSchema = (t: (key: string) => string) =>
@@ -53,10 +58,6 @@ type LoginFormValues = z.infer<ReturnType<typeof loginSchema>>;
 // does not contain the username or the password at all -- previously they sat
 // in module-level constants here and were readable in the shipped JavaScript
 // even though the panel itself was gated off.
-
-// Google OAuth client id from Vite env. If not configured, we hide the
-// Google button entirely instead of rendering a broken OAuth flow.
-const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 
 // Hook for the login API request
 const useLoginMutation = () => {
@@ -93,40 +94,6 @@ const useLoginMutation = () => {
 };
 
 
-const useGoogleLoginMutation = () => {
-	const { login } = useAuth();
-	const { toast } = useToast();
-	const { t } = useTranslation("login");
-
-	return useMutation({
-		mutationFn: async (googleToken: string) => {
-			const response = await fetch("/api/v1/auth/google", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ token: googleToken }),
-			});
-
-			if (!response.ok) {
-				const errorData = await response.json();
-				throw new Error(errorData.detail || t("toastFailureTitle"));
-			}
-			return response.json();
-		},
-		onSuccess: async (data) => {
-			await login(data);
-			toast({ title: t("cardTitle"), description: t("toastSuccess") });
-		},
-		onError: (error: Error) => {
-			toast({
-				variant: "destructive",
-				title: t("toastFailureTitle"),
-				description: "Google Login Failed",
-			});
-		},
-	});
-};
-
-
 export default function LoginPage() {
 	const { t } = useTranslation(["login", "common"]);
 	const { toast } = useToast();
@@ -144,7 +111,30 @@ export default function LoginPage() {
 		defaultValues: { username: "", password: "" },
 	});
 	const loginMutation = useLoginMutation();
-	const googleLoginMutation = useGoogleLoginMutation();
+
+	// Google OAuth client id from Vite env. If not configured, we hide the
+	// Google button entirely instead of rendering a broken OAuth flow.
+	const googleClientId = getGoogleClientId();
+
+	// Google sign-in, REDIRECT flow. The request is built ONCE per page
+	// render so the `state` in the link and the `state` we remember on click
+	// are the same value. See src/lib/googleOAuth.ts for why the redirect URI
+	// is the bare origin and not /login.
+	const googleSignIn = useMemo(
+		() => createGoogleAuthorizeRequest(googleClientId),
+		[googleClientId],
+	);
+
+	// A sign-in that was started and then abandoned (the user pressed Back)
+	// must not leave a stale request behind: the handler would then report a
+	// failure for a sign-in the user never completed.
+	useEffect(() => {
+		clearPendingGoogleRequest();
+	}, []);
+
+	const startGoogleSignIn = () => {
+		rememberPendingGoogleRequest(googleSignIn.state);
+	};
 
 	const onSubmit = (data: LoginFormValues) => {
 		const formData = new URLSearchParams();
@@ -273,7 +263,7 @@ export default function LoginPage() {
 							</form>
 						</Form>
 
-						{GOOGLE_CLIENT_ID && (
+						{googleClientId && (
 							<>
 								<div className="relative my-5">
 									<div className="absolute inset-0 flex items-center">
@@ -287,22 +277,37 @@ export default function LoginPage() {
 								</div>
 
 								<div className="flex justify-center w-full my-2">
-									<GoogleLogin
-										onSuccess={(credentialResponse) => {
-											if (credentialResponse.credential) {
-												googleLoginMutation.mutate(
-													credentialResponse.credential,
-												);
-											}
-										}}
-										onError={() => {
-											toast({
-												variant: "destructive",
-												title: t("toastFailureTitle"),
-												description: "Google Login Failed",
-											});
-										}}
-									/>
+									<a
+										href={googleSignIn.url}
+										onClick={startGoogleSignIn}
+										data-testid="google-signin"
+										className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md border border-border/60 bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+									>
+										<svg
+											aria-hidden="true"
+											width="18"
+											height="18"
+											viewBox="0 0 48 48"
+										>
+											<path
+												fill="#EA4335"
+												d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+											/>
+											<path
+												fill="#4285F4"
+												d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+											/>
+											<path
+												fill="#FBBC05"
+												d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+											/>
+											<path
+												fill="#34A853"
+												d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+											/>
+										</svg>
+										{t("googleSignIn") || "Sign in with Google"}
+									</a>
 								</div>
 							</>
 						)}

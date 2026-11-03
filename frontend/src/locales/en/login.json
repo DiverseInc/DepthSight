@@ -27,5 +27,8 @@
 	"resetPassword": "Reset Password",
 	"passwordResetSuccess": "Your password has been reset. You can now log in.",
 	"passwordMismatch": "Passwords do not match",
-	"invalidResetLink": "This reset link is invalid or has expired."
+	"invalidResetLink": "This reset link is invalid or has expired.",
+	"googleSignIn": "Sign in with Google",
+	"googleSignInFailed": "Google sign-in failed. Please try again.",
+	"googleSignInUnverified": "Google sign-in could not be verified. Please try again."
 }

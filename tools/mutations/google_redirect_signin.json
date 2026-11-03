@@ -1,0 +1,105 @@
+{
+  "_comment": [
+    "Mutations that break the Google REDIRECT sign-in flow, one at a time.",
+    "Every mutation must be caught by frontend/src/__tests__/googleRedirectSignIn.test.tsx.",
+    "",
+    "This spec has no pytest target: the flow is front-end only and its tests",
+    "are run by vitest. The harness accepts a 'command' for exactly that case",
+    "and keeps every other guarantee it already had -- snapshot before, SHA-256",
+    "revert verification after, and a SKIP counts as a failure.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/google_redirect_signin.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "command": [
+    "npm",
+    "--prefix",
+    "frontend",
+    "run",
+    "test",
+    "--",
+    "src/__tests__/googleRedirectSignIn.test.tsx"
+  ],
+  "timeout_s": 600,
+  "mutations": [
+    {
+      "label": "A: the redirect URI gains a trailing slash (Google rejects it with redirect_uri_mismatch)",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "export const GOOGLE_REDIRECT_URI = \"https://depthsight.diverseinc.net\";\n",
+      "replace": "export const GOOGLE_REDIRECT_URI = \"https://depthsight.diverseinc.net/\";  // MUTANT\n"
+    },
+    {
+      "label": "B: the flow asks for an auth code, so no credential ever arrives in the fragment",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "\t\tresponse_type: \"id_token\",\n",
+      "replace": "\t\tresponse_type: \"code\",  // MUTANT\n"
+    },
+    {
+      "label": "C: the email scope is dropped",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "export const GOOGLE_SCOPE = \"openid email profile\";\n",
+      "replace": "export const GOOGLE_SCOPE = \"openid profile\";  // MUTANT\n"
+    },
+    {
+      "label": "D: the browser is sent somewhere other than Google's authorization endpoint",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "export const GOOGLE_AUTHORIZE_ENDPOINT =\n\t\"https://accounts.google.com/o/oauth2/v2/auth\";\n",
+      "replace": "export const GOOGLE_AUTHORIZE_ENDPOINT =\n\t\"https://example.invalid/o/oauth2/v2/auth\";  // MUTANT\n"
+    },
+    {
+      "label": "E: the credential is left in the address bar and in the browser history",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "\tconst search = stripOAuthParams(location.search);\n\tif (!location.hash && search === location.search) return;\n\thistory.replaceState(history.state, \"\", `${location.pathname}${search}`);\n",
+      "replace": "\tconst search = stripOAuthParams(location.search);\n\tif (!location.hash && search === location.search) return;\n\t// MUTANT: the credential is never removed from the URL\n"
+    },
+    {
+      "label": "F: the handler stops checking that the credential belongs to this sign-in request",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\tif (!pending || pending.state !== payload.state) {\n",
+      "replace": "\t\tif (!pending) {  // MUTANT: the state is not checked\n"
+    },
+    {
+      "label": "G: the credential is posted to the wrong endpoint",
+      "file": "frontend/src/hooks/useGoogleLoginMutation.ts",
+      "needle": "\t\t\tconst response = await fetch(\"/api/v1/auth/google\", {\n",
+      "replace": "\t\t\tconst response = await fetch(\"/api/v1/auth/token\", {  // MUTANT\n"
+    },
+    {
+      "label": "H: the credential is sent under the wrong body key",
+      "file": "frontend/src/hooks/useGoogleLoginMutation.ts",
+      "needle": "\t\t\t\tbody: JSON.stringify({ token: googleToken }),\n",
+      "replace": "\t\t\t\tbody: JSON.stringify({ credential: googleToken }),  // MUTANT\n"
+    },
+    {
+      "label": "I: the handler never forwards the credential, so nobody is signed in",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\tmutate(payload.credential);\n",
+      "replace": "\t\t// MUTANT: the credential is never forwarded\n"
+    },
+    {
+      "label": "J: the failure path is silent, so a broken sign-in looks like a normal page load",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\tconst fail = (description: string) => {\n\t\t\tclearPendingGoogleRequest();\n\t\t\ttoast({\n\t\t\t\tvariant: \"destructive\",\n\t\t\t\ttitle: t(\"toastFailureTitle\"),\n\t\t\t\tdescription,\n\t\t\t});\n\t\t\tnavigate(\"/login\");\n\t\t};\n",
+      "replace": "\t\tconst fail = (description: string) => {\n\t\t\tclearPendingGoogleRequest();\n\t\t\t// MUTANT: the failure is never shown to the user\n\t\t\tnavigate(\"/login\");\n\t\t};\n"
+    },
+    {
+      "label": "K: a redirect that comes back without a credential is not reported",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\tif (payload.kind === \"empty\") {\n\t\t\tif (pending) {\n\t\t\t\tclearGoogleRedirectParams(window.history, window.location);\n\t\t\t\tfail(t(\"googleSignInFailed\"));\n\t\t\t}\n\t\t\treturn;\n\t\t}\n",
+      "replace": "\t\tif (payload.kind === \"empty\") {\n\t\t\t// MUTANT: the missing credential is not reported\n\t\t\treturn;\n\t\t}\n"
+    },
+    {
+      "label": "L: the handler is not mounted, so the sign-in cannot complete on the site root",
+      "file": "frontend/src/App.tsx",
+      "needle": "\t\t\t\t\t\t\t<GoogleRedirectHandler />\n",
+      "replace": "\t\t\t\t\t\t\t{/* MUTANT: the handler is not mounted */}\n"
+    },
+    {
+      "label": "M: the button does not remember the sign-in request, so the credential cannot be verified",
+      "file": "frontend/src/pages/Login.tsx",
+      "needle": "\t\trememberPendingGoogleRequest(googleSignIn.state);\n",
+      "replace": "\t\t// MUTANT: the sign-in request is not remembered\n"
+    }
+  ]
+}
