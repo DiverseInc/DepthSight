@@ -268,9 +268,10 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 						</select>
 
 						{/* THE ORACLE IS NOT AVAILABLE: say so, plainly.
-						    The old code hid the Oracle option and said nothing,
-						    which reads as "the screen is broken" rather than
-						    "this server has no oracle model". */}
+						    The Oracle option above is not offered, because
+						    there is no model to filter on. Hiding it alone
+						    reads as "the screen is broken" rather than "this
+						    server has no oracle model", so it is stated. */}
 						{!canUseOracle && (
 							<p className="text-xs text-[hsl(var(--muted-foreground))]">
 								{t(

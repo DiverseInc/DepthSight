@@ -334,11 +334,16 @@ const EditorScreen: React.FC<EditorScreenProps> = ({
 						>
 							<option value="STATIC">Static List</option>
 							<option value="DYNAMIC_NATR">Dynamic Filter by NATR</option>
-							{canUseOracle && (
-								<option value="DYNAMIC_ORACLE">
-									Dynamic Filter by Oracle
-								</option>
-							)}
+							{/* The option is ALWAYS rendered, so that a strategy
+							    already saved as DYNAMIC_ORACLE still shows its own
+							    mode instead of a select whose value matches no
+							    option. It cannot be CHOSEN while there is no
+							    oracle model. */}
+							<option value="DYNAMIC_ORACLE" disabled={!canUseOracle}>
+								{canUseOracle
+									? "Dynamic Filter by Oracle"
+									: "Dynamic Filter by Oracle (unavailable)"}
+							</option>
 						</select>
 						{!canUseOracle && (
 							<p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
@@ -370,7 +375,11 @@ const EditorScreen: React.FC<EditorScreenProps> = ({
 						</div>
 					)}
 
-					{symbol_selection_mode === "DYNAMIC_ORACLE" && (
+					{/* With no oracle model there is no regime and no confidence
+					    to show: they are measurements, and nothing has made
+					    any. The strategy's own saved values stay in the store
+					    and are still saved unchanged. */}
+					{symbol_selection_mode === "DYNAMIC_ORACLE" && canUseOracle && (
 						<>
 							<div>
 								<label className="text-sm text-[hsl(var(--muted-foreground))] mb-2 block">
