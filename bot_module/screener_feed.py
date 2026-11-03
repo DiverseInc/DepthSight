@@ -73,6 +73,7 @@ __all__ = [
     "is_upstream_depthsight_url",
     "describe_ws_url_problem",
     "screener_feed_misconfigured",
+    "ws_origin_header",
 ]
 
 
@@ -118,6 +119,64 @@ def ws_url_host(url: Any) -> str:
         return ""
     host = parsed.hostname or ""
     return host.strip().lower().rstrip(".")
+
+
+def ws_origin_header(url: Any) -> str:
+    """The ``Origin`` header to send when connecting to this WebSocket URL.
+
+    The Origin has to name the host the client is ACTUALLY talking to.  A
+    browser sends the origin of the page it is on, so a server (or a CDN in
+    front of it) that compares Origin against its own host sees a request
+    that claims to come from somewhere else.
+
+    The fork used to send a HARDCODED ``https://screener.depthsight.pro`` --
+    the UPSTREAM's reserved hostname -- no matter where the bot connected.
+    So it pointed at a deployment this fork does not control, and it
+    disagreed with the host in MAIN_APP_WS_URL.
+
+    The scheme is mapped the way a browser maps it (``ws://`` is ``http://``,
+    ``wss://`` is ``https://``) and the port is included only when it is not
+    the default for that scheme.
+
+    A URL that is not a WebSocket URL, that carries no usable host, or that
+    names the UPSTREAM's reserved hostname falls back to THIS fork's own
+    domain -- never to the upstream's.
+    """
+    fallback = f"https://{FORK_OWN_DOMAIN}"
+    text = url.strip() if isinstance(url, str) else ""
+    if not text:
+        return fallback
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return fallback
+    scheme = parsed.scheme.lower()
+    if scheme not in ("ws", "wss"):
+        return fallback
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return fallback
+    if is_upstream_depthsight_url(text):
+        # Never name the UPSTREAM's reserved hostname, not even when the
+        # operator has pointed MAIN_APP_WS_URL at it.  The feed guard
+        # refuses that configuration, so this is unreachable in practice --
+        # but an Origin naming the upstream is the one thing that would
+        # make the upstream answer this fork.  This fork's own domain is
+        # the fail-closed answer: the upstream's CDN then rejects us.
+        return fallback
+    # An IPv6 literal has to stay BRACKETED, or the result is not a URL at all
+    # ("https://::1:8765" does not parse).  A hostname never contains a colon,
+    # so the colon is the discriminator.
+    authority = f"[{host}]" if ":" in host else host
+    http_scheme = "https" if scheme == "wss" else "http"
+    default_port = 443 if http_scheme == "https" else 80
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None and port != default_port:
+        return f"{http_scheme}://{authority}:{port}"
+    return f"{http_scheme}://{authority}"
 
 
 def is_upstream_depthsight_url(url: Any) -> bool:

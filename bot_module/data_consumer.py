@@ -22,7 +22,7 @@ import math
 import uuid
 
 from bot_module import config
-from bot_module.screener_feed import describe_ws_url_problem
+from bot_module.screener_feed import describe_ws_url_problem, ws_origin_header
 from .data_loader import download_klines, download_open_interest  # Ensure imported
 from .utils import (
     calculate_scalper_natr,
@@ -3405,9 +3405,15 @@ class DataConsumer:
                     # BROWSER MASKING
                     # This will make Cloudflare think we are Chrome and let us through
                     # even without configuring IP whitelists.
+                    #
+                    # The Origin is DERIVED from MAIN_APP_WS_URL, so it names the
+                    # host this client is actually connecting to.  It used to be
+                    # hardcoded to the UPSTREAM's reserved hostname (the one
+                    # listed in bot_module/screener_feed.py), which is not this fork's
+                    # deployment and disagreed with the host being contacted.
                     extra_headers = {
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                        "Origin": "https://screener.depthsight.pro",
+                        "Origin": ws_origin_header(self._main_app_ws_url),
                         "Accept-Language": "en-US,en;q=0.9",
                     }
 

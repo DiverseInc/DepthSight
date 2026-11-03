@@ -39,6 +39,7 @@ Redis command listener.  Nothing here re-implements the behaviour under test.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import fnmatch
@@ -46,6 +47,7 @@ import importlib
 import json
 import logging
 import os
+from pathlib import Path
 
 import pytest
 from httpx import AsyncClient
@@ -59,6 +61,8 @@ from bot_module.regime_feed import screener_feed_can_deliver_regime_data
 
 
 CONFIG_ID = "0123456789abcdef0123456789abcdef"
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # This fork's own screener WebSocket.  The route in this repository is /ws,
 # with /ws/main as an alias (api/websocket_server.py).
@@ -1014,4 +1018,121 @@ async def test_the_bot_still_starts_a_dynamic_strategy_in_static_list_mode(
     assert created_strategies == ["VisualBuilderStrategy"], (
         "in STATIC_LIST mode the symbol list is read from the config, so a "
         f"DYNAMIC strategy is startable. Got {created_strategies!r}."
+    )
+
+# ---------------------------------------------------------------------------
+# 3b: the Origin header the screener client sends.
+# ---------------------------------------------------------------------------
+
+
+def test_the_origin_header_names_the_host_the_bot_actually_connects_to():
+    """The Origin a browser would send for the fork's own screener."""
+    from bot_module import screener_feed
+
+    assert screener_feed.ws_origin_header(FORK_OWN_WS_URL) == (
+        "https://depthsight.diverseinc.net"
+    )
+
+
+def test_the_origin_header_is_never_the_upstream_hostname():
+    """The upstream's reserved hostname must not be sent by this fork."""
+    from bot_module import screener_feed
+
+    origin = screener_feed.ws_origin_header(FORK_OWN_WS_URL)
+    assert "depthsight.pro" not in origin, (
+        "the Origin header still names the UPSTREAM's reserved hostname: "
+        f"{origin!r}"
+    )
+
+
+def test_the_origin_header_follows_the_configured_feed_host():
+    """Point the feed at another host and the Origin follows it."""
+    from bot_module import screener_feed
+
+    assert screener_feed.ws_origin_header("wss://screener.example.com/ws/bot/") == (
+        "https://screener.example.com"
+    )
+    assert screener_feed.ws_origin_header("ws://localhost:8765/ws") == (
+        "http://localhost:8765"
+    )
+    # A DEFAULT port is left off, exactly as a browser omits it.
+    assert screener_feed.ws_origin_header("wss://screener.example.com:443/ws") == (
+        "https://screener.example.com"
+    )
+    assert screener_feed.ws_origin_header("ws://localhost:80/ws") == (
+        "http://localhost"
+    )
+    # An IPv6 literal has to keep its brackets, or the Origin is not a URL.
+    assert screener_feed.ws_origin_header("wss://[::1]:8765/ws") == (
+        "https://[::1]:8765"
+    )
+
+
+def test_the_origin_header_falls_back_to_this_fork_own_domain():
+    """An unusable URL still never yields the upstream's hostname."""
+    from bot_module import screener_feed
+
+    for bad in ("", "   ", "not a url", "https://example.com/x"):
+        assert screener_feed.ws_origin_header(bad) == (
+            "https://depthsight.diverseinc.net"
+        ), f"bad URL {bad!r} produced the wrong Origin"
+
+
+def test_the_screener_client_derives_its_origin_instead_of_hardcoding_it():
+    """The client's Origin must be DERIVED from MAIN_APP_WS_URL, not literal."""
+    source = (REPO_ROOT / "bot_module" / "data_consumer.py").read_text(
+        encoding="utf-8"
+    )
+    assert "screener.depthsight.pro" not in source, (
+        "bot_module/data_consumer.py still hardcodes the UPSTREAM's reserved "
+        "hostname"
+    )
+
+    tree = ast.parse(source)
+    origins = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(getattr(t, "id", None) == "extra_headers" for t in node.targets):
+            continue
+        if not isinstance(node.value, ast.Dict):
+            continue
+        for key, value in zip(node.value.keys, node.value.values):
+            if getattr(key, "value", None) == "Origin":
+                origins.append(value)
+
+    assert origins, "the extra_headers dict must set an Origin header"
+    for value in origins:
+        assert isinstance(value, ast.Call), (
+            "the Origin header must be a CALL that derives the host, not a "
+            f"literal: {ast.dump(value)}"
+        )
+        assert getattr(value.func, "id", None) == "ws_origin_header", (
+            "the Origin header must be derived by ws_origin_header(): "
+            f"{ast.dump(value)}"
+        )
+        arg = value.args[0] if value.args else None
+        assert (
+            isinstance(arg, ast.Attribute)
+            and arg.attr == "_main_app_ws_url"
+        ), (
+            "the Origin header must be derived from the CONFIGURED feed "
+            "URL (self._main_app_ws_url), not from a literal or from "
+            "some other URL: "
+            f"{ast.dump(value)}"
+        )
+
+
+def test_the_origin_header_never_names_the_upstream_even_when_it_is_configured():
+    """Even pointed at the upstream, the Origin must not be the upstream's.
+
+    The feed guard refuses that configuration, so it cannot reach the wire
+    today.  The property is kept unconditional anyway: an Origin naming the
+    upstream's reserved hostname is the one thing that would make the
+    upstream answer this fork.
+    """
+    from bot_module import screener_feed
+
+    assert screener_feed.ws_origin_header("wss://screener.depthsight.pro/ws/bot/") == (
+        "https://depthsight.diverseinc.net"
     )
