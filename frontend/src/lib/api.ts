@@ -33,6 +33,7 @@ import type {
 	BEAnalysisStats,
 	BEScatterDataResponse,
 	BinanceKline,
+	Capabilities,
 	CandleHealthResponse,
 	DashboardStats,
 	DatasetRunCreate,
@@ -943,6 +944,29 @@ export const useCandleHealth = (params?: { mode?: "live" | "paper" }) => {
 		refetchOnWindowFocus: true,
 	});
 };
+// What this deployment can actually do.
+//
+// The oracle is not available to everyone: it is available when a REAL
+// model is loaded on the server, and it is not today. The client used to
+// decide this itself -- the HFT controls shipped `use_oracle: true` in
+// their local config -- while the api container logged, once per worker:
+// "Oracle model not found at /app/data/oracle_model.joblib".
+//
+// The server is the only thing that knows, so the server is asked. A
+// failed probe is NOT an available oracle: the query fails closed.
+export const useOracleAvailability = () => {
+	return useQuery<Capabilities, Error>({
+		queryKey: authScopedQueryKey("capabilities"),
+		queryFn: () => apiClient<Capabilities>("/capabilities"),
+		// The capability only changes when a model is deployed, so there is
+		// no reason to poll it. It is refetched on mount and on window
+		// focus, which is when an operator would want it refreshed.
+		staleTime: 60_000,
+		gcTime: 300_000,
+		refetchOnWindowFocus: true,
+	});
+};
+
 // Retrieves a single strategy configuration. The returned data type has been updated.
 export const useGetStrategy = (id: string | null) => {
 	return useQuery<StrategyConfig, Error>({

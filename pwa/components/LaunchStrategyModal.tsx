@@ -4,6 +4,7 @@ import type React from "react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAuth } from "../contexts/AuthContext";
+import { useOracleAvailability } from "../lib/useOracleAvailability";
 import type { DisplayStrategy } from "../types";
 
 interface LaunchStrategyModalProps {
@@ -40,7 +41,19 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 	const { user } = useAuth();
 	const isAdmin = user?.role === "admin";
 	const isPro = user?.plan === "pro";
-	const canUseOracle = true; // Oracle is available to everyone
+
+	// The oracle is NOT available to everyone. It was a constant here:
+	//
+	//     const canUseOracle = true; // Oracle is available to everyone
+	//
+	// on a server whose api container logged, once per worker:
+	//     WARNING [api.simulation_router:122] - Oracle model not found at
+	//     /app/data/oracle_model.joblib
+	//
+	// The server is the only thing that knows, so the server is asked.
+	// The answer is NO until a real model is deployed, and the whole
+	// oracle UI below switches itself on the day one is.
+	const { oracleAvailable: canUseOracle } = useOracleAvailability();
 
 	const [mode, setMode] = useState<"paper" | "live">("paper");
 	const [symbolSelectionMode, setSymbolSelectionMode] = useState<
@@ -53,8 +66,17 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 		"DYNAMIC_NATR" | "DYNAMIC_ORACLE"
 	>("DYNAMIC_NATR");
 	const [minNatr, setMinNatr] = useState(1.5);
-	const [oracleRegime, setOracleRegime] = useState("1");
-	const [oracleConfidence, setOracleConfidence] = useState(95);
+	// NO default regime and NO default confidence. Both are measurements
+	// only a loaded model could produce, and there is none: the old
+	// `useState("1")` / `useState(95)` put a regime and a 95% confidence on
+	// screen that no model had ever produced. They start unset and are
+	// filled from the strategy's OWN stored settings, when it has any.
+	const [oracleRegime, setOracleRegime] = useState<string | undefined>(
+		undefined,
+	);
+	const [oracleConfidence, setOracleConfidence] = useState<number | undefined>(
+		undefined,
+	);
 	const [maxConcurrentSymbols, setMaxConcurrentSymbols] = useState(5);
 
 	// ML & Regime settings
@@ -86,10 +108,12 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 					}
 
 					if (configData.oracle_settings) {
-						setOracleRegime(
-							configData.oracle_settings.regime?.toString() || "1",
-						);
-						setOracleConfidence(configData.oracle_settings.confidence || 95);
+						// The strategy's OWN stored values, exactly as they are.
+						// The old `|| "1"` and `|| 95` invented a regime and a
+						// 95% confidence for a strategy that had never been
+						// given one.
+						setOracleRegime(configData.oracle_settings.regime?.toString());
+						setOracleConfidence(configData.oracle_settings.confidence);
 					}
 
 					setMaxConcurrentSymbols(configData.max_concurrent_symbols || 5);
@@ -111,14 +135,32 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 			return;
 		}
 
+		// A regime filter needs a regime. The server's own contract
+		// refuses a DYNAMIC_ORACLE strategy without one
+		// (bot_module/symbol_selection.py: "oracle_regime must be provided
+		// for DYNAMIC_ORACLE mode"), so the client says it here rather
+		// than letting the launch fail later with no explanation.
+		if (
+			symbolSelectionMode === "DYNAMIC" &&
+			dynamicMode === "DYNAMIC_ORACLE" &&
+			canUseOracle &&
+			(oracleRegime === undefined || oracleRegime === "")
+		) {
+			alert(t("launchStrategyModal.oracleRegimeRequired"));
+			return;
+		}
+
 		onSubmit({
 			mode,
 			symbolSelectionMode,
 			symbols: symbolSelectionMode === "STATIC" ? symbols : undefined,
-			dynamicMode,
+			// With no oracle model there is no oracle filter to configure,
+			// so no oracle mode is submitted and no oracle numbers travel
+			// to the server. An ABSENT value is honest; a made-up 95 is not.
+			dynamicMode: canUseOracle ? dynamicMode : "DYNAMIC_NATR",
 			minNatr,
-			oracleRegime,
-			oracleConfidence,
+			oracleRegime: canUseOracle ? oracleRegime : undefined,
+			oracleConfidence: canUseOracle ? oracleConfidence : undefined,
 			maxConcurrentSymbols,
 			useMlConfirmation,
 			breakevenOnRegimeChange,
@@ -225,6 +267,19 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 							</option>
 						</select>
 
+						{/* THE ORACLE IS NOT AVAILABLE: say so, plainly.
+						    The old code hid the Oracle option and said nothing,
+						    which reads as "the screen is broken" rather than
+						    "this server has no oracle model". */}
+						{!canUseOracle && (
+							<p className="text-xs text-[hsl(var(--muted-foreground))]">
+								{t(
+									"launchStrategyModal.oracleUnavailable",
+									"Oracle filter unavailable: this server has no oracle model deployed.",
+								)}
+							</p>
+						)}
+
 						{/* ORACLE SPECIFIC */}
 						{dynamicMode === "DYNAMIC_ORACLE" && canUseOracle && (
 							<>
@@ -234,9 +289,18 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 									</label>
 									<select
 										className="w-full p-3 bg-[hsl(var(--secondary))] border border-[hsl(var(--border))] rounded-lg text-base text-[hsl(var(--foreground))] outline-none"
-										value={oracleRegime}
+										value={oracleRegime ?? ""}
 										onChange={(e) => setOracleRegime(e.target.value)}
 									>
+										{/* No regime is preselected: a preselected
+										    regime would claim a measurement that was
+										    never made. The customer picks one. */}
+										<option value="">
+											{t(
+												"launchStrategyModal.oracleRegimeUnset",
+												"-- select a regime --",
+											)}
+										</option>
 										<option value="0">
 											{t("launchStrategyModal.oracleRegimeParanoiaFull")}
 										</option>
@@ -257,14 +321,14 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 											)}
 										</label>
 										<span className="text-xs text-[hsl(var(--muted-foreground))]">
-											{oracleConfidence}%
+											{oracleConfidence ?? 0}%
 										</span>
 									</div>
 									<input
 										type="range"
 										min="0"
 										max="100"
-										value={oracleConfidence}
+										value={oracleConfidence ?? 0}
 										onChange={(e) =>
 											setOracleConfidence(parseInt(e.target.value, 10))
 										}

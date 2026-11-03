@@ -211,9 +211,21 @@ const StrategiesScreen: React.FC<StrategiesScreenProps> = ({
 					params.oracle_regime = null;
 					params.oracle_confidence = 0;
 				} else if (details.dynamicMode === "DYNAMIC_ORACLE") {
-					const regime = parseInt(details.oracleRegime || "1", 10);
-					const confidence = details.oracleConfidence || 95;
-					params.oracle_settings = { regime, confidence };
+					// The regime and the confidence the customer actually
+					// chose. The old `|| "1"` and `|| 95` INVENTED both when
+					// the customer had chosen neither -- a regime and a 95%
+					// confidence that no model had ever produced, handed
+					// straight to the server.
+					const regime =
+						details.oracleRegime === undefined || details.oracleRegime === ""
+							? null
+							: parseInt(details.oracleRegime, 10);
+					// 0 is the SERVER's own declared default for
+					// oracle_confidence (bot_module/symbol_selection.py:
+					// Field(0.0)), and it is what the slider showed.
+					const confidence = details.oracleConfidence ?? 0;
+					params.oracle_settings =
+						regime === null ? null : { regime, confidence };
 					params.oracle_regime = regime;
 					params.oracle_confidence = confidence;
 					params.natr_settings = null;

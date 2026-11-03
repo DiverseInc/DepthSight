@@ -1,0 +1,66 @@
+{
+  "_comment": [
+    "Mutations that re-introduce the FABRICATED ORACLE in the two places whose",
+    "tests are NOT pytest, one at a time.",
+    "",
+    "This spec has no pytest target: the code it mutates is TypeScript, and its",
+    "tests are run by vitest. The harness accepts a 'command' for exactly that",
+    "case and keeps every other guarantee it already had -- snapshot before,",
+    "SHA-256 revert verification after, and a SKIP counts as a failure.",
+    "",
+    "What is covered here and NOT in oracle_availability_truth.json:",
+    "  * pwa/lib/oracleCapability.ts -- the PWA's own decision function. The PWA",
+    "    has NO test runner of its own (pwa/package.json declares no test script,",
+    "    no vitest/jest dependency and no vitest/jest config), so this module is",
+    "    exercised by the repository's only frontend runner. That is a real",
+    "    behavioural test of the PWA's decision, not a grep of its source.",
+    "  * frontend/src/features/hft-dashboard/* -- the HFT dashboard equivalents.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/oracle_availability_frontend.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "command": [
+    "npm",
+    "--prefix",
+    "frontend",
+    "run",
+    "test",
+    "--",
+    "src/__tests__/oracleAvailability.test.tsx",
+    "src/__tests__/pwaOracleCapability.test.ts"
+  ],
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "K: the PWA's decision function always says the oracle is usable",
+      "file": "pwa/lib/oracleCapability.ts",
+      "needle": "\treturn capability?.oracleAvailable === true;\n",
+      "replace": "\treturn true; // MUTANT: the oracle is always usable\n"
+    },
+    {
+      "label": "L: the PWA's decision function always says the oracle is UNusable",
+      "file": "pwa/lib/oracleCapability.ts",
+      "needle": "\treturn capability?.oracleAvailable === true;\n",
+      "replace": "\treturn capability?.oracleAvailable !== true; // MUTANT\n"
+    },
+    {
+      "label": "M: the HFT dashboard believes the oracle is always available",
+      "file": "frontend/src/features/hft-dashboard/components/StrategyControls.tsx",
+      "needle": "\tconst oracleAvailable = capabilities?.oracleAvailable === true;\n",
+      "replace": "\tconst oracleAvailable = true; // MUTANT: always available\n"
+    },
+    {
+      "label": "N: the HFT dashboard keeps the Oracle filter ON with no oracle model",
+      "file": "frontend/src/features/hft-dashboard/components/StrategyControls.tsx",
+      "needle": ": { ...localConfig, use_oracle: false };",
+      "replace": ": { ...localConfig, use_oracle: true }; // MUTANT"
+    },
+    {
+      "label": "O: the Oracle scanner claims 'Active' whatever it can see",
+      "file": "frontend/src/features/hft-dashboard/components/OracleScanner.tsx",
+      "needle": "oracleSymbols.length > 0 ? \"Receiving\" : \"No signal\"",
+      "replace": "oracleSymbols.length > 0 ? \"Active\" : \"Active\" // MUTANT"
+    }
+  ]
+}

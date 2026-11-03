@@ -125,6 +125,38 @@ def get_oracle():
     return _oracle_instance
 
 
+def oracle_model_available() -> bool:
+    """Whether a REAL oracle model exists and loads RIGHT NOW.
+
+    THE ONLY HONEST ANSWER TO "is the oracle available?".
+    =====================================================
+    The clients used to answer this question themselves, with a constant:
+    the PWA shipped ``const canUseOracle = true; // Oracle is available to
+    everyone`` and showed a 95% confidence that no model ever produced,
+    while this deployment's api container logged, once per worker:
+
+        WARNING [api.simulation_router:122] - Oracle model not found at
+        /app/data/oracle_model.joblib
+
+    A constant cannot be right. This function answers from the same call
+    the API already makes to decide whether the oracle works at all:
+    ``get_oracle()`` returns the loaded model, or ``None`` when the model
+    file is missing, when the Oracle class could not be imported, or when
+    the file failed to load. There is no second source of truth to drift
+    from -- the flag IS the runtime state.
+
+    NOT cached at import time on purpose: ``get_oracle()`` re-checks the
+    model path on every call until the model loads, so this flips to True
+    the day a real ``data/oracle_model.joblib`` is deployed -- with no code
+    change, no restart, and nothing for the client to re-learn.
+    """
+    try:
+        return get_oracle() is not None
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(f"Oracle availability check failed: {e}")
+        return False
+
+
 def apply_oracle_signal(df, oracle_instance, threshold=0.95):
     """
     Apply Oracle predictions to DataFrame.

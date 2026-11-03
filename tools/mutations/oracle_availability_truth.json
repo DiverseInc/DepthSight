@@ -1,0 +1,89 @@
+{
+  "_comment": [
+    "Mutations that re-introduce the FABRICATED ORACLE, one at a time.",
+    "Every mutation must be caught by the tests in this spec's pytest target:",
+    "  tests/test_oracle_availability.py  -- the server must report the REAL state",
+    "  tests/test_pwa_oracle_honesty.py    -- the PWA must not fabricate one",
+    "",
+    "The fiction being re-introduced, in its original form:",
+    "  const canUseOracle = true; // Oracle is available to everyone",
+    "  const [oracleConfidence, setOracleConfidence] = useState(95);",
+    "  const regime = parseInt(details.oracleRegime || \"1\", 10);",
+    "  const confidence = details.oracleConfidence || 95;",
+    "on a deployment whose api container logs, once per worker:",
+    "  WARNING [api.simulation_router:122] - Oracle model not found at",
+    "  /app/data/oracle_model.joblib",
+    "",
+    "The server-side mutants matter as much as the client-side ones: a hard-coded",
+    "False in the endpoint would also 'pass' the unavailable case while keeping",
+    "the oracle switched off forever. Both directions are pinned.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/oracle_availability_truth.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_oracle_availability.py tests/test_pwa_oracle_honesty.py",
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "A: the server says the oracle is NEVER available (a constant False)",
+      "file": "api/simulation_router.py",
+      "needle": "        return get_oracle() is not None\n",
+      "replace": "        return False  # MUTANT: the oracle is never available\n"
+    },
+    {
+      "label": "B: the server says the oracle is ALWAYS available (a constant True)",
+      "file": "api/simulation_router.py",
+      "needle": "        return get_oracle() is not None\n",
+      "replace": "        return True  # MUTANT: the oracle is always available\n"
+    },
+    {
+      "label": "C: the endpoint ignores the server and always answers False",
+      "file": "api/routes/capabilities.py",
+      "needle": "        oracle_available = oracle_model_available()\n",
+      "replace": "        oracle_available = False  # MUTANT\n"
+    },
+    {
+      "label": "D: the endpoint ignores the server and always answers True",
+      "file": "api/routes/capabilities.py",
+      "needle": "        oracle_available = oracle_model_available()\n",
+      "replace": "        oracle_available = True  # MUTANT\n"
+    },
+    {
+      "label": "E: the endpoint FAILS OPEN when the probe errors",
+      "file": "api/routes/capabilities.py",
+      "needle": "        oracle_available = False\n",
+      "replace": "        oracle_available = True  # MUTANT: fail open\n"
+    },
+    {
+      "label": "F: the PWA hard-codes the oracle as available again",
+      "file": "pwa/components/LaunchStrategyModal.tsx",
+      "needle": "\tconst { oracleAvailable: canUseOracle } = useOracleAvailability();\n",
+      "replace": "\tconst canUseOracle = true; // MUTANT: Oracle is available to everyone\n"
+    },
+    {
+      "label": "G: the PWA defaults the oracle confidence back to 95",
+      "file": "pwa/components/LaunchStrategyModal.tsx",
+      "needle": "\tconst [oracleConfidence, setOracleConfidence] = useState<number | undefined>(\n\t\tundefined,\n\t);\n",
+      "replace": "\tconst [oracleConfidence, setOracleConfidence] = useState(95); // MUTANT\n"
+    },
+    {
+      "label": "H: the PWA launch payload invents a 95% confidence again",
+      "file": "pwa/screens/StrategiesScreen.tsx",
+      "needle": "\t\t\t\t\tconst confidence = details.oracleConfidence ?? 0;\n",
+      "replace": "\t\t\t\t\tconst confidence = details.oracleConfidence || 95; // MUTANT\n"
+    },
+    {
+      "label": "I: the PWA launch payload invents oracle regime 1 again",
+      "file": "pwa/screens/StrategiesScreen.tsx",
+      "needle": "\t\t\t\t\tconst regime =\n\t\t\t\t\t\tdetails.oracleRegime === undefined || details.oracleRegime === \"\"\n\t\t\t\t\t\t\t? null\n\t\t\t\t\t\t\t: parseInt(details.oracleRegime, 10);\n",
+      "replace": "\t\t\t\t\tconst regime = parseInt(details.oracleRegime || \"1\", 10); // MUTANT\n"
+    },
+    {
+      "label": "J: the strategy editor preselects oracle regime 1 again",
+      "file": "pwa/screens/EditorScreen.tsx",
+      "needle": "value={oracleRegime !== null && oracleRegime !== undefined ? String(oracleRegime) : \"\"}",
+      "replace": "value={oracleRegime !== null && oracleRegime !== undefined ? String(oracleRegime) : \"1\"} // MUTANT"
+    }
+  ]
+}

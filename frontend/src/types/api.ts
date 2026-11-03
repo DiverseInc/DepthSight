@@ -24,6 +24,20 @@ export interface SystemStatusData {
 	components: SystemComponent[];
 }
 
+/**
+ * What this deployment can actually do, as reported by the server
+ * (`GET /api/v1/capabilities`).
+ *
+ * `oracleAvailable` is the honest answer to "is there an oracle model?".
+ * It is FALSE until a real `oracle_model.joblib` is deployed on the
+ * server. It is not a plan, a role, or a promise, and a client that shows
+ * an oracle regime or an oracle confidence while it is false is showing a
+ * number that no model produced.
+ */
+export interface Capabilities {
+	oracleAvailable: boolean;
+}
+
 export interface PortfolioData {
 	balance: number;
 	today_pnl: number;
