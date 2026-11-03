@@ -167,6 +167,18 @@ def _read_persisted_number(
     * the field is present but NULL;
     * the field is present but is not a number.
 
+    A fourth shape is unreadable too: a number that is not FINITE -- NaN, or
+    +/-Infinity. Those are not measurements, they are the result of an
+    arithmetic accident (a division by zero, an overflow), and every
+    comparison against them is silently FALSE: `nan < 0` is False, so a day's
+    PnL of NaN is read by the loss guard as "no loss today" -- the guard
+    measures NOTHING while reporting OK. json.dumps writes NaN as the literal
+    `NaN` and json.loads reads it straight back, so such a value survives a
+    save/restore round trip and reaches the guard exactly as a number would.
+    An unreadable value must be UNKNOWN; unknown must never be more permissive
+    than known, so a non-finite value is UNREADABLE and takes the same
+    fail-closed path as a missing one.
+
     The idiom this replaces -- ``payload.get(key) or 0`` -- cannot tell any of
     them apart from a genuine zero: a missing field yields None, ``None or 0``
     is 0, and a field that is present but null yields the same 0. So a partial
@@ -187,9 +199,15 @@ def _read_persisted_number(
     if raw is None:
         return None
     try:
-        return cast(raw)
-    except (TypeError, ValueError):
+        value = cast(raw)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(float("inf")) raises it, and it is NOT a
+        # ValueError -- without it in this tuple a persisted infinite streak
+        # would escape as an exception instead of an unknown.
         return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 def _day_str_is_a_calendar_day(day_str: Any) -> bool:

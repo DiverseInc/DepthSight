@@ -40,6 +40,20 @@
     "RESERVING positions too -- so a PAPER signal's placeholder moved the LIVE",
     "loss streak and could close the LIVE gate on a simulated loss.",
     "",
+    "G is the non-finite check removed. NaN and +/-Infinity are not",
+    "measurements, they are the result of an arithmetic accident, and every",
+    "comparison against them is silently FALSE -- `nan < 0` is False, so a day's",
+    "PnL of NaN is read by the loss guard as 'no loss today'. json.dumps writes",
+    "NaN as the literal `NaN` and json.loads reads it straight back, so such a",
+    "value survives a save/restore round trip and reaches the guard exactly as a",
+    "number would. Measured: the same payload with -5000.0 closed the PAPER",
+    "gate, and with NaN left it OPEN with no unknown-state latch.",
+    "",
+    "H is OverflowError no longer caught. `int(float('inf'))` raises",
+    "OverflowError, which is NOT a ValueError, so a persisted INFINITE loss",
+    "streak escapes the reader as an exception instead of an unknown -- and an",
+    "exception thrown out of the restore is not a fail-closed restore.",
+    "",
     "Run with:  python tools/mutation_harness.py tools/mutations/risk_restore_paper_only_account.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
     "read a file that is mid-mutation and report on code that does not exist."
@@ -82,6 +96,18 @@
       "file": "bot_module/risk_manager.py",
       "needle": "        if \"paper\" in payload:\n",
       "replace": "        if False:\n"
+    },
+    {
+      "label": "G: a persisted number that is not FINITE is read as a measurement again",
+      "file": "bot_module/risk_manager.py",
+      "needle": "    if isinstance(value, float) and not math.isfinite(value):\n        return None\n    return value\n",
+      "replace": "    return value\n"
+    },
+    {
+      "label": "H: an INFINITE persisted number escapes the reader as an exception again",
+      "file": "bot_module/risk_manager.py",
+      "needle": "    except (TypeError, ValueError, OverflowError):\n",
+      "replace": "    except (TypeError, ValueError):\n"
     }
   ]
 }

@@ -586,3 +586,134 @@ async def test_the_reserving_placeholder_carries_the_signals_own_mode():
         "'paper'. A close is booked into the sandbox its position names, so an "
         "unstamped placeholder books a PAPER close into the LIVE counters."
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. A persisted number that is not FINITE is UNREADABLE, not a measurement
+# ---------------------------------------------------------------------------
+
+
+async def test_a_non_finite_persisted_day_pnl_fails_closed_at_start_up(
+    redis_store,
+):
+    """NaN is not a day's PnL -- it is an arithmetic accident.
+
+    ``json.dumps`` writes ``float("nan")`` as the literal ``NaN`` and
+    ``json.loads`` reads it straight back, so a non-finite value survives a
+    save/restore round trip and reaches the guard EXACTLY as a number would.
+
+    And then every comparison against it is silently FALSE: ``nan < 0`` is
+    False, so the loss guard reads "no loss today" while the persisted number
+    says something else entirely. Measured on the code before this fix: the
+    same payload with ``-5000.0`` closed the PAPER gate, and with ``NaN`` left
+    it OPEN with no unknown-state latch -- the guard was measuring nothing
+    and reporting OK.
+
+    An unreadable value is UNKNOWN, and unknown must never be more permissive
+    than known.
+    """
+    rm = _keyless_paper_account(redis_store)
+    paper = _paper_section(TODAY)
+    paper["today_pnl"] = float("nan")
+    paper["consecutive_losses"] = 0
+    _write_payload(
+        redis_store,
+        rm,
+        {
+            "version": 2,
+            "day_str": TODAY,
+            "consecutive_losses": 0,
+            "today_pnl": 0.0,
+            "start_of_day_balance": PAPER_BALANCE,
+            "start_of_day_day_str": TODAY,
+            "paper": paper,
+        },
+    )
+
+    await rm.restore_state()
+    await rm.initialize_balance()
+
+    assert rm._paper_is_trading_allowed is False, (
+        "the PAPER gate RE-OPENED on a payload whose day's PnL is NaN: a "
+        "non-finite number is not a measurement, and every comparison against "
+        "it is FALSE, so the loss guard measured NOTHING while reporting OK"
+    )
+    assert rm._guard_state_is_unknown() is True, (
+        "a non-finite persisted value must latch the fail-closed state, so the "
+        "gate cannot be re-opened by the start-up machinery"
+    )
+
+
+async def test_an_infinite_persisted_day_pnl_fails_closed_at_start_up(
+    redis_store,
+):
+    """The other non-finite shape: +/-Infinity.
+
+    ``int(float("inf"))`` raises OverflowError, which is NOT a ValueError, so
+    a persisted INFINITE LOSS STREAK used to escape the reader as an
+    exception instead of an unknown -- an exception thrown out of the restore
+    is not a fail-closed restore.
+    """
+    rm = _keyless_paper_account(redis_store)
+    paper = _paper_section(TODAY)
+    paper["consecutive_losses"] = float("inf")
+    paper["today_pnl"] = float("-inf")
+    _write_payload(
+        redis_store,
+        rm,
+        {
+            "version": 2,
+            "day_str": TODAY,
+            "consecutive_losses": 0,
+            "today_pnl": 0.0,
+            "start_of_day_balance": PAPER_BALANCE,
+            "start_of_day_day_str": TODAY,
+            "paper": paper,
+        },
+    )
+
+    await rm.restore_state()
+    await rm.initialize_balance()
+
+    assert rm._paper_is_trading_allowed is False, (
+        "the PAPER gate RE-OPENED on a payload whose counters are infinite: "
+        "an infinite number is not a measurement"
+    )
+    assert rm._guard_state_is_unknown() is True
+
+
+async def test_a_non_finite_persisted_live_day_pnl_fails_closed_at_start_up(
+    redis_store,
+):
+    """The LIVE half: a NaN day's PnL must not blind the LIVE loss guard.
+
+    The live account's balance is healthy here, so the gate opens on the
+    unfixed code and MUST NOT open on the fixed one.
+    """
+    from tests.test_per_mode_risk_gating import _dual_mode_risk_manager
+
+    rm = _dual_mode_risk_manager(FakeRedis(redis_store))
+    _write_payload(
+        redis_store,
+        rm,
+        {
+            "version": 2,
+            "day_str": TODAY,
+            "consecutive_losses": 0,
+            "today_pnl": float("nan"),
+            "start_of_day_balance": LIVE_BALANCE,
+            "start_of_day_day_str": TODAY,
+        },
+    )
+
+    await rm.restore_state()
+    await rm.initialize_balance()
+
+    assert rm._is_trading_allowed is False, (
+        "the LIVE gate RE-OPENED on a payload whose day's PnL is NaN: the "
+        "daily-loss guard compared NaN against the limit, every comparison "
+        "was FALSE, and the guard measured NOTHING"
+    )
+    assert rm._guard_state_is_unknown() is True, (
+        "a non-finite persisted LIVE value must latch the fail-closed state"
+    )
