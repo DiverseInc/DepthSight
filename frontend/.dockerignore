@@ -9,3 +9,15 @@ build.sh
 docker
 Makefile
 .vite
+# Developer-LOCAL env overrides. frontend/Dockerfile.prod does `COPY . .`, so
+# anything not excluded here is copied into the image and read by vite at build
+# time. In a production build vite reads `.env`, `.env.production`,
+# `.env.local` and `.env.production.local`; of those only `.env.production` is
+# tracked, so the other three are developer-local files that could set
+# VITE_SHOW_DEMO and compile the seeded demo credentials into the production
+# bundle.
+# frontend/.env.production is deliberately NOT excluded: it is tracked, it
+# holds only public values, and the build needs it.
+.env
+.env.local
+.env.*.local

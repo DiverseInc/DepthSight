@@ -36,7 +36,38 @@ RISK_STATE_PERSIST_TIMEOUT_SECONDS = 5.0
 # PnL belong to -- so the reader validated one day's worth of facts and then
 # applied a quantity scoped to a DIFFERENT day. See
 # `_apply_persisted_guard_state`.
-RISK_STATE_VERSION = 2
+#
+# v3 adds `peak_equity` and `peak_equity_set_at`: the account's HIGH-WATER
+# MARK for the peak-to-trough drawdown limit. A v2 payload records NO peak at
+# all, so it must NOT be read as "the peak is zero" -- that would read as
+# "there is no drawdown" and open the gate. It means the peak is UNKNOWN, and
+# an unknown peak fails CLOSED. See `_apply_persisted_guard_state`.
+RISK_STATE_VERSION = 3
+
+# The payload version that introduced `peak_equity`. A payload OLDER than
+# this carries no high-water mark at all -- it is not a peak of zero, it is
+# an UNKNOWN peak -- while a payload at or above it carries a real one. This
+# is pinned separately from `RISK_STATE_VERSION` so that a LATER version bump
+# (for an unrelated field) does not make every existing payload lose its
+# high-water mark and block every account.
+RISK_STATE_VERSION_WITH_PEAK = 3
+
+# THE HIGH-WATER-MARK WINDOW.
+#
+# `maxDrawdown` is a PEAK-TO-TROUGH limit: the distance from the account's
+# highest observed balance down to the balance now. The high-water mark is
+# only meaningful over a window, so the peak carries the moment it was set and
+# EXPIRES this many days later. On expiry the peak is re-established from the
+# balance at that moment and the drawdown starts again from there, so an
+# account can always recover.
+#
+# THE OWNER CHOSE 7 DAYS on 2026-11-01. This is the one place to change it.
+#
+# It is NOT a daily reset. A daily reset would collapse the peak-to-trough
+# limit back into the daily-loss limit -- both would measure the day's loss
+# against the day's opening balance -- and the peak-to-trough limit would
+# change nothing at all.
+DRAWDOWN_PEAK_WINDOW_DAYS = 7
 
 # Why the gate is closed while the guard state is UNVERIFIABLE.
 #
@@ -58,6 +89,29 @@ RISK_GUARD_UNVERIFIED_REASON = (
 RISK_GUARD_BASE_UNKNOWN_REASON = (
     "the opening balance for the current UTC day is unknown "
     "- trading disabled until it can be established"
+)
+
+# Why the gate is closed while the account's HIGH-WATER MARK is UNKNOWN.
+#
+# The peak-to-trough drawdown is a RATIO against the high-water mark. With no
+# high-water mark the ratio cannot be computed at all, and "cannot be
+# computed" is NOT "within limits" -- the same rule the unknown opening
+# balance follows. A missing peak is never read as "no drawdown".
+RISK_GUARD_PEAK_UNKNOWN_REASON = (
+    "the account's high-water mark (peak) is unknown "
+    "- trading disabled until it can be established"
+)
+
+# Why the gate is closed while the last BALANCE READ was REJECTED.
+#
+# `update_balance` discards a balance read that looks like a bad API read (see
+# the anomaly guard there). The discarded read is not relaxed: it is still
+# refused. But it means the balance the drawdown would be measured against is
+# NOT a balance the server trusts, so the trough is unknown and the limit
+# cannot be evaluated. The gate re-opens by itself on the next credible read.
+RISK_GUARD_BALANCE_REJECTED_REASON = (
+    "the last balance read was rejected as unreliable, so the drawdown "
+    "cannot be measured - trading disabled until a credible balance is read"
 )
 
 # Why the gate is closed when the persisted guard state has VANISHED for an
@@ -136,6 +190,58 @@ def ensure_dict(obj) -> Dict[str, Any]:
 
 
 class RiskManager:
+    # ------------------------------------------------------------------
+    # THE HIGH-WATER MARK (the peak) for the peak-to-trough drawdown
+    # ------------------------------------------------------------------
+    #
+    # `maxDrawdown` is a PEAK-TO-TROUGH limit: the distance from the
+    # account's highest observed balance down to the balance now. The
+    # backtesters already measure it that way
+    # (`bot_module/depthsight_backtester.py`: `drawdown = (peak_equity -
+    # current_balance) / peak_equity`, with `peak_equity = max(peak_equity,
+    # current_balance)`), and the live bot did NOT -- it measured the day's
+    # loss against the day's opening balance, which is the daily-loss limit
+    # wearing the drawdown's name. The live gate and the backtest therefore
+    # disagreed about the same limit.
+    #
+    # THE PEAK IS SERVER-OWNED, ON PURPOSE. It is deliberately NOT a field
+    # of `RiskManagementSettings`, NOT in `SERVER_RISK_FLOOR` and NOT in
+    # `RISK_FIELD_TO_RM_KEY`: every field in those IS client-writable through
+    # `api/routes/config.py`'s `_the_fields_the_client_actually_sent`, so a
+    # client-writable peak would let a client declare its own high-water
+    # mark and loosen its own limit. It is server state, full stop.
+    #
+    # It is persisted with the rest of the trading-guard state (the same
+    # Redis key, scoped per user AND per api key), because the bot restarts
+    # on every deploy and a peak that is re-derived on every start is a peak
+    # that forgets.
+    #
+    # These are CLASS attributes so that a RiskManager built without
+    # `__init__` (the test doubles that call `RiskManager.__new__`) still
+    # has them: a missing attribute must not become a crash in the middle of
+    # a limit check.
+    #
+    # 0.0 means UNKNOWN -- it is never a legitimate balance, so it is never
+    # a legitimate peak.
+    _peak_equity: float = 0.0
+    # WHEN the peak was set (epoch seconds). 0.0 == the peak is UNKNOWN.
+    # The peak's OWN timestamp travels with it, so the window is measured
+    # from when the high-water mark was actually reached.
+    _peak_equity_set_at: float = 0.0
+    # The `today_pnl` that `stats.current_balance` ALREADY reflects.
+    #
+    # `update_trade_result` moves `today_pnl` and NOTHING ELSE: the balance
+    # only moves when it is read. So the balance on its own is STALE exactly
+    # when a trade closes, and a peak-to-trough measured on it would
+    # UNDER-TRIP: the loss would not be visible until the next balance read.
+    # This is the amount of realised PnL that the last read did not yet
+    # contain.
+    _balance_pnl_baseline: float = 0.0
+    # True while the last balance read was REJECTED as a suspected bad API
+    # read. The balance is then not a number the server trusts, so the
+    # drawdown cannot be measured against it.
+    _balance_read_rejected: bool = False
+
     def __init__(
         self,
         executor: ExchangeExecutor,
@@ -844,6 +950,9 @@ class RiskManager:
                 )
             else:
                 self.stats.today_pnl = 0.0
+                # The day's PnL restarts at zero, so the balance now reflects
+                # zero of today's realised PnL. See `_set_balance_pnl_baseline`.
+                self._set_balance_pnl_baseline()
                 self.stats.consecutive_losses = 0
                 self.stats.current_trading_day_start_ts = (
                     current_trading_day_start_ts_float_actual
@@ -957,8 +1066,22 @@ class RiskManager:
                             f"{log_prefix} Detected anomalously low new balance (${current_total_usdt:.2f}) compared to previous (${self.stats.current_balance:.2f}). "
                             f"This might be a temporary API issue. NOT UPDATING BALANCE THIS TIME."
                         )
+                        # THE GUARD IS NOT RELAXED -- the read is still refused.
+                        # But a refused read means the balance the drawdown
+                        # would be measured against is NOT a balance the server
+                        # trusts, so the peak-to-trough limit cannot be
+                        # evaluated at all. Rather than let a REAL crash be
+                        # swallowed by this guard (it would be measured against
+                        # the pre-crash balance and read as no drawdown), the
+                        # drawdown check fails CLOSED until a credible balance
+                        # is read. The latch clears itself on the next
+                        # credible read.
+                        self._balance_read_rejected = True
                         # Retry logic can be added here or the update can simply be skipped
                         return False  # Return False to signal a possible data issue
+
+                    # This read was accepted, so the balance is credible again.
+                    self._balance_read_rejected = False
 
                     if (
                         abs(current_total_usdt - self.stats.current_balance) > 1e-9
@@ -967,10 +1090,20 @@ class RiskManager:
                             f"{log_prefix} Balance updated: Previous=${self.stats.current_balance:.2f}, New=${current_total_usdt:.2f} (Free: {free_bal:.2f}, Locked: {locked_bal:.2f})"
                         )
                         self.stats.current_balance = current_total_usdt
+                        # The balance now reflects the day's realised PnL as it
+                        # stands, so that is what the PnL baseline is.
+                        self._set_balance_pnl_baseline()
                     else:
                         logger.debug(
                             f"{log_prefix} Balance unchanged: ${self.stats.current_balance:.2f}"
                         )
+
+                    # A balance the server has just read is the only evidence it
+                    # has about the account's high-water mark -- and an
+                    # UNCHANGED balance is still an observation of it. The peak
+                    # only ever rises, so observing it again can never lower
+                    # the limit.
+                    self._observe_balance_for_peak(current_total_usdt)
 
                     # A successful balance read is the only trustworthy evidence
                     # available about whether the global gate should be open, so
@@ -1312,6 +1445,12 @@ class RiskManager:
                         "Trading stays DISABLED until the day rolls over."
                     )
             self.stats.today_pnl = 0.0
+            # The day's PnL restarts at zero, so the balance now reflects zero
+            # of today's realised PnL. The HIGH-WATER MARK is NOT reset here:
+            # it is not a day quantity, and clearing it every midnight would
+            # collapse the peak-to-trough limit back into the daily-loss
+            # limit. See `_observe_balance_for_peak`.
+            self._set_balance_pnl_baseline()
             self.stats.consecutive_losses = 0
             self.stats.current_trading_day_start_ts = current_start_ts_float
             self.stats.last_known_day_str = current_day_str_utc
@@ -2181,6 +2320,172 @@ class RiskManager:
             return stamp == self._current_utc_day_str()
         return True
 
+    # ------------------------------------------------------------------
+    # THE HIGH-WATER MARK (the peak) for the peak-to-trough drawdown
+    # ------------------------------------------------------------------
+    #
+    # `maxDrawdown` is a PEAK-TO-TROUGH limit: the distance from the
+    # account's highest observed balance down to the balance now. The
+    # backtesters already measure it that way
+    # (`bot_module/depthsight_backtester.py`: `drawdown = (peak_equity -
+    # current_balance) / peak_equity`, with `peak_equity = max(peak_equity,
+    # current_balance)`), and the live bot did NOT -- it measured the day's
+    # loss against the day's opening balance, which is the daily-loss limit
+    # wearing the drawdown's name. The live gate and the backtest therefore
+    # disagreed about the same limit.
+    #
+    # THE PEAK IS SERVER-OWNED. It is not a field of
+    # `RiskManagementSettings`, not in `SERVER_RISK_FLOOR` and not in
+    # `RISK_FIELD_TO_RM_KEY`: every field in those IS client-writable through
+    # `api/routes/config.py`'s `_the_fields_the_client_actually_sent`, so a
+    # client-writable peak would let a client declare its own high-water
+    # mark and loosen its own limit.
+    #
+    # A peak that is UNKNOWN is never read as "no drawdown": it fails CLOSED,
+    # exactly like the unknown opening balance.
+
+    def _set_balance_pnl_baseline(self) -> None:
+        """Remember the `today_pnl` that `stats.current_balance` reflects.
+
+        Set at every point where the balance and the day's PnL are known to
+        describe the same instant: a balance read, a restore of the persisted
+        state, and the UTC rollover (where the day's PnL restarts at zero).
+        """
+        self._balance_pnl_baseline = float(getattr(self.stats, "today_pnl", 0.0) or 0.0)
+
+    def _known_peak_candidates(self, observed_balance: float) -> float:
+        """The highest balance the server can VOUCH for right now.
+
+        That is the balance that was just read, plus today's opening balance
+        when it is usable -- it is a real balance the server observed, and a
+        higher high-water mark is a tighter limit, never a looser one.
+        """
+        candidates = [float(observed_balance)]
+        base = float(getattr(self.stats, "start_of_day_balance", 0.0) or 0.0)
+        stamp = getattr(self.stats, "start_of_day_day_str", None)
+        if base > 1e-9 and stamp and stamp == self._current_utc_day_str():
+            candidates.append(base)
+        return max(candidates)
+
+    def _expire_stale_peak(self, replacement: Optional[float] = None) -> bool:
+        """Expire a high-water mark that has outlived the window.
+
+        The peak expires `DRAWDOWN_PEAK_WINDOW_DAYS` (7 days, the owner's
+        decision of 2026-11-01) after it was set. An expired peak is NOT
+        counted. It is replaced by the balance as it stands now -- the
+        account's high-water mark for the new window -- which is what makes
+        the limit RECOVERABLE: no account can be blocked for ever by a peak
+        that is too old to mean anything.
+
+        Returns True when a stale peak was expired.
+        """
+        now = time.time()
+        peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
+        peak_at = float(getattr(self, "_peak_equity_set_at", 0.0) or 0.0)
+        if peak <= 1e-9 or peak_at <= 0:
+            return False
+        age_seconds = now - peak_at
+        if age_seconds < DRAWDOWN_PEAK_WINDOW_DAYS * 86400.0:
+            return False
+
+        logger.info(
+            f"[RiskManager:Peak] The high-water mark ${peak:.2f} was set "
+            f"{age_seconds / 86400.0:.1f} days ago, outside the "
+            f"{DRAWDOWN_PEAK_WINDOW_DAYS}-day window, so it is expired and is "
+            "no longer counted."
+        )
+        if replacement is None:
+            replacement = self._drawdown_trough_balance()
+        if replacement is not None and float(replacement) > 1e-9:
+            self._peak_equity = float(replacement)
+            self._peak_equity_set_at = now
+            logger.info(
+                f"[RiskManager:Peak] The high-water mark for the new window is "
+                f"${float(replacement):.2f} (the balance as it stands now)."
+            )
+        else:
+            # No credible balance to start the new window from: the peak is
+            # UNKNOWN, and an unknown peak fails CLOSED.
+            self._peak_equity = 0.0
+            self._peak_equity_set_at = 0.0
+        return True
+
+    def _observe_balance_for_peak(self, balance: float) -> bool:
+        """Fold a freshly OBSERVED balance into the high-water mark.
+
+        Returns True when the peak changed.
+
+        While the peak is in force it only ever RISES: a lower balance does
+        not lower the high-water mark. It is lowered only by the window
+        expiry, which is the one moment the account's high-water mark is
+        allowed to be forgotten.
+        """
+        try:
+            balance = float(balance)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(balance) or balance <= 1e-9:
+            return False
+
+        now = time.time()
+        candidate = self._known_peak_candidates(balance)
+        # An expired peak is not a peak: the new window starts here.
+        expired = self._expire_stale_peak(replacement=candidate)
+
+        peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
+        if peak <= 1e-9:
+            self._peak_equity = candidate
+            self._peak_equity_set_at = now
+            logger.info(
+                f"[RiskManager:Peak] The account's high-water mark is "
+                f"${candidate:.2f} (it was not known before)."
+            )
+            return True
+        if candidate > peak:
+            self._peak_equity = candidate
+            self._peak_equity_set_at = now
+            return True
+        return expired
+
+    def _usable_peak_equity(self) -> Optional[float]:
+        """The account's high-water mark, or None when there is not one.
+
+        None means UNKNOWN, and an unknown peak must never be read as a
+        zero drawdown.
+        """
+        peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
+        if not math.isfinite(peak) or peak <= 1e-9:
+            return None
+        return peak
+
+    def _drawdown_trough_balance(self) -> Optional[float]:
+        """The balance the drawdown is measured DOWN TO.
+
+        None when the balance is not a number the server trusts: either no
+        balance has been read yet, or the last read was REJECTED as a
+        suspected bad API read.
+        """
+        if getattr(self, "_balance_read_rejected", False):
+            return None
+        balance = float(getattr(self.stats, "current_balance", 0.0) or 0.0)
+        if not math.isfinite(balance) or balance <= 1e-9:
+            return None
+        # THE BALANCE IS STALE EXACTLY WHEN A TRADE CLOSES.
+        # `update_trade_result` moves `today_pnl` and leaves
+        # `current_balance` alone, so the balance on its own still shows the
+        # value from BEFORE the trade. The realised PnL that the last read
+        # did not yet contain is added back, so the trough moves when a trade
+        # closes. Without this the peak-to-trough limit would UNDER-TRIP at
+        # precisely the moment the loss is realised, and would only catch up
+        # at the next balance read.
+        unreflected = float(getattr(self.stats, "today_pnl", 0.0) or 0.0) - float(
+            getattr(self, "_balance_pnl_baseline", 0.0) or 0.0
+        )
+        trough = balance + unreflected
+        if not math.isfinite(trough):
+            return None
+        return trough
+
     def _check_risk_limits(self):  # Global limits
         # A risk limit may only be treated as "within range" when the numbers
         # it is computed from are KNOWN. If the guard state could not be read
@@ -2230,14 +2535,48 @@ class RiskManager:
                 should_be_allowed = False
                 disable_reason = RISK_GUARD_BASE_UNKNOWN_REASON
             else:
-                drawdown_pct = (
-                    abs(self.stats.today_pnl / self.stats.start_of_day_balance)
-                    if self.stats.today_pnl < 0
-                    else 0
-                )
-                if drawdown_pct >= self.max_drawdown_threshold:
+                # THE PEAK-TO-TROUGH DRAWDOWN.
+                #
+                # `maxDrawdown` is the distance from the account's HIGH-WATER
+                # MARK down to the balance now, which is what the backtesters
+                # measure (`depthsight_backtester.py`: `drawdown = (peak_equity
+                # - current_balance) / peak_equity`).
+                #
+                # It used to be `abs(today_pnl / start_of_day_balance)` -- the
+                # SAME expression as the daily-loss check one line below, so
+                # the daily-loss limit (5%) was always the tighter of the two
+                # and the 10% drawdown limit could never be the limit that
+                # fired. It was also 0 whenever the day was PROFITABLE, so an
+                # account 12% below its high-water mark went on trading
+                # whenever it happened to make money that day.
+                #
+                # The peak is SERVER-OWNED state (`_peak_equity`): it is not a
+                # client-writable setting, and it is persisted with the rest
+                # of the trading-guard state so a restart cannot silently
+                # reset it. See `_observe_balance_for_peak`.
+                #
+                # An EXPIRED peak is not counted (see `_expire_stale_peak`),
+                # and an UNKNOWN peak is never read as "no drawdown": it
+                # fails CLOSED, exactly like the unknown opening balance
+                # above.
+                self._expire_stale_peak()
+                peak = self._usable_peak_equity()
+                trough = self._drawdown_trough_balance()
+                if peak is None or trough is None:
                     should_be_allowed = False
-                    disable_reason = f"Max drawdown ({drawdown_pct * 100:.2f}%) >= limit ({self.max_drawdown_threshold * 100:.2f}%)"
+                    if getattr(self, "_balance_read_rejected", False):
+                        disable_reason = RISK_GUARD_BALANCE_REJECTED_REASON
+                    else:
+                        disable_reason = RISK_GUARD_PEAK_UNKNOWN_REASON
+                else:
+                    drawdown_pct = max(0.0, (peak - trough) / peak)
+                    if drawdown_pct >= self.max_drawdown_threshold:
+                        should_be_allowed = False
+                        disable_reason = (
+                            f"Max drawdown ({drawdown_pct * 100:.2f}%) >= limit "
+                            f"({self.max_drawdown_threshold * 100:.2f}%) "
+                            f"[peak ${peak:.2f}, trough ${trough:.2f}]"
+                        )
                 daily_loss_pct = (
                     abs(self.stats.today_pnl / self.stats.start_of_day_balance)
                     if self.stats.today_pnl < 0
@@ -2263,7 +2602,6 @@ class RiskManager:
             if self._is_trading_allowed:
                 logger.critical(f"Trading disabled globally! Reason: {disable_reason}")
                 self._is_trading_allowed = False
-                self._trading_disabled_reason = breach_reason
                 # Added check for self.loop_from_controller
                 if self.telegram_notifier and self.loop_from_controller:
                     try:
@@ -2280,6 +2618,27 @@ class RiskManager:
                         )
                     except Exception as e:
                         logger.error(f"Failed to schedule Telegram notification: {e}")
+            # THE OPERATOR-FACING REASON MUST BE THE CURRENT ONE.
+            #
+            # This block only rewrote `_trading_disabled_reason` when THIS
+            # evaluation CLOSED the gate. Once the gate was already closed the
+            # published reason stayed frozen on the FIRST breach that ever
+            # tripped, while `_global_gate_disable_reason` (refreshed on every
+            # evaluation) moved on. The two fields then disagreed: the operator
+            # was told "Max drawdown (30.63%) >= limit (20.00%)" while the
+            # limit actually in force was "Daily loss (11.53%) >= limit (5.00%)",
+            # measured against a base that had since moved.
+            #
+            # The published reason is now refreshed with the CURRENT breach on
+            # every evaluation, exactly like the sibling paths in this file: the
+            # guard-state latches above, `restore_state()`, and the
+            # re-verification path -- all of which already refresh it from
+            # `_global_gate_disable_reason` for this same reason.
+            #
+            # The emergency-stop latch OWNS the published reason while it is
+            # engaged: its message must NOT be overwritten by a limit reason.
+            if not getattr(self, "_emergency_stop_active", False):
+                self._trading_disabled_reason = breach_reason
             self._global_gate_disable_reason = breach_reason
         elif should_be_allowed:
             # The limits are within range again.
@@ -2390,6 +2749,12 @@ class RiskManager:
                             )
                             current_balance_val = self.stats.current_balance
                             balance_updated_successfully = True
+                            # The same trust problem the default path refuses to
+                            # act on: the drawdown cannot be measured against a
+                            # balance the server does not believe, so it fails
+                            # CLOSED until a credible balance is read. See
+                            # `update_balance`.
+                            self._balance_read_rejected = True
                         else:
                             current_balance_val = fetched_total
                             balance_updated_successfully = current_balance_val > 0
@@ -2406,6 +2771,12 @@ class RiskManager:
                                 # min_balance_threshold kept opening positions.
                                 async with self._balance_lock:
                                     self.stats.current_balance = current_balance_val
+                                # This read was accepted, so the balance is
+                                # credible again, and it is the evidence the
+                                # account's high-water mark is folded into.
+                                self._balance_read_rejected = False
+                                self._set_balance_pnl_baseline()
+                                self._observe_balance_for_peak(current_balance_val)
                                 self._check_risk_limits()
                 except Exception as e:
                     logger.error(
@@ -2426,21 +2797,86 @@ class RiskManager:
         if current_balance_val <= 1e-9:
             return False, None, 0.0, "ZERO_BALANCE"
 
+        # --- THE PER-TRADE RISK CEILING -------------------------------------
+        # A signal may TIGHTEN the per-trade risk but never LOOSEN it.
+        #
+        # `signal.risk_pct` and `signal.risk_usd` are the strategy's own
+        # budget for a trade, and they REPLACE the account's budget for that
+        # trade (the `risk_pct` branch below). Both of them are reachable
+        # from the CLIENT's own configuration -- `risk_pct` through the
+        # strategy parameter `risk_pct_per_trade`, which the strategy reads
+        # out of the client's `config_data`
+        # (bot_module/strategy.py:2386-2404), and `risk_usd` through the
+        # visual builder's "risk_value"/"risk_type" action parameter
+        # (bot_module/strategy.py:5004-5016) -- so without a ceiling here a
+        # client could ask for 99% of the balance on a single trade.
+        #
+        # The ceiling is the account's own effective limit, itself capped by
+        # the server's floor:
+        #   * `self.risk_per_trade` is the account's `riskPerTradePercent`
+        #     (bot_module/risk_manager.py:222-229). It is used in preference
+        #     to `self.live_risk_per_trade` because the latter is 0.0 when
+        #     the account has no `riskPerTradePercent` at all, and clamping
+        #     to 0 would newly reject every trade.
+        #   * the server floor is `config.DEFAULT_RISK_PER_TRADE_PERCENT`,
+        #     a PERCENT, expressed here as a FRACTION -- the unit
+        #     `signal.risk_pct` is in.
+        server_floor_fraction = (
+            float(config.DEFAULT_RISK_PER_TRADE_PERCENT) / 100.0
+        )
+        risk_ceiling_fraction = max(
+            0.0, min(self.risk_per_trade, server_floor_fraction)
+        )
+        if mode == "paper":
+            # The paper budget is never 0 (it falls back to the live block
+            # and then to the server default), so it can only tighten the
+            # ceiling here.
+            risk_ceiling_fraction = min(
+                risk_ceiling_fraction, max(0.0, self.paper_risk_per_trade)
+            )
+        logger.debug(
+            f"{log_prefix} Per-trade risk ceiling: {risk_ceiling_fraction * 100:.4f}% "
+            f"of the balance (account limit {self.risk_per_trade * 100:.4f}%, "
+            f"server floor {server_floor_fraction * 100:.4f}%)"
+        )
+
         # 1. By default, the final risk is equal to the base risk for the current mode.
         if signal.risk_usd is not None:
-            initial_base_risk_usd_planned = max(float(signal.risk_usd), 0.0)
-            logger.debug(
-                f"{log_prefix} Using fixed risk budget from strategy signal: ${initial_base_risk_usd_planned:.2f}"
-            )
+            requested_risk_usd = max(float(signal.risk_usd), 0.0)
+            max_risk_usd = current_balance_val * risk_ceiling_fraction
+            initial_base_risk_usd_planned = min(requested_risk_usd, max_risk_usd)
+            if initial_base_risk_usd_planned < requested_risk_usd:
+                logger.warning(
+                    f"{log_prefix} Signal risk budget CLAMPED: the strategy asked for "
+                    f"${requested_risk_usd:.2f} but the account's per-trade limit "
+                    f"({risk_ceiling_fraction * 100:.4f}% of "
+                    f"${current_balance_val:.2f} = ${max_risk_usd:.2f}) allows no more. "
+                    f"Using ${initial_base_risk_usd_planned:.2f}."
+                )
+            else:
+                logger.debug(
+                    f"{log_prefix} Using fixed risk budget from strategy signal: ${initial_base_risk_usd_planned:.2f}"
+                )
         else:
             risk_per_trade_final = risk_per_trade_base
 
-            # 2. If there is an override in the signal, use it.
+            # 2. If there is an override in the signal, use it -- but never
+            #    above the ceiling computed above.
             if signal.risk_pct is not None:
-                risk_per_trade_final = max(float(signal.risk_pct), 0.0)
-                logger.debug(
-                    f"{log_prefix} Using risk per trade from strategy signal: {risk_per_trade_final * 100:.2f}%"
-                )
+                requested_risk_pct = max(float(signal.risk_pct), 0.0)
+                risk_per_trade_final = min(requested_risk_pct, risk_ceiling_fraction)
+                if risk_per_trade_final < requested_risk_pct:
+                    logger.warning(
+                        f"{log_prefix} Signal risk per trade CLAMPED: the strategy asked "
+                        f"for {requested_risk_pct * 100:.4f}% of the balance but the "
+                        f"account's per-trade limit is "
+                        f"{risk_ceiling_fraction * 100:.4f}%. Using "
+                        f"{risk_per_trade_final * 100:.4f}%."
+                    )
+                else:
+                    logger.debug(
+                        f"{log_prefix} Using risk per trade from strategy signal: {risk_per_trade_final * 100:.2f}%"
+                    )
 
             # Now `risk_per_trade_final` always has a correct value.
             initial_base_risk_usd_planned = current_balance_val * risk_per_trade_final
@@ -3153,6 +3589,25 @@ class RiskManager:
                 # account while the daily-loss gate measured a real loss
                 # against a denominator from days ago.
                 "start_of_day_day_str": self.stats.start_of_day_day_str or "",
+                # THE HIGH-WATER MARK for the peak-to-trough drawdown.
+                #
+                # It travels with the rest of the trading-guard state because
+                # the bot restarts on every deploy, and a peak that is
+                # re-derived on every start is a peak that forgets -- which
+                # would leave the drawdown limit measured against whatever
+                # the balance happens to be today.
+                #
+                # The peak's OWN timestamp travels with it, so the window is
+                # measured from when the high-water mark was actually
+                # reached and a restart cannot silently renew a stale peak's
+                # seven days.
+                #
+                # A peak of 0.0 means UNKNOWN. It is written as unknown, never
+                # as a guess.
+                "peak_equity": float(getattr(self, "_peak_equity", 0.0) or 0.0),
+                "peak_equity_set_at": float(
+                    getattr(self, "_peak_equity_set_at", 0.0) or 0.0
+                ),
                 "saved_at_utc": datetime.now(timezone.utc).isoformat(),
             }
             try:
@@ -3381,12 +3836,88 @@ class RiskManager:
             return None, "the persisted payload is not a JSON object"
         return payload, None
 
+    def _restore_persisted_peak(self, payload: Dict[str, Any]) -> None:
+        """Restore the account's high-water mark from the persisted payload.
+
+        The peak is SERVER-OWNED state and it is persisted with the rest of
+        the trading-guard state, because the bot restarts on every deploy and
+        a peak that is re-derived on every start is a peak that forgets.
+
+        A payload that carries NO peak -- any payload written before
+        `RISK_STATE_VERSION` 3 -- means the peak is UNKNOWN. It is NOT read
+        as "the peak is zero", because a zero peak reads as "there is no
+        drawdown" and would open the gate. An unknown peak fails CLOSED.
+
+        The payload's VERSION is what decides this, not the shape alone: a
+        payload written by an older build never had a peak to write, so its
+        version says the peak is missing rather than zero.
+        """
+        payload_version = payload.get("version")
+        try:
+            payload_version = int(payload_version)
+        except (TypeError, ValueError):
+            payload_version = 0
+
+        if (
+            payload_version < RISK_STATE_VERSION_WITH_PEAK
+            or "peak_equity" not in payload
+        ):
+            logger.critical(
+                "[RiskGuard] The persisted trading-guard state (version "
+                f"{payload_version or 'unknown'}) carries NO high-water mark, "
+                "so the peak-to-trough drawdown cannot be measured. The peak is "
+                "UNKNOWN -- not zero -- and the drawdown gate fails CLOSED "
+                "until a balance read establishes it."
+            )
+            self._peak_equity = 0.0
+            self._peak_equity_set_at = 0.0
+            return
+
+        try:
+            peak = float(payload.get("peak_equity") or 0.0)
+        except (TypeError, ValueError):
+            peak = 0.0
+        try:
+            peak_set_at = float(payload.get("peak_equity_set_at") or 0.0)
+        except (TypeError, ValueError):
+            peak_set_at = 0.0
+        if not math.isfinite(peak) or peak < 0:
+            peak = 0.0
+        if not math.isfinite(peak_set_at) or peak_set_at < 0:
+            peak_set_at = 0.0
+
+        if peak <= 1e-9:
+            # A persisted zero means UNKNOWN, not a peak of zero.
+            self._peak_equity = 0.0
+            self._peak_equity_set_at = 0.0
+            return
+
+        current_peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
+        if current_peak > peak:
+            # A balance THIS process has already read is higher, so that is
+            # the high-water mark, with its own (more recent) timestamp. The
+            # lower of the two is never the high-water mark.
+            return
+
+        self._peak_equity = peak
+        self._peak_equity_set_at = peak_set_at if peak_set_at > 0 else time.time()
+
     def _apply_persisted_guard_state(self, payload: Dict[str, Any]) -> bool:
         """Apply a persisted guard state to this RiskManager.
 
         Returns True when a state was applied, False when it was discarded
         because it belongs to a previous UTC day.
         """
+        # THE HIGH-WATER MARK IS RESTORED FIRST, BEFORE THE DAY CHECK.
+        #
+        # The peak is NOT a day quantity: it is the account's high-water mark
+        # and it must SURVIVE the UTC rollover, so a payload written
+        # yesterday still carries a usable peak. Restoring it after the day
+        # check would discard the peak of every account whose payload was
+        # written on an earlier day -- which is exactly the account that
+        # needs it most.
+        self._restore_persisted_peak(payload)
+
         current_day_str = self._current_utc_day_str()
         persisted_day_str = str(payload.get("day_str") or "")
         if persisted_day_str != current_day_str:
@@ -3470,6 +4001,10 @@ class RiskManager:
             int(self.stats.consecutive_losses or 0),
         )
         self.stats.today_pnl = today_pnl
+        # The balance this process holds (if it has read one) and the day's
+        # PnL now describe the same instant, so the PnL the balance already
+        # reflects is the restored one. See `_set_balance_pnl_baseline`.
+        self._set_balance_pnl_baseline()
 
         # THE BASE MUST CARRY ITS OWN DAY. `day_str` above describes the STREAK
         # and the day's PnL. It says nothing about which day

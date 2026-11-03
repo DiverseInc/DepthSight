@@ -1496,9 +1496,27 @@ def mock_binance_server():
     """
     Starts and stops the Binance mock server for each test.
     Uses subprocess to run uvicorn in the background.
+
+    MEASURED FIX (2026-10-31, round 24): this fixture used to start the mock
+    exchange with a BARE "uvicorn" name and then WAIT A FIXED TWO SECONDS
+    before asking whether it was up. Both halves are unreliable:
+
+    * the bare name is resolved through PATH, so the server is not found at
+      all unless the CALLER put the venv's Scripts directory on PATH. The
+      gate now does that itself (gate_run.py), but a fixture that only works
+      when its caller is correct is not a fixture. ``sys.executable -m
+      uvicorn`` always uses the interpreter that is running the test.
+    * two seconds is a guess. MEASURED on the riskmode branch (2026-10-31,
+      the 19:16-20:01 gate run): the mock server was still not answering when
+      the fixture asked, the fixture called pytest.fail, and the GATE failed
+      with 2 collection errors -- a launcher race, not a product defect. The
+      fixture now WAITS for the server to answer (bounded), so a slow start
+      is a slow start and not a failed gate.
     """
     server_process = subprocess.Popen(
         [
+            sys.executable,
+            "-m",
             "uvicorn",
             "tests.e2e.mock_binance_server:app",
             "--host",
@@ -1508,15 +1526,32 @@ def mock_binance_server():
         ]
     )
 
-    time.sleep(2)
+    startup_error = None
+    started = False
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        if server_process.poll() is not None:
+            # uvicorn exited on its own -- it will never answer.
+            break
+        try:
+            response = requests.get("http://127.0.0.1:9999/docs", timeout=2)
+            response.raise_for_status()
+            started = True
+            break
+        except (requests.ConnectionError, requests.HTTPError) as e:
+            startup_error = e
+            time.sleep(0.25)
 
-    try:
-        response = requests.get("http://127.0.0.1:9999/docs")
-        response.raise_for_status()
-        print("\nMock Binance server is up and running.")
-    except (requests.ConnectionError, requests.HTTPError) as e:
+    if not started:
+        exit_code = server_process.poll()
         server_process.terminate()
-        pytest.fail(f"Mock Binance server did not start correctly: {e}")
+        pytest.fail(
+            "Mock Binance server did not start correctly: "
+            f"{startup_error or f'uvicorn exited with code {exit_code}'} "
+            "(waited up to 30s for 127.0.0.1:9999)"
+        )
+
+    print("\nMock Binance server is up and running.")
 
     yield "http://127.0.0.1:9999"
 
