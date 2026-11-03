@@ -16,7 +16,7 @@ from api.models import (
     Base,
 )
 from api.database import (
-    DATABASE_URL,
+    alembic_database_url,
 )
 
 
@@ -25,7 +25,17 @@ from api.database import (
 config = context.config
 
 
-config.set_main_option("sqlalchemy.url", DATABASE_URL.replace("+asyncpg", ""))
+# The URL Alembic connects with comes from the environment, via
+# api.database.alembic_database_url().
+#
+# It MUST name the sync driver (psycopg2) explicitly. The previous code did
+# DATABASE_URL.replace("+asyncpg", ""), which leaves the BARE "postgresql://"
+# scheme; on SQLAlchemy 2.x that does not mean "no driver", it means "pick
+# one", and it picks psycopg3 -- which is not installed.  `alembic upgrade
+# head` therefore died with "ModuleNotFoundError: No module named 'psycopg'",
+# and docker-startup.sh swallowed that, so the API served traffic while the
+# schema never advanced.
+config.set_main_option("sqlalchemy.url", alembic_database_url())
 
 
 if config.config_file_name is not None:
