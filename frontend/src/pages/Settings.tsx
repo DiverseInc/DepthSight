@@ -105,6 +105,26 @@ const InfoPanel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
 	<div className="bg-accent/50 p-4 rounded-lg space-y-4 h-fit">{children}</div>
 );
 
+// An EMPTY field is not a number, and a 0 is not "missing".
+//
+// The page used to write `parseFloat(x) || 0`, which turned a CLEARED field
+// into a 0 -- and a stored 0 is not a tighter risk limit, it is a brick: the
+// RiskManager compares the live value with ">=", so a limit of 0 is true
+// before the first trade and the account stops trading with nothing to
+// explain why. An empty field now means "keep what the server already has",
+// and a 0 the user typed is still sent as 0.
+const _num = (value: number | string): number | undefined => {
+	if (typeof value === "number") {
+		return Number.isFinite(value) ? value : undefined;
+	}
+	const trimmed = String(value).trim();
+	if (trimmed === "") {
+		return undefined;
+	}
+	const parsed = Number(trimmed);
+	return Number.isFinite(parsed) ? parsed : undefined;
+};
+
 // --- Main Page Component ---
 export default function Settings() {
 	const { t } = useTranslation(["settings", "common"]);
@@ -235,7 +255,13 @@ export default function Settings() {
 			setRiskMaxConcurrentTrades(rm?.maxConcurrentTrades ?? "");
 			setRiskStopLossEnabled(rm?.stopLossEnabled ?? false);
 			setRiskDefaultStopLossPercent(rm?.defaultStopLossPercent ?? "");
-			setRiskMaxStopDistancePct(rm?.maxStopDistancePct ?? 10);
+			// 5.0 is the number the platform DECLARES
+			// (bot_module/strategy_registry.py: SERVER_MAX_STOP_DISTANCE_PCT)
+			// and the number the RiskManager falls back to when the account
+			// holds none (bot_module/risk_manager.py:184-186). The old 10
+			// was the schema default: a value the server's own write guard
+			// refuses for an account that holds none.
+			setRiskMaxStopDistancePct(rm?.maxStopDistancePct ?? 5);
 			setRiskDailyMaxLossPercent(rm?.dailyMaxLossPercent ?? 5);
 
 			setAdaptiveRmEnabled(rm?.strategySymbolAdjustmentEnabled ?? false);
@@ -260,7 +286,8 @@ export default function Settings() {
 			setBacktestRiskDefaultStopLossPercent(
 				String(brm?.defaultStopLossPercent ?? ""),
 			);
-			setBacktestRiskMaxStopDistancePct(String(brm?.maxStopDistancePct ?? 10));
+			// The same declared floor as the live section above.
+			setBacktestRiskMaxStopDistancePct(String(brm?.maxStopDistancePct ?? 5));
 			setBacktestRiskDailyMaxLossPercent(String(brm?.dailyMaxLossPercent ?? 5));
 			setBacktestRiskPerTrade(String(brm?.riskPerTradePercent ?? 1));
 			setBacktestLeverage(String(brm?.leverage ?? 10));
@@ -384,57 +411,83 @@ export default function Settings() {
 			case "Risk Management":
 				payload = {
 					riskManagement: {
-						maxDrawdown: parseFloat(riskMaxDrawdown as string) || 0,
+						// An empty field means "keep what the server has" (see
+						// _num). A field the server has no value for is left
+						// out entirely, so the server refuses it loudly
+						// instead of storing a limit that stops all trading.
+						maxDrawdown:
+							_num(riskMaxDrawdown) ?? config?.riskManagement?.maxDrawdown,
 						maxConsecutiveLosses:
-							parseInt(riskMaxConsecutiveLosses as string, 10) || 0,
+							_num(riskMaxConsecutiveLosses) ??
+							config?.riskManagement?.maxConsecutiveLosses,
 						maxConcurrentTrades:
-							parseInt(riskMaxConcurrentTrades as string, 10) || 0,
+							_num(riskMaxConcurrentTrades) ??
+							config?.riskManagement?.maxConcurrentTrades,
 						stopLossEnabled: riskStopLossEnabled,
-						defaultStopLossPercent: riskDefaultStopLossPercent
-							? parseFloat(riskDefaultStopLossPercent as string)
-							: undefined,
+						defaultStopLossPercent: _num(riskDefaultStopLossPercent),
 						maxStopDistancePct:
-							parseFloat(riskMaxStopDistancePct as string) || 10,
+							_num(riskMaxStopDistancePct) ??
+							config?.riskManagement?.maxStopDistancePct,
 						dailyMaxLossPercent:
-							parseFloat(riskDailyMaxLossPercent as string) || 5,
+							_num(riskDailyMaxLossPercent) ??
+							config?.riskManagement?.dailyMaxLossPercent,
 						strategySymbolAdjustmentEnabled: adaptiveRmEnabled,
-						strategySymbolWindowSize: parseInt(windowSize as string, 10) || 20,
+						strategySymbolWindowSize:
+							_num(windowSize) ??
+							config?.riskManagement?.strategySymbolWindowSize,
 						strategySymbolMinTradesForAssessment:
-							parseInt(minTrades as string, 10) || 10,
+							_num(minTrades) ??
+							config?.riskManagement?.strategySymbolMinTradesForAssessment,
 						strategySymbolPnlThresholdPct:
-							parseFloat(pnlThreshold as string) || -150.0,
+							_num(pnlThreshold) ??
+							config?.riskManagement?.strategySymbolPnlThresholdPct,
 						strategySymbolWinRateThresholdPct:
-							parseFloat(winRateThreshold as string) || 35.0,
+							_num(winRateThreshold) ??
+							config?.riskManagement?.strategySymbolWinRateThresholdPct,
 						strategySymbolMaxConsecutiveLosses:
-							parseInt(maxConsecLosses as string, 10) || 5,
+							_num(maxConsecLosses) ??
+							config?.riskManagement?.strategySymbolMaxConsecutiveLosses,
 						strategySymbolRecoveryConsecutiveWins:
-							parseInt(recoveryWins as string, 10) || 3,
+							_num(recoveryWins) ??
+							config?.riskManagement?.strategySymbolRecoveryConsecutiveWins,
 						strategySymbolRecoveryPnlThresholdPct:
-							parseFloat(recoveryPnl as string) || 50.0,
+							_num(recoveryPnl) ??
+							config?.riskManagement?.strategySymbolRecoveryPnlThresholdPct,
 						strategySymbolCooldownAfterPenaltySeconds:
-							parseInt(cooldownSeconds as string, 10) || 86400,
+							_num(cooldownSeconds) ??
+							config?.riskManagement?.strategySymbolCooldownAfterPenaltySeconds,
 					},
 				};
 				break;
 			case "Backtest Risk Management":
 				payload = {
 					backtestRiskManagement: {
-						maxDrawdown: parseFloat(backtestRiskMaxDrawdown as string) || 0,
+						// Same rule as the live section above.
+						maxDrawdown:
+							_num(backtestRiskMaxDrawdown) ??
+							config?.backtestRiskManagement?.maxDrawdown,
 						dailyMaxLossPercent:
-							parseFloat(backtestRiskDailyMaxLossPercent as string) || 0,
+							_num(backtestRiskDailyMaxLossPercent) ??
+							config?.backtestRiskManagement?.dailyMaxLossPercent,
 						maxConsecutiveLosses:
-							parseInt(backtestRiskMaxConsecutiveLosses as string, 10) || 0,
+							_num(backtestRiskMaxConsecutiveLosses) ??
+							config?.backtestRiskManagement?.maxConsecutiveLosses,
 						maxConcurrentTrades:
-							parseInt(backtestRiskMaxConcurrentTrades as string, 10) || 0,
+							_num(backtestRiskMaxConcurrentTrades) ??
+							config?.backtestRiskManagement?.maxConcurrentTrades,
 						stopLossEnabled: backtestRiskStopLossEnabled,
-						defaultStopLossPercent: backtestRiskDefaultStopLossPercent
-							? parseFloat(backtestRiskDefaultStopLossPercent as string)
-							: undefined,
+						defaultStopLossPercent: _num(
+							backtestRiskDefaultStopLossPercent,
+						),
 						maxStopDistancePct:
-							parseFloat(backtestRiskMaxStopDistancePct as string) || 10,
+							_num(backtestRiskMaxStopDistancePct) ??
+							config?.backtestRiskManagement?.maxStopDistancePct,
 						riskPerTradePercent:
-							parseFloat(backtestRiskPerTrade as string) || 1,
-						leverage: parseFloat(backtestLeverage as string) || 10,
+							_num(backtestRiskPerTrade) ??
+							config?.backtestRiskManagement?.riskPerTradePercent,
+						leverage:
+							_num(backtestLeverage) ??
+							config?.backtestRiskManagement?.leverage,
 						strategySymbolAdjustmentEnabledForBacktest:
 							adaptiveRmEnabledForBacktest,
 					},

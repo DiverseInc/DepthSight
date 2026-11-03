@@ -70,6 +70,7 @@ import type {
 	StrategyConfigCreatePayload,
 	StrategyConfigData,
 	StrategyData,
+	StrategyRegistryContract,
 	StrategyRunRequest,
 	SymbolSelectionConfig,
 	SystemMetrics,
@@ -955,6 +956,22 @@ export const useStrategyConfigsList = () => {
 	return useQuery<StrategyConfig[], Error>({
 		queryKey: authScopedQueryKey("strategyConfigsList"),
 		queryFn: () => apiClient<StrategyConfig[]>("/strategies/config"),
+	});
+};
+/**
+ * The strategy pick and risk-limit contract the server publishes.
+ *
+ * The client used to carry its own hand-written copy of the strategy list and
+ * of the server's risk floors, so the two could drift apart: the editor
+ * offered a strategy the server could not run, and mirrored a floor the
+ * server had moved. This is the server's own answer.
+ */
+export const useStrategyRegistry = () => {
+	return useQuery<StrategyRegistryContract, Error>({
+		queryKey: authScopedQueryKey("strategyRegistry"),
+		queryFn: () => apiClient<StrategyRegistryContract>("/strategies/registry"),
+		staleTime: 5 * 60 * 1000,
+		refetchOnWindowFocus: false,
 	});
 };
 export const useEventLog = () =>

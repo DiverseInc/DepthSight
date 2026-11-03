@@ -353,8 +353,13 @@ class RiskManagementSettings(BaseModel):
     maxConcurrentTrades: int
     stopLossEnabled: bool
     defaultStopLossPercent: Optional[float] = None
+    # The stop distance a NEW account is handed. The owner's decision of
+    # 2026-11-01: 5% everywhere -- the same as the declared server floor
+    # (``SERVER_MAX_STOP_DISTANCE_PCT``). This is the value a new client
+    # is given; it is NOT a sweep of the accounts that already exist, and
+    # an account that already holds a looser value keeps it.
     maxStopDistancePct: float = Field(
-        default=10.0,
+        default=5.0,
         description="Maximum allowed distance to stop-loss in % of entry price",
     )
     riskPerTradePercent: Optional[float] = Field(
@@ -406,8 +411,13 @@ class BacktestRiskManagementSettings(BaseModel):
     maxConcurrentTrades: int
     stopLossEnabled: bool
     defaultStopLossPercent: Optional[float] = None
+    # The stop distance a NEW account is handed. The owner's decision of
+    # 2026-11-01: 5% everywhere -- the same as the declared server floor
+    # (``SERVER_MAX_STOP_DISTANCE_PCT``). This is the value a new client
+    # is given; it is NOT a sweep of the accounts that already exist, and
+    # an account that already holds a looser value keeps it.
     maxStopDistancePct: float = Field(
-        default=10.0,
+        default=5.0,
         description="Maximum allowed distance to stop-loss in % of entry price",
     )
     riskPerTradePercent: Optional[float] = Field(
@@ -1755,6 +1765,53 @@ class StrategyV2ConfigData(BaseModel):
     oracle_confidence: Optional[float] = None
     use_ml_confirmation: Optional[bool] = False
     breakeven_on_regime_change: Optional[bool] = False
+    # The client's strategy PICK parameters and RISK limits.
+    #
+    # These two blocks are part of the contract the API validates
+    # (bot_module/strategy_registry.py). They MUST be declared fields here:
+    # `model_dump()` drops every key that is not a declared field, so an
+    # undeclared `risk_settings` was silently removed from the payload the
+    # routes persist -- the client set a risk limit and the server stored
+    # nothing.
+    risk_settings: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "The client's risk limits, validated against the server floor by "
+            "bot_module/strategy_registry.py. Every key is optional; omitting "
+            "one means 'leave the account's current value alone'."
+        ),
+    )
+    strategy_params: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "The per-strategy parameter set merged into the params the strategy "
+            "instance is constructed with."
+        ),
+    )
+    #: The per-trade risk, as a FRACTION of the balance (0.01 is 1%).
+    #:
+    #: It is declared so it survives ``model_dump()`` and so it is visible in
+    #: the OpenAPI schema. The server bounds it against the floor in
+    #: bot_module/strategy_registry.py and never stores a value above it.
+    risk_pct_per_trade: Optional[float] = Field(
+        None,
+        description=(
+            "Risk per trade as a fraction of the balance (0.01 is 1%). "
+            "Bounded by the server floor; a looser value is refused."
+        ),
+    )
+
+    # The client's own strategy parameters are placed at the TOP LEVEL of
+    # ``config_data``, because that is where ``BaseStrategy._get_param``
+    # reads them from (bot_module/strategy.py:2386-2404) -- the controller
+    # hands the strategy the client's ``config_data`` verbatim
+    # (bot_module/controller.py:2386-2391).
+    #
+    # ``model_dump()`` drops every key that is not a declared field, so those
+    # parameters were silently removed on the way into the database: the
+    # client set them and the strategy never saw them. ``extra="allow"``
+    # keeps them.
+    model_config = ConfigDict(extra="allow")
 
 
 # AI_CONTEXT_END
