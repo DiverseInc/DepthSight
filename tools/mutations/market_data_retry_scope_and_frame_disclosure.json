@@ -1,0 +1,97 @@
+{
+  "_comment": [
+    "Mutations that break the two fixes of PR #44 round 2.",
+    "",
+    "F1: the Binance geo-block give-up was scoped to the WHOLE shared",
+    "    request helper, so a 451 aborted the aggTrades and the",
+    "    open-interest paths after ONE request -- two endpoints that have",
+    "    NO archive fallback to get to, and whose five tries were the only",
+    "    chance to get through a flapping block.  The give-up belongs to the",
+    "    klines path alone, because the klines path is the one with the",
+    "    bulk-archive fallback.",
+    "",
+    "F2: the coverage note was computed by the loader and read by TWO",
+    "    hand-picked call sites, so the trainer, the data consumer, the",
+    "    diagnostics routes, the API and the celery paths could all",
+    "    receive a shortened, hole-riddled archive frame with nothing",
+    "    saying so.  The note has to travel WITH THE FRAME.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/market_data_retry_scope_and_frame_disclosure.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "",
+    "A mutant is KILLED when the pytest run of the target files reports a",
+    "failure or an error.  A SKIP (needle not found) is NOT a kill: the",
+    "harness exits non-zero on it."
+  ],
+  "pytest_target": "tests/test_data_loader_retry_scope_and_disclosure.py tests/test_data_loader_bulk_archive_coverage.py tests/test_backtest_data_window_disclosure.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "F1-A: the geo-block give-up is back on the shared path, so EVERY endpoint gives up after one request",
+      "file": "bot_module/data_loader.py",
+      "needle": "    logger=logger,\n)\ndef _make_api_request_with_retry_budget(\n",
+      "replace": "    logger=logger,\n    giveup=_is_binance_location_block,\n)\ndef _make_api_request_with_retry_budget(\n"
+    },
+    {
+      "label": "F1-B: the klines path loses the give-up, so it spends the five tries before the archive answers",
+      "file": "bot_module/data_loader.py",
+      "needle": "    if endpoint in _ENDPOINTS_WITH_ARCHIVE_FALLBACK:\n        return _make_api_request_giveup_on_geo_block(endpoint, params, market_type)\n",
+      "replace": "    if endpoint in _ENDPOINTS_WITH_ARCHIVE_FALLBACK:\n        return _make_api_request_with_retry_budget(endpoint, params, market_type)\n"
+    },
+    {
+      "label": "F1-C: the give-up is attached to the WRONG caller (aggTrades is declared to have a fallback)",
+      "file": "bot_module/data_loader.py",
+      "needle": "_ENDPOINTS_WITH_ARCHIVE_FALLBACK = frozenset({\"klines\"})\n",
+      "replace": "_ENDPOINTS_WITH_ARCHIVE_FALLBACK = frozenset({\"klines\", \"aggTrades\"})\n"
+    },
+    {
+      "label": "F2-A: the coverage note is never attached to the frame",
+      "file": "bot_module/data_loader.py",
+      "needle": "    note = klines_window_coverage(frame)\n    if note:\n        frame.attrs[COVERAGE_ATTR] = note\n    return frame\n",
+      "replace": "    return frame  # MUTANT: the note is never attached to the frame\n"
+    },
+    {
+      "label": "F2-B: the frame the loader returns does not carry the note",
+      "file": "bot_module/data_loader.py",
+      "needle": "        _attach_klines_coverage_note(df_processed)\n",
+      "replace": "        pass  # MUTANT: the note is not attached to the returned frame\n"
+    },
+    {
+      "label": "F2-C: the cache-only frame does not carry the note",
+      "file": "bot_module/data_loader.py",
+      "needle": "                _attach_klines_coverage_note(df_cached)\n",
+      "replace": "                pass  # MUTANT: the note is not attached to the cached frame\n"
+    },
+    {
+      "label": "F2-D: the coverage key is renamed, so the note cannot be read by name",
+      "file": "bot_module/data_loader.py",
+      "needle": "COVERAGE_ATTR = \"klines_window_coverage\"\n",
+      "replace": "COVERAGE_ATTR = \"klines_window_coverage_renamed\"  # MUTANT: the key cannot be read\n"
+    },
+    {
+      "label": "F2-E: the provenance key is renamed, so the coverage cannot be computed at all",
+      "file": "bot_module/data_loader.py",
+      "needle": "PROVENANCE_ATTR = \"klines_provenance\"\n",
+      "replace": "PROVENANCE_ATTR = \"klines_provenance_renamed\"  # MUTANT: the key cannot be read\n"
+    },
+    {
+      "label": "F2-F: the trainer stops logging the window it did not get (the process path)",
+      "file": "bot_module/trainer.py",
+      "needle": "                    log_klines_window_coverage(df_loaded, log_prefix=log_prefix)\n",
+      "replace": "                    pass  # MUTANT: the disclosure is dropped\n"
+    },
+    {
+      "label": "F2-G: the trainer stops logging the window it did not get (the class path)",
+      "file": "bot_module/trainer.py",
+      "needle": "                    log_klines_window_coverage(result, log_prefix=log_prefix)\n",
+      "replace": "                    pass  # MUTANT: the disclosure is dropped\n"
+    },
+    {
+      "label": "F2-H: the strategy backtest stops carrying the disclosure (tasks.py)",
+      "file": "tasks.py",
+      "needle": "        attach_klines_window_coverage(\n            kpi_results_to_save,\n            historical_data,\n            log_prefix=f\"Task {task_id} (Symbol: {symbol}): \",\n        )\n",
+      "replace": "        pass  # MUTANT: the disclosure is dropped\n"
+    }
+  ]
+}

@@ -85,6 +85,19 @@ SOURCE_ATTR = "klines_source"
 # which says exactly HOW it differs.
 PROVENANCE_ATTR = "klines_provenance"
 
+# The key under which the loader records the COVERAGE NOTE of a frame:
+# what ``klines_window_coverage`` says about the window the frame
+# ACTUALLY covers, as opposed to the window that was asked for.
+#
+# THE NOTE TRAVELS WITH THE FRAME, so every consumer of a frame the
+# loader returns can ask "what did I actually get?" without knowing
+# which call site was instrumented.  The note used to be computed by the
+# loader and read by TWO hand-picked call sites, so the trainer, the
+# data consumer, the diagnostics routes, the API and two of the celery
+# paths could all receive a shortened, hole-riddled archive frame with
+# nothing at all saying so.
+COVERAGE_ATTR = "klines_window_coverage"
+
 
 def klines_provenance(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
     """The provenance of ``frame``: where it came from and what it covers.
@@ -236,6 +249,78 @@ def klines_window_coverage(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, 
         "remote_failed": remote_failed,
         "reason": reason,
     }
+
+
+# THE MARKER every caller logs when the frame it holds does not cover
+# the window it asked for.  It is greppable on purpose: a shortened
+# training window must be FINDABLE in a log, not swallowed by a generic
+# message.
+COVERAGE_LOG_MARKER = "klines_data_window_not_as_requested"
+
+
+def klines_coverage_note(frame: Optional[pd.DataFrame]) -> Optional[Dict[str, Any]]:
+    """The coverage note the loader attached to ``frame``, if it has one.
+
+    ``None`` for a frame that carries no note -- which is the case for a
+    frame that covers the window that was asked for: there is nothing to
+    say about that one.
+
+    The note is read FROM THE FRAME.  A caller that cannot find it there
+    has been handed a frame nobody disclosed, and that has to be visible
+    rather than papered over by recomputing it here.
+    """
+    if frame is None:
+        return None
+    attrs = getattr(frame, "attrs", None)
+    if not isinstance(attrs, dict):
+        return None
+    note = attrs.get(COVERAGE_ATTR)
+    if isinstance(note, dict):
+        return dict(note)
+    return None
+
+
+def _attach_klines_coverage_note(
+    frame: Optional[pd.DataFrame],
+) -> Optional[pd.DataFrame]:
+    """Puts the coverage note ON the frame, where the frame is built.
+
+    THIS IS THE FRAME BOUNDARY.  Every consumer of the loader's frames
+    gets the disclosure from here -- not from the two call sites that
+    were instrumented by hand, which is how a trainer could train on a
+    shortened, hole-riddled archive frame with nothing saying so.
+    """
+    if frame is None:
+        return None
+    note = klines_window_coverage(frame)
+    if note:
+        frame.attrs[COVERAGE_ATTR] = note
+    return frame
+
+
+def log_klines_window_coverage(
+    frame: Optional[pd.DataFrame], log_prefix: str = ""
+) -> Optional[Dict[str, Any]]:
+    """Logs the coverage note of ``frame``, when it has one.
+
+    ONE place formats it, so every caller says the same thing about the
+    same frame (see AGENTS.md: a predicate that is duplicated must
+    handle the same special cases in every copy).
+
+    The note is READ FROM THE FRAME, not recomputed: the disclosure
+    travels with the data, and a caller that cannot find it on the frame
+    it holds has been given a frame nobody disclosed.
+    """
+    note = klines_coverage_note(frame)
+    if not note:
+        return None
+    logger.warning(
+        f"{log_prefix}{COVERAGE_LOG_MARKER} source={note.get('source')} "
+        f"requested={note.get('requested_start')}..{note.get('requested_end')} "
+        f"delivered={note.get('actual_start')}..{note.get('actual_end')} "
+        f"rows={note.get('rows')}: {note.get('reason')}"
+    )
+    return note
 
 
 def _delivered_trailing_short(provenance: Dict[str, Any]) -> float:
@@ -567,32 +652,23 @@ def _is_binance_location_block(error: Exception) -> bool:
     return False
 
 
-@backoff.on_exception(
-    backoff.expo,
-    requests.exceptions.RequestException,
-    max_tries=5,
-    max_time=60,
-    logger=logger,
-    giveup=_is_binance_location_block,
-)
-def _make_api_request(
+# THE ENDPOINTS THAT HAVE A BULK-ARCHIVE FALLBACK.  A Binance geo-block
+# (HTTP 451) on one of these is ANSWERED by the archive, so the extra
+# attempts could not succeed and only delayed the fallback that does
+# work.  EVERY OTHER ENDPOINT HAS NO FALLBACK TO GET TO, so its five
+# tries are the only chance to get through a block that flaps, and they
+# are kept.
+_ENDPOINTS_WITH_ARCHIVE_FALLBACK = frozenset({"klines"})
+
+
+def _perform_api_request(
     endpoint: str, params: Optional[Dict[str, Any]] = None, market_type: str = "spot"
 ) -> List[Any]:
-    """Performs a request to the Binance API with consideration of the environment (mainnet/testnet).
+    """Performs ONE request to the Binance API with consideration of the environment (mainnet/testnet).
 
-    A GEO-BLOCK IS NOT RETRIED.  ``giveup=_is_binance_location_block`` stops
-    the retry loop the moment the answer is HTTP 451, and nothing else:
-    every other failure keeps the five tries and the 60 second budget it
-    has always had.
-
-    The reason is measured, not assumed: before this change a blocked load
-    made FIVE requests to the same blocked host (the retry loop measured
-    5.75s on this machine, with a jittered worst case of 15s and a 60s
-    ceiling) before the bulk-archive fallback was even tried.  HTTP 451 is
-    Binance's deterministic answer to a request from a blocked address --
-    the same request from the same address gets the same answer a second
-    later -- so those four extra attempts could not succeed and only
-    delayed the fallback that does work.
+    NO RETRY LOGIC IS HERE.  What a failure MEANS depends on whether the
+    caller has a fallback to go to, and only the caller knows that, so
+    the decision is made by the two wrappers below.
 
     THE VENUE IS DECIDED IN ONE PLACE.  ``config.resolve_market_venue``
     maps the market type onto the venue, and the bulk-archive fallback asks
@@ -623,6 +699,77 @@ def _make_api_request(
     response = http_session.get(url, params=params, timeout=30)
     response.raise_for_status()
     return response.json()
+
+
+@backoff.on_exception(
+    backoff.expo,
+    requests.exceptions.RequestException,
+    max_tries=5,
+    max_time=60,
+    logger=logger,
+    giveup=_is_binance_location_block,
+)
+def _make_api_request_giveup_on_geo_block(
+    endpoint: str, params: Optional[Dict[str, Any]] = None, market_type: str = "spot"
+) -> List[Any]:
+    """A request whose caller HAS an archive fallback to go to.
+
+    A GEO-BLOCK IS NOT RETRIED HERE.  ``giveup=_is_binance_location_block``
+    stops the retry loop the moment the answer is HTTP 451, and nothing else:
+    every other failure keeps the five tries and the 60 second budget it
+    has always had.
+
+    The reason is measured, not assumed: before this change a blocked load
+    made FIVE requests to the same blocked host (the retry loop measured
+    5.75s on this machine, with a jittered worst case of 15s and a 60s
+    ceiling) before the bulk-archive fallback was even tried.  HTTP 451 is
+    Binance's deterministic answer to a request from a blocked address --
+    the same request from the same address gets the same answer a second
+    later -- so those four extra attempts could not succeed and only
+    delayed the fallback that does work.
+
+    ONLY A CALLER WITH A FALLBACK MAY USE THIS.  On an endpoint with no
+    fallback the four extra attempts were not delay at all: they were the
+    only chance to get through a block that flaps.
+    """
+    return _perform_api_request(endpoint, params, market_type)
+
+
+@backoff.on_exception(
+    backoff.expo,
+    requests.exceptions.RequestException,
+    max_tries=5,
+    max_time=60,
+    logger=logger,
+)
+def _make_api_request_with_retry_budget(
+    endpoint: str, params: Optional[Dict[str, Any]] = None, market_type: str = "spot"
+) -> List[Any]:
+    """A request whose caller has NO fallback: EVERY failure keeps the five
+    tries and the 60 second budget it has always had."""
+    return _perform_api_request(endpoint, params, market_type)
+
+
+def _make_api_request(
+    endpoint: str, params: Optional[Dict[str, Any]] = None, market_type: str = "spot"
+) -> List[Any]:
+    """The ONE entry point every caller of the loader uses.
+
+    THE GIVE-UP ON A GEO-BLOCK IS SCOPED TO THE CALLER THAT HAS A
+    FALLBACK.  The give-up used to sit on this shared helper, so a 451
+    aborted the aggTrades and the open-interest paths after ONE request
+    -- two endpoints that have NO archive fallback to get to, and whose
+    five tries were the only chance to get through a flapping block.  The
+    klines path is the one WITH a fallback, so it is the one that gives
+    up: one attempt, then the archive.
+
+    A 451 THAT IS NOT BINANCE'S IS RE-RAISED UNCHANGED ON EVERY PATH:
+    ``_is_binance_location_block`` / ``_is_binance_geo_block_body`` are
+    the only things that decide it, and they decide it the same way here.
+    """
+    if endpoint in _ENDPOINTS_WITH_ARCHIVE_FALLBACK:
+        return _make_api_request_giveup_on_geo_block(endpoint, params, market_type)
+    return _make_api_request_with_retry_budget(endpoint, params, market_type)
 
 
 # ==============================================================================
@@ -1008,6 +1155,9 @@ async def download_klines(
                 df_local.attrs[PROVENANCE_ATTR] = _provenance_record(
                     "local_cache", start_dt_utc, end_dt_utc, df_local, interval=timeframe
                 )
+                # THE NOTE IS ATTACHED HERE, ON THE FRAME, so every
+                # consumer of a loader frame can read it.
+                _attach_klines_coverage_note(df_local)
                 return df_local
 
         api_start_dt = start_dt_utc
@@ -1065,6 +1215,9 @@ async def download_klines(
                     ),
                     interval=timeframe,
                 )
+                # THE NOTE IS ATTACHED HERE, ON THE FRAME, so every
+                # consumer of a loader frame can read it.
+                _attach_klines_coverage_note(df_cached)
                 return df_cached
             logger.error(
                 f"Klines unavailable for {symbol} ({timeframe}): no data from "
@@ -1160,6 +1313,11 @@ async def download_klines(
             difference=difference,
             interval=timeframe,
         )
+        # THE NOTE IS ATTACHED HERE, ON THE FRAME, so every consumer of a
+        # loader frame can read it -- the trainer, the data consumer, the
+        # diagnostics routes, the API and the celery paths all get it, and
+        # not only the two call sites that were instrumented by hand.
+        _attach_klines_coverage_note(df_processed)
 
         logger.info(f"Loaded/merged and processed {len(df_final)} candles.")
         return df_processed

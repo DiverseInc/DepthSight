@@ -430,8 +430,9 @@ _INTERVAL_ALIASES = {
 def _archive_market_path(market_type: str) -> str:
     """Maps a loader ``market_type`` onto the archive's folder layout.
 
-    This MUST mirror ``data_loader._make_api_request`` exactly, because the
-    archive is a FALLBACK for that REST path: for one request the two must
+    This MUST mirror ``data_loader._perform_api_request`` exactly (the
+    request behind ``data_loader._make_api_request``), because the archive
+    is a FALLBACK for that REST path: for one request the two must
     answer with the same venue.  Both of them ask
     ``config.resolve_market_venue`` for the venue, so they cannot drift
     apart the way two hand-written lists can.
