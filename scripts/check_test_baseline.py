@@ -73,7 +73,35 @@ FAILED_RE = re.compile(r"(?<![A-Za-z0-9_])FAILED\s+(\S+\.py::\S+)")
 # "ERROR collecting tests/test_broken.py". So the "::node" part is optional
 # here. A file-level id never matches a baseline key (those all carry "::"),
 # which is correct: a broken import should always fail the gate.
-ERROR_RE = re.compile(r"(?<![A-Za-z0-9_])ERROR\s+(\S+\.py(?:::\S+)?)")
+#
+# ⚠️ WHY THE TOKEN MUST BE A PATH AND NOT JUST A FILE NAME. The product logs
+# its own errors, and one of those lines lands inside a failing test's
+# CAPTURED output:
+#
+#     ERROR    bot_module.controller:controller.py:4740 [PublishState:User1] ...
+#
+# There "controller.py" is a BARE module filename behind a dotted logger name
+# and a line number -- it is not a path and the file does not exist. The old
+# regex matched it and the gate reported
+# "[COLLECTION ERROR] ... bot_module.controller:controller.py" on a run whose
+# own pytest summary showed NO collection error at all (measured on the PR #59
+# gate artifact).
+#
+# A real pytest ERROR names a FILE PATH, so the token must:
+#   * contain a path separator ("/" or "\") -- "tests/test_broken.py" -- or be
+#     a bare file name in the current directory ("test_broken.py");
+#   * carry no colon other than a Windows drive letter ("C:\dev\tests\x.py"),
+#     because a logger reference is full of them;
+#   * END at ".py" (optionally followed by "::node") -- the captured log line
+#     continues with ":4740", pytest's ERROR line does not.
+#
+# The optional "collecting" covers pytest's other spelling of the same thing:
+# "_____ ERROR collecting tests/test_broken.py _____".
+ERROR_RE = re.compile(
+    r"(?<![A-Za-z0-9_])ERROR\s+(?:collecting\s+)?"
+    r"((?:[A-Za-z]:)?(?:[^\s:]*[\\/][^\s:]*|[^\s:]+)\.py(?:::\S+)?)"
+    r"(?=\s|$)"
+)
 
 # A pytest run that produced a real epilogue ends with a line like:
 #   "1 failed, 1 passed in 0.06s"
@@ -155,6 +183,10 @@ def parse_errors(output: str) -> set[str]:
     `ERROR tests/...` or `ERROR collecting tests/...`, not `FAILED tests/...`.
     Ignoring those would mean a broken import shows up as zero failures, i.e.
     green.
+
+    A CAPTURED product log line that merely starts with ERROR is NOT one of
+    these -- see ERROR_RE. Reading one as a collection error is a false RED:
+    it fails a merge over a line of the product's own output.
     """
     return {canonical(m.group(1)) for m in ERROR_RE.finditer(strip_ansi(output))}
 

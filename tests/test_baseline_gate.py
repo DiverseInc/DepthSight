@@ -188,6 +188,44 @@ def test_collection_error_is_red(tmp_path, baseline_file):
         expected=1,
     )
 
+# The exact product log lines captured inside a failing test's output in the
+# PR #59 gate artifact. The gate reported the second one as a collection
+# error for "bot_module.controller:controller.py" -- a file that does not
+# exist anywhere in the repo.
+CAPTURED_PRODUCT_LOG_ERRORS = (
+    "2026-11-04 16:58:06,098 - ERROR - [bot_module.controller:4740] - "
+    "[PublishState:User1] Could not read the realized PnL of the running "
+    "strategies: the database is on fire.\n"
+    "ERROR    bot_module.controller:controller.py:4740 [PublishState:User1] "
+    "Could not read the realized PnL of the running strategies: the database "
+    "is on fire.\n"
+)
+
+
+def test_captured_log_line_is_not_a_collection_error(tmp_path, baseline_file):
+    """A captured product log line is NOT a pytest collection error.
+
+    MEASURED against the PR #59 gate artifact, not invented: a failing test's
+    captured output contained the product's own log line
+    "ERROR    bot_module.controller:controller.py:4740 ..." and the gate
+    reported "[COLLECTION ERROR] ... bot_module.controller:controller.py" on a
+    run whose own pytest summary showed NO collection error at all.
+
+    The gate asks "did anything NEW break?". Inventing a collection error out
+    of a line of product output is a false RED: it blocks a merge over
+    something the suite never reported. The baselined failure below is known,
+    so this log must grade green.
+    """
+    run_gate(
+        tmp_path,
+        baseline_file,
+        {"tests/test_a.py::test_one": 1},
+        failed_line("tests/test_a.py::test_one")
+        + CAPTURED_PRODUCT_LOG_ERRORS
+        + summary(failed=1),
+        expected=0,
+    )
+
 
 # --- pytest never actually ran -------------------------------------------
 
