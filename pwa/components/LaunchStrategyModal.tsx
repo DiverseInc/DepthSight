@@ -4,6 +4,11 @@ import type React from "react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAuth } from "../contexts/AuthContext";
+import {
+	effectiveOracleConfidence,
+	oracleLaunchRefusal,
+	savedDynamicMode,
+} from "../lib/oracleCapability";
 import { useOracleAvailability } from "../lib/useOracleAvailability";
 import type { DisplayStrategy } from "../types";
 
@@ -53,7 +58,8 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 	// The server is the only thing that knows, so the server is asked.
 	// The answer is NO until a real model is deployed, and the whole
 	// oracle UI below switches itself on the day one is.
-	const { oracleAvailable: canUseOracle } = useOracleAvailability();
+	const { oracleAvailable: canUseOracle, defaultConfidence } =
+		useOracleAvailability();
 
 	const [mode, setMode] = useState<"paper" | "live">("paper");
 	const [symbolSelectionMode, setSymbolSelectionMode] = useState<
@@ -76,6 +82,16 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 	);
 	const [oracleConfidence, setOracleConfidence] = useState<number | undefined>(
 		undefined,
+	);
+	// The confidence the customer SEES, and the one that is SENT. It is
+	// the customer's own choice when they made one, and otherwise the
+	// server's DECLARED threshold (sent as `oracleDefaultConfidence` on
+	// /api/v1/capabilities). It is never a number this client invented:
+	// the old `useState(95)` put a 95% confidence on screen that no model
+	// had ever produced.
+	const shownConfidence = effectiveOracleConfidence(
+		oracleConfidence,
+		defaultConfidence,
 	);
 	const [maxConcurrentSymbols, setMaxConcurrentSymbols] = useState(5);
 
@@ -135,6 +151,28 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 			return;
 		}
 
+		// A strategy the customer SAVED as an oracle strategy must not be
+		// relaunched under a different symbol-selection mode.
+		//
+		// It used to be:
+		//
+		//     dynamicMode: canUseOracle ? dynamicMode : "DYNAMIC_NATR",
+		//
+		// so with no oracle model the customer's DYNAMIC_ORACLE strategy
+		// was quietly relaunched as a NATR one -- a different strategy from
+		// the one they chose, launched without a word. There is no oracle
+		// filter to run, so the launch FAILS LOUDLY instead.
+		const savedMode = savedDynamicMode(strategy?.config_data);
+		if (oracleLaunchRefusal(savedMode, canUseOracle) === "ORACLE_UNAVAILABLE") {
+			alert(
+				t(
+					"launchStrategyModal.oracleUnavailableForSavedStrategy",
+					"This strategy was saved with the Oracle filter, and this server has no oracle model. It cannot be launched as it is.",
+				),
+			);
+			return;
+		}
+
 		// A regime filter needs a regime. The server's own contract
 		// refuses a DYNAMIC_ORACLE strategy without one
 		// (bot_module/symbol_selection.py: "oracle_regime must be provided
@@ -154,13 +192,17 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 			mode,
 			symbolSelectionMode,
 			symbols: symbolSelectionMode === "STATIC" ? symbols : undefined,
-			// With no oracle model there is no oracle filter to configure,
-			// so no oracle mode is submitted and no oracle numbers travel
-			// to the server. An ABSENT value is honest; a made-up 95 is not.
-			dynamicMode: canUseOracle ? dynamicMode : "DYNAMIC_NATR",
+			// The mode the customer chose. It is NOT silently replaced with
+			// another one: the case where the oracle is gone is refused
+			// above, loudly.
+			dynamicMode,
 			minNatr,
+			// The regime and the confidence the customer chose, or the
+			// server's declared confidence threshold. With no oracle there
+			// are no oracle numbers to send: an ABSENT value is honest, a
+			// made-up 95 is not.
 			oracleRegime: canUseOracle ? oracleRegime : undefined,
-			oracleConfidence: canUseOracle ? oracleConfidence : undefined,
+			oracleConfidence: canUseOracle ? (shownConfidence ?? undefined) : undefined,
 			maxConcurrentSymbols,
 			useMlConfirmation,
 			breakevenOnRegimeChange,
@@ -322,14 +364,14 @@ const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 											)}
 										</label>
 										<span className="text-xs text-[hsl(var(--muted-foreground))]">
-											{oracleConfidence ?? 0}%
+											{shownConfidence ?? 0}%
 										</span>
 									</div>
 									<input
 										type="range"
 										min="0"
 										max="100"
-										value={oracleConfidence ?? 0}
+										value={shownConfidence ?? 0}
 										onChange={(e) =>
 											setOracleConfidence(parseInt(e.target.value, 10))
 										}

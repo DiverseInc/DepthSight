@@ -1,5 +1,7 @@
 // src/types/api.ts
 
+import type { OracleCapability } from "@/lib/oracleCapability";
+
 // --- Common types ---
 export interface ApiResponse<T = unknown> {
 	data: T;
@@ -33,10 +35,11 @@ export interface SystemStatusData {
  * server. It is not a plan, a role, or a promise, and a client that shows
  * an oracle regime or an oracle confidence while it is false is showing a
  * number that no model produced.
+ *
+ * The shape is the one the client's own decision module reads, so the two
+ * cannot drift apart.
  */
-export interface Capabilities {
-	oracleAvailable: boolean;
-}
+export type Capabilities = OracleCapability;
 
 export interface PortfolioData {
 	balance: number;

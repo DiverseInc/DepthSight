@@ -23,6 +23,17 @@
 # decide whether the oracle works. There is no second source of truth, so
 # the flag cannot drift from reality, and it flips to True on its own the
 # day a real model file is deployed.
+#
+# IT ALSO REPORTS THE ORACLE'S DECLARED CONFIDENCE THRESHOLD, because the
+# clients must not invent one either. The threshold is a filter setting,
+# not a model output: it is the minimum confidence a symbol must reach to
+# be traded. The server owns it
+# (`bot_module.symbol_selection.DEFAULT_ORACLE_CONFIDENCE_PERCENT`), the
+# filter applies it, and the clients display and send back exactly what
+# the server declares. 95 (percent) is the value the clients used to send
+# before the honest-oracle change, so this is NOT a new number and NOT a
+# new policy -- it is the previous effective behaviour, now in one place
+# instead of hard-coded in three clients.
 
 import logging
 
@@ -40,12 +51,30 @@ capabilities_router = APIRouter(
 )
 
 
+def _declared_default_confidence() -> float:
+    """The oracle confidence threshold this deployment applies, in percent.
+
+    Imported lazily for the same reason `oracle_model_available` is: the
+    import must not make importing the API heavier than it was.
+    """
+    from bot_module.symbol_selection import DEFAULT_ORACLE_CONFIDENCE_PERCENT
+
+    return DEFAULT_ORACLE_CONFIDENCE_PERCENT
+
+
 class Capabilities(BaseModel):
     """What this deployment can actually do, right now.
 
     `oracle_available` is the honest answer to "is there an oracle model?".
     It is False on a deployment with no `data/oracle_model.joblib`, which
     is every deployment today: the model is not trained and not shipped.
+
+    `oracle_default_confidence` is the minimum oracle confidence (in
+    percent) the DYNAMIC_ORACLE filter applies when a strategy has not
+    been given one of its own. It is the SAME number the filter uses
+    (`bot_module.symbol_selection.DEFAULT_ORACLE_CONFIDENCE_PERCENT`), so
+    a client that displays it and sends it back gets exactly the filter
+    that is running.
     """
 
     oracle_available: bool = Field(
@@ -55,6 +84,17 @@ class Capabilities(BaseModel):
             "True only when a real oracle model is loaded and usable. "
             "False means no model exists, so no oracle regime and no oracle "
             "confidence may be shown to a customer."
+        ),
+    )
+    oracle_default_confidence: float = Field(
+        default_factory=_declared_default_confidence,
+        alias="oracleDefaultConfidence",
+        description=(
+            "The minimum oracle confidence, in percent, that the "
+            "DYNAMIC_ORACLE filter applies when a strategy has no "
+            "confidence of its own. Zero means 'no threshold' nowhere: "
+            "an absent or zero confidence falls back to this value, "
+            "because a filter that accepts every symbol is not a filter."
         ),
     )
 

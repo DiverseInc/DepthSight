@@ -8,7 +8,11 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../services/api";
-import { oracleIsUsable, type OracleCapability } from "./oracleCapability";
+import {
+	oracleDefaultConfidencePercent,
+	oracleIsUsable,
+	type OracleCapability,
+} from "./oracleCapability";
 
 export interface OracleAvailability {
 	/** The server says a real oracle model is loaded and usable. */
@@ -18,6 +22,12 @@ export interface OracleAvailability {
 	 * about the oracle rather than guessing.
 	 */
 	loaded: boolean;
+	/**
+	 * The server's DECLARED confidence threshold, in percent. Null when
+	 * the server did not declare one -- and then the client sends no
+	 * confidence at all rather than making a number up.
+	 */
+	defaultConfidence: number | null;
 }
 
 export function useOracleAvailability(): OracleAvailability {
@@ -45,5 +55,6 @@ export function useOracleAvailability(): OracleAvailability {
 	return {
 		oracleAvailable: oracleIsUsable(capability),
 		loaded: capability !== null,
+		defaultConfidence: oracleDefaultConfidencePercent(capability),
 	};
 }

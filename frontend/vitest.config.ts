@@ -45,6 +45,12 @@ export default defineConfig({
 		alias: {
 			"@": path.resolve(__dirname, "./src"),
 		},
+		// The PWA has its OWN node_modules, and its own React (19). A
+		// component imported from `pwa/` into a test in this project would
+		// otherwise pull in a SECOND React instance, and the hooks would
+		// break with "Cannot read properties of null (reading 'useContext')".
+		// `dedupe` makes one React serve the whole test run.
+		dedupe: ["react", "react-dom", "react-i18next"],
 	},
 	test: {
 		environment: "node",

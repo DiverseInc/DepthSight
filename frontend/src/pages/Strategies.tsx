@@ -66,6 +66,7 @@ import { useToast } from "@/components/ui/use-toast";
 // API & Types
 import {
 	useDeleteStrategyConfig,
+	useOracleAvailability,
 	useRunBacktest,
 	useStartStrategy,
 	useStopStrategy,
@@ -74,6 +75,10 @@ import {
 	useStrategyRegistry,
 	useUpdateStrategyConfig,
 } from "@/lib/api";
+import {
+	buildOracleLaunchSettings,
+	oracleDefaultConfidencePercent,
+} from "@/lib/oracleCapability";
 import { useAccountStore } from "@/stores/accountStore";
 import type {
 	StrategyConfig,
@@ -481,6 +486,16 @@ export default function Strategies() {
 		error: errorConfigs,
 	} = useStrategyConfigsList();
 
+	// What this deployment can actually do. The launch payload is built
+	// from the SERVER's answer, not from a constant: the old
+	// `parseInt(formData.oracleRegime || "1", 10)` and
+	// `formData.oracleConfidence || 95` invented a regime and a 95%
+	// confidence that no model had ever produced, and sent them to the
+	// server.
+	const { data: capabilities } = useOracleAvailability();
+	const oracleAvailable = capabilities?.oracleAvailable === true;
+	const defaultConfidence = oracleDefaultConfidencePercent(capabilities);
+
 	// The server's registry is the authority on which strategy classes can
 	// run; it is applied here so the card badge below is right.
 	const { data: strategyRegistry } = useStrategyRegistry();
@@ -734,15 +749,31 @@ export default function Strategies() {
 				configDataOverrides.oracle_regime = null;
 				configDataOverrides.oracle_confidence = 0;
 			} else if (formData.dynamicMode === "DYNAMIC_ORACLE") {
-				const regime = parseInt(formData.oracleRegime || "1", 10);
-				const confidence = formData.oracleConfidence || 95;
-				configDataOverrides.oracle_settings = {
-					regime: regime,
-					confidence: confidence,
-				};
+				// The regime and the confidence the CUSTOMER chose, or the
+				// server's DECLARED threshold for the confidence.
+				//
+				// The old `parseInt(formData.oracleRegime || "1", 10)` and
+				// `formData.oracleConfidence || 95` INVENTED a regime and a
+				// 95% confidence that no model had ever produced, and
+				// handed them straight to the server. Nothing is invented
+				// here: with no oracle on this deployment there are no
+				// oracle numbers to send at all.
+				const settings = buildOracleLaunchSettings({
+					oracleAvailable,
+					regime: formData.oracleRegime,
+					confidence: formData.oracleConfidence,
+					defaultConfidence,
+				});
+				configDataOverrides.oracle_settings =
+					settings.regime === null
+						? null
+						: {
+								regime: settings.regime,
+								confidence: settings.confidence,
+							};
 				// Synchronize with the top level for compatibility with backtests
-				configDataOverrides.oracle_regime = regime;
-				configDataOverrides.oracle_confidence = confidence;
+				configDataOverrides.oracle_regime = settings.regime;
+				configDataOverrides.oracle_confidence = settings.confidence ?? 0;
 				// Clear natr settings if switching modes
 				configDataOverrides.natr_settings = null;
 			}

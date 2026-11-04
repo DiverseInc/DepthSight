@@ -21,6 +21,20 @@
 // interprets the answer. It is deliberately dependency-free and pure: the
 // decision "may I show an oracle regime / confidence?" must have exactly
 // one implementation, and it must be testable without a browser.
+//
+// IT ALSO OWNS THE CONFIDENCE THRESHOLD. The threshold is a filter
+// setting, not a model output: the minimum confidence a symbol must
+// reach to be traded. The server declares it
+// (`bot_module.symbol_selection.DEFAULT_ORACLE_CONFIDENCE_PERCENT`, sent
+// as `oracleDefaultConfidence` on `GET /api/v1/capabilities`), the
+// filter applies it, and the client displays and sends back exactly that.
+//
+// The reason this matters is a SILENT one. When the clients stopped
+// sending a hard-coded 95 and sent 0 instead ("there is no oracle
+// here"), the server read 0 as "no threshold at all": the >= 0.95 filter
+// became `>= 0.0`, which admits EVERY symbol. The guard was weaker and
+// nothing said so. So "not chosen" must never become "no threshold" on
+// either side of the wire.
 
 /** The server's answer about the oracle. */
 export interface OracleCapability {
@@ -29,6 +43,13 @@ export interface OracleCapability {
 	 * server. False on every deployment today.
 	 */
 	oracleAvailable: boolean;
+	/**
+	 * The minimum oracle confidence this deployment applies, in percent,
+	 * when a strategy has no confidence of its own. Null/absent means
+	 * the server did not say, and the client then sends nothing rather
+	 * than inventing a number.
+	 */
+	oracleDefaultConfidence?: number | null;
 }
 
 /**
@@ -49,6 +70,73 @@ export function oracleIsUsable(
 }
 
 /**
+ * The server's DECLARED confidence threshold, in percent.
+ *
+ * Null when the server did not declare one. A client that has no
+ * declared threshold sends no confidence at all -- it does not fall back
+ * to a number it made up.
+ */
+export function oracleDefaultConfidencePercent(
+	capability: OracleCapability | null | undefined,
+): number | null {
+	const declared = capability?.oracleDefaultConfidence;
+	if (typeof declared !== "number" || !Number.isFinite(declared)) {
+		return null;
+	}
+	return declared > 0 ? declared : null;
+}
+
+/**
+ * The confidence the client DISPLAYS and SENDS.
+ *
+ * The customer's own choice when they made one; otherwise the server's
+ * declared threshold; otherwise nothing at all.
+ *
+ * A choice of 0 is treated as "not chosen", because that is exactly what
+ * the server does with it: an absent or zero confidence falls back to
+ * the declared threshold, and a filter that accepts every symbol is not
+ * a filter. Treating 0 as a real choice here would show the customer a
+ * 0% threshold while the filter ran at the declared one.
+ */
+export function effectiveOracleConfidence(
+	chosen: number | null | undefined,
+	defaultConfidence: number | null | undefined,
+): number | null {
+	if (typeof chosen === "number" && Number.isFinite(chosen) && chosen > 0) {
+		return chosen;
+	}
+	if (
+		typeof defaultConfidence === "number" &&
+		Number.isFinite(defaultConfidence) &&
+		defaultConfidence > 0
+	) {
+		return defaultConfidence;
+	}
+	return null;
+}
+
+/**
+ * The oracle regime, as the server accepts it (0, 1 or 2).
+ *
+ * Null when nothing valid was chosen. A regime is never invented: the
+ * server refuses a DYNAMIC_ORACLE strategy without one
+ * (`bot_module/symbol_selection.py`: "oracle_regime must be provided for
+ * DYNAMIC_ORACLE mode"), so the client says so instead of picking one.
+ */
+export function parseOracleRegime(
+	regime: string | number | null | undefined,
+): number | null {
+	if (regime === null || regime === undefined || regime === "") {
+		return null;
+	}
+	const parsed = typeof regime === "number" ? regime : parseInt(regime, 10);
+	if (!Number.isFinite(parsed)) {
+		return null;
+	}
+	return parsed === 0 || parsed === 1 || parsed === 2 ? parsed : null;
+}
+
+/**
  * The oracle settings to send when the oracle is NOT usable.
  *
  * Absent, not zero and not a default: `null` means "there is no oracle
@@ -60,3 +148,89 @@ export const NO_ORACLE_SETTINGS = {
 	oracleRegime: null,
 	oracleConfidence: null,
 } as const;
+
+export interface OracleLaunchInput {
+	/** The server's answer: is there a real model? */
+	oracleAvailable: boolean;
+	/** The regime the customer chose, as the client holds it. */
+	regime?: string | number | null;
+	/** The confidence the customer chose. */
+	confidence?: number | null;
+	/** The server's declared threshold, in percent. */
+	defaultConfidence?: number | null;
+}
+
+export interface OracleLaunchSettings {
+	regime: number | null;
+	confidence: number | null;
+}
+
+/**
+ * The oracle numbers that go to the server.
+ *
+ * Nothing is invented here. With no oracle there are no oracle numbers:
+ * the regime and the confidence are absent, and the server is told
+ * "there is no oracle filter on this strategy".
+ *
+ * With an oracle, the regime is the customer's own choice (null when
+ * they have not chosen one -- the client refuses to launch rather than
+ * picking one) and the confidence is the number the customer chose, or
+ * the server's declared threshold when they have not chosen one.
+ */
+export function buildOracleLaunchSettings(
+	input: OracleLaunchInput,
+): OracleLaunchSettings {
+	if (!input.oracleAvailable) {
+		return { regime: null, confidence: null };
+	}
+	return {
+		regime: parseOracleRegime(input.regime),
+		confidence: effectiveOracleConfidence(
+			input.confidence,
+			input.defaultConfidence,
+		),
+	};
+}
+
+/**
+ * The dynamic mode a SAVED strategy was stored with.
+ *
+ * "DYNAMIC_NATR" when the strategy carries NATR settings, "DYNAMIC_ORACLE"
+ * when it carries oracle settings, null when it carries neither (the
+ * client cannot know what the server would have used).
+ */
+export function savedDynamicMode(configData: unknown): "DYNAMIC_NATR" | "DYNAMIC_ORACLE" | null {
+	const config = configData as
+		| { natr_settings?: unknown; oracle_settings?: unknown }
+		| null
+		| undefined;
+	if (!config) return null;
+	if (config.natr_settings) return "DYNAMIC_NATR";
+	if (config.oracle_settings) return "DYNAMIC_ORACLE";
+	return null;
+}
+
+export type OracleLaunchRefusal = "ORACLE_UNAVAILABLE" | null;
+
+/**
+ * MUST THE LAUNCH BE REFUSED?
+ *
+ * A strategy the customer SAVED as an oracle strategy must not be
+ * relaunched under a different symbol-selection mode. The old code did
+ * exactly that:
+ *
+ *     dynamicMode: canUseOracle ? dynamicMode : "DYNAMIC_NATR",
+ *
+ * so a DYNAMIC_ORACLE strategy was quietly relaunched as a NATR one --
+ * a different strategy from the one the customer chose, launched without
+ * a word. The launch now fails loudly instead.
+ */
+export function oracleLaunchRefusal(
+	savedMode: "DYNAMIC_NATR" | "DYNAMIC_ORACLE" | null,
+	oracleAvailable: boolean,
+): OracleLaunchRefusal {
+	if (savedMode === "DYNAMIC_ORACLE" && !oracleAvailable) {
+		return "ORACLE_UNAVAILABLE";
+	}
+	return null;
+}

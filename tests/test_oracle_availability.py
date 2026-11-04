@@ -201,3 +201,103 @@ def test_the_capability_fails_closed_when_the_probe_errors(client, monkeypatch):
 
     assert response.status_code == 200, response.text
     assert response.json()["data"]["oracleAvailable"] is False
+
+
+def test_the_flag_stops_claiming_a_model_whose_file_is_gone(
+    client, oracle_points_at, real_oracle_model
+):
+    """A model that has been DELETED must not be reported as available.
+
+    The model file can be removed while the worker runs -- a deploy that
+    swaps it, an operator that cleans it up. The flag used to keep
+    reporting "available" because the loaded instance stayed cached in
+    the worker, so the server could claim a model that was gone.
+
+    The docstring of `oracle_model_available()` used to promise that
+    "get_oracle() re-checks the model path on every call". It did not,
+    in that direction. Now it does, in both.
+    """
+    oracle_points_at(real_oracle_model)
+    assert (
+        client.get("/api/v1/capabilities").json()["data"]["oracleAvailable"]
+        is True
+    ), "A real model was deployed and the server did not report it."
+
+    real_oracle_model.unlink()
+
+    assert (
+        client.get("/api/v1/capabilities").json()["data"]["oracleAvailable"]
+        is False
+    ), (
+        "The server still reports an available oracle after the model file "
+        "was deleted. The flag can report a model that is gone."
+    )
+
+
+def test_the_capability_reports_the_declared_confidence_threshold(
+    client, oracle_points_at, tmp_path
+):
+    """The client is told the threshold this deployment applies.
+
+    The threshold is a filter setting, not a model output, and the
+    server owns it. The clients display it and send it back, so the
+    number on screen is the number the filter uses.
+    """
+    oracle_points_at(tmp_path / "absent.joblib")
+
+    body = client.get("/api/v1/capabilities").json()["data"]
+
+    assert body["oracleDefaultConfidence"] == 95.0, (
+        "The server does not report its declared oracle confidence "
+        "threshold, so the client has to invent one."
+    )
+
+
+def test_the_reported_threshold_is_the_threshold_the_filter_applies(
+    client, oracle_points_at, tmp_path
+):
+    """The capability report and the filter quote the SAME number."""
+    from bot_module.symbol_selection import (
+        DEFAULT_ORACLE_CONFIDENCE_PERCENT,
+        effective_oracle_confidence_fraction,
+    )
+
+    oracle_points_at(tmp_path / "absent.joblib")
+    reported = client.get("/api/v1/capabilities").json()["data"][
+        "oracleDefaultConfidence"
+    ]
+
+    assert reported == DEFAULT_ORACLE_CONFIDENCE_PERCENT
+    assert effective_oracle_confidence_fraction(None) * 100 == reported
+
+
+def test_the_hft_config_default_follows_the_servers_own_answer(
+    monkeypatch, tmp_path, real_oracle_model
+):
+    """`HftConfig.use_oracle` used to be the constant True.
+
+    The client already derives its own availability from the server's
+    capability report, so a server-side default that says True while
+    the server says the oracle does not exist says the opposite of the
+    server's own answer.
+    """
+    from api import hft_router
+
+    monkeypatch.setattr(
+        simulation_router, "ORACLE_MODEL_PATH", tmp_path / "absent.joblib"
+    )
+    monkeypatch.setattr(simulation_router, "_oracle_instance", None)
+
+    assert hft_router.HftConfig().use_oracle is False, (
+        "With no oracle model on this deployment the server's own default "
+        "still says the oracle filter is on."
+    )
+
+    monkeypatch.setattr(simulation_router, "ORACLE_MODEL_PATH", real_oracle_model)
+    monkeypatch.setattr(simulation_router, "_oracle_instance", None)
+
+    assert hft_router.HftConfig().use_oracle is True, (
+        "A real oracle model is loaded and the server's own default still "
+        "says the oracle filter is off. The oracle UI would stay switched "
+        "off forever."
+    )

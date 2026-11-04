@@ -96,13 +96,54 @@ ORACLE_MODEL_PATH = Path(__file__).parent.parent / "data" / "oracle_model.joblib
 ORACLE_THRESHOLD = 0.95
 
 
+class _LoadedOracle:
+    """A loaded Oracle instance AND the model file it was loaded from.
+
+    The file is remembered on purpose. A model file can be removed while
+    the worker is running (a deploy that swaps it, an operator that
+    cleans it up), and a flag that goes on reporting "the oracle is
+    available" after that is reporting a model that is GONE.
+
+    Keeping the instance and its path in ONE object means there is a
+    single piece of state to reset, and no way for the two to disagree.
+    """
+
+    __slots__ = ("oracle", "path")
+
+    def __init__(self, oracle, path: Path):
+        self.oracle = oracle
+        self.path = path
+
+
 def get_oracle():
-    """Get or create Oracle instance (singleton pattern with thread-safe access)"""
+    """Get or create Oracle instance (singleton pattern with thread-safe access)
+
+    The model FILE is re-checked on every call, in both directions:
+
+      * before a model is loaded, the path is checked and the model is
+        loaded from it as soon as it exists;
+      * after a model is loaded, the path is checked again, and an
+        instance whose file has since been DELETED is dropped -- so the
+        availability flag cannot keep reporting a model that is gone.
+
+    Returns the Oracle instance, or None when there is no usable model.
+    """
     global _oracle_instance
 
     # First check without lock (fast path)
     if _oracle_instance is not None:
-        return _oracle_instance
+        loaded = _oracle_instance
+        if isinstance(loaded, _LoadedOracle) and not loaded.path.exists():
+            # The model file is gone: this deployment no longer HAS the
+            # model, so the flag must go back to "unavailable" rather
+            # than keep claiming an oracle that is not there.
+            logger.warning(
+                f"Oracle model file {loaded.path} was removed; dropping the "
+                f"cached oracle instance in worker PID: {os.getpid()}"
+            )
+            _oracle_instance = None
+        else:
+            return loaded.oracle if isinstance(loaded, _LoadedOracle) else loaded
 
     # Thread-safe initialization
     with _oracle_lock:
@@ -110,11 +151,14 @@ def get_oracle():
         if _oracle_instance is None and ORACLE_AVAILABLE:
             if ORACLE_MODEL_PATH.exists():
                 try:
-                    _oracle_instance = Oracle(ORACLE_MODEL_PATH)
+                    _oracle_instance = _LoadedOracle(
+                        Oracle(ORACLE_MODEL_PATH), ORACLE_MODEL_PATH
+                    )
                     logger.info(
                         f"Oracle model loaded from {ORACLE_MODEL_PATH} in worker PID: {os.getpid()}"
                     )
                 except Exception as e:
+                    _oracle_instance = None
                     logger.error(
                         f"Failed to load Oracle model in worker PID {os.getpid()}: {e}"
                     )
@@ -122,7 +166,11 @@ def get_oracle():
                 logger.warning(
                     f"Oracle model not found at {ORACLE_MODEL_PATH} in worker PID: {os.getpid()}"
                 )
-    return _oracle_instance
+    return (
+        _oracle_instance.oracle
+        if isinstance(_oracle_instance, _LoadedOracle)
+        else _oracle_instance
+    )
 
 
 def oracle_model_available() -> bool:
@@ -146,9 +194,17 @@ def oracle_model_available() -> bool:
     from -- the flag IS the runtime state.
 
     NOT cached at import time on purpose: ``get_oracle()`` re-checks the
-    model path on every call until the model loads, so this flips to True
-    the day a real ``data/oracle_model.joblib`` is deployed -- with no code
-    change, no restart, and nothing for the client to re-learn.
+    model path on every call, so this flips to True the day a real
+    ``data/oracle_model.joblib`` is deployed -- with no code change, no
+    restart, and nothing for the client to re-learn.
+
+    AND IT KEEPS CHECKING. ``get_oracle()`` re-checks the model path on
+    every call in the OTHER direction too: a model that was loaded from a
+    file and has since been DELETED is dropped, so this flag cannot go
+    on reporting a model that is gone. The claim this docstring used to
+    make ("re-checks the model path on every call until the model loads")
+    was half true -- it did not say what happens AFTER the model loads.
+    It is now true in both directions, and the code says so.
     """
     try:
         return get_oracle() is not None

@@ -79,6 +79,10 @@
 		"oracleRegimeParanoiaFull": "0: Paranoia (Trend-following/Sideways)",
 		"oracleRegimeAmnesiaFull": "1: Amnesia (News/Trend)",
 		"oracleRegimeSchizophreniaFull": "2: Schizophrenia (Volatile)",
+		"oracleRegimeUnset": "-- select a regime --",
+		"oracleRegimeRequired": "Please select the regime to filter by.",
+		"oracleUnavailable": "Oracle filter unavailable: this server has no oracle model deployed.",
+		"oracleUnavailableForSavedStrategy": "This strategy was saved with the Oracle filter, and this server has no oracle model. It cannot be launched as it is.",
 		"errors": {
 			"nameRequired": "Instance name is required.",
 			"modeRequired": "Please select a symbol mode.",

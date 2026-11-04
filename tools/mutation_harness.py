@@ -151,7 +151,32 @@ def run_command(argv: list[str], timeout: int = 1800) -> tuple[int, str]:
             if line.strip()
         ][-3:]
         return 3, "NO TEST SUMMARY -- the test command did not run. Output:\n" + "\n".join(tail)
+    if summary_ran_no_test(summary):
+        # Every test was SKIPPED. The command still exits 0, so this would
+        # be recorded as "the mutant SURVIVED" -- a false green, and the
+        # exact thing this harness exists to prevent. A run in which no
+        # test ran is a BROKEN run, not a passing one.
+        return 3, "ALL TESTS SKIPPED -- the test command ran no test: " + summary
     return proc.returncode, summary
+
+
+def summary_ran_no_test(summary: str) -> bool:
+    """Did the summary say that NO test actually ran?
+
+    A vitest run in which every test is skipped still exits 0:
+
+        Tests  139 skipped (139)
+
+    That is not a pass. The harness would otherwise record the mutant as
+    SURVIVED, which is a false green.
+
+    A run that executed SOME tests is fine, however many were skipped:
+
+        Tests  2 failed | 137 passed | 1 skipped (140)
+    """
+    if "skipped" not in summary:
+        return False
+    return "passed" not in summary
 
 
 def eol_variants(text: str) -> list[bytes]:

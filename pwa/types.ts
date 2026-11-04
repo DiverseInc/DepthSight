@@ -1028,6 +1028,12 @@ export type RarityTier = "COMMON" | "RARE" | "EPIC" | "LEGENDARY";
  */
 export interface Capabilities {
 	oracleAvailable: boolean;
+	/**
+	 * The minimum oracle confidence this deployment applies, in percent,
+	 * when a strategy has no confidence of its own. It is the server's
+	 * own declaration -- the client must not make a threshold up.
+	 */
+	oracleDefaultConfidence?: number | null;
 }
 
 export interface SymbolSelectionConfig {

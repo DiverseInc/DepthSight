@@ -8,6 +8,8 @@ import LaunchStrategyModal, {
 } from "../components/LaunchStrategyModal";
 import { Logo } from "../components/ui/logo";
 import { ICONS } from "../constants";
+import { buildOracleLaunchSettings } from "../lib/oracleCapability";
+import { useOracleAvailability } from "../lib/useOracleAvailability";
 import { api } from "../services/api";
 import type { DisplayStrategy } from "../types";
 
@@ -139,6 +141,9 @@ const StrategiesScreen: React.FC<StrategiesScreenProps> = ({
 	const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
 	const [strategyToDelete, setStrategyToDelete] = useState<string | null>(null);
 	const { t } = useTranslation("pwa-common");
+	// What this deployment can actually do. The launch payload is built
+	// from the SERVER's answer, not from a constant.
+	const { oracleAvailable, defaultConfidence } = useOracleAvailability();
 
 	const swipeHandlers = useSwipeable({
 		onSwipedLeft: () => setTab("saved"),
@@ -212,22 +217,32 @@ const StrategiesScreen: React.FC<StrategiesScreenProps> = ({
 					params.oracle_confidence = 0;
 				} else if (details.dynamicMode === "DYNAMIC_ORACLE") {
 					// The regime and the confidence the customer actually
-					// chose. The old `|| "1"` and `|| 95` INVENTED both when
-					// the customer had chosen neither -- a regime and a 95%
+					// chose, or the server's DECLARED threshold for the
+					// confidence. Nothing is invented here.
+					//
+					// The old `|| "1"` and `|| 95` INVENTED both when the
+					// customer had chosen neither -- a regime and a 95%
 					// confidence that no model had ever produced, handed
 					// straight to the server.
-					const regime =
-						details.oracleRegime === undefined || details.oracleRegime === ""
-							? null
-							: parseInt(details.oracleRegime, 10);
-					// 0 is the SERVER's own declared default for
-					// oracle_confidence (bot_module/symbol_selection.py:
-					// Field(0.0)), and it is what the slider showed.
-					const confidence = details.oracleConfidence ?? 0;
+					//
+					// And the honest-oracle change's `?? 0` was worse in a
+					// quieter way: 0 does not mean "no confidence", it
+					// means "the threshold was not chosen", and the server
+					// read it as 0.0 -- a filter that admits EVERY symbol.
+					// The effective threshold must not change silently,
+					// so the server's declared default is what is sent.
+					const settings = buildOracleLaunchSettings({
+						oracleAvailable,
+						regime: details.oracleRegime,
+						confidence: details.oracleConfidence,
+						defaultConfidence,
+					});
 					params.oracle_settings =
-						regime === null ? null : { regime, confidence };
-					params.oracle_regime = regime;
-					params.oracle_confidence = confidence;
+						settings.regime === null
+							? null
+							: { regime: settings.regime, confidence: settings.confidence };
+					params.oracle_regime = settings.regime;
+					params.oracle_confidence = settings.confidence ?? 0;
 					params.natr_settings = null;
 				}
 			} else {

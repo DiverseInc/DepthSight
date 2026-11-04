@@ -650,6 +650,7 @@
 		"dynamicSettings": "Настройки динамического выбора",
 		"oracleFilter": "Фильтр Oracle",
 		"oracleUnavailable": "Фильтр Oracle недоступен: на этом сервере не развёрнута модель Oracle.",
+		"oracleUnavailableForSavedStrategy": "Эта стратегия сохранена с фильтром Oracle, а на этом сервере нет модели Oracle. Запустить её как есть нельзя — выберите другой способ выбора символов.",
 		"oracleRegimeUnset": "-- выберите режим --",
 		"oracleRegimeRequired": "Пожалуйста, выберите режим для фильтрации.",
 		"lowVolatilityNatr": "Низкая волатильность (NATR)",

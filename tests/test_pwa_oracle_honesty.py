@@ -190,3 +190,98 @@ def test_the_oracle_decision_module_is_dependency_free():
     assert imports == [], (
         f"pwa/lib/oracleCapability.ts must have no imports, found: {imports}"
     )
+
+
+def test_the_pwa_never_switches_the_mode_behind_the_customers_back(
+    modal_source: str,
+):
+    """A saved oracle strategy must FAIL LOUDLY, not be relaunched as NATR.
+
+    The old line was:
+
+        dynamicMode: canUseOracle ? dynamicMode : "DYNAMIC_NATR",
+
+    so a strategy the customer had saved as DYNAMIC_ORACLE was quietly
+    relaunched as a NATR strategy -- a DIFFERENT strategy from the one
+    they chose, launched without a word.
+    """
+    assert not re.search(r"dynamicMode:\s*canUseOracle", modal_source), (
+        "The launch modal still substitutes the symbol-selection mode: a "
+        "strategy the customer saved as an oracle strategy is relaunched "
+        "under a different one instead of failing loudly."
+    )
+    assert "oracleLaunchRefusal" in modal_source, (
+        "The launch modal no longer refuses a saved oracle strategy when "
+        "the oracle is gone."
+    )
+
+
+def test_the_pwa_launch_payload_uses_the_shared_builder(
+    strategies_source: str,
+):
+    """One implementation decides what the oracle numbers are."""
+    assert "buildOracleLaunchSettings(" in strategies_source, (
+        "The launch payload is not built by the shared decision module, so "
+        "it can carry a regime and a confidence nobody chose."
+    )
+
+
+def test_the_pwa_never_sends_zero_as_a_confidence(strategies_source: str):
+    """0 is not a threshold -- and it is not what the customer sees.
+
+    The server reads an absent or zero confidence as "not chosen" and
+    falls back to its declared threshold. A client that sends 0 anyway
+    is sending a number that is not on the customer's screen.
+    """
+    assert not re.search(r"details\.oracleConfidence\s*\?\?\s*0", strategies_source), (
+        "The launch payload sends 0 when the customer has not chosen a "
+        "confidence. That is not the threshold the customer sees."
+    )
+
+
+def test_the_pwa_shows_the_servers_declared_threshold(modal_source: str):
+    """The number on the slider is the number the server declared."""
+    assert "effectiveOracleConfidence(" in modal_source, (
+        "The launch modal does not derive the confidence it displays from "
+        "the server's declaration."
+    )
+
+
+def test_the_launch_payload_never_falls_back_to_an_invented_number(
+    strategies_source: str,
+):
+    """The SCREEN must not re-introduce a fallback AFTER the shared builder.
+
+    ``buildOracleLaunchSettings`` decides what the oracle numbers are, and
+    that module is covered as real behaviour by the frontend's vitest suite.
+    What the screen does with the builder's answer is a SECOND place where a
+    fallback can creep in -- and it did: ``confidence: settings.confidence
+    || 95`` and ``params.oracle_regime = settings.regime ?? 1`` both put
+    back exactly the fiction the builder exists to remove.
+    """
+    assert not re.search(r"confidence[^;\n]*\|\|\s*95", strategies_source), (
+        "The launch payload invents a 95% confidence again."
+    )
+    assert not re.search(r"oracle_regime[^;\n]*\?\?\s*1\b", strategies_source), (
+        "The launch payload invents oracle regime 1 again."
+    )
+
+
+def test_the_refusal_is_the_condition_that_guards_the_launch(
+    modal_source: str,
+):
+    """The refusal must GUARD the launch, not sit in a branch that never runs.
+
+    ``oracleLaunchRefusal`` merely being present in the file is not enough:
+    the guard has to be the thing that DECIDES. A condition that is never
+    true (``if (false)``) leaves the code reading as honest while the launch
+    goes straight through and a saved oracle strategy is relaunched under a
+    different mode.
+    """
+    assert re.search(
+        r"if\s*\(\s*oracleLaunchRefusal\([^)]*\)\s*===\s*\"ORACLE_UNAVAILABLE\"\s*\)",
+        modal_source,
+    ), (
+        "The launch modal's refusal is no longer the condition that guards "
+        "the launch."
+    )

@@ -26,7 +26,13 @@ import { describe, expect, it } from "vitest";
 // Cross-project import: the PWA's pure decision module.
 import {
 	NO_ORACLE_SETTINGS,
+	buildOracleLaunchSettings,
+	effectiveOracleConfidence,
+	oracleDefaultConfidencePercent,
 	oracleIsUsable,
+	oracleLaunchRefusal,
+	parseOracleRegime,
+	savedDynamicMode,
 } from "../../../pwa/lib/oracleCapability";
 
 describe("the PWA's oracle decision", () => {
@@ -47,5 +53,79 @@ describe("the PWA's oracle decision", () => {
 	it("carries no oracle numbers when there is no oracle", () => {
 		expect(NO_ORACLE_SETTINGS.oracleRegime).toBeNull();
 		expect(NO_ORACLE_SETTINGS.oracleConfidence).toBeNull();
+	});
+});
+
+describe("the PWA's oracle THRESHOLD comes from the server", () => {
+	it("reads the server's declared threshold", () => {
+		expect(
+			oracleDefaultConfidencePercent({
+				oracleAvailable: true,
+				oracleDefaultConfidence: 95,
+			}),
+		).toBe(95);
+		expect(
+			oracleDefaultConfidencePercent({ oracleAvailable: true }),
+		).toBeNull();
+	});
+
+	it("shows the customer's own choice when they made one", () => {
+		expect(effectiveOracleConfidence(60, 95)).toBe(60);
+	});
+
+	it("falls back to the declared threshold when none was chosen", () => {
+		// 0 is "not chosen" on the server too. Showing 0% while the filter
+		// runs at 95% is the lie this removes.
+		expect(effectiveOracleConfidence(undefined, 95)).toBe(95);
+		expect(effectiveOracleConfidence(0, 95)).toBe(95);
+		expect(effectiveOracleConfidence(undefined, null)).toBeNull();
+	});
+
+	it("never invents a regime", () => {
+		expect(parseOracleRegime(undefined)).toBeNull();
+		expect(parseOracleRegime("")).toBeNull();
+		expect(parseOracleRegime("1")).toBe(1);
+		expect(parseOracleRegime("9")).toBeNull();
+	});
+
+	it("builds a launch payload with no invented numbers", () => {
+		expect(
+			buildOracleLaunchSettings({
+				oracleAvailable: false,
+				regime: "1",
+				confidence: 95,
+				defaultConfidence: 95,
+			}),
+		).toEqual({ regime: null, confidence: null });
+
+		expect(
+			buildOracleLaunchSettings({
+				oracleAvailable: true,
+				regime: "2",
+				confidence: 70,
+				defaultConfidence: 95,
+			}),
+		).toEqual({ regime: 2, confidence: 70 });
+	});
+});
+
+describe("a saved oracle strategy is not relaunched under another mode", () => {
+	it("refuses the launch when the oracle is gone", () => {
+		expect(oracleLaunchRefusal("DYNAMIC_ORACLE", false)).toBe(
+			"ORACLE_UNAVAILABLE",
+		);
+		expect(oracleLaunchRefusal("DYNAMIC_ORACLE", true)).toBeNull();
+		expect(oracleLaunchRefusal("DYNAMIC_NATR", false)).toBeNull();
+	});
+
+	it("recognises the mode a strategy was saved with", () => {
+		expect(savedDynamicMode({ oracle_settings: { regime: 1 } })).toBe(
+			"DYNAMIC_ORACLE",
+		);
+		expect(savedDynamicMode({ natr_settings: { min_natr: 1.5 } })).toBe(
+			"DYNAMIC_NATR",
+		);
+		expect(savedDynamicMode({})).toBeNull();
+		expect(savedDynamicMode(null)).toBeNull();
 	});
 });
