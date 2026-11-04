@@ -1072,7 +1072,16 @@ class PaperTradingExecutor:
         funding_reported = False
         if rm is not None:
             try:
-                funding_reported = bool(await rm.apply_funding_pnl(symbol, amount))
+                # `mode="paper"` is not optional: the funding was debited from
+                # the PAPER wallet, so it is simulated money and belongs to the
+                # PAPER sandbox. Letting the risk manager GUESS the sandbox
+                # from the account would book a paper carry cost against the
+                # LIVE day's PnL for any account that also has a live
+                # executor -- the same defect class this branch exists to
+                # fix (simulated money closing the real-money gate).
+                funding_reported = bool(
+                    await rm.apply_funding_pnl(symbol, amount, mode="paper")
+                )
             except Exception as e:
                 logger.error(
                     f"[PaperFunding:{symbol}] Failed to report the funding "
