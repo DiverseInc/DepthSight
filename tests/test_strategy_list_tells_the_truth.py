@@ -37,7 +37,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pytest
 
 from bot_module import config
-from bot_module.controller import TradingBotController
+from bot_module.controller import TradingController
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -154,7 +154,7 @@ def _config_dict(
 
 async def _publish(stub: _StubController) -> List[Dict[str, Any]]:
     """Run the REAL publisher and return the strategy list it wrote to Redis."""
-    await TradingBotController._publish_state_to_redis(stub)
+    await TradingController._publish_state_to_redis(stub)
     key = f"{config.REDIS_STATE_KEY_STRATEGIES}:{stub.user_id}:{stub.api_key_id}"
     return json.loads(stub.redis_client.pipe.written[key])
 
