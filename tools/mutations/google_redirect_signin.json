@@ -4,9 +4,13 @@
     "Every mutation must be caught by frontend/src/__tests__/googleRedirectSignIn.test.tsx.",
     "",
     "This spec has no pytest target: the flow is front-end only and its tests",
-    "are run by vitest. The harness accepts a 'command' for exactly that case",
+    "are run by vitest. The harness accepts a 'command' for exactly that case,",
     "and keeps every other guarantee it already had -- snapshot before, SHA-256",
     "revert verification after, and a SKIP counts as a failure.",
+    "",
+    "The server half of the same flow (single-use enforcement, and the rule",
+    "that a credential is never logged) is a SEPARATE spec with a pytest",
+    "target: tools/mutations/google_signin_server.json.",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/google_redirect_signin.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -21,7 +25,7 @@
     "--",
     "src/__tests__/googleRedirectSignIn.test.tsx"
   ],
-  "timeout_s": 600,
+  "timeout_s": 180,
   "mutations": [
     {
       "label": "A: the redirect URI gains a trailing slash (Google rejects it with redirect_uri_mismatch)",
@@ -56,8 +60,8 @@
     {
       "label": "F: the handler stops checking that the credential belongs to this sign-in request",
       "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
-      "needle": "\t\tif (!pending) {\n\t\t\t// There is no request to compare against: the marker was lost or\n\t\t\t// already cleaned up, most often because the sign-in took longer\n\t\t\t// than the window. Say that, instead of calling the credential\n\t\t\t// unverified.\n\t\t\tfail(t(\"googleSignInExpired\"));\n\t\t\treturn;\n\t\t}\n\n\t\tif (pending.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
-      "replace": "\t\t// MUTANT: neither a missing request nor a foreign state is rejected\n"
+      "needle": "\t\tif (pending.kind === \"unavailable\") {\n\t\t\t// The browser is blocking storage, so the marker could not be\n\t\t\t// checked at all. Say THAT, instead of calling the credential\n\t\t\t// unverified.\n\t\t\tfail(t(\"googleSignInStorageBlocked\"));\n\t\t\treturn;\n\t\t}\n\n\t\tif (pending.kind !== \"found\") {\n\t\t\t// There is no request to compare against: the marker was lost or\n\t\t\t// already cleaned up, most often because the sign-in took longer\n\t\t\t// than the window. Say that, instead of calling the credential\n\t\t\t// unverified.\n\t\t\tfail(t(\"googleSignInExpired\"));\n\t\t\treturn;\n\t\t}\n\n\t\tif (pending.request.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
+      "replace": "\t\t// MUTANT: neither a missing marker nor a foreign state is rejected\n"
     },
     {
       "label": "G: the credential is posted to the wrong endpoint",
@@ -68,14 +72,14 @@
     {
       "label": "H: the credential is sent under the wrong body key",
       "file": "frontend/src/hooks/useGoogleLoginMutation.ts",
-      "needle": "\t\t\t\tbody: JSON.stringify({ token: googleToken }),\n",
-      "replace": "\t\t\t\tbody: JSON.stringify({ credential: googleToken }),  // MUTANT\n"
+      "needle": "\t\t\t\t\ttoken: submission.token,\n",
+      "replace": "\t\t\t\t\tcredential: submission.token,  // MUTANT\n"
     },
     {
       "label": "I: the handler never forwards the credential, so nobody is signed in",
       "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
-      "needle": "\t\tmutate(payload.credential);\n",
-      "replace": "\t\t// MUTANT: the credential is never forwarded\n"
+      "needle": "\t\tmutate({\n\t\t\ttoken: payload.credential,\n",
+      "replace": "\t\t// MUTANT: the credential is never forwarded\n\t\tif (false) mutate({\n\t\t\ttoken: payload.credential,\n"
     },
     {
       "label": "J: the failure path is silent, so a broken sign-in looks like a normal page load",
@@ -98,19 +102,19 @@
     {
       "label": "M: the button does not remember the sign-in request, so the credential cannot be verified",
       "file": "frontend/src/pages/Login.tsx",
-      "needle": "\t\trememberPendingGoogleRequest(googleSignIn.state);\n",
-      "replace": "\t\t// MUTANT: the sign-in request is not remembered\n"
+      "needle": "\t\tif (!rememberPendingGoogleRequest(googleSignIn.state)) {\n",
+      "replace": "\t\tif (false) {  // MUTANT: the sign-in request is not remembered\n"
     },
     {
       "label": "N: the age of the request rejects a credential whose state MATCHES (the slow-user bug)",
       "file": "frontend/src/lib/googleOAuth.ts",
-      "needle": "\t\treturn {\n\t\t\tstate: parsed.state,\n\t\t\tat,\n\t\t\texpired: Date.now() - at > PENDING_MAX_AGE_MS,\n\t\t};\n",
-      "replace": "\t\tif (Date.now() - at > PENDING_MAX_AGE_MS) {\n\t\t\tclearPendingGoogleRequest();\n\t\t\treturn null;\n\t\t}\n\t\treturn {\n\t\t\tstate: parsed.state,\n\t\t\tat,\n\t\t\texpired: false,\n\t\t};\n"
+      "needle": "\tconst at = typeof parsed.at === \"number\" ? parsed.at : 0;\n",
+      "replace": "\tconst at = typeof parsed.at === \"number\" ? parsed.at : 0;\n\tif (Date.now() - at > PENDING_MAX_AGE_MS) return null;  // MUTANT: an aged marker is dropped\n"
     },
     {
       "label": "O: the state is not compared at all, so a foreign response is accepted",
       "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
-      "needle": "\t\tif (pending.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
+      "needle": "\t\tif (pending.request.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
       "replace": "\t\t// MUTANT: the state is never compared\n"
     },
     {
@@ -122,8 +126,56 @@
     {
       "label": "R: a stale marker makes an unrelated later visit report a sign-in failure",
       "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
-      "needle": "\t\t\tif (pending.expired) {\n",
+      "needle": "\t\t\tif (pending.request.expired) {\n",
       "replace": "\t\t\tif (false) {  // MUTANT: a stale marker is treated as fresh\n"
+    },
+    {
+      "label": "S: the marker is not written to the SHARED store, so a sign-in that comes back in another tab is rejected",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "\t\tlocalStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);\n",
+      "replace": "\t\t// MUTANT: the marker is not written to the shared store\n"
+    },
+    {
+      "label": "T: the SHARED store is never read, so a sign-in that comes back in another tab is rejected",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "\t\tsharedRaw = localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);\n",
+      "replace": "\t\tsharedRaw = null;  // MUTANT: the shared store is never read\n"
+    },
+    {
+      "label": "U: a browser that blocks storage is not reported, so the sign-in fails in silence",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "\tif (!sharedUsable && !tabUsable) {\n\t\treturn {\n\t\t\tkind: \"unavailable\",\n\t\t\treason:\n\t\t\t\t\"This browser is blocking site storage, so the sign-in cannot be verified.\",\n\t\t};\n\t}\n",
+      "replace": "\t// MUTANT: an unavailable storage is not reported\n"
+    },
+    {
+      "label": "V: the sign-in starts even when the marker cannot be recorded, so it is guaranteed to be rejected on the way back",
+      "file": "frontend/src/pages/Login.tsx",
+      "needle": "\t\tif (!rememberPendingGoogleRequest(googleSignIn.state)) {\n",
+      "replace": "\t\tif (!rememberPendingGoogleRequest(googleSignIn.state) && false) {\n"
+    },
+    {
+      "label": "W: the claim never refuses a second attempt, so a reload sends the credential twice",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "\tif (seen.includes(state)) return false;\n",
+      "replace": "\t// MUTANT: the claim never refuses a second attempt\n"
+    },
+    {
+      "label": "X: the one-time value is not sent to the server, so the server cannot consume it once",
+      "file": "frontend/src/hooks/useGoogleLoginMutation.ts",
+      "needle": "\t\t\t\t\tsignin_nonce: submission.signin_nonce,\n",
+      "replace": "\t\t\t\t\t// MUTANT: the one-time value is not sent\n"
+    },
+    {
+      "label": "Y: every attempt carries the SAME one-time value, so the server refuses the user's second attempt",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "\t\tnonce: randomToken(),\n",
+      "replace": "\t\tnonce: \"the-same-one-time-value\",  // MUTANT\n"
+    },
+    {
+      "label": "Z: a new attempt does not supersede the previous claim, so the user cannot sign in again",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "\tclearGoogleSignInSubmission(state);\n",
+      "replace": "\t// MUTANT: the previous claim is never superseded\n"
     }
   ]
 }

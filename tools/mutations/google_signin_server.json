@@ -1,0 +1,61 @@
+{
+  "_comment": [
+    "Mutations that break the SERVER half of the Google sign-in, one at a time.",
+    "Every mutation must be caught by tests/test_google_signin_security.py.",
+    "",
+    "This spec has a pytest target, so it runs on the harness's pytest path:",
+    "the verdict comes from the pytest SUMMARY, exactly as for every other",
+    "spec. (The front-end half of the same flow is a separate spec with a",
+    "'command': tools/mutations/google_redirect_signin.json.)",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/google_signin_server.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_google_signin_security.py",
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "S1: the credential is logged again, in full",
+      "file": "api/routes/auth.py",
+      "needle": "        logger.warning(\n            \"Failed to verify Google token (sha256:%s): %s\",\n            token_digest[:16],\n            type(e).__name__,\n        )\n",
+      "replace": "        logger.warning(\n            f\"Failed to verify Google token: {e}\"  # MUTANT: the credential is logged\n        )\n"
+    },
+    {
+      "label": "S2: the exception message is logged, and it carries the credential",
+      "file": "api/routes/auth.py",
+      "needle": "            type(e).__name__,\n        )\n        audit_logger.login_failed(\n            username=f\"google_{token_digest[:12]}\",\n            ip_address=get_client_ip(request),\n            user_agent=get_user_agent(request),\n            reason=\"Invalid Google token\",\n",
+      "replace": "            f\"{type(e).__name__}: {e}\",  # MUTANT: the message carries the credential\n        )\n        audit_logger.login_failed(\n            username=f\"google_{token_digest[:12]}\",\n            ip_address=get_client_ip(request),\n            user_agent=get_user_agent(request),\n            reason=\"Invalid Google token\",\n"
+    },
+    {
+      "label": "S3: the audit log gets a PREFIX of the credential again",
+      "file": "api/routes/auth.py",
+      "needle": "            username=f\"google_{token_digest[:12]}\",\n            ip_address=get_client_ip(request),\n            user_agent=get_user_agent(request),\n            reason=\"Invalid Google token\",\n",
+      "replace": "            username=f\"google_{payload.token[:10]}...\",  # MUTANT: a prefix is audited\n            ip_address=get_client_ip(request),\n            user_agent=get_user_agent(request),\n            reason=\"Invalid Google token\",\n"
+    },
+    {
+      "label": "S4: the attempt is never consumed, so a replay is accepted",
+      "file": "api/routes/auth.py",
+      "needle": "    if not await google_signin.consume_once(db, consumed_values):\n        audit_logger.login_failed(\n            username=f\"google_{token_digest[:12]}\",\n            ip_address=get_client_ip(request),\n            user_agent=get_user_agent(request),\n            reason=\"Google sign-in attempt already used\",\n        )\n        raise HTTPException(\n            status_code=status.HTTP_409_CONFLICT,\n            detail=\"This sign-in has already been used. Please sign in again.\",\n        )\n",
+      "replace": "    # MUTANT: the attempt is never consumed, so a replay is accepted\n"
+    },
+    {
+      "label": "S5: the credential itself is not consumed, only the one-time value",
+      "file": "api/routes/auth.py",
+      "needle": "    consumed_values = [google_signin.credential_value(token_digest)]\n",
+      "replace": "    consumed_values = []  # MUTANT: the credential itself is not consumed\n"
+    },
+    {
+      "label": "S6: the client one-time value is not consumed",
+      "file": "api/routes/auth.py",
+      "needle": "    if payload.signin_nonce:\n        consumed_values.append(google_signin.nonce_value(payload.signin_nonce))\n",
+      "replace": "    # MUTANT: the client one-time value is not consumed\n"
+    },
+    {
+      "label": "S7: a value that was already consumed is accepted again",
+      "file": "api/google_signin.py",
+      "needle": "    except IntegrityError:\n        # One of the values was already consumed. This attempt is a replay.\n        await db.rollback()\n        return False\n",
+      "replace": "    except IntegrityError:\n        # One of the values was already consumed. This attempt is a replay.\n        await db.rollback()\n        return True  # MUTANT: a replay is accepted\n"
+    }
+  ]
+}

@@ -87,11 +87,35 @@ export const GOOGLE_AUTHORIZE_ENDPOINT =
 	"https://accounts.google.com/o/oauth2/v2/auth";
 
 /**
- * sessionStorage key holding the sign-in request that is currently in flight.
- * It carries the `state` value that must come back with the credential, which
- * is what proves the response belongs to a sign-in THIS browser started.
+ * Key holding the sign-in request that is currently in flight. It carries the
+ * `state` value that must come back with the credential, which is what proves
+ * the response belongs to a sign-in THIS browser started.
+ *
+ * It is written to TWO stores, on purpose:
+ *
+ *   * `localStorage` -- the SHARED copy. A sign-in does not always come back
+ *     in the tab that started it: the user may open a second tab, reopen a
+ *     closed one, duplicate one, or come back through a restored session.
+ *     `sessionStorage` is PER TAB, so a marker that only lived there was
+ *     missing in every one of those cases and the LEGITIMATE sign-in was
+ *     rejected -- silently, which is the failure this file exists to
+ *     prevent.
+ *
+ *   * `sessionStorage` -- the PER-TAB copy. It records "THIS tab started a
+ *     sign-in", which is what lets the tab that started it report a sign-in
+ *     that came back without a credential, without every other open tab
+ *     reporting a failure that is not its own.
  */
 export const GOOGLE_OAUTH_PENDING_KEY = "depthsight:google-oauth-pending";
+
+/**
+ * Key holding the one-time values that have ALREADY been sent to the server.
+ *
+ * The value is the OAuth `state`: a random value this browser generated to
+ * tie a response to a request. It is not a credential, so keeping it here
+ * exposes nothing that was not already in the URL.
+ */
+export const GOOGLE_OAUTH_SUBMITTED_KEY = "depthsight:google-oauth-submitted";
 
 /**
  * Query parameters that belong to an OAuth round-trip and must not be left
@@ -228,8 +252,26 @@ export const clearGoogleRedirectParams = (
 	history.replaceState(history.state, "", `${location.pathname}${search}`);
 };
 
+/**
+ * Where a pending sign-in request was found.
+ *
+ * "tab" means THIS tab started the sign-in (the per-tab copy).
+ * "shared" means another tab in this browser started it (the shared copy).
+ */
+export type PendingGoogleRequestScope = "tab" | "shared";
+
 export interface PendingGoogleRequest {
 	state: string;
+	/**
+	 * The one-time value for THIS attempt.
+	 *
+	 * It is generated fresh on every click, so the server can consume it
+	 * exactly once without a second attempt of the same sign-in ever
+	 * being refused. The OAuth `state` cannot play that role: it is built
+	 * once per page render, so a second click on the same page would reuse
+	 * a value the server has already consumed.
+	 */
+	nonce: string;
 	at: number;
 	/**
 	 * True when the request is older than PENDING_MAX_AGE_MS.
@@ -239,7 +281,23 @@ export interface PendingGoogleRequest {
 	 * is rejected -- the STATE MATCH is (see GoogleRedirectHandler).
 	 */
 	expired: boolean;
+	/** Which store the request was found in. */
+	scope: PendingGoogleRequestScope;
 }
+
+/**
+ * The result of looking the in-flight sign-in request up.
+ *
+ * "missing" and "unavailable" are DIFFERENT outcomes and must not be
+ * confused. A missing marker means "no sign-in was started here" -- the
+ * credential is rejected. "unavailable" means the browser is blocking
+ * storage, so the app cannot even tell -- the credential is rejected, and
+ * the user is told WHY, instead of being met with silence.
+ */
+export type PendingGoogleLookup =
+	| { kind: "found"; request: PendingGoogleRequest }
+	| { kind: "missing" }
+	| { kind: "unavailable"; reason: string };
 
 /**
  * A sign-in that has not come back within this window is treated as probably
@@ -257,47 +315,218 @@ export const PENDING_MAX_AGE_MS = 15 * 60 * 1000;
 /**
  * Remember that a sign-in is in flight, so the credential that comes back can
  * be tied to this request.
+ *
+ * Returns FALSE when NEITHER store could be written: the browser is blocking
+ * storage (private mode with storage disabled, blocked third-party storage, a
+ * hardened profile). The caller MUST then fail loudly. A sign-in whose marker
+ * cannot be recorded is a sign-in that is guaranteed to be rejected on the way
+ * back, and it must never start silently.
  */
-export const rememberPendingGoogleRequest = (state: string): void => {
+export const rememberPendingGoogleRequest = (state: string): boolean => {
+	const payload = JSON.stringify({
+		state,
+		nonce: randomToken(),
+		at: Date.now(),
+	});
+	let stored = false;
+	// A new attempt supersedes the previous one for this `state`: the
+	// server consumes the one-time value exactly once, so a second attempt
+	// must carry a NEW one.
+	clearGoogleSignInSubmission(state);
 	try {
-		sessionStorage.setItem(
-			GOOGLE_OAUTH_PENDING_KEY,
-			JSON.stringify({ state, at: Date.now() }),
-		);
+		// The SHARED copy: this is what makes the sign-in verifiable in
+		// another tab.
+		localStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
+		stored = true;
 	} catch {
-		// Storage is unavailable (private mode, blocked storage). The sign-in
-		// then fails the state check below instead of silently succeeding.
+		// The shared store is unavailable. The per-tab store is the fallback.
 	}
+	try {
+		// The PER-TAB copy: this is what lets THIS tab report a sign-in that
+		// came back without a credential.
+		sessionStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
+		stored = true;
+	} catch {
+		// The per-tab store is unavailable too.
+	}
+	return stored;
 };
 
-/**
- * Read the sign-in request that is in flight, if there is one.
- *
- * This READS the marker; it never discards it, however old it is. The caller
- * is the one that consumes it, and it is the `state` -- not the age -- that
- * decides whether a credential is accepted.
- */
-export const readPendingGoogleRequest = (): PendingGoogleRequest | null => {
+const parsePendingRecord = (
+	raw: string,
+	scope: PendingGoogleRequestScope,
+): PendingGoogleRequest | null => {
 	try {
-		const raw = sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);
-		if (!raw) return null;
-		const parsed = JSON.parse(raw) as { state?: unknown; at?: unknown };
+		const parsed = JSON.parse(raw) as {
+			state?: unknown;
+			nonce?: unknown;
+			at?: unknown;
+		};
 		if (!parsed || typeof parsed.state !== "string") return null;
 		const at = typeof parsed.at === "number" ? parsed.at : 0;
 		return {
 			state: parsed.state,
+			nonce: typeof parsed.nonce === "string" ? parsed.nonce : parsed.state,
 			at,
 			expired: Date.now() - at > PENDING_MAX_AGE_MS,
+			scope,
 		};
 	} catch {
 		return null;
 	}
 };
 
+/**
+ * Look the sign-in request that is in flight up, if there is one.
+ *
+ * The PER-TAB copy wins: it is the one that says "this tab started the
+ * sign-in", and it is the only copy that still carries that meaning when two
+ * tabs are signing in at the same time. The SHARED copy is the fallback that
+ * makes a sign-in started in one tab verifiable in another.
+ *
+ * This READS the marker; it never discards it, however old it is. The caller
+ * is the one that consumes it, and it is the `state` -- not the age -- that
+ * decides whether a credential is accepted.
+ */
+export const lookupPendingGoogleRequest = (): PendingGoogleLookup => {
+	let sharedUsable = true;
+	let sharedRaw: string | null = null;
+	try {
+		sharedRaw = localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);
+	} catch {
+		sharedUsable = false;
+	}
+
+	let tabRaw: string | null = null;
+	let tabUsable = true;
+	try {
+		tabRaw = sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);
+	} catch {
+		tabUsable = false;
+	}
+
+	const tab = tabRaw ? parsePendingRecord(tabRaw, "tab") : null;
+	if (tab) return { kind: "found", request: tab };
+
+	const shared = sharedRaw ? parsePendingRecord(sharedRaw, "shared") : null;
+	if (shared) return { kind: "found", request: shared };
+
+	if (!sharedUsable && !tabUsable) {
+		return {
+			kind: "unavailable",
+			reason:
+				"This browser is blocking site storage, so the sign-in cannot be verified.",
+		};
+	}
+	return { kind: "missing" };
+};
+
+/**
+ * Read the sign-in request that is in flight, if there is one.
+ *
+ * This is the simple form of `lookupPendingGoogleRequest`, for callers that
+ * only care whether there is a marker at all.
+ */
+export const readPendingGoogleRequest = (): PendingGoogleRequest | null => {
+	const found = lookupPendingGoogleRequest();
+	return found.kind === "found" ? found.request : null;
+};
+
+/**
+ * Remove the marker from BOTH stores.
+ */
 export const clearPendingGoogleRequest = (): void => {
+	try {
+		localStorage.removeItem(GOOGLE_OAUTH_PENDING_KEY);
+	} catch {
+		// Nothing to clear.
+	}
 	try {
 		sessionStorage.removeItem(GOOGLE_OAUTH_PENDING_KEY);
 	} catch {
 		// Nothing to clear.
 	}
+};
+
+/**
+ * Claim the one-time value for THIS sign-in attempt.
+ *
+ * Returns TRUE when this call is the one that claimed it, and FALSE when it
+ * had already been claimed -- which means the credential carrying it has
+ * already been sent and must not be sent again.
+ *
+ * The claim lives in `localStorage`, so it survives a remount of the
+ * component AND a full reload of the page. A React ref survives neither, and
+ * the credential lives in the URL fragment, which a reload keeps.
+ *
+ * This is DEFENCE IN DEPTH. The guarantee that one redirect produces exactly
+ * one session is enforced on the server, which consumes the same one-time
+ * value; the claim only stops the browser from making a request that the
+ * server is going to refuse.
+ */
+const readSubmittedStates = (): string[] => {
+	try {
+		const raw = localStorage.getItem(GOOGLE_OAUTH_SUBMITTED_KEY);
+		const parsed = raw ? (JSON.parse(raw) as { states?: unknown }) : null;
+		return Array.isArray(parsed?.states)
+			? (parsed!.states as unknown[]).filter(
+					(value): value is string => typeof value === "string",
+				)
+			: [];
+	} catch {
+		return [];
+	}
+};
+
+const writeSubmittedStates = (states: string[]): void => {
+	try {
+		localStorage.setItem(
+			GOOGLE_OAUTH_SUBMITTED_KEY,
+			// Only the most recent values are kept. A dropped claim can only
+			// ever let an ANCIENT one-time value be sent again, and the
+			// server has long since forgotten it.
+			JSON.stringify({ states: states.slice(-20) }),
+		);
+	} catch {
+		// Storage is blocked. The server refuses a second attempt with the
+		// same one-time value, so the guarantee still holds.
+	}
+};
+
+/**
+ * Claim the sign-in attempt for this `state`.
+ *
+ * Returns TRUE when this call is the one that claimed it, and FALSE when it
+ * had already been claimed -- which means the credential that carries it has
+ * already been sent and must not be sent again.
+ *
+ * The claim lives in `localStorage`, so it survives a remount of the
+ * component AND a full reload of the page. A React ref survives neither, and
+ * the credential lives in the URL fragment, which a reload keeps.
+ *
+ * This is DEFENCE IN DEPTH. The guarantee that one redirect produces exactly
+ * one session is enforced on the server, which consumes the one-time value
+ * once; the claim only stops the browser from making a request that the
+ * server is going to refuse.
+ */
+export const claimGoogleSignInSubmission = (state: string): boolean => {
+	if (!state) return true;
+	const seen = readSubmittedStates();
+	if (seen.includes(state)) return false;
+	writeSubmittedStates([...seen, state]);
+	return true;
+};
+
+/**
+ * Forget the claim for this `state`.
+ *
+ * A new attempt supersedes the previous one: the server consumes the
+ * one-time value exactly once, so an attempt that has already been sent must
+ * not stop the user from signing in again.
+ */
+export const clearGoogleSignInSubmission = (state: string): void => {
+	if (!state) return;
+	const seen = readSubmittedStates();
+	if (!seen.includes(state)) return;
+	writeSubmittedStates(seen.filter((value) => value !== state));
 };

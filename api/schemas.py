@@ -138,6 +138,15 @@ class LoginResponse(BaseModel):
 
 class GoogleLoginRequest(BaseModel):
     token: str
+    # The one-time value the client generated for THIS sign-in attempt. The
+    # server consumes it exactly once, so one redirect cannot mint two
+    # sessions -- not by a remount, not by a reload, and not by a second tab
+    # that received the same redirect.
+    #
+    # It is optional so a client that does not have one (the PWA popup flow)
+    # keeps working; that client is still protected, because the credential
+    # itself is consumed by its digest.
+    signin_nonce: Optional[str] = Field(default=None, max_length=256)
 
 
 class TokenData(BaseModel):

@@ -4,6 +4,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation } from "@tanstack/react-query";
 import { Eye, EyeOff, Loader2, Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
+import type { MouseEvent } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
@@ -124,8 +125,19 @@ export default function LoginPage() {
 		[googleClientId],
 	);
 
-	const startGoogleSignIn = () => {
-		rememberPendingGoogleRequest(googleSignIn.state);
+	const startGoogleSignIn = (event: MouseEvent<HTMLAnchorElement>) => {
+		// If the marker cannot be written, the sign-in CANNOT be verified when
+		// it comes back -- so it must not start at all. Say so, loudly,
+		// instead of sending the user to Google only to reject them on the
+		// way back.
+		if (!rememberPendingGoogleRequest(googleSignIn.state)) {
+			event.preventDefault();
+			toast({
+				variant: "destructive",
+				title: t("toastFailureTitle"),
+				description: t("googleSignInStorageBlocked"),
+			});
+		}
 	};
 
 	const onSubmit = (data: LoginFormValues) => {

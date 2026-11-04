@@ -94,7 +94,10 @@ import { GoogleRedirectHandler } from "@/components/auth/GoogleRedirectHandler";
 import LoginPage from "@/pages/Login";
 import {
 	GOOGLE_OAUTH_PENDING_KEY,
+	GOOGLE_OAUTH_SUBMITTED_KEY,
 	PENDING_MAX_AGE_MS,
+	claimGoogleSignInSubmission,
+	lookupPendingGoogleRequest,
 	readPendingGoogleRequest,
 	rememberPendingGoogleRequest,
 } from "@/lib/googleOAuth";
@@ -120,6 +123,12 @@ const installLocalStorage = () => {
 		clear: () => tokenStore.clear(),
 	});
 };
+
+/**
+ * The REAL jsdom sessionStorage, captured before any test stubs it, so a
+ * test that blocks storage cannot leak into the next one.
+ */
+const realSessionStorage = sessionStorage;
 
 const LocationProbe = () => {
 	const location = useLocation();
@@ -153,16 +162,85 @@ const renderLogin = () =>
 /**
  * Write a sign-in request that is OLDER than the window, the way a slow
  * device or a long hesitation at Google's consent screen would leave it.
+ *
+ * It is written to BOTH stores, exactly as the app writes it: the shared
+ * copy and the per-tab copy.
  */
 const writeAgedMarker = (
 	state: string,
 	ageMs: number = PENDING_MAX_AGE_MS + 5 * 60 * 1000,
 ) => {
-	sessionStorage.setItem(
-		GOOGLE_OAUTH_PENDING_KEY,
-		JSON.stringify({ state, at: Date.now() - ageMs }),
-	);
+	const payload = JSON.stringify({ state, at: Date.now() - ageMs });
+	localStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
+	sessionStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
 };
+
+/**
+ * A browser that blocks storage for the sign-in marker.
+ *
+ * The marker cannot be read or written, while the rest of the app's storage
+ * still works. This is the shape of the failure the app has to survive: it
+ * cannot tell "no sign-in was started" from "I cannot look".
+ */
+const installMarkerStorageBlocked = () => {
+	const real = localStorage as Storage;
+	const realSession = sessionStorage as Storage;
+	const block = (key: string) => key === GOOGLE_OAUTH_PENDING_KEY;
+	vi.stubGlobal("localStorage", {
+		getItem: (key: string) => {
+			if (block(key)) throw new Error("storage is blocked");
+			return real.getItem(key);
+		},
+		setItem: (key: string, value: string) => {
+			if (block(key)) throw new Error("storage is blocked");
+			real.setItem(key, value);
+		},
+		removeItem: (key: string) => {
+			if (block(key)) throw new Error("storage is blocked");
+			real.removeItem(key);
+		},
+		clear: () => real.clear(),
+	});
+	vi.stubGlobal("sessionStorage", {
+		getItem: (key: string) => {
+			if (block(key)) throw new Error("storage is blocked");
+			return realSession.getItem(key);
+		},
+		setItem: (key: string, value: string) => {
+			if (block(key)) throw new Error("storage is blocked");
+			realSession.setItem(key, value);
+		},
+		removeItem: (key: string) => {
+			if (block(key)) throw new Error("storage is blocked");
+			realSession.removeItem(key);
+		},
+		clear: () => realSession.clear(),
+	});
+};
+
+/**
+ * A browser that blocks storage entirely: writes throw, so a sign-in cannot
+ * record its marker.
+ */
+const installStorageWritesBlocked = () => {
+	const blocked = {
+		getItem: () => null,
+		setItem: () => {
+			throw new Error("storage is blocked");
+		},
+		removeItem: () => {
+			throw new Error("storage is blocked");
+		},
+		clear: () => {},
+		key: () => null,
+		length: 0,
+	};
+	vi.stubGlobal("localStorage", blocked);
+	vi.stubGlobal("sessionStorage", blocked);
+};
+
+/** Let every pending promise and timer settle before asserting a count. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 50));
 
 beforeAll(async () => {
 	await i18n.use(initReactI18next).init({
@@ -177,6 +255,9 @@ beforeAll(async () => {
 beforeEach(() => {
 	tokenStore.clear();
 	installLocalStorage();
+	// The real sessionStorage: a test that blocks storage must not leak
+	// into the next one.
+	vi.stubGlobal("sessionStorage", realSessionStorage);
 	toastSpy.mockClear();
 	fetchMock.mockReset();
 	fetchMock.mockResolvedValue({
@@ -211,6 +292,7 @@ beforeEach(() => {
 afterEach(() => {
 	cleanup();
 	vi.unstubAllEnvs();
+	vi.unstubAllGlobals();
 });
 
 describe("the login page starts the REDIRECT flow (no popup)", () => {
@@ -249,11 +331,19 @@ describe("the login page starts the REDIRECT flow (no popup)", () => {
 
 		fireEvent.click(link, { preventDefault: true });
 
+		// The SHARED store is the one that makes the sign-in verifiable in
+		// another tab, so the marker has to be in it.
 		const pending = JSON.parse(
-			sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
 		);
 		expect(pending).not.toBeNull();
 		expect(pending.state).toBe(state);
+		// And in the PER-TAB store, which is what tells THIS tab that it
+		// started the sign-in.
+		expect(
+			JSON.parse(sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null")
+				.state,
+		).toBe(state);
 	});
 });
 
@@ -271,7 +361,10 @@ describe("the redirect handler signs in on the site root", () => {
 			),
 		);
 		const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-		expect(body).toEqual({ token: "google-id-token" });
+		expect(body).toEqual({
+			token: "google-id-token",
+			signin_nonce: expect.any(String),
+		});
 	});
 
 	it("removes the credential from the URL", async () => {
@@ -291,6 +384,210 @@ describe("the redirect handler signs in on the site root", () => {
 		await waitFor(() => expect(screen.getByTestId("pathname")).toBeTruthy());
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(toastSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe("a sign-in that comes back in ANOTHER tab", () => {
+	it("is accepted, because the marker is reachable across tabs", async () => {
+		// Tab A started the sign-in. In tab B the PER-TAB store is empty and
+		// only the SHARED store holds the marker -- which is exactly what a
+		// second tab, a reopened tab or a duplicated tab sees. A marker that
+		// only lived in sessionStorage is missing here, and the LEGITIMATE
+		// sign-in is rejected.
+		localStorage.setItem(
+			GOOGLE_OAUTH_PENDING_KEY,
+			JSON.stringify({ state: "state-abc", at: Date.now() }),
+		);
+		expect(sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY)).toBeNull();
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+
+		renderHandler();
+
+		await waitFor(() =>
+			expect(fetchMock).toHaveBeenCalledWith(
+				"/api/v1/auth/google",
+				expect.objectContaining({ method: "POST" }),
+			),
+		);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("still refuses a credential that has no marker at all", async () => {
+		// The marker is the proof that THIS browser started the sign-in.
+		// Without it the credential is a login CSRF attempt, and it is
+		// refused.
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+
+		renderHandler();
+
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("reports a blocked storage browser instead of failing in silence", async () => {
+		installMarkerStorageBlocked();
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+
+		renderHandler();
+
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		const description = String(toastSpy.mock.calls[0][0].description);
+		expect(description).toBe(
+			(loginEn as unknown as Record<string, string>).googleSignInStorageBlocked,
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+});
+
+describe("a browser that blocks storage", () => {
+	it("cannot record the marker, so the sign-in is reported and not started", async () => {
+		installStorageWritesBlocked();
+		renderLogin();
+		const link = screen.getByTestId("google-signin");
+
+		// The click is cancelled: a sign-in whose marker cannot be recorded
+		// is a sign-in that is guaranteed to be rejected on the way back.
+		const notCancelled = fireEvent.click(link);
+
+		expect(notCancelled).toBe(false);
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		const description = String(toastSpy.mock.calls[0][0].description);
+		expect(description).toBe(
+			(loginEn as unknown as Record<string, string>).googleSignInStorageBlocked,
+		);
+	});
+
+	it("reports that the marker cannot be read at all", () => {
+		// Both stores refuse to be read: the app cannot even tell whether a
+		// sign-in was started, and that has to be said out loud rather than
+		// turned into a silent rejection.
+		const blocked = {
+			getItem: () => {
+				throw new Error("storage is blocked");
+			},
+			setItem: () => {
+				throw new Error("storage is blocked");
+			},
+			removeItem: () => {
+				throw new Error("storage is blocked");
+			},
+			clear: () => {},
+		};
+		vi.stubGlobal("localStorage", blocked);
+		vi.stubGlobal("sessionStorage", blocked);
+
+		const lookup = lookupPendingGoogleRequest();
+
+		expect(lookup.kind).toBe("unavailable");
+	});
+});
+
+describe("one redirect produces exactly one session", () => {
+	it("does not send the credential twice when the handler is remounted", async () => {
+		rememberPendingGoogleRequest("state-abc");
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+		// The handler is unmounted and mounted again: a fresh component
+		// instance, with a fresh `handled` ref. The storage is the same.
+		cleanup();
+		renderHandler();
+		await settle();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not send the credential twice after a reload", async () => {
+		rememberPendingGoogleRequest("state-abc");
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+		// The page is reloaded and the browser restores the URL with the
+		// credential still in it. The storage survives the reload; a React
+		// ref does not, and the credential lives in the URL fragment, which
+		// a reload keeps.
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+		cleanup();
+		renderHandler();
+		await settle();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		// The restored page must not report a failure either: the sign-in
+		// this credential belongs to is under way.
+		expect(toastSpy).not.toHaveBeenCalledWith(
+			expect.objectContaining({ variant: "destructive" }),
+		);
+	});
+
+	it("claims the one-time value in storage, so the claim survives a reload", () => {
+		// The claim lives in localStorage, which a reload keeps. A React ref
+		// survives neither a remount nor a reload.
+		expect(claimGoogleSignInSubmission("state-abc")).toBe(true);
+		expect(claimGoogleSignInSubmission("state-abc")).toBe(false);
+		expect(
+			JSON.parse(localStorage.getItem(GOOGLE_OAUTH_SUBMITTED_KEY) || "{}")
+				.states,
+		).toContain("state-abc");
+	});
+
+	it("sends the one-time value to the server, so the server can consume it once", async () => {
+		rememberPendingGoogleRequest("state-abc");
+		const marker = JSON.parse(
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+		);
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+
+		renderHandler();
+
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+		const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+		expect(body.signin_nonce).toBe(marker.nonce);
+	});
+
+	it("generates a fresh one-time value for every attempt", () => {
+		// The server consumes the one-time value exactly once, so a second
+		// attempt must carry a NEW one. The OAuth `state` cannot play that
+		// role: it is built once per page render, so a second click on the
+		// same page would reuse a value the server has already consumed --
+		// and the user's second attempt would be refused as a replay.
+		rememberPendingGoogleRequest("state-abc");
+		const first = JSON.parse(
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+		);
+		rememberPendingGoogleRequest("state-abc");
+		const second = JSON.parse(
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+		);
+
+		expect(second.nonce).toBeTruthy();
+		expect(second.nonce).not.toBe(first.nonce);
+	});
+
+	it("lets the user try again after a sign-in was already sent", () => {
+		// The claim stops the SAME credential from being sent twice. It must
+		// not stop the user from signing in again.
+		expect(claimGoogleSignInSubmission("state-abc")).toBe(true);
+		expect(claimGoogleSignInSubmission("state-abc")).toBe(false);
+
+		rememberPendingGoogleRequest("state-abc");
+
+		expect(claimGoogleSignInSubmission("state-abc")).toBe(true);
 	});
 });
 
@@ -360,7 +657,10 @@ describe("a sign-in that takes longer than the window", () => {
 			),
 		);
 		const body = JSON.parse(fetchMock.mock.calls[0][1].body);
-		expect(body).toEqual({ token: "google-id-token" });
+		expect(body).toEqual({
+			token: "google-id-token",
+			signin_nonce: expect.any(String),
+		});
 	});
 
 	it("rejects a credential whose state does not match an old marker", async () => {
