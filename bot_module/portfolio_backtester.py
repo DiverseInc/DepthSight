@@ -12,6 +12,7 @@ from .data_loader import (
     attach_klines_window_coverage,
     download_klines,
 )
+from .market_data_disclosure import attach_candles_disclosure
 from .depthsight_backtester import L2HistoricalDataReader
 from .execution_simulator import (
     simulate_market_order_execution,
@@ -1213,6 +1214,17 @@ class PortfolioBacktester:
             for (symbol, timeframe), df in self.market_data.items()
         }
         attach_klines_window_coverage(
+            kpi_results,
+            frames_by_key,
+            log_prefix="Portfolio data: ",
+        )
+        # THE CUSTOMER IS TOLD WHICH WINDOW THE NUMBERS ARE ABOUT.  The
+        # note above says which frames do not cover the window they were
+        # asked for; this says, for EVERY frame, where its candles came
+        # from and whether the window they cover is the one that was asked
+        # for.  A frame that covers its window is reported as COMPLETE, so
+        # the absence of a warning is a statement and not a silence.
+        attach_candles_disclosure(
             kpi_results,
             frames_by_key,
             log_prefix="Portfolio data: ",

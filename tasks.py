@@ -49,6 +49,7 @@ from bot_module.data_loader import (
     attach_klines_window_coverage,
     download_klines,
 )
+from bot_module.market_data_disclosure import attach_candles_disclosure
 from bot_module.genetic_strategy_finder import (
     GeneticStrategyFinder,
     resample_to_timeframes,
@@ -1049,6 +1050,17 @@ async def _single_symbol_backtest_body(
         # would be reported as the KPIs of the window that was asked for.
         # The coverage is therefore carried by the KPIs the run saves.
         attach_klines_window_coverage(
+            kpi_results_to_save,
+            historical_data,
+            log_prefix=f"Task {task_id} (Symbol: {symbol}): ",
+        )
+        # THE CUSTOMER IS TOLD WHICH WINDOW THE NUMBERS ARE ABOUT.  The
+        # note above says which frames do not cover the window they were
+        # asked for; this says, for EVERY frame, where its candles came
+        # from and whether the window they cover is the one that was asked
+        # for.  A frame that covers its window is reported as COMPLETE, so
+        # the absence of a warning is a statement and not a silence.
+        attach_candles_disclosure(
             kpi_results_to_save,
             historical_data,
             log_prefix=f"Task {task_id} (Symbol: {symbol}): ",

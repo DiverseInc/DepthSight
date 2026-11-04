@@ -261,6 +261,18 @@
 		"totalCommissionLabel": "Total Commission",
 		"descCommissionTotal": "Sum of fees paid for all trades"
 	},
+	"dataWindowDisclosure": {
+		"incompleteTitle": "Incomplete data window",
+		"incompleteBody": "The candles for this backtest do not cover the whole period you asked for, so the numbers below were computed over a shorter window.",
+		"missingDaysLabel": "Missing from the window: {{days}}",
+		"missingDaysNone": "Some days of the window are missing.",
+		"sourceLabel": "Data source: {{source}}",
+		"sourceRestApi": "Binance REST API",
+		"sourceBulkArchive": "Binance bulk archive",
+		"sourceLocalCache": "local cache",
+		"differsFromRest": "These candles are not the ones the REST API would have returned.",
+		"completeBody": "The candles cover the whole period you asked for."
+	},
 	"tradeHistoryTable": {
 		"title": "Trade History",
 		"description": "Detailed log of all trades executed during the backtest.",

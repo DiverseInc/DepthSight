@@ -24,6 +24,15 @@
     "E8: the trailing edge of a frame that is not from the archive was never",
     "    measured, so a REST or cached frame that ends before the window it",
     "    was asked for was reported as if it covered it.",
+    "E9: the disclosure DROPPED the gap, so a backtest computed over a",
+    "    shorter window looked exactly like a backtest of the window that",
+    "    was asked for.",
+    "E10: the disclosure REPORTED a gap that is not there, so every",
+    "    backtest was announced as an incomplete one and the warning",
+    "    stopped meaning anything.",
+    "E11: the portfolio backtest stopped carrying the disclosure.",
+    "E12: the disclosure stopped saying where the candles came from, so",
+    "    the customer could not tell the archive's frame from the REST one.",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/market_data_coverage_honesty.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -35,7 +44,7 @@
     "calls is covered by E1-A below.  A mutation of that one line would",
     "SURVIVE, which is why it is not in this spec."
   ],
-  "pytest_target": "tests/test_data_loader_bulk_archive_coverage.py tests/test_data_loader_bulk_archive.py tests/test_data_loader_bulk_archive_honesty.py",
+  "pytest_target": "tests/test_data_loader_bulk_archive_coverage.py tests/test_data_loader_bulk_archive.py tests/test_data_loader_bulk_archive_honesty.py tests/test_backtest_data_window_disclosure.py",
   "timeout_s": 1800,
   "mutations": [
     {
@@ -115,6 +124,30 @@
       "file": "bot_module/data_loader.py",
       "needle": "    if trailing_short <= 0:\n        trailing_short = _delivered_trailing_short(provenance)\n",
       "replace": "    if trailing_short <= 0:\n        trailing_short = 0.0  # MUTANT: the delivered trailing edge is not measured\n"
+    },
+    {
+      "label": "E9: the disclosure drops the gap from the result",
+      "file": "bot_module/market_data_disclosure.py",
+      "needle": "            record.update(note)\n            record[\"complete\"] = False\n",
+      "replace": "            record[\"complete\"] = True  # MUTANT: the gap is dropped\n"
+    },
+    {
+      "label": "E10: the disclosure reports a gap that is not there",
+      "file": "bot_module/market_data_disclosure.py",
+      "needle": "            record[\"complete\"] = True\n",
+      "replace": "            record[\"complete\"] = False  # MUTANT: a gap is reported where there is none\n"
+    },
+    {
+      "label": "E11: the portfolio backtest stops carrying the disclosure",
+      "file": "bot_module/portfolio_backtester.py",
+      "needle": "        attach_candles_disclosure(\n            kpi_results,\n            frames_by_key,\n            log_prefix=\"Portfolio data: \",\n        )\n",
+      "replace": "        pass  # MUTANT: the disclosure is dropped\n"
+    },
+    {
+      "label": "E12: the disclosure stops saying where the candles came from",
+      "file": "bot_module/market_data_disclosure.py",
+      "needle": "            \"source\": provenance.get(\"source\"),\n",
+      "replace": "            \"source\": None,  # MUTANT: the source is never said\n"
     }
   ]
 }
