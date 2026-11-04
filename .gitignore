@@ -45,15 +45,35 @@ gcp_key.json
 # rotation copy, and a scratch file. `.env.*` closes the whole class rather
 # than the three names that happened to be observed.
 #
+# `.env_*` covers the same class with an UNDERSCORE separator. `.env_backup`
+# and `.env_staging` match NEITHER `.env.*` NOR `*.env`, so they were still
+# committable after the `.env.*` rule went in. MEASURED 2026-11-03
+# (`git check-ignore --no-index`): both returned "not ignored".
+#
+# THE NEGATIONS ARE ANCHORED TO THE FILES THEY MEAN. An unanchored
+# `!.env.production` re-opens `.env.production` at EVERY level -- including
+# the repository ROOT, where `deploy.sh` (deploy.sh:63) treats it as one of
+# the four canonical live env filenames (`.env .env.example .env.local
+# .env.production`). MEASURED 2026-11-03: with the unanchored negation,
+# `.env.production`, `subdir/.env.production` and `deploy/.env.production`
+# were all committable -- the rule re-opened the exact class it claimed to
+# close, in the one directory where that name holds live production secrets.
+# The root file is NOT tracked (measured: `git ls-files` lists no root
+# `.env.production`), so ignoring it un-tracks nothing.
+#
 # The tracked templates are negated so they stay addable: `.env.example` and
 # the public build values in `frontend/.env.production` and
 # `pwa/.env.production` are deliberately tracked and must not be ignored.
 # A tracked file is unaffected by an ignore rule either way, but a NEW file
 # with one of those names would be silently un-addable, so they are negated
-# explicitly.
+# explicitly. `!.env.example` stays UNANCHORED on purpose: an `.env.example`
+# is a template wherever it sits, and `frontend/.env.example` and
+# `pwa/.env.example` are tracked too.
 .env.*
+.env_*
 !.env.example
-!.env.production
+!frontend/.env.production
+!pwa/.env.production
 
 # The third untracked file found in the 2026-11-03 production checkout was a
 # scratch file of unknown content, at the root of the tree. Unlike the two

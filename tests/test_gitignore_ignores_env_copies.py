@@ -52,6 +52,17 @@ MUST_BE_IGNORED = [
     "frontend/.env.production.local",
     "pwa/.env.local",
     "check.txt",
+    # MEASURED 2026-11-03: with an UNANCHORED `!.env.production` negation these
+    # three were all committable -- the negation re-opened the class at every
+    # level, including the repository ROOT, where `deploy.sh:63` names
+    # `.env.production` as one of the four canonical live env filenames.
+    ".env.production",
+    "subdir/.env.production",
+    "deploy/.env.production",
+    # MEASURED 2026-11-03: these match NEITHER `.env.*` NOR `*.env`, so they
+    # were committable after the `.env.*` rule went in.
+    ".env_backup",
+    ".env_staging",
 ]
 
 # Deliberately tracked: placeholder templates and the public build values the
@@ -111,12 +122,41 @@ def test_the_deliberately_tracked_templates_are_not_ignored(path):
     )
 
 
-def test_every_tracked_environment_like_file_stays_addable():
-    """No file this repository tracks may become un-addable by this rule."""
-    tracked = subprocess.run(
+def _tracked_files() -> list[str]:
+    """The repository's tracked-file list, or a LOUD failure.
+
+    `git ls-files` exits non-zero when git is missing, or when the path is not
+    inside a repository. The return code used to be ignored, and the check
+    below it read `stdout` -- so a FAILED listing produced an EMPTY list, the
+    loop over that list never ran once, and "no tracked file is un-addable"
+    was true because NOTHING WAS CHECKED. That is a vacuous pass, and it is
+    the same failure shape as the `--no-index` defect above: the assertion
+    looks meaningful and measures nothing.
+
+    Both failure modes are now refused loudly: a non-zero exit code and an
+    empty listing both raise.
+    """
+    p = subprocess.run(
         ["git", "-C", str(REPO_ROOT), "ls-files"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
-    ).stdout.splitlines()
+    )
+    if p.returncode != 0:
+        raise AssertionError(
+            f"git ls-files failed with exit code {p.returncode}: "
+            f"{p.stderr.strip()!r} -- the tracked-file check would be vacuous"
+        )
+    names = p.stdout.splitlines()
+    if not names:
+        raise AssertionError(
+            "git ls-files returned no files -- the tracked-file check would "
+            "be vacuous"
+        )
+    return names
+
+
+def test_every_tracked_environment_like_file_stays_addable():
+    """No file this repository tracks may become un-addable by this rule."""
+    tracked = _tracked_files()
 
     offenders = []
     for name in tracked:
