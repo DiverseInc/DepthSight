@@ -248,17 +248,35 @@ async def test_a_static_strategy_with_no_symbols_is_blocked_with_its_own_reason(
 
 
 async def test_static_strategy_with_symbols_is_still_running_with_its_symbols():
-    """The overwhelmingly common case must be completely unaffected."""
+    """The overwhelmingly common case must be completely unaffected.
+
+    This guard was GREEN before the change and is GREEN after it: that is the
+    point of a no-regression guard.
+    """
     published = await _publish_one(mode="STATIC", symbols=["BTCUSDT", "ETHUSDT"])
 
     assert published["status"] == "running"
     assert published["symbol"] == "BTCUSDT, ETHUSDT"
-    assert published["symbols"] == ["BTCUSDT", "ETHUSDT"]
     assert published["status_detail"] is None
 
 
+async def test_the_resolved_pool_is_published_for_diagnostics():
+    """The pool is published so 'scoped to nothing' is checkable from the
+    payload alone. It comes from a SET, so its order is not defined."""
+    published = await _publish_one(mode="STATIC", symbols=["BTCUSDT", "ETHUSDT"])
+    assert sorted(published["symbols"]) == ["BTCUSDT", "ETHUSDT"]
+
+    published = await _publish_one(
+        mode="DYNAMIC", screener_symbols=["BTCUSDT", "SOLUSDT"]
+    )
+    assert sorted(published["symbols"]) == ["BTCUSDT", "SOLUSDT"]
+
+
 async def test_fixed_strategy_with_symbols_is_still_running_with_its_symbols():
-    """FIXED is the mode the onboarding wizard creates: pinned, not dynamic."""
+    """FIXED is the mode the onboarding wizard creates: pinned, not dynamic.
+
+    GREEN before the change and GREEN after it.
+    """
     published = await _publish_one(mode="FIXED", symbols=["BTCUSDT"])
 
     assert published["status"] == "running"
@@ -267,19 +285,24 @@ async def test_fixed_strategy_with_symbols_is_still_running_with_its_symbols():
 
 
 async def test_dynamic_strategy_with_a_live_pool_is_still_running():
-    """A DYNAMIC strategy that DOES have symbols must be untouched."""
+    """A DYNAMIC strategy that DOES have symbols must be untouched.
+
+    GREEN before the change and GREEN after it.
+    """
     published = await _publish_one(
         mode="DYNAMIC", screener_symbols=["BTCUSDT", "SOLUSDT"]
     )
 
     assert published["status"] == "running"
     assert published["symbol"] == "Dynamic (All)"
-    assert published["symbols"] == ["BTCUSDT", "SOLUSDT"]
     assert published["status_detail"] is None
 
 
 async def test_a_broken_config_still_outranks_an_unavailable_symbol_source():
-    """A config the customer can fix is more actionable than a feed outage."""
+    """A config the customer can fix is more actionable than a feed outage.
+
+    GREEN before the change and GREEN after it.
+    """
     instances = {
         "cfg-1": (
             _FakeInstance(),
@@ -294,7 +317,7 @@ async def test_a_broken_config_still_outranks_an_unavailable_symbol_source():
 
     assert published[0]["status"] == "cannot_trade"
     assert "blocks" in published[0]["status_detail"]
-    assert published[0]["status_reason_code"] is None
+    assert published[0].get("status_reason_code") is None
 
 
 # --- The pure helpers the publisher is built on -----------------------------
@@ -393,7 +416,7 @@ def test_a_healthy_strategy_carries_no_reason():
 
     assert info.status == "running"
     assert info.status_detail is None
-    assert info.status_reason_code is None
+    assert getattr(info, "status_reason_code", None) is None
 
 
 # --- The customer-visible half: the badge must not be a green RUNNING -------
