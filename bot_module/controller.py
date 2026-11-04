@@ -109,7 +109,9 @@ def _make_position_key(market_type: Optional[Any], symbol: str) -> str:
 
 
 def _derive_strategy_status(
-    open_positions: int, cannot_trade_reason: Optional[str]
+    open_positions: int,
+    cannot_trade_reason: Optional[str],
+    symbol_scope_reason: Optional[str] = None,
 ) -> str:
     """Derives the published status for one running strategy instance.
 
@@ -120,13 +122,88 @@ def _derive_strategy_status(
     strategy stops being rendered as a working one.
 
     Precedence is deliberate: an open position still wins, because it is the
-    risk-relevant fact and a config warning must never hide it.
+    risk-relevant fact and a config warning must never hide it. A broken
+    config ("cannot_trade") outranks an unavailable symbol source
+    ("blocked"), because the config is the thing the customer can fix.
+
+    "blocked" is a THIRD thing and it is not a crash: the strategy is fine,
+    the thing that feeds it symbols is not there right now. It must not be
+    rendered as "running" (the strategy cannot trade) and it must not be
+    rendered as a red error (nothing is broken in the customer's config).
     """
     if open_positions > 0:
         return "in_position"
     if cannot_trade_reason:
         return "cannot_trade"
+    if symbol_scope_reason:
+        return "blocked"
     return "running"
+
+
+# The label a strategy is published with when its RESOLVED symbol pool is
+# empty. It is deliberately NOT "Dynamic (All)": that label claims a scope
+# the strategy does not have, which is the whole point of this change.
+NO_SYMBOLS_LABEL = "No symbols"
+
+# Machine-readable reason codes for a blocked strategy. The bot decides the
+# CAUSE; the UI only translates it. Deriving the cause again from the mode in
+# the UI is how two copies of one rule drift apart.
+REASON_SYMBOL_SOURCE_UNAVAILABLE = "symbol_source_unavailable"
+REASON_NO_SYMBOLS_CONFIGURED = "no_symbols_configured"
+REASON_UNKNOWN_SYMBOL_MODE = "unknown_symbol_mode"
+
+
+def _derive_symbol_scope(
+    resolved_mode: str, resolved_pool: List[str], mode_known: bool
+) -> Tuple[str, Optional[str], Optional[str]]:
+    """Derives the PUBLISHED symbol label and the reason it is empty.
+
+    ``resolved_mode`` and ``resolved_pool`` MUST come from
+    ``_resolve_symbol_pool_for_strategy`` -- the single source of truth for
+    mode -> symbols. The publisher used to invent its own label ("Dynamic
+    (All)" for anything that was not STATIC/FIXED), so a strategy whose pool
+    resolved to NOTHING was published as a healthy, unscoped, RUNNING one:
+    the customer was told it was trading every symbol while it was scoped to
+    no symbol at all.
+
+    Returns ``(label, scope_reason, reason_code)``. The reason and the code
+    are None when the strategy has a real scope; otherwise the reason is a
+    short human-readable sentence and the code is the stable identifier the
+    UI translates. The reason names the CAUSE (the symbol source is
+    unavailable), never the mode name -- "dynamic" is not a reason, it is a
+    category.
+    """
+    if not mode_known:
+        return (
+            NO_SYMBOLS_LABEL,
+            f"Unknown symbol selection mode {resolved_mode!r}: no symbols can be "
+            "resolved for this strategy, so it is scoped to nothing and cannot "
+            "trade.",
+            REASON_UNKNOWN_SYMBOL_MODE,
+        )
+
+    if resolved_pool:
+        if resolved_mode in ("STATIC", "FIXED"):
+            # Unchanged from before: an explicit-symbol strategy publishes its
+            # own symbol list.
+            return ", ".join(resolved_pool), None, None
+        # DYNAMIC with a live pool: unchanged from before.
+        return "Dynamic (All)", None, None
+
+    if resolved_mode in ("STATIC", "FIXED"):
+        return (
+            NO_SYMBOLS_LABEL,
+            "No symbols are configured for this strategy, so it is scoped to "
+            "nothing and cannot trade.",
+            REASON_NO_SYMBOLS_CONFIGURED,
+        )
+
+    return (
+        NO_SYMBOLS_LABEL,
+        "Symbol source unavailable: the screener feed is providing no symbols "
+        "for this strategy, so it is scoped to nothing and cannot trade.",
+        REASON_SYMBOL_SOURCE_UNAVAILABLE,
+    )
 
 
 class ActivePositionMap(dict):
@@ -4828,18 +4905,24 @@ class TradingController:
         pnl_known = pnl_aggregates is not None
 
         for config_id, (instance, config_dict) in instances_copy.items():
-            symbols_str = "Dynamic (All)"
-            # FIXED and STATIC are BOTH explicit-symbol modes
-            # (_resolve_symbol_pool_for_strategy accepts exactly those two), so
+            # The RESOLVED symbol pool is the single source of truth for what
+            # this strategy is actually scoped to
+            # (_resolve_symbol_pool_for_strategy -- the same call the
+            # subscription builder and the event matcher use). The publisher
+            # used to invent its own label instead: "Dynamic (All)" for
+            # anything that was not STATIC/FIXED, which is how a strategy
+            # scoped to NOTHING was published as a healthy, unscoped, RUNNING
+            # one. Asking the resolver also fixes the older FIXED bug for
+            # free: FIXED and STATIC are BOTH explicit-symbol modes, so
             # honouring only "STATIC" here made every FIXED strategy render as
             # "Dynamic (All)" with no symbols -- an instance could be correctly
-            # pinned to BTCUSDT and still look unscoped. Which is worse than
-            # cosmetic: it sent me chasing a broken symbol pool for a strategy
-            # whose pool was fine.
-            _sel_mode = str(config_dict.get("symbol_selection_mode") or "").strip().upper()
-            if _sel_mode in ("STATIC", "FIXED"):
-                symbols_list = config_dict.get("symbols") or []
-                symbols_str = ", ".join(symbols_list) if symbols_list else "None"
+            # pinned to BTCUSDT and still look unscoped.
+            _pool_mode, _pool_symbols, _pool_mode_known = (
+                self._resolve_symbol_pool_for_strategy(config_dict)
+            )
+            symbols_str, _symbol_scope_reason, _symbol_scope_code = _derive_symbol_scope(
+                _pool_mode, _pool_symbols, _pool_mode_known
+            )
 
             # The realized PnL of THIS strategy: its own config id and its own
             # trading mode, read from the authoritative trades table. The
@@ -4894,6 +4977,12 @@ class TradingController:
             # as such, rather than as a healthy "running" one.
             _cannot_trade_reason = config_dict.get("cannot_trade_reason")
 
+            # The detail explains the status that was ACTUALLY published: a
+            # broken config outranks an unavailable symbol source, so the
+            # reason shown must be the one that decided the status.
+            _status_detail = _cannot_trade_reason or _symbol_scope_reason
+            _status_reason_code = None if _cannot_trade_reason else _symbol_scope_code
+
             strat_data = {
                 "id": config_id,
                 "strategy_name": instance.NAME,
@@ -4902,9 +4991,15 @@ class TradingController:
                 .get("marketType", "PAPER")
                 .lower(),
                 "status": _derive_strategy_status(
-                    instance_open_positions, _cannot_trade_reason
+                    instance_open_positions,
+                    _cannot_trade_reason,
+                    _symbol_scope_reason,
                 ),
-                "status_detail": _cannot_trade_reason,
+                "status_detail": _status_detail,
+                # The machine-readable cause, so the UI can TRANSLATE the reason
+                # instead of showing an English sentence to a Russian customer.
+                # None unless the published status is 'blocked'.
+                "status_reason_code": _status_reason_code,
                 # `pnl` keeps its meaning: what the strategy is worth RIGHT
                 # NOW = the money it realized (from the trades table) plus
                 # what its open positions are worth. The realized part used
@@ -4937,9 +5032,19 @@ class TradingController:
                 "params": config_dict.get("config_data", {}).get("params", {}),
                 "user_id": config_dict.get("user_id"),
                 "api_key_id": strat_api_key_id,  # Added api_key_id with fallback
-                "symbol_selection_mode": config_dict.get(
-                    "symbol_selection_mode", "STATIC"
-                ),
+                # The RESOLVED mode, not the raw config value. A legacy row with
+                # no symbol_selection_mode is DYNAMIC -- that is what
+                # _resolve_symbol_pool_for_strategy treats a missing mode as --
+                # and publishing "STATIC" for it told the customer their
+                # screener-fed strategy was pinned to its own symbol list.
+                "symbol_selection_mode": _pool_mode,
+                # The resolved pool, for diagnostics. An empty list is the
+                # honest scope of a blocked strategy, and it is what makes
+                # "scoped to nothing" checkable from the payload alone.
+                # Only strings are published: this whole payload is one
+                # json.dumps, so a single malformed entry would take the
+                # ENTIRE strategy list down with it.
+                "symbols": [s for s in _pool_symbols if isinstance(s, str)],
                 "mode": config_dict.get("mode", "live"),
             }
             strategies_to_publish.append(strat_data)
