@@ -290,6 +290,25 @@ async def test_endpoint_counts_a_missing_minute_as_downtime():
     assert "downtime" in result["notes"]["uptime_30_days_percent"]
 
 
+async def test_the_uptime_note_says_which_process_the_heartbeat_covers():
+    """The heartbeat sees the API process, not the whole platform.
+
+    The API, the trading bot, the market-data worker and the Celery workers
+    are separate containers. A note that said only "downtime" would let an
+    operator read an API-only measurement as platform uptime -- the same
+    class of overclaim this whole change exists to remove.
+    """
+    now = _now()
+    store = FakeMetricsStore()
+    seed_full_history(store, now)
+
+    result = await get_system_metrics(redis_client=store)
+
+    note = result["notes"]["uptime_30_days_percent"]
+    assert "API process" in note
+    assert "not cover" in note
+
+
 # --- The schema ---------------------------------------------------------
 
 

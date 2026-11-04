@@ -421,7 +421,10 @@ async def collect_system_metrics(
         missing = WINDOW_30D_MINUTES - observed
         notes["uptime_30_days_percent"] = (
             f"the heartbeat observed {observed} of {WINDOW_30D_MINUTES} "
-            f"minutes; {missing} minute(s) had no heartbeat and count as downtime"
+            f"minutes; {missing} minute(s) had no heartbeat and count as "
+            "downtime of the API process -- this heartbeat runs in the API "
+            "container only, so it does not cover the trading bot, the "
+            "market-data worker or the Celery workers"
         )
 
     return result
