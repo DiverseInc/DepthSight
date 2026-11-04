@@ -468,6 +468,14 @@ def build_plan_catalog(include_inactive: bool = False) -> dict:
                 # Kept for the in-app billing modal. The marketing page does NOT
                 # use this copy -- it uses the derived entitlements below.
                 "features": config.get("features", []) or [],
+                # A curated HEADLINE for the pricing card. Some tiers (the
+                # managed service) hold so many entitlements that the derived
+                # label list is unreadable, so the card shows a short
+                # hand-written summary instead. It still lives in the CATALOG,
+                # so the page is still catalog-sourced, and the pricing test
+                # asserts every quantified claim in it against the raw plan.
+                "headline_bullets": config.get("headline_bullets", []) or [],
+
                 "quotas": config.get("quotas", {}) or {},
                 "permissions": config.get("permissions", []) or [],
                 "limits": config.get("limits", {}) or {},

@@ -437,3 +437,114 @@ class TestTheTierLadderAndTheDisplayName:
         source = ADMIN_DETAIL_PAGE.read_text(encoding="utf-8")
         assert '<SelectItem value="managed">Managed</SelectItem>' in source
         assert "canonicalPlanKey(editData.plan)" in source
+
+
+def _card_block(page: str, plan_key: str) -> str:
+    """The HTML of one pricing card, found by matching the div nesting.
+
+    A naive `page.find("</div>", start)` stops at the first inner div -- the
+    price amount -- which is BEFORE the bullet list, so the block would not
+    contain the bullets at all.
+    """
+    marker = 'data-plan-key="%s"' % plan_key
+    start = page.index(marker)
+    open_at = page.rindex("<div", 0, start)
+    depth = 0
+    index = open_at
+    while index < len(page):
+        nxt_open = page.find("<div", index)
+        nxt_close = page.find("</div>", index)
+        if nxt_close == -1:
+            break
+        if nxt_open != -1 and nxt_open < nxt_close:
+            depth += 1
+            index = nxt_open + 4
+            continue
+        depth -= 1
+        index = nxt_close + 6
+        if depth == 0:
+            return page[start:index]
+    raise AssertionError("the %s card has no closing div" % plan_key)
+
+
+class TestTheManagedHeadline:
+    """The $499 card shows a CURATED headline instead of the derived label
+    list (twenty bullets is unreadable), so the copy is pinned here and every
+    QUANTIFIED claim in it is checked against the raw plan.
+
+    Without this, a curated headline could claim a quota the tier does not
+    have -- the exact failure the derived-label guard prevents for the other
+    cards. The owner approved this wording on 2026-11-04; a copy change must
+    re-verify every claim below.
+    """
+
+    EXPECTED_BULLETS = ["Everything in Professional","We deploy, monitor and adjust your strategies within your risk limits","Unlimited optimization runs, genetic searches and model trainings","100 live strategies (Professional has 30)","Highest queue priority, 20 concurrent tasks",
+        "Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)"]
+    EXPECTED_DESCRIPTION = "We deploy, monitor and adjust your strategies inside the risk limits you set."
+
+    @pytest.fixture(scope="class")
+    def page(self) -> str:
+        return WELCOME_HTML.read_text(encoding="utf-8")
+
+    def test_the_catalog_carries_the_owners_approved_headline(self, catalog):
+        plan = {p["key"]: p for p in catalog["plans"]}["managed"]
+        assert plan["headline_bullets"] == self.EXPECTED_BULLETS, (
+            "the Managed headline is not the wording the owner approved"
+        )
+
+    def test_the_card_shows_exactly_that_headline_and_blurb(self, page):
+        block = _card_block(page, "managed")
+        listed = re.findall(r"<li>(.*?)</li>", block)
+        assert listed == self.EXPECTED_BULLETS, (
+            "the Managed card's bullets are not the approved headline. "
+            "card=%r approved=%r" % (listed, self.EXPECTED_BULLETS)
+        )
+        assert '<p class="desc">%s</p>' % self.EXPECTED_DESCRIPTION in block, (
+            "the Managed card does not show the approved description"
+        )
+
+    def test_the_unlimited_claim_is_true_of_the_raw_plan(self, raw_plans):
+        quotas = raw_plans["managed"]["quotas"]
+        for key in (
+            "run_optimization_per_month",
+            "run_genetic_search_per_month",
+            "train_model_per_month",
+        ):
+            assert quotas[key] == -1, (
+                "the headline claims unlimited %s but the quota is %r"
+                % (key, quotas[key])
+            )
+
+    def test_the_live_strategy_counts_are_true_of_the_raw_plan(self, raw_plans):
+        assert raw_plans["managed"]["limits"]["max_live_strategies"] == 100, (
+            "the headline claims 100 live strategies"
+        )
+        assert raw_plans["pro"]["limits"]["max_live_strategies"] == 30, (
+            "the headline compares itself with Professional's 30"
+        )
+
+    def test_the_priority_and_concurrency_claim_is_true_of_the_raw_plan(self, raw_plans):
+        limits = raw_plans["managed"]["limits"]
+        assert limits["celery_task_priority"] == 0, (
+            "the headline claims the highest queue priority"
+        )
+        assert limits["max_concurrent_tasks"] == 20, (
+            "the headline claims 20 concurrent tasks"
+        )
+
+    def test_everything_in_professional_is_true_of_the_raw_plan(self, raw_plans):
+        managed = raw_plans["managed"]
+        pro = raw_plans["pro"]
+        missing = set(pro["permissions"]) - set(managed["permissions"])
+        assert not missing, (
+            "the headline claims Everything in Professional, but %r is missing"
+            % sorted(missing)
+        )
+        for key, value in pro["quotas"].items():
+            if value == -1:
+                continue
+            mine = managed["quotas"].get(key)
+            assert mine == -1 or (mine is not None and mine >= value), (
+                "the headline claims Everything in Professional, but the %s quota "
+                "is %r against Professional's %r" % (key, mine, value)
+            )

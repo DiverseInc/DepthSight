@@ -210,7 +210,14 @@ plans:
       lifetime:
         enabled: false
     active: true
-    description: "Managed service. We deploy, monitor and adjust your strategies inside the risk limits you set."
+    description: "We deploy, monitor and adjust your strategies inside the risk limits you set."
+    headline_bullets:
+      - "Everything in Professional"
+      - "We deploy, monitor and adjust your strategies within your risk limits"
+      - "Unlimited optimization runs, genetic searches and model trainings"
+      - "100 live strategies (Professional has 30)"
+      - "Highest queue priority, 20 concurrent tasks"
+      - "Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)"
     features:
       - "Everything in Professional"
       - "Managed strategy monitoring within your risk limits"

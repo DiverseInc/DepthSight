@@ -648,12 +648,45 @@ class TestTheEntitlementsAreTheCatalogsOwn:
             plan = plans_by_name.get(card["name"])
             assert plan is not None
             granted = _expected_included_labels(plan, raw_plans[plan["key"]])
+            # A curated tier (the $499 managed service) shows a short,
+            # hand-written HEADLINE instead of the derived label list, because
+            # its derived list is twenty bullets long. The headline still lives
+            # in the CATALOG, so the card must list EXACTLY the catalog's bullets
+            # for that tier -- and every number inside the headline is checked
+            # against the raw plan in
+            # tests/test_managed_499_tier.py::TestTheManagedHeadline.
+            headline = plan.get("headline_bullets") or []
+            expected = set(headline) if headline else granted
 
-            assert set(card["included"]) == granted, (
-                f"the {card['name']} card does not list exactly the entitlements "
-                f"the catalog grants. missing={sorted(granted - set(card['included']))} "
-                f"extra={sorted(set(card['included']) - granted)}"
+            assert set(card["included"]) == expected, (
+                f"the {card['name']} card does not list exactly the bullets "
+                f"the catalog holds for it. missing={sorted(expected - set(card['included']))} "
+                f"extra={sorted(set(card['included']) - expected)}"
             )
+
+    def test_a_curated_headline_claims_nothing_from_another_tier(
+        self, cards, plans_by_name, raw_plans
+    ):
+        """A curated headline is hand-written copy, so it needs the same
+        cross-tier guard the derived labels already have: it must not reuse
+        a label that belongs to another tier alone.
+        """
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+            if not (plan.get("headline_bullets") or []):
+                continue
+            mine = _expected_included_labels(plan, raw_plans[plan["key"]])
+
+            for other_name, other in plans_by_name.items():
+                if other_name == card["name"]:
+                    continue
+                theirs = _expected_included_labels(other, raw_plans[other["key"]])
+                for label in theirs - mine:
+                    assert label not in card["included"], (
+                        f"the {card['name']} headline claims {label!r}, which "
+                        f"belongs to the {other_name} tier"
+                    )
 
     def test_no_card_claims_a_quota_from_another_tier(
         self, cards, plans_by_name, raw_plans

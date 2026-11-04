@@ -14,9 +14,12 @@
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/managed_499_tier.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
-    "read a file that is mid-mutation and report on code that does not exist."
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "I and J are the CURATED HEADLINE: a hand-written summary on the $499 card. Its numbers must be checked against the raw plan, so I (200 live strategies instead of 100) and J (the old wording) must both be killed.",
+    "K, L and M are the LIVE-TRADING DISCLOSURE the curated headline had dropped: Managed may trade live on all six venues (allow_real_trading, api/routes/strategies.py:538-554), Standard and Professional both say so on the page, and the $499 card must say it too.",
+    "K and M target the MANAGED card and carry its own preceding bullet, because the Standard and Professional cards carry a byte-identical venue line and the Standard card comes FIRST: an ambiguous needle silently mutated the wrong card. N removes the disclosure from the STANDARD card on purpose -- it is killed only by the pre-existing guard test_a_tier_that_may_trade_everywhere_says_so, which is why the harness target now includes tests/test_public_pricing_matches_catalog.py."
   ],
-  "pytest_target": "tests/test_managed_499_tier.py",
+  "pytest_target": "tests/test_managed_499_tier.py tests/test_public_pricing_matches_catalog.py",
   "timeout_s": 1800,
   "mutations": [
     {
@@ -66,6 +69,42 @@
       "file": "api/plans_config.yml",
       "needle": "deferred_permissions:\n  - run_portfolio_backtest\n",
       "replace": "deferred_permissions: []\n"
+    },
+    {
+      "label": "I: the Managed headline claims 200 live strategies instead of 100",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>100 live strategies (Professional has 30)</li>\n",
+      "replace": "          <li>200 live strategies (Professional has 30)</li>\n"
+    },
+    {
+      "label": "J: the Managed card reverts to the old 'Managed service.' wording",
+      "file": "frontend/welcome.html",
+      "needle": "<p class=\"desc\">We deploy, monitor and adjust your strategies inside the risk limits you set.</p>",
+      "replace": "<p class=\"desc\">Managed service. We deploy, monitor and adjust your strategies inside the risk limits you set.</p>"
+    },
+    {
+      "label": "K: the Managed card drops the all-venues live-trading disclosure",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>Highest queue priority, 20 concurrent tasks</li>\n          <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>\n",
+      "replace": "          <li>Highest queue priority, 20 concurrent tasks</li>\n"
+    },
+    {
+      "label": "L: the catalog's Managed headline drops the all-venues disclosure",
+      "file": "api/plans_config.yml",
+      "needle": "      - \"Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)\"\n",
+      "replace": ""
+    },
+    {
+      "label": "M: the Managed card names only three of the six venues",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>Highest queue priority, 20 concurrent tasks</li>\n          <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>\n",
+      "replace": "          <li>Highest queue priority, 20 concurrent tasks</li>\n          <li>Live trading on all three exchanges (OKX, Binance, Bybit)</li>\n"
+    },
+    {
+      "label": "N: the STANDARD card drops the all-venues live-trading disclosure",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>Strategy backtesting</li>\n          <li>Saved strategies</li>\n          <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>\n",
+      "replace": "          <li>Strategy backtesting</li>\n          <li>Saved strategies</li>\n"
     }
   ]
 }
