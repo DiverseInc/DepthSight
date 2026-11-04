@@ -406,6 +406,125 @@ async def test_a_rest_sourced_backtest_keeps_its_numbers():
 
 
 # ==============================================================================
+# E6: the portfolio result carries the disclosure to the customer
+# ==============================================================================
+
+
+async def test_the_portfolio_kpis_carry_the_disclosure():
+    """The portfolio KPIs are a CLOSED model, and a closed model drops what
+    it does not declare.
+
+    The disclosure is computed by the backtester -- it is in the dict the
+    run saves -- and was then thrown away at the schema boundary, so a
+    portfolio backtest over a shorter window reported the numbers of the
+    shorter window as the numbers of the window that was asked for.
+    """
+    frame = _frame_with_provenance(
+        missing_buckets=[
+            {"start": "2024-01-10T00:00:00+00:00", "end": "2024-01-11T00:00:00+00:00"},
+        ],
+        trailing_short=2 * 24 * 3600,
+    )
+
+    results = await _run_portfolio_backtest(frame)
+
+    # THE BACKTESTER COMPUTES IT ...
+    assert results["data_window"], "the backtester must compute the disclosure"
+    assert results["data_window"][0]["complete"] is False
+
+    # ... AND THE SCHEMA THAT HOLDS THE PORTFOLIO KPIs MUST CARRY IT.
+    kpis = schemas.PortfolioBacktestKPIs(**results).model_dump()
+    assert "data_window" in kpis, (
+        "the portfolio KPIs drop what they do not declare: the disclosure is "
+        "computed and then thrown away, which is the same as no disclosure"
+    )
+    assert kpis["data_window"][0]["complete"] is False
+    assert kpis["data_window"][0]["missing_buckets"]
+    assert kpis["data_window"][0]["source"] == "bulk_archive"
+
+
+async def test_the_portfolio_result_carries_the_disclosure_to_the_response():
+    """The disclosure has to reach the RESPONSE, not just the model.
+
+    The response is what the customer reads.  The disclosure rides in the
+    same place the single-strategy result already carries it: inside the
+    KPI payload, under the key the two paths have in common.
+    """
+    frame = _frame_with_provenance(
+        missing_buckets=[
+            {"start": "2024-01-10T00:00:00+00:00", "end": "2024-01-11T00:00:00+00:00"},
+        ],
+        trailing_short=2 * 24 * 3600,
+    )
+
+    results = await _run_portfolio_backtest(frame)
+
+    response = schemas.PortfolioBacktestResult(
+        portfolio_kpis=results,
+        sliced_analytics={
+            "by_strategy": {},
+            "by_symbol": {},
+            "by_strategy_symbol": {},
+        },
+        trade_log=[],
+        equity_curve=[],
+    )
+    stored = response.model_dump()
+
+    assert "data_window" in stored["portfolio_kpis"], (
+        "the disclosure has to be in the response the customer reads"
+    )
+    assert stored["portfolio_kpis"]["data_window"][0]["complete"] is False
+    assert stored["portfolio_kpis"]["data_window"][0]["missing_buckets"]
+
+
+async def test_a_portfolio_result_without_a_disclosure_is_still_valid():
+    """The field is OPTIONAL: a result that carries no disclosure still
+    validates, and its numbers are unchanged."""
+    frame = _frame_with_provenance(
+        source="rest_api",
+        bars=24 * 30,
+        requested_end=datetime(2024, 1, 30, 23, 0, tzinfo=timezone.utc),
+    )
+
+    results = await _run_portfolio_backtest(frame)
+    results.pop("data_window", None)
+
+    kpis = schemas.PortfolioBacktestKPIs(**results).model_dump()
+
+    assert kpis["data_window"] is None
+    assert kpis["total_trades"] == results["total_trades"]
+    assert kpis["final_balance"] == results["final_balance"]
+
+
+def test_the_single_strategy_api_shape_is_unchanged():
+    """The single-strategy result serves the KPI payload as a free-form
+    dictionary.  It is NOT touched by the portfolio change: a payload
+    without a disclosure is served exactly as it was, with no new key."""
+    details = schemas.BacktestRunDetails(
+        id="run-1",
+        task_id="task-1",
+        strategy_name="VolumeBreakout",
+        symbol="BTCUSDT",
+        status="COMPLETED",
+        created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        start_date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        end_date=datetime(2024, 1, 31, tzinfo=timezone.utc),
+        initial_balance=10000.0,
+        parameters_json={},
+        kpi_results_json={"total_pnl": 12.5, "sharpe_ratio": 1.2},
+        trades=[],
+    )
+
+    served = details.model_dump()["kpi_results_json"]
+
+    assert served == {"total_pnl": 12.5, "sharpe_ratio": 1.2}, (
+        "the single-strategy API shape must not change: a client that reads "
+        "this payload today must see exactly what it saw before"
+    )
+
+
+# ==============================================================================
 # E5: the disclosure is attached where the numbers are saved
 # ==============================================================================
 

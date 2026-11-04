@@ -33,6 +33,10 @@
     "E11: the portfolio backtest stopped carrying the disclosure.",
     "E12: the disclosure stopped saying where the candles came from, so",
     "    the customer could not tell the archive's frame from the REST one.",
+    "E13: the portfolio KPIs stopped declaring the disclosure, so the",
+    "    closed model dropped it again and a portfolio backtest over a",
+    "    shorter window read like a backtest of the window that was asked",
+    "    for.",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/market_data_coverage_honesty.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -148,6 +152,12 @@
       "file": "bot_module/market_data_disclosure.py",
       "needle": "            \"source\": provenance.get(\"source\"),\n",
       "replace": "            \"source\": None,  # MUTANT: the source is never said\n"
+    },
+    {
+      "label": "E13: the portfolio KPIs stop declaring the disclosure, so it is dropped again",
+      "file": "api/schemas.py",
+      "needle": "    data_window: Optional[List[Dict[str, Any]]] = None\n",
+      "replace": "    data_window_removed: Optional[List[Dict[str, Any]]] = None  # MUTANT: the disclosure is dropped again\n"
     }
   ]
 }
