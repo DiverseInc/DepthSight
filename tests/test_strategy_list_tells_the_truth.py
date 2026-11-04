@@ -141,6 +141,25 @@ class _StubController:
         self._resolve_symbol_pool_for_strategy = (
             TradingController._resolve_symbol_pool_for_strategy.__get__(self)
         )
+        # The publisher reads two more things before it publishes anything, so
+        # the stub has to answer both -- with the REAL implementations, bound
+        # the same way, so the publisher's own contract is exercised end to
+        # end and not a copy of it.
+        #
+        # `_fetch_strategy_pnl_aggregates` returns None when the numbers are
+        # UNKNOWN, and they are unknown here: this stub has no database
+        # session, so the real reader cannot read the trades table and says
+        # so. The publisher then publishes a null PnL instead of a fake 0.0,
+        # which is the honest answer for a strategy with no recorded trades.
+        self._fetch_strategy_pnl_aggregates = (
+            TradingController._fetch_strategy_pnl_aggregates.__get__(self)
+        )
+        # `_published_account_state` reads the sandbox THIS controller trades
+        # from its RiskManager, and the stub's RiskManager is the fake one the
+        # tests set up -- so the real snapshot is used, not a copy of it.
+        self._published_account_state = (
+            TradingController._published_account_state.__get__(self)
+        )
 
 
 def _config_dict(
