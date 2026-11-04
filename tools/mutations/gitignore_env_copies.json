@@ -1,0 +1,71 @@
+{
+  "_comment": [
+    "Mutations for the gitignore rules that keep a COPY of the live environment",
+    "file out of the PUBLIC repository.",
+    "",
+    "E1: the HYPHEN separator rule `.env-*` is gone. Measured 2026-11-04 by the",
+    "    review panel: `.env-backup`, `.env-copy` and `.env-20261103` matched",
+    "    NEITHER `.env.*` NOR `.env_*` NOR `*.env`, so `git add -A` still swept",
+    "    them into a public commit.",
+    "E2: the tracked-file guard no longer recognises `check.txt`. The guard",
+    "    filters on basenames starting or ending with `.env`, so a tracked",
+    "    `check.txt` -- which this diff newly ignores -- would become",
+    "    un-addable with NOTHING guarding it. The guard is a named function",
+    "    precisely so that this coverage is testable.",
+    "E3: the DOT separator rule `.env.*` is gone.",
+    "E4: the UNDERSCORE separator rule `.env_*` is gone.",
+    "E5: the negation is UNANCHORED again (`!.env.production`). The original",
+    "    defect: it re-opened `.env.production` at EVERY level, including the",
+    "    repository ROOT, where `deploy.sh:63` names it as one of the four",
+    "    canonical live env filenames.",
+    "E6: the probe drops `--no-index`. WITHOUT it `git check-ignore` consults",
+    "    the index first and reports every TRACKED path as 'not ignored' no",
+    "    matter what the rules say -- so the whole suite would pass while",
+    "    measuring nothing. The control test in the target file proves the",
+    "    difference on a real tracked file, so this mutant cannot hide.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/gitignore_env_copies.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_gitignore_ignores_env_copies.py",
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "E1: the HYPHEN separator rule `.env-*` is gone (the panel's finding)",
+      "file": ".gitignore",
+      "needle": ".env.*\n.env_*\n.env-*\n",
+      "replace": ".env.*\n.env_*\n"
+    },
+    {
+      "label": "E2: the tracked-file guard no longer recognises `check.txt`",
+      "file": "tests/test_gitignore_ignores_env_copies.py",
+      "needle": "        or basename == \"check.txt\"\n",
+      "replace": ""
+    },
+    {
+      "label": "E3: the DOT separator rule `.env.*` is gone",
+      "file": ".gitignore",
+      "needle": ".env.*\n.env_*\n.env-*\n",
+      "replace": ".env_*\n.env-*\n"
+    },
+    {
+      "label": "E4: the UNDERSCORE separator rule `.env_*` is gone",
+      "file": ".gitignore",
+      "needle": ".env.*\n.env_*\n.env-*\n",
+      "replace": ".env.*\n.env-*\n"
+    },
+    {
+      "label": "E5: the negation is UNANCHORED again (`!.env.production`)",
+      "file": ".gitignore",
+      "needle": "!frontend/.env.production\n",
+      "replace": "!.env.production\n"
+    },
+    {
+      "label": "E6: the probe drops `--no-index`, so the whole suite measures nothing",
+      "file": "tests/test_gitignore_ignores_env_copies.py",
+      "needle": "\"check-ignore\", \"-q\", \"--no-index\", \"--\", path],",
+      "replace": "\"check-ignore\", \"-q\", \"--\", path],"
+    }
+  ]
+}
