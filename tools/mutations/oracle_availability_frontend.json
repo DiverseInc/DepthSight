@@ -67,15 +67,15 @@
     },
     {
       "label": "N: the HFT dashboard keeps the Oracle filter ON with no oracle model",
-      "file": "frontend/src/features/hft-dashboard/components/StrategyControls.tsx",
-      "needle": ": { ...localConfig, use_oracle: false };",
-      "replace": ": { ...localConfig, use_oracle: true }; // MUTANT"
+      "file": "frontend/src/features/hft-dashboard/lib/oracleConfig.ts",
+      "needle": "\treturn { ...config, use_oracle: false };",
+      "replace": "\treturn { ...config, use_oracle: true };"
     },
     {
       "label": "O: the Oracle scanner claims 'Active' whatever it can see",
       "file": "frontend/src/features/hft-dashboard/components/OracleScanner.tsx",
       "needle": "oracleSymbols.length > 0 ? \"Receiving\" : \"No signal\"",
-      "replace": "oracleSymbols.length > 0 ? \"Active\" : \"Active\" // MUTANT"
+      "replace": "oracleSymbols.length > 0 ? \"Active\" : \"Active\""
     }
   ]
 }

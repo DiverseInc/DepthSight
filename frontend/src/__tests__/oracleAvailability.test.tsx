@@ -44,6 +44,8 @@ vi.mock("@/context/AuthContext", () => ({
 import { OracleScanner } from "@/features/hft-dashboard/components/OracleScanner";
 import { StrategyControls } from "@/features/hft-dashboard/components/StrategyControls";
 import { useHftStore } from "@/features/hft-dashboard/hooks/useHftStore";
+import { applyOracleAvailability } from "@/features/hft-dashboard/lib/oracleConfig";
+import type { HftConfig } from "@/features/hft-dashboard/types/hft.types";
 
 beforeAll(() => {
 	// The radix Switch needs these to render at all.
@@ -94,6 +96,34 @@ describe("the HFT dashboard believes the server about the oracle", () => {
 
 		expect(screen.queryByText("Unavailable")).toBeNull();
 		expect(screen.getByText("Oracle")).toBeTruthy();
+	});
+});
+
+describe("the config the dashboard SAVES must not claim an oracle filter", () => {
+	// The stored HFT config on the server still says `use_oracle: true` --
+	// that is the server's default, and it is not this client's to change.
+	// What the client must never do is SAVE that claim back while there is
+	// no model to act on it.
+	const storedConfig = { use_oracle: true } as HftConfig;
+
+	it("turns the oracle filter OFF when the server has no oracle model", () => {
+		const saved = applyOracleAvailability(storedConfig, false);
+
+		expect(saved.use_oracle).toBe(false);
+	});
+
+	it("leaves the customer's own setting alone when a model IS loaded", () => {
+		const saved = applyOracleAvailability(storedConfig, true);
+
+		expect(saved.use_oracle).toBe(true);
+	});
+
+	it("does not mutate the config it was given", () => {
+		const original = { use_oracle: true } as HftConfig;
+
+		applyOracleAvailability(original, false);
+
+		expect(original.use_oracle).toBe(true);
 	});
 });
 

@@ -26,6 +26,7 @@ import { Switch } from "@/components/ui/switch";
 import { useAuth } from "../../../context/AuthContext";
 import { useOracleAvailability } from "../../../lib/api";
 import { useHftStore } from "../hooks/useHftStore";
+import { applyOracleAvailability } from "../lib/oracleConfig";
 import type { HftConfig, PartialTakeProfitConfig } from "../types/hft.types";
 
 const apiBase = import.meta.env.VITE_PUBLIC_API_URL || "";
@@ -98,9 +99,10 @@ export const StrategyControls: React.FC = () => {
 	// DERIVED, not stored: whatever the saved config says, an unavailable
 	// oracle means the oracle filter is OFF. Storing it would let a
 	// re-fetch of the saved config switch the fiction back on.
-	const effectiveConfig: HftConfig = oracleAvailable
-		? localConfig
-		: { ...localConfig, use_oracle: false };
+	const effectiveConfig: HftConfig = applyOracleAvailability(
+		localConfig,
+		oracleAvailable,
+	);
 
 	const fetchConfig = useCallback(async () => {
 		const token = authToken;
