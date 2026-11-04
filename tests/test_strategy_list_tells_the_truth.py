@@ -135,6 +135,12 @@ class _StubController:
         self.currently_managed_symbols = list(managed_symbols)
         self._last_known_symbols_from_consumer = set(screener_symbols)
         self._emergency_stop_state_for_publish = lambda: {}
+        # The REAL resolver, bound to this stub. The publisher must resolve
+        # the pool through the documented single source of truth, so the test
+        # has to exercise that function and not a copy of it.
+        self._resolve_symbol_pool_for_strategy = (
+            TradingController._resolve_symbol_pool_for_strategy.__get__(self)
+        )
 
 
 def _config_dict(
