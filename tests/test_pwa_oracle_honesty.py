@@ -162,6 +162,22 @@ def test_the_editor_does_not_preselect_an_oracle_regime(editor_source: str):
     )
 
 
+def test_the_pwa_shows_an_honest_unavailable_state(
+    modal_source: str, editor_source: str
+):
+    """With no oracle there must be a VISIBLE, honest statement.
+
+    Hiding the Oracle option on its own reads as "the screen is broken"
+    rather than "this server has no oracle model". Both surfaces state it.
+    """
+    assert "oracleUnavailable" in modal_source, (
+        "The launch modal no longer says the oracle filter is unavailable."
+    )
+    assert "oracleUnavailable" in editor_source, (
+        "The strategy editor no longer says the oracle filter is unavailable."
+    )
+
+
 def test_the_oracle_decision_module_is_dependency_free():
     """The PWA's decision module must stay importable on its own.
 

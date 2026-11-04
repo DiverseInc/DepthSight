@@ -18,7 +18,22 @@
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/oracle_availability_frontend.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
-    "read a file that is mid-mutation and report on code that does not exist."
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "",
+    "RUN IT WITH PYTHONUTF8=1 ON WINDOWS.",
+    "The harness's `run_command` calls subprocess.run(..., text=True) with no",
+    "encoding, so it decodes the child's output with the LOCALE encoding --",
+    "cp1252 on a default Windows box. vitest writes UTF-8 (its box-drawing and",
+    "check glyphs) and cp1252 cannot decode byte 0x9d, so the reader thread",
+    "raised UnicodeDecodeError, no output was captured, the harness found no",
+    "test summary and ABORTED with rc=3. MEASURED: with PYTHONUTF8=1 the same",
+    "command decodes the output intact and the 'Test Files' summary is read.",
+    "That is why the harness file is NOT patched for this: the environment",
+    "setting fixes it, so the harness stays byte-identical to the commit it",
+    "was taken from.",
+    "",
+    "    $env:PYTHONUTF8='1'",
+    "    python tools/mutation_harness.py tools/mutations/oracle_availability_frontend.json"
   ],
   "command": [
     "npm",
