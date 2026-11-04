@@ -30,7 +30,7 @@ import {
 	vi,
 } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import {
 	cleanup,
 	fireEvent,
@@ -94,6 +94,8 @@ import { GoogleRedirectHandler } from "@/components/auth/GoogleRedirectHandler";
 import LoginPage from "@/pages/Login";
 import {
 	GOOGLE_OAUTH_PENDING_KEY,
+	PENDING_MAX_AGE_MS,
+	readPendingGoogleRequest,
 	rememberPendingGoogleRequest,
 } from "@/lib/googleOAuth";
 
@@ -147,6 +149,20 @@ const renderLogin = () =>
 		</AuthProvider>,
 		{ wrapper },
 	);
+
+/**
+ * Write a sign-in request that is OLDER than the window, the way a slow
+ * device or a long hesitation at Google's consent screen would leave it.
+ */
+const writeAgedMarker = (
+	state: string,
+	ageMs: number = PENDING_MAX_AGE_MS + 5 * 60 * 1000,
+) => {
+	sessionStorage.setItem(
+		GOOGLE_OAUTH_PENDING_KEY,
+		JSON.stringify({ state, at: Date.now() - ageMs }),
+	);
+};
 
 beforeAll(async () => {
 	await i18n.use(initReactI18next).init({
@@ -327,15 +343,108 @@ describe("a redirect without a usable credential is a VISIBLE failure", () => {
 	});
 });
 
+describe("a sign-in that takes longer than the window", () => {
+	it("accepts a credential whose state matches a marker older than the window", async () => {
+		// A slow device, a hesitation at the consent screen, a phone in the
+		// background: the credential is still perfectly valid, and the age of
+		// the request is not a reason to throw it away.
+		writeAgedMarker("state-abc");
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+
+		renderHandler();
+
+		await waitFor(() =>
+			expect(fetchMock).toHaveBeenCalledWith(
+				"/api/v1/auth/google",
+				expect.objectContaining({ method: "POST" }),
+			),
+		);
+		const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+		expect(body).toEqual({ token: "google-id-token" });
+	});
+
+	it("rejects a credential whose state does not match an old marker", async () => {
+		writeAgedMarker("state-abc");
+		window.location.hash = "#id_token=google-id-token&state=someone-elses-state";
+
+		renderHandler();
+
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(window.location.hash).toBe("");
+	});
+
+	it("keeps an old marker, so the state can still be compared", () => {
+		writeAgedMarker("state-abc");
+
+		const pending = readPendingGoogleRequest();
+
+		expect(pending).not.toBeNull();
+		expect(pending?.state).toBe("state-abc");
+	});
+
+	it("says the sign-in took too long when there is no marker at all", async () => {
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+
+		renderHandler();
+
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		const description = String(toastSpy.mock.calls[0][0].description);
+		// "took too long" is the accurate message here -- not "unverified".
+		expect(description).not.toBe(loginEn.googleSignInUnverified);
+		expect(description).toBe(
+			(loginEn as unknown as Record<string, string>).googleSignInExpired,
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("does not let a stale marker fail an unrelated later visit", async () => {
+		writeAgedMarker("state-abc");
+		window.location.hash = "";
+
+		renderHandler();
+
+		await waitFor(() => expect(screen.getByTestId("pathname")).toBeTruthy());
+		expect(toastSpy).not.toHaveBeenCalled();
+		expect(fetchMock).not.toHaveBeenCalled();
+		// The stale marker is cleaned up, so it cannot linger.
+		expect(sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY)).toBeNull();
+	});
+});
+
+/**
+ * Locate frontend/src/App.tsx from wherever the runner was started: the
+ * front-end directory, the repository root, or a directory below them.
+ */
+const findAppSource = (): string | undefined => {
+	let dir = process.cwd();
+	for (let depth = 0; depth < 6; depth += 1) {
+		for (const candidate of [
+			resolve(dir, "src/App.tsx"),
+			resolve(dir, "frontend/src/App.tsx"),
+		]) {
+			if (existsSync(candidate)) return candidate;
+		}
+		const parent = dirname(dir);
+		if (parent === dir) break;
+		dir = parent;
+	}
+	return undefined;
+};
+
 describe("the handler is mounted above the router", () => {
 	it("sits inside the auth provider and before the route table", () => {
 		// The sign-in completes on the SITE ROOT, so the handler must not live
 		// inside a route element. This pins where it is mounted.
-		const candidates = [
-			resolve(process.cwd(), "src/App.tsx"),
-			resolve(process.cwd(), "frontend/src/App.tsx"),
-		];
-		const appPath = candidates.find((path) => existsSync(path));
+		const appPath = findAppSource();
 		expect(appPath).toBeDefined();
 		// Comments are dropped first: the wiring is commented in App.tsx, and a
 		// comment mentioning the route table must not be mistaken for it.

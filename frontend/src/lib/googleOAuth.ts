@@ -231,12 +231,26 @@ export const clearGoogleRedirectParams = (
 export interface PendingGoogleRequest {
 	state: string;
 	at: number;
+	/**
+	 * True when the request is older than PENDING_MAX_AGE_MS.
+	 *
+	 * This is a SOFT bound: it says the request is probably abandoned. It does
+	 * NOT make the request unusable. The age is never the reason a credential
+	 * is rejected -- the STATE MATCH is (see GoogleRedirectHandler).
+	 */
+	expired: boolean;
 }
 
 /**
- * A sign-in that has not come back within this window is treated as
+ * A sign-in that has not come back within this window is treated as probably
  * abandoned. Without it, a marker left behind by a closed tab could make a
  * later, unrelated visit to the site root report a sign-in failure.
+ *
+ * It is a SOFT bound and it only decides that one thing. It must never be
+ * the reason a credential whose `state` matches is rejected: a user who
+ * takes longer than this at Google's consent screen -- a slow device, a
+ * hesitation, a phone in the background, a long MFA prompt -- comes back
+ * with a perfectly valid credential.
  */
 export const PENDING_MAX_AGE_MS = 15 * 60 * 1000;
 
@@ -256,6 +270,13 @@ export const rememberPendingGoogleRequest = (state: string): void => {
 	}
 };
 
+/**
+ * Read the sign-in request that is in flight, if there is one.
+ *
+ * This READS the marker; it never discards it, however old it is. The caller
+ * is the one that consumes it, and it is the `state` -- not the age -- that
+ * decides whether a credential is accepted.
+ */
 export const readPendingGoogleRequest = (): PendingGoogleRequest | null => {
 	try {
 		const raw = sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);
@@ -263,11 +284,11 @@ export const readPendingGoogleRequest = (): PendingGoogleRequest | null => {
 		const parsed = JSON.parse(raw) as { state?: unknown; at?: unknown };
 		if (!parsed || typeof parsed.state !== "string") return null;
 		const at = typeof parsed.at === "number" ? parsed.at : 0;
-		if (Date.now() - at > PENDING_MAX_AGE_MS) {
-			clearPendingGoogleRequest();
-			return null;
-		}
-		return { state: parsed.state, at };
+		return {
+			state: parsed.state,
+			at,
+			expired: Date.now() - at > PENDING_MAX_AGE_MS,
+		};
 	} catch {
 		return null;
 	}

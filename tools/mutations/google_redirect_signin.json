@@ -56,8 +56,8 @@
     {
       "label": "F: the handler stops checking that the credential belongs to this sign-in request",
       "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
-      "needle": "\t\tif (!pending || pending.state !== payload.state) {\n",
-      "replace": "\t\tif (!pending) {  // MUTANT: the state is not checked\n"
+      "needle": "\t\tif (!pending) {\n\t\t\t// There is no request to compare against: the marker was lost or\n\t\t\t// already cleaned up, most often because the sign-in took longer\n\t\t\t// than the window. Say that, instead of calling the credential\n\t\t\t// unverified.\n\t\t\tfail(t(\"googleSignInExpired\"));\n\t\t\treturn;\n\t\t}\n\n\t\tif (pending.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
+      "replace": "\t\t// MUTANT: neither a missing request nor a foreign state is rejected\n"
     },
     {
       "label": "G: the credential is posted to the wrong endpoint",
@@ -86,8 +86,8 @@
     {
       "label": "K: a redirect that comes back without a credential is not reported",
       "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
-      "needle": "\t\tif (payload.kind === \"empty\") {\n\t\t\tif (pending) {\n\t\t\t\tclearGoogleRedirectParams(window.history, window.location);\n\t\t\t\tfail(t(\"googleSignInFailed\"));\n\t\t\t}\n\t\t\treturn;\n\t\t}\n",
-      "replace": "\t\tif (payload.kind === \"empty\") {\n\t\t\t// MUTANT: the missing credential is not reported\n\t\t\treturn;\n\t\t}\n"
+      "needle": "\t\t\tfail(t(\"googleSignInFailed\"));\n",
+      "replace": "\t\t\t// MUTANT: the missing credential is not reported\n\t\t\treturn;\n"
     },
     {
       "label": "L: the handler is not mounted, so the sign-in cannot complete on the site root",
@@ -100,6 +100,30 @@
       "file": "frontend/src/pages/Login.tsx",
       "needle": "\t\trememberPendingGoogleRequest(googleSignIn.state);\n",
       "replace": "\t\t// MUTANT: the sign-in request is not remembered\n"
+    },
+    {
+      "label": "N: the age of the request rejects a credential whose state MATCHES (the slow-user bug)",
+      "file": "frontend/src/lib/googleOAuth.ts",
+      "needle": "\t\treturn {\n\t\t\tstate: parsed.state,\n\t\t\tat,\n\t\t\texpired: Date.now() - at > PENDING_MAX_AGE_MS,\n\t\t};\n",
+      "replace": "\t\tif (Date.now() - at > PENDING_MAX_AGE_MS) {\n\t\t\tclearPendingGoogleRequest();\n\t\t\treturn null;\n\t\t}\n\t\treturn {\n\t\t\tstate: parsed.state,\n\t\t\tat,\n\t\t\texpired: false,\n\t\t};\n"
+    },
+    {
+      "label": "O: the state is not compared at all, so a foreign response is accepted",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\tif (pending.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
+      "replace": "\t\t// MUTANT: the state is never compared\n"
+    },
+    {
+      "label": "P: a missing marker is reported as an unverified credential instead of a sign-in that took too long",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\t\tfail(t(\"googleSignInExpired\"));\n",
+      "replace": "\t\t\tfail(t(\"googleSignInUnverified\"));  // MUTANT: the wrong message\n"
+    },
+    {
+      "label": "R: a stale marker makes an unrelated later visit report a sign-in failure",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\t\tif (pending.expired) {\n",
+      "replace": "\t\t\tif (false) {  // MUTANT: a stale marker is treated as fresh\n"
     }
   ]
 }

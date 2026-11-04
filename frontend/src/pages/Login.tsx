@@ -3,7 +3,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation } from "@tanstack/react-query";
 import { Eye, EyeOff, Loader2, Sparkles } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
@@ -34,7 +34,6 @@ import {
 	isDemoCredentialsEnabled,
 } from "@/lib/demoAccess";
 import {
-	clearPendingGoogleRequest,
 	createGoogleAuthorizeRequest,
 	getGoogleClientId,
 	rememberPendingGoogleRequest,
@@ -124,13 +123,6 @@ export default function LoginPage() {
 		() => createGoogleAuthorizeRequest(googleClientId),
 		[googleClientId],
 	);
-
-	// A sign-in that was started and then abandoned (the user pressed Back)
-	// must not leave a stale request behind: the handler would then report a
-	// failure for a sign-in the user never completed.
-	useEffect(() => {
-		clearPendingGoogleRequest();
-	}, []);
 
 	const startGoogleSignIn = () => {
 		rememberPendingGoogleRequest(googleSignIn.state);

@@ -70,10 +70,14 @@ export function GoogleRedirectHandler() {
 		// Nothing came back. If a sign-in was in flight, that is a failure the
 		// user must SEE -- not a silent landing on the dashboard.
 		if (payload.kind === "empty") {
-			if (pending) {
-				clearGoogleRedirectParams(window.history, window.location);
-				fail(t("googleSignInFailed"));
+			if (!pending) return; // a normal page load
+			if (pending.expired) {
+				// An abandoned attempt. Clean the marker up, but do not report
+				// a failure for a later, unrelated visit to the site root.
+				clearPendingGoogleRequest();
+				return;
 			}
+			fail(t("googleSignInFailed"));
 			return;
 		}
 
@@ -88,7 +92,22 @@ export function GoogleRedirectHandler() {
 
 		// The credential must come back with the `state` this browser sent.
 		// Without that check, a crafted link could sign somebody else in.
-		if (!pending || pending.state !== payload.state) {
+		//
+		// The age of the request is NOT a reason to reject it. A user who
+		// takes longer than PENDING_MAX_AGE_MS at Google's consent screen has
+		// a perfectly valid credential, and a matching `state` proves the
+		// response belongs to a sign-in this browser started.
+		if (!pending) {
+			// There is no request to compare against: the marker was lost or
+			// already cleaned up, most often because the sign-in took longer
+			// than the window. Say that, instead of calling the credential
+			// unverified.
+			fail(t("googleSignInExpired"));
+			return;
+		}
+
+		if (pending.state !== payload.state) {
+			// A response that does not carry our state is not ours.
 			fail(t("googleSignInUnverified"));
 			return;
 		}

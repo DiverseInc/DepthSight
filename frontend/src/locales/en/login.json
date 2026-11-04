@@ -30,5 +30,6 @@
 	"invalidResetLink": "This reset link is invalid or has expired.",
 	"googleSignIn": "Sign in with Google",
 	"googleSignInFailed": "Google sign-in failed. Please try again.",
+	"googleSignInExpired": "Google sign-in took too long. Please try again.",
 	"googleSignInUnverified": "Google sign-in could not be verified. Please try again."
 }

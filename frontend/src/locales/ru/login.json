@@ -30,5 +30,6 @@
 	"invalidResetLink": "Ссылка недействительна или истекла.",
 	"googleSignIn": "Войти через Google",
 	"googleSignInFailed": "Вход через Google не удался. Попробуйте ещё раз.",
+	"googleSignInExpired": "Вход через Google занял слишком много времени. Попробуйте ещё раз.",
 	"googleSignInUnverified": "Не удалось подтвердить вход через Google. Попробуйте ещё раз."
 }
