@@ -21,6 +21,12 @@ import { Link } from "react-router-dom";
 import { Bar, BarChart, CartesianGrid, Cell, XAxis, YAxis } from "recharts";
 import { Badge } from "@/components/ui/badge";
 import {
+	METRIC_TONE_CLASS,
+	errorRateTone,
+	formatMetric,
+	uptimeTone,
+} from "@/lib/formatSystemMetric";
+import {
 	Card,
 	CardContent,
 	CardDescription,
@@ -424,29 +430,47 @@ const AdminDashboardPage: React.FC = () => {
 								<div className="flex items-center justify-between py-1.5 border-b">
 									<span className="text-sm font-medium">Uptime (30d)</span>
 									<span
-										className={`text-sm font-bold ${sysMetrics.uptime_30_days_percent >= 99 ? "text-emerald-600" : sysMetrics.uptime_30_days_percent >= 95 ? "text-amber-600" : "text-red-600"}`}
+										className={`text-sm font-bold ${METRIC_TONE_CLASS[uptimeTone(sysMetrics.uptime_30_days_percent)]}`}
+										title={sysMetrics.notes?.uptime_30_days_percent}
 									>
-										{sysMetrics.uptime_30_days_percent.toFixed(2)}%
+										{formatMetric(sysMetrics.uptime_30_days_percent, {
+											digits: 2,
+											suffix: "%",
+										})}
 									</span>
 								</div>
 								<div className="flex items-center justify-between py-1.5 border-b">
 									<span className="text-sm font-medium">Avg response</span>
-									<span className="text-sm text-muted-foreground">
-										{sysMetrics.average_response_time_ms.toFixed(0)} ms
+									<span
+										className="text-sm text-muted-foreground"
+										title={sysMetrics.notes?.average_response_time_ms}
+									>
+										{formatMetric(sysMetrics.average_response_time_ms, {
+											suffix: " ms",
+										})}
 									</span>
 								</div>
 								<div className="flex items-center justify-between py-1.5 border-b">
 									<span className="text-sm font-medium">Requests (24h)</span>
-									<span className="text-sm text-muted-foreground">
-										{sysMetrics.total_requests_24h.toLocaleString()}
+									<span
+										className="text-sm text-muted-foreground"
+										title={sysMetrics.notes?.total_requests_24h}
+									>
+										{formatMetric(sysMetrics.total_requests_24h, {
+											groupThousands: true,
+										})}
 									</span>
 								</div>
 								<div className="flex items-center justify-between py-1.5">
 									<span className="text-sm font-medium">Error rate (24h)</span>
 									<span
-										className={`text-sm font-bold ${sysMetrics.error_rate_24h < 1 ? "text-emerald-600" : sysMetrics.error_rate_24h < 5 ? "text-amber-600" : "text-red-600"}`}
+										className={`text-sm font-bold ${METRIC_TONE_CLASS[errorRateTone(sysMetrics.error_rate_24h)]}`}
+										title={sysMetrics.notes?.error_rate_24h}
 									>
-										{sysMetrics.error_rate_24h.toFixed(2)}%
+										{formatMetric(sysMetrics.error_rate_24h, {
+											digits: 2,
+											suffix: "%",
+										})}
 									</span>
 								</div>
 							</div>

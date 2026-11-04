@@ -19,6 +19,12 @@ import {
 } from "@/components/ui/card";
 import { Spinner } from "@/components/ui/Spinner";
 import {
+	METRIC_TONE_CLASS,
+	errorRateTone,
+	formatMetric,
+	uptimeTone,
+} from "@/lib/formatSystemMetric";
+import {
 	useAdminErrorLogs,
 	useAdminSystemMetrics,
 	useSystemStatus,
@@ -224,28 +230,50 @@ const PlatformHealthPage: React.FC = () => {
 								<span className="text-sm font-medium">
 									Average Response Time
 								</span>
-								<span className="text-sm text-muted-foreground">
-									{systemMetrics.average_response_time_ms.toFixed(0)}ms
+								<span
+									className="text-sm text-muted-foreground"
+									title={systemMetrics.notes?.average_response_time_ms}
+								>
+									{formatMetric(systemMetrics.average_response_time_ms, {
+										suffix: "ms",
+									})}
 								</span>
 							</div>
 							<div className="flex justify-between items-center py-3 border-b">
 								<span className="text-sm font-medium">Uptime (30 days)</span>
-								<span className="text-sm text-green-600 font-medium">
-									{systemMetrics.uptime_30_days_percent.toFixed(2)}%
+								<span
+									className={`text-sm font-medium ${METRIC_TONE_CLASS[uptimeTone(systemMetrics.uptime_30_days_percent)]}`}
+									title={systemMetrics.notes?.uptime_30_days_percent}
+								>
+									{formatMetric(systemMetrics.uptime_30_days_percent, {
+										digits: 2,
+										suffix: "%",
+									})}
 								</span>
 							</div>
 							<div className="flex justify-between items-center py-3 border-b">
 								<span className="text-sm font-medium">
 									Total Requests (24h)
 								</span>
-								<span className="text-sm text-muted-foreground">
-									{systemMetrics.total_requests_24h.toLocaleString()}
+								<span
+									className="text-sm text-muted-foreground"
+									title={systemMetrics.notes?.total_requests_24h}
+								>
+									{formatMetric(systemMetrics.total_requests_24h, {
+										groupThousands: true,
+									})}
 								</span>
 							</div>
 							<div className="flex justify-between items-center py-3">
 								<span className="text-sm font-medium">Error Rate (24h)</span>
-								<span className="text-sm text-muted-foreground">
-									{systemMetrics.error_rate_24h.toFixed(2)}%
+								<span
+									className={`text-sm font-medium ${METRIC_TONE_CLASS[errorRateTone(systemMetrics.error_rate_24h)]}`}
+									title={systemMetrics.notes?.error_rate_24h}
+								>
+									{formatMetric(systemMetrics.error_rate_24h, {
+										digits: 2,
+										suffix: "%",
+									})}
 								</span>
 							</div>
 						</div>

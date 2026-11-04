@@ -1,0 +1,90 @@
+{
+  "_comment": [
+    "Mutations of the admin 'Platform Health' honesty fix.",
+    "",
+    "The defect: GET /api/v1/admin/health/metrics answered with four",
+    "constants (22.0 ms, 99.98%, 1234567 requests, 0.02%) under a",
+    "'# TODO: Replace with real metric gathering logic' comment. The owner's",
+    "admin dashboard showed those literals as if they were measurements.",
+    "",
+    "The fix publishes only what this service actually measured, and reports",
+    "everything else as null plus a reason. Each mutation below takes the",
+    "fix back to one of the ways it could lie, and each must be KILLED by",
+    "tests/test_admin_platform_health_metrics.py and",
+    "tests/test_system_metrics_recorder.py.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/admin_platform_health_real_metrics.json",
+    "NEVER run concurrently with a test run or another harness -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_admin_platform_health_metrics.py tests/test_system_metrics_recorder.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: the endpoint falls back to the old constants when the metrics store is down",
+      "file": "api/system_metrics.py",
+      "needle": "        for field in METRIC_FIELDS:\n            notes[field] = reason\n        return result\n",
+      "replace": "        for field in METRIC_FIELDS:\n            notes[field] = reason\n        return {\n            \"average_response_time_ms\": 22.0,\n            \"uptime_30_days_percent\": 99.98,\n            \"total_requests_24h\": 1234567,\n            \"error_rate_24h\": 0.02,\n            \"notes\": {},\n        }\n"
+    },
+    {
+      "label": "M2: the endpoint reports 0.00% error rate when no requests were handled",
+      "file": "api/system_metrics.py",
+      "needle": "            else:\n                # 0/0 is not 0%. A zero error rate over no requests would\n                # read as \"perfectly healthy\" and mean nothing at all.\n                notes[\"error_rate_24h\"] = (\n",
+      "replace": "            else:\n                result[\"error_rate_24h\"] = 0.0\n                result[\"average_response_time_ms\"] = 0.0\n                notes[\"error_rate_24h\"] = (\n"
+    },
+    {
+      "label": "M3: the client renders 0 instead of \"Not measured\"",
+      "file": "frontend/src/lib/formatSystemMetric.ts",
+      "needle": "\tif (!isMeasured(value)) return NOT_MEASURED_LABEL;\n",
+      "replace": "\tif (!isMeasured(value)) return \"0\";\n"
+    },
+    {
+      "label": "M4: the not-measured branch is removed from the client",
+      "file": "frontend/src/lib/formatSystemMetric.ts",
+      "needle": "\tif (!isMeasured(value)) return NOT_MEASURED_LABEL;\n\tconst { digits = 0, suffix = \"\", groupThousands = false } = options;\n",
+      "replace": "\tconst { digits = 0, suffix = \"\", groupThousands = false } = options;\n"
+    },
+    {
+      "label": "M5: the hardcoded constants come back into the endpoint",
+      "file": "api/routes/admin.py",
+      "needle": "    return await collect_system_metrics(redis_client)\n",
+      "replace": "    return {\n        \"average_response_time_ms\": 22.0,\n        \"uptime_30_days_percent\": 99.98,\n        \"total_requests_24h\": 1234567,\n        \"error_rate_24h\": 0.02,\n    }\n"
+    },
+    {
+      "label": "M6: the schema stops accepting an unmeasured metric",
+      "file": "api/schemas.py",
+      "needle": "    average_response_time_ms: Optional[float] = Field(\n",
+      "replace": "    average_response_time_ms: float = Field(\n"
+    },
+    {
+      "label": "M7: uptime is published from a partially observed 30-day window",
+      "file": "api/system_metrics.py",
+      "needle": "    if not _marker_present(heartbeat_days, window_30d_start):\n",
+      "replace": "    if not True:\n"
+    },
+    {
+      "label": "M8: the 24-hour figures are published from a partially observed window",
+      "file": "api/system_metrics.py",
+      "needle": "    if not _marker_present(heartbeat_days, window_24h_start):\n",
+      "replace": "    if not True:\n"
+    },
+    {
+      "label": "M9: the recorder-failure check is removed, so incomplete counters get published",
+      "file": "api/system_metrics.py",
+      "needle": "        if totals[\"recorder_errors\"]:\n",
+      "replace": "        if False:\n"
+    },
+    {
+      "label": "M10: an unmeasured metric gets a healthy verdict instead of no verdict",
+      "file": "frontend/src/lib/formatSystemMetric.ts",
+      "needle": "\tif (!isMeasured(value)) return \"unknown\";\n",
+      "replace": "\tif (!isMeasured(value)) return \"good\";\n"
+    },
+    {
+      "label": "M11: the client formats a possibly-null metric directly again",
+      "file": "frontend/src/pages/admin/AdminDashboardPage.tsx",
+      "needle": "\t\t\t\t\t\t\t\t\t\t{formatMetric(sysMetrics.uptime_30_days_percent, {\n\t\t\t\t\t\t\t\t\t\t\tdigits: 2,\n\t\t\t\t\t\t\t\t\t\t\tsuffix: \"%\",\n\t\t\t\t\t\t\t\t\t\t})}\n",
+      "replace": "\t\t\t\t\t\t\t\t\t\t{sysMetrics.uptime_30_days_percent !== null\n\t\t\t\t\t\t\t\t\t\t\t? sysMetrics.uptime_30_days_percent.toFixed(2)\n\t\t\t\t\t\t\t\t\t\t\t: \"0\"}\n"
+    }
+  ]
+}
