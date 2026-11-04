@@ -39,8 +39,10 @@ import {
 	type ComponentCategory,
 	type ComponentType,
 	type ConditionBlock as ConditionBlockType,
+	type PlanTier,
 	TOP_LEVEL_MANAGEMENT_BLOCK_TYPES,
 } from "@/components/strategy-editor/types";
+import { canonicalPlanKey } from "@/lib/plans";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import {

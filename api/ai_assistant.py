@@ -368,7 +368,7 @@ def _sanitize_strategy_nulls(node: Any) -> Any:
     return node
 
 
-from .plans import plans_config
+from .plans import plan_has_pro_block_access, plans_config
 
 
 def _build_tier_context_message(user: models.User, is_advisor: bool) -> str:
@@ -378,7 +378,7 @@ def _build_tier_context_message(user: models.User, is_advisor: bool) -> str:
     context = "\n\n# User Subscription & System Limits Context:\n"
     context += f"The user is currently on the '{user.plan}' subscription tier.\n"
 
-    if user.plan not in ["pro", "institutional"]:
+    if not plan_has_pro_block_access(user.plan):
         context += f"IMPORTANT: They DO NOT have access to Pro blocks. The restricted Pro blocks are: {', '.join(pro_blocks)}.\n"
         if not is_advisor:
             context += "CRITICAL RULE: Since you are generating a JSON strategy payload, you MUST NOT include any of the restricted Pro blocks. Doing so will cause the system to reject the strategy with a 403 error.\n"

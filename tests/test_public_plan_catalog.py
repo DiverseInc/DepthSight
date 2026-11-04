@@ -36,8 +36,15 @@ class TestCatalogMatchesConfig:
     def catalog(self):
         return build_plan_catalog()
 
-    def test_all_three_tiers_are_published(self, catalog):
-        assert {p["key"] for p in catalog["plans"]} == {"free", "standard", "pro"}
+    def test_all_four_tiers_are_published(self, catalog):
+        # The catalog gained a fourth tier by owner decision (2026-11-04):
+        # the $499/month "Managed" service.
+        assert {p["key"] for p in catalog["plans"]} == {
+            "free",
+            "standard",
+            "pro",
+            "managed",
+        }
 
     @pytest.mark.parametrize(
         "plan_key,quota_key,subject,period",
@@ -172,7 +179,12 @@ class TestPublicPlansEndpoint:
         assert response.status_code == 200, response.text
 
         data = response.json()
-        assert {p["key"] for p in data["plans"]} == {"free", "standard", "pro"}
+        assert {p["key"] for p in data["plans"]} == {
+            "free",
+            "standard",
+            "pro",
+            "managed",
+        }
 
     async def test_public_plans_matches_the_catalog(self, test_client):
         response = await test_client.get("/api/v1/public/plans")

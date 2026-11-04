@@ -21,6 +21,7 @@
 		"importConfig": "Import Configuration",
 		"import": "Import",
 		"deletePreset": "Delete preset",
+		"upgradeRequired": "Upgrade to {{tier}}",
 		"noTemplates": "No strategy templates found.",
 		"loadFailed": "Failed to load verified templates"
 	},

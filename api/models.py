@@ -264,7 +264,9 @@ class StrategyTemplate(Base):
     config_data = Column(JSON, nullable=False)
     # Recommended risk settings for the template.
     risk_profile = Column(JSON, nullable=False)
-    # 'free' | 'pro' | 'premium' — minimum plan required to deploy this template.
+    # 'free' | 'standard' | 'pro' | 'managed' — minimum plan required to deploy
+    # this template. 'premium' is the legacy spelling of 'managed' and still
+    # resolves to it (see `plan_aliases` in api/plans_config.yml).
     tier_required = Column(String, default="free", nullable=False)
     # Display order (lower = first).
     sort_order = Column(Integer, default=100, nullable=False)

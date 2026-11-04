@@ -14,8 +14,8 @@ plans the backend does not sell:
   * a "$29 Pro" tier   -- the backend's top tier is $100 and is called
                           "Professional"; there is no $29 tier at all;
   * a "$99 Team" tier  -- the backend sells NO team tier, no seats and no
-                          RBAC; `api/plans_config.yml` has three plans:
-                          free, standard, pro;
+                          RBAC; `api/plans_config.yml` has four plans:
+                          free, standard, pro, managed;
   * per-tier quotas belonging to no tier -- "100 backtest runs / day" and
                           "500 AI Co-Pilot requests / day" on the $29 card,
                           "Unlimited backtest runs" on the $99 card.
@@ -561,8 +561,16 @@ class TestTheCatalogIsTheSourceOfTruth:
             )
             assert plan["price_usd"] == expected
 
-    def test_the_catalog_sells_three_tiers_and_no_team_tier(self, catalog):
-        assert {p["key"] for p in catalog["plans"]} == {"free", "standard", "pro"}
+    def test_the_catalog_sells_four_tiers_and_no_team_tier(self, catalog):
+        # The catalog gained a fourth tier by owner decision (2026-11-04):
+        # the $499/month "Managed" service. This is the only place in the
+        # test suite where the number of tiers is written down.
+        assert {p["key"] for p in catalog["plans"]} == {
+            "free",
+            "standard",
+            "pro",
+            "managed",
+        }
         assert "team" not in {p["key"] for p in catalog["plans"]}
         assert "Team" not in {p["name"] for p in catalog["plans"]}
 
@@ -1383,53 +1391,64 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
             "creates them"
         )
 
-    def test_portfolio_backtesting_follows_the_permission_not_the_quota(
-        self, cards, plans_by_name, raw_plans
-    ):
-        """Portfolio backtesting is gated by a PERMISSION.
+    def test_no_tier_advertises_portfolio_backtesting(self, cards):
+        """Portfolio backtesting is HELD but never ADVERTISED.
 
-        `run_portfolio_backtest_per_day` is 0 for every tier, but that quota
-        is enforced NOWHERE. There are exactly two quota mechanisms in the
-        backend and neither touches the portfolio route:
+        The permission is a real entitlement and it is UNCHANGED: the route
+        (api/routes/portfolio.py:917-925) checks the `run_portfolio_backtest`
+        PERMISSION, and `tests/test_plans.py` pins free -> 403 and
+        standard -> 202 for POST /api/v1/portfolio-backtests.
 
-          * `check_usage_quota` (api/dependencies.py:90) is wired up only on
-            the two backtest engines (api/routes/backtests.py:232) and on
-            genetic search (api/routes/discovery.py:112);
-          * `QuotaManager.check_and_consume` (api/quota_manager.py:22, whose
-            limit 0 means "forbidden", api/quota_manager.py:71-72) is called
-            from exactly one place: api/ai_assistant.py:1474, with the
-            feature "use_ai_assistant".
+        What changed is the ADVERTISEMENT. The feature is an unfinished
+        scaffold: `portfolio_kpis` appears nowhere in `bot_module/`, so
+        `tasks.py:1666` always raises and `tasks.py:1673` marks the run
+        FAILED, and the viewer's GET /portfolio-backtests/{runId} does not
+        exist, so the frontend fetch 404s. A paying customer could launch a
+        run that always fails and then click a run that 404s.
 
-        The portfolio endpoint (api/routes/portfolio.py:917-925) checks the
-        `run_portfolio_backtest` PERMISSION and the concurrent-task limit,
-        and the Celery task (tasks.py:1869-1902) checks no daily quota at
-        all. The live catalog agrees: GET /api/v1/public/plans returns
-        "Portfolio backtesting" as INCLUDED for Standard and Professional,
-        and the live OpenAPI publishes /api/v1/portfolio-backtests.
-
-        So the capability follows the permission -- Standard and Pro hold
-        it, Free does not -- and the page must follow the permission too.
+        So no tier may promise it -- not as included, and not under "Not
+        included" either, because that still advertises it. The suppression
+        is config-driven (`deferred_permissions` in api/plans_config.yml),
+        so it cannot drift back into the page by hand.
         """
         for card in cards:
-            plan = plans_by_name.get(card["name"])
-            assert plan is not None
-            permissions = raw_plans[plan["key"]].get("permissions", []) or []
-            holds = "run_portfolio_backtest" in permissions
-
-            claims = "Portfolio backtesting" in card["included"]
-            assert claims == holds, (
-                f"the {card['name']} card {'claims' if claims else 'does not claim'} "
-                "portfolio backtesting, but that tier "
-                f"{'holds' if holds else 'does not hold'} the "
-                "run_portfolio_backtest permission"
+            assert "Portfolio backtesting" not in card["included"], (
+                f"the {card['name']} card advertises a feature that always "
+                "fails"
             )
+            assert "Portfolio backtesting" not in card["not_included"], (
+                f"the {card['name']} card lists portfolio backtesting as "
+                "something the customer does not get, which still "
+                "advertises it"
+            )
+
+    def test_the_portfolio_backtest_entitlement_is_unchanged(self, raw_plans):
+        """A3 stops ADVERTISING the capability; it does not take it away.
+
+        Standard and Professional still hold the permission, so
+        `tests/test_plans.py` keeps pinning standard -> 202 and free -> 403.
+        """
+        for tier in ("standard", "pro"):
+            permissions = raw_plans[tier].get("permissions", []) or []
+            assert "run_portfolio_backtest" in permissions, (
+                f"the {tier} tier lost the run_portfolio_backtest permission: "
+                "the entitlement is not what A3 was allowed to change"
+            )
+        free_permissions = raw_plans["free"].get("permissions", []) or []
+        assert "run_portfolio_backtest" not in free_permissions
+        assert raw_plans["free"]["quotas"]["run_portfolio_backtest_per_day"] == 0
 
     def test_a_tier_without_a_capability_says_so(self, cards, plans_by_name):
         """The page states the boundary in BOTH directions.
 
-        A card that says "Portfolio backtesting" on Standard and says
-        nothing about it on Free leaves the reader guessing. The catalog
-        excludes the capability from Free, so the Free card must say it.
+        A card that says a capability on Standard and says nothing about it
+        on Free leaves the reader guessing, so a capability the catalog
+        excludes from a tier must be listed on that tier's card.
+
+        Since the $499 Managed tier (2026-11-04) the catalog excludes
+        "Portfolio backtesting" from EVERY tier -- the feature is an
+        unfinished scaffold -- so that label is not in `excluded` any more
+        and the loop below has nothing to say about it.
         """
         for card in cards:
             plan = plans_by_name.get(card["name"])

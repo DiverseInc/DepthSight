@@ -33,6 +33,7 @@ import {
 import { Slider } from "@/components/ui/slider";
 import { useAuth } from "@/context/AuthContext";
 import { useConfig, useMultiAccountBalances } from "@/lib/api";
+import { hasProfessionalTierAccess } from "@/lib/plans";
 import type { CombinedStrategy } from "@/types/api";
 
 interface LaunchStrategyModalProps {
@@ -79,7 +80,7 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 	const { data: config } = useConfig();
 	const { data: balances } = useMultiAccountBalances();
 	const isAdmin = user?.role === "admin";
-	const isPro = user?.plan === "pro";
+	const isPro = hasProfessionalTierAccess(user?.plan);
 	const canUseOracle = isAdmin || isPro; // Oracle is available to admins and Pro users
 
 	// Get active API keys for live trading

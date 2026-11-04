@@ -4,6 +4,21 @@ registration_trial:
   plan: standard
   days: 0
 
+# Legacy plan keys that are still stored on real rows (user accounts and the
+# seeded strategy templates). Each one points at the canonical plan that carries
+# the tier today. An alias is NOT a plan of its own: it is never sold, it never
+# appears in the catalog, and the stored rows are never migrated.
+plan_aliases:
+  premium: managed
+
+# Permissions a plan may HOLD but that no tier may ADVERTISE yet. The
+# capability is an unfinished scaffold: the entitlement stays (and is still
+# enforced), but the pricing copy must not promise it. Listing a permission
+# here is the single switch that suppresses its label on EVERY tier -- it is
+# neither advertised as included nor listed as "Not included".
+deferred_permissions:
+  - run_portfolio_backtest
+
 block_restrictions:
   pro_only:
     - btc_state_filter
@@ -184,6 +199,53 @@ plans:
       max_backtest_duration_days: -1
       celery_task_priority: 1
       max_concurrent_tasks: 5
+
+  managed:
+    name: "Managed"
+    price_usd: 499
+    billing:
+      monthly:
+        price_usd: 499
+        period_days: 30
+      lifetime:
+        enabled: false
+    active: true
+    description: "Managed service. We deploy, monitor and adjust your strategies inside the risk limits you set."
+    features:
+      - "Everything in Professional"
+      - "Managed strategy monitoring within your risk limits"
+      - "Unlimited backtest history"
+      - "Highest task priority and concurrency"
+      - "Extended live strategy allowance"
+    permissions:
+      - view_dashboard
+      - run_backtest
+      - run_portfolio_backtest
+      - run_optimization
+      - run_genetic_search
+      - run_simulation
+      - generate_dataset
+      - train_model
+      - save_strategy_config
+      - view_strategies
+      - allow_real_trading
+      - use_ai_assistant
+    quotas:
+      run_vector_backtest_per_day: -1
+      run_kline_backtest_per_day: -1
+      use_ai_assistant_per_day: -1
+      run_portfolio_backtest_per_day: 0
+      run_optimization_per_month: -1
+      run_genetic_search_per_month: -1
+      generate_dataset_per_month: -1
+      train_model_per_month: -1
+    limits:
+      allow_real_trading: true
+      max_live_strategies: 100
+      allow_intracandle_triggers: true
+      max_backtest_duration_days: -1
+      celery_task_priority: 0
+      max_concurrent_tasks: 20
 
 referral_program:
   referrer_bonus:

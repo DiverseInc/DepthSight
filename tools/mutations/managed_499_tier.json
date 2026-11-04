@@ -1,0 +1,71 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the $499 'Managed' tier",
+    "(owner decision 2026-11-04).",
+    "",
+    "A is the price the tier is sold at. B is the PRO-block gate in",
+    "api/plans.py. C is the alias resolution in PlansConfig.get_plan -- the",
+    "`premium` rows must keep working. D and H are the two halves of the",
+    "A3 suppression: D stops derive_entitlements from consulting the",
+    "deferred list, H empties the list itself. E is the tier ladder, where",
+    "`premium` must stay on the same rung as `managed`. F and G are the",
+    "marketing page: the price the Managed card shows, and the false",
+    "'Portfolio backtesting' claim coming back.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/managed_499_tier.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_managed_499_tier.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the Managed tier is priced at $490 instead of $499",
+      "file": "api/plans_config.yml",
+      "needle": "  managed:\n    name: \"Managed\"\n    price_usd: 499\n",
+      "replace": "  managed:\n    name: \"Managed\"\n    price_usd: 490\n"
+    },
+    {
+      "label": "B: managed is no longer a PRO-block plan",
+      "file": "api/plans.py",
+      "needle": "_PRO_BLOCK_PLANS = (\"pro\", \"managed\", \"institutional\")",
+      "replace": "_PRO_BLOCK_PLANS = (\"pro\", \"institutional\")"
+    },
+    {
+      "label": "C: get_plan no longer resolves the premium alias",
+      "file": "api/plans.py",
+      "needle": "        self._reload_if_changed()\n        key = self.resolve_plan_key(plan_name)\n        return self._plans.get(key, {\"permissions\": [], \"quotas\": {}})\n",
+      "replace": "        self._reload_if_changed()\n        key = plan_name\n        return self._plans.get(key, {\"permissions\": [], \"quotas\": {}})\n"
+    },
+    {
+      "label": "D: derive_entitlements ignores the deferred-permission list",
+      "file": "api/plans.py",
+      "needle": "        if permission in deferred_permissions:\n",
+      "replace": "        if False and permission in deferred_permissions:\n"
+    },
+    {
+      "label": "E: the premium rung is lowered below managed",
+      "file": "frontend/src/pages/CommunityHub.tsx",
+      "needle": "\t\tmanaged: 3,\n\t\tpremium: 3,\n",
+      "replace": "\t\tmanaged: 3,\n\t\tpremium: 2,\n"
+    },
+    {
+      "label": "F: the marketing page prices the Managed card at $490",
+      "file": "frontend/welcome.html",
+      "needle": "<div class=\"amt\">$499<small> /month</small></div>",
+      "replace": "<div class=\"amt\">$490<small> /month</small></div>"
+    },
+    {
+      "label": "G: the marketing page advertises Portfolio backtesting on Standard again",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>Strategy backtesting</li>\n          <li>Saved strategies</li>\n",
+      "replace": "          <li>Strategy backtesting</li>\n          <li>Portfolio backtesting</li>\n          <li>Saved strategies</li>\n"
+    },
+    {
+      "label": "H: the config's deferred-permission list is emptied",
+      "file": "api/plans_config.yml",
+      "needle": "deferred_permissions:\n  - run_portfolio_backtest\n",
+      "replace": "deferred_permissions: []\n"
+    }
+  ]
+}
