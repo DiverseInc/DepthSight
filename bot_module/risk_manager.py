@@ -6,7 +6,7 @@ import time
 import asyncio
 import json
 from datetime import timedelta, datetime, time as dt_time, timezone
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple, List, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from collections import defaultdict, deque
@@ -125,6 +125,24 @@ RISK_GUARD_STATE_LOST_REASON = (
     "traded before - treated as an unknown state, trading disabled"
 )
 
+# Why the gate is closed when the persisted guard state's SCOPE cannot be read.
+#
+# The state was READ, but the day stamp it carries cannot be: the field is
+# missing, null, or not a readable string. So it is NOT known whether the
+# payload holds today's numbers or yesterday's.
+#
+# "Unknown day" is NOT "another day". A previous day's numbers must not be
+# resurrected, and today's must not be assumed -- so the counters cannot be
+# shown to be within limits, and the state is treated as unknown exactly like
+# a lost one. Reading an unreadable stamp as "belongs to yesterday" would
+# discard the whole persisted state, restore the loss streak and the day's
+# PnL as ZEROS, and re-open a gate that was closed.
+RISK_GUARD_SCOPE_UNKNOWN_REASON = (
+    "the persisted trading-guard state's day stamp could not be read, so it is "
+    "not known whether it holds today's numbers or yesterday's - treated as an "
+    "unknown state, trading disabled"
+)
+
 
 @dataclass
 class TradeStats:
@@ -189,6 +207,97 @@ def ensure_dict(obj) -> Dict[str, Any]:
     return {}
 
 
+def _read_persisted_number(
+    payload: Dict[str, Any], key: str, cast: Callable[[Any], Any]
+) -> Optional[Any]:
+    """Read a NUMBER out of a persisted payload, keeping "absent" apart from "zero".
+
+    Returns the cast value, or None when the value is UNREADABLE.
+
+    Three things make a persisted number UNREADABLE, and NONE of them is a
+    zero:
+
+    * the field is MISSING from the payload;
+    * the field is present but NULL;
+    * the field is present but is not a number.
+
+    A fourth shape is unreadable too: a number that is not FINITE -- NaN, or
+    +/-Infinity. Those are not measurements, they are the result of an
+    arithmetic accident (a division by zero, an overflow), and every
+    comparison against them is silently FALSE: `nan < 0` is False, so a day's
+    PnL of NaN is read by the loss guard as "no loss today" -- the guard
+    measures NOTHING while reporting OK. json.dumps writes NaN as the literal
+    `NaN` and json.loads reads it straight back, so such a value survives a
+    save/restore round trip and reaches the guard exactly as a number would.
+    An unreadable value must be UNKNOWN; unknown must never be more permissive
+    than known, so a non-finite value is UNREADABLE and takes the same
+    fail-closed path as a missing one.
+
+    The idiom this replaces -- ``payload.get(key) or 0`` -- cannot tell any of
+    them apart from a genuine zero: a missing field yields None, ``None or 0``
+    is 0, and a field that is present but null yields the same 0. So a partial
+    or corrupt payload restored as "no loss today" and "no loss streak" --
+    which DISCARDS the numbers the guard was blocking on and RE-OPENS a gate
+    that was closed. That is the fail-OPEN this helper exists to close.
+
+    A field that IS present and readable is returned EXACTLY as it is, so a
+    genuine zero (a streak of 0, a day's PnL of 0.0) is still restored as a
+    zero. "Absent" and "zero" are DIFFERENT facts and must never be confused:
+    one of them is an unknown, the other is a measurement.
+
+    `cast` is `int` for the loss streak and `float` for the day's PnL.
+    """
+    if key not in payload:
+        return None
+    raw = payload[key]
+    if raw is None:
+        return None
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: int(float("inf")) raises it, and it is NOT a
+        # ValueError -- without it in this tuple a persisted infinite streak
+        # would escape as an exception instead of an unknown.
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _day_str_is_a_calendar_day(day_str: Any) -> bool:
+    """Is this day stamp a day the guard can BELIEVE?
+
+    The guard writes its day stamp as `YYYY-MM-DD` (`_current_utc_day_str`),
+    and it compares day stamps as STRINGS, because `YYYY-MM-DD` sorts
+    chronologically. So a stamp that is not a calendar day cannot be compared
+    with today's stamp, and it cannot be ordered against the day the latch
+    was raised on either.
+
+    A stamp that is a non-blank string but NOT a calendar day -- "unknown",
+    "2026-13-45", "yesterday" -- is therefore UNREADABLE, and unreadable must
+    never be read as "another day". Reading it as "another day" silently
+    DISCARDS the persisted counters, restores them as ZEROS and re-opens a
+    gate that was closed: the same fail-open the missing/null stamp was fixed
+    for, reached through a third door.
+
+    An EMPTY stamp is not a calendar day either, but it is handled by the
+    caller: for the LIVE section an empty stamp means "there is no stamp at
+    all" (unreadable), while for the PAPER section it is the "the paper
+    sandbox was never persisted" marker -- a FACT, not a corruption -- and is
+    decided by `_paper_payload_scope_is_readable`.
+    """
+    if not isinstance(day_str, str):
+        return False
+    text = day_str.strip()
+    if not text:
+        return False
+    try:
+        datetime.strptime(text, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 class RiskManager:
     # ------------------------------------------------------------------
     # THE HIGH-WATER MARK (the peak) for the peak-to-trough drawdown
@@ -242,6 +351,25 @@ class RiskManager:
     # drawdown cannot be measured against it.
     _balance_read_rejected: bool = False
 
+    # THE PAPER SANDBOX'S OWN HIGH-WATER MARK.
+    #
+    # The PAPER sandbox now measures its drawdown with the SAME
+    # peak-to-trough measure the LIVE sandbox uses (see
+    # `_check_paper_risk_limits`), so it needs its own peak, its own PnL
+    # baseline and its own "this read was rejected" flag. They live in
+    # their own attributes -- NOT in the LIVE ones -- because the paper
+    # wallet is a different wallet: a paper balance must never raise the
+    # live high-water mark, and the live one must never be measured
+    # against the paper wallet.
+    #
+    # The PAPER peak is NOT persisted and NOT restored: it is established
+    # from the paper wallet's own balance reads, so it can never be
+    # inherited from the live sandbox, and a restore can never wipe it.
+    _paper_peak_equity: float = 0.0
+    _paper_peak_equity_set_at: float = 0.0
+    _paper_balance_pnl_baseline: float = 0.0
+    _paper_balance_read_rejected: bool = False
+
     def __init__(
         self,
         executor: ExchangeExecutor,
@@ -269,6 +397,18 @@ class RiskManager:
         # ID is unique and stable across a rename.
         self.api_key_id: Optional[int] = None
         self.stats = TradeStats()
+        # THE PAPER SANDBOX. Its counters are a DIFFERENT set of numbers from
+        # the live ones above, on purpose: a loss taken on simulated money
+        # must never be able to close the gate on real money.
+        #
+        # Upstream DepthSight keeps the two in separate `TradeStats` objects
+        # (upstream `bot_module/risk_manager.py:294`). This fork had
+        # collapsed them into one, so a PAPER loss was added to the LIVE
+        # `today_pnl` / `consecutive_losses` and `_check_risk_limits()` then
+        # closed the LIVE gate on it -- real money blocked by a simulated
+        # loss. Everything that touches a counter must now ask which sandbox
+        # it is touching (see `_mode_stats`).
+        self.paper_stats = TradeStats()
         self.trade_history: List[Dict[str, Any]] = []
 
         self.telegram_notifier: Optional[Any] = None
@@ -335,6 +475,33 @@ class RiskManager:
         )
         self.max_consecutive_losses: int = get_ival(
             rm_settings, "maxConsecutiveLosses", config.DEFAULT_MAX_CONSECUTIVE_LOSSES
+        )
+
+        # THE PAPER SANDBOX'S OWN LIMITS (upstream `risk_manager.py:192`,
+        # `:200`, `:208`). Read from the PAPER settings, and DEFAULTING TO THE
+        # LIVE VALUES, so the paper gate is never LOOSER than the live one:
+        # a user who has configured no paper-specific limits gets exactly the
+        # live limits applied to the paper sandbox.
+        self.paper_max_drawdown_threshold: float = (
+            get_fval(
+                paper_rm_settings,
+                "maxDrawdown",
+                self.max_drawdown_threshold * 100.0,
+            )
+            / 100.0
+        )
+        self.paper_daily_max_loss_threshold: float = (
+            get_fval(
+                paper_rm_settings,
+                "dailyMaxLossPercent",
+                self.daily_max_loss_threshold * 100.0,
+            )
+            / 100.0
+        )
+        self.paper_max_consecutive_losses: int = get_ival(
+            paper_rm_settings,
+            "maxConsecutiveLosses",
+            self.max_consecutive_losses,
         )
 
         # Maximum number of simultaneous trades
@@ -414,6 +581,27 @@ class RiskManager:
             )
 
         self._is_trading_allowed = True
+        # THE PAPER SANDBOX'S OWN GATE (upstream `risk_manager.py:295`).
+        # Deliberately separate from `_is_trading_allowed`: the two sandboxes
+        # are judged independently, so a breach in one never closes the
+        # other's gate.
+        self._paper_is_trading_allowed = True
+        # Has the PAPER wallet's balance been read in THIS process? Until it
+        # has, the paper limits cannot be judged at all: the balance is
+        # UNKNOWN, not zero. Evaluating them against an unknown balance
+        # closes the paper gate for the wrong reason, and since the
+        # controller consults the paper gate BEFORE the balance is refreshed,
+        # that would stop paper trading until the next restart.
+        self._paper_balance_known = False
+        # Why the PAPER gate is off, when it is off for a reason other than
+        # the emergency stop. The live equivalent is `_global_gate_disable_reason`.
+        self._paper_global_gate_disable_reason: Optional[str] = None
+        # The reason the PAPER gate was LAST closed, kept separately from
+        # `_paper_global_gate_disable_reason` (which is CLEARED as soon as the
+        # paper limits are back within range). Initialised here because it is
+        # written on more than one path and must never be read off an
+        # attribute that does not exist yet.
+        self._paper_last_disable_reason: Optional[str] = None
         # Latching emergency stop. Deliberately separate from
         # _is_trading_allowed, which both the daily-stat reset and
         # _check_risk_limits() legitimately flip back to True on their own.
@@ -468,6 +656,30 @@ class RiskManager:
         # without this the latch would release on the very same start that set
         # it and never mean anything.
         self._guard_state_lost_day_str: str = ""
+        # True when the persisted guard state was READ but its SCOPE could not
+        # be: the day stamp it carries is missing, null or not a readable
+        # string, so it is not known whether the payload holds today's numbers
+        # or yesterday's.
+        #
+        # This is a THIRD kind of unknown state, and it is not the same as a
+        # lost one (the key is there) nor as an unreadable one (Redis was
+        # reachable). It is the same in its CONSEQUENCE: today's PnL and the
+        # loss streak cannot be shown to be within limits, so the gate fails
+        # CLOSED, the state is not re-persisted, and the latch clears at the
+        # UTC rollover -- the one moment the day's counters legitimately
+        # restart at zero by definition.
+        #
+        # It is deliberately NOT folded into `_guard_state_lost`: that latch
+        # means "the key VANISHED", and an operator reading "the persisted
+        # state is missing" for a payload that is sitting in Redis right now
+        # would be sent looking in the wrong place.
+        self._guard_state_scope_unknown: bool = False
+        # The UTC day the scope became unreadable on. The latch may only be
+        # released on a STRICTLY LATER day, for the same reason the lost
+        # state's latch is: a fresh process sees its first day-key change on
+        # its very first `_check_and_reset_daily_stats()`, so releasing on any
+        # day change would clear the latch on the same start that set it.
+        self._guard_state_scope_unknown_day_str: str = ""
         # Has this controller EVER traded? True / False / None (unknown).
         #
         # It decides whether the live balance may be installed as today's
@@ -541,7 +753,18 @@ class RiskManager:
 
         # AUTO-BLACKLIST: Tracking consecutive stops by symbols
         # Store a list of stop timestamps (to support within_period)
+        #
+        # PER SANDBOX. The stop history is what the auto-blacklist rules
+        # COUNT, and the rules write the symbol into the user's
+        # ACCOUNT-LEVEL blacklist -- which the LIVE gate consults. So one
+        # shared dict let a PAPER stop-loss push the LIVE account's stop
+        # count up (a simulated loss could blacklist a real-money symbol)
+        # and let a PAPER win ERASE the LIVE stop history (which weakens a
+        # live risk control). `_symbol_stop_timestamps` stays the LIVE
+        # dict -- existing code reads it directly -- and the PAPER sandbox
+        # has its own.
         self._symbol_stop_timestamps: Dict[str, List[float]] = {}
+        self._paper_symbol_stop_timestamps: Dict[str, List[float]] = {}
 
         # Caching auto-blacklist rules from settings
         rm_settings = user_settings.get("risk_management", {}) if user_settings else {}
@@ -580,6 +803,166 @@ class RiskManager:
         logger.info(f"RiskManager initialized for user_id: {self.user_id}.")
         if self._strategy_symbol_adjustment_enabled:
             logger.info("Strategy-Symbol dynamic risk adjustment ENABLED.")
+
+    # ------------------------------------------------------------------
+    # TRADING-MODE SELECTORS.
+    #
+    # Ported by hand from upstream DepthSight (`bot_module/risk_manager.py`
+    # `:351`-`:382`): upstream already separated the paper sandbox from the
+    # live one, and this fork had lost that separation. Everything that
+    # reads or writes a counter, a threshold or a gate flag goes through
+    # these helpers, so there is exactly ONE place that decides which
+    # sandbox a value belongs to.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_mode(mode: Optional[str]) -> str:
+        """Trading-mode gate selector: anything but an explicit 'paper' is live."""
+        return "paper" if str(mode or "live").lower() == "paper" else "live"
+
+    def _mode_stats(self, mode: Optional[str]) -> TradeStats:
+        """The stats object that owns this mode's counters.
+
+        Upstream `risk_manager.py:356`-`:357`. The PAPER sandbox's counters
+        live in `self.paper_stats`; the LIVE ones in `self.stats`.
+        """
+        return self.paper_stats if self._normalize_mode(mode) == "paper" else self.stats
+
+    def _mode_thresholds(self, mode: Optional[str]) -> Tuple[float, float, int]:
+        """(max_drawdown, daily_max_loss, max_consecutive_losses) for the mode.
+
+        Upstream `risk_manager.py:359`-`:370`. The paper sandbox has its own
+        limits (defaulting to the live ones), so the two sandboxes are never
+        measured against each other's thresholds.
+        """
+        if self._normalize_mode(mode) == "paper":
+            return (
+                self.paper_max_drawdown_threshold,
+                self.paper_daily_max_loss_threshold,
+                self.paper_max_consecutive_losses,
+            )
+        return (
+            self.max_drawdown_threshold,
+            self.daily_max_loss_threshold,
+            self.max_consecutive_losses,
+        )
+
+    def _is_mode_trading_allowed(self, mode: Optional[str]) -> bool:
+        """Is TRADING allowed in this mode? The two gates are independent."""
+        if self._normalize_mode(mode) == "paper":
+            return self._paper_is_trading_allowed
+        return self._is_trading_allowed
+
+    def _mode_disable_reason(self, mode: Optional[str]) -> Optional[str]:
+        """Why this mode's gate is off, when it is off."""
+        if self._normalize_mode(mode) == "paper":
+            return self._paper_global_gate_disable_reason
+        return self._global_gate_disable_reason
+
+    def _stop_timestamps_for(self, mode: Optional[str]) -> Dict[str, List[float]]:
+        """The auto-blacklist stop history that owns THIS sandbox's stops.
+
+        The stop history is what the auto-blacklist rules COUNT, and a rule
+        that fires writes the symbol into the account-level blacklist --
+        which the LIVE gate consults. So the two sandboxes must not share
+        one history: a PAPER stop-loss must not push the LIVE account's
+        stop count up (a simulated loss could blacklist a real-money
+        symbol), and a PAPER win must not ERASE the live stop history
+        (which would reset the live auto-blacklist counter with simulated
+        money -- a weakening of a live risk control).
+        """
+        if self._normalize_mode(mode) == "paper":
+            return self._paper_symbol_stop_timestamps
+        return self._symbol_stop_timestamps
+
+    @staticmethod
+    def _blacklist_entry_applies_to_mode(coin: Any, mode: str) -> bool:
+        """Does this blacklist entry apply to the sandbox being asked about?
+
+        An entry that CARRIES a mode applies to THAT sandbox only: an entry
+        written for the PAPER sandbox must never block a LIVE signal, or a
+        paper loss would close the live gate.
+
+        An entry with NO mode is a LEGACY entry -- written before the
+        split, or added by the OPERATOR through the API -- and it applies
+        to BOTH sandboxes. That is the behaviour such an entry always had,
+        and an operator's manual blacklist is an account-level control, so
+        it keeps working for the paper sandbox too (including for the
+        keyless paper accounts, which have no other way to be stopped).
+        """
+        entry_mode = (
+            coin.get("mode")
+            if isinstance(coin, dict)
+            else getattr(coin, "mode", None)
+        )
+        if not entry_mode:
+            return True
+        return str(entry_mode).strip().lower() == str(mode or "live").strip().lower()
+
+    def _peak_state_attrs(self, mode: Optional[str] = "live") -> Tuple[str, str, str, str]:
+        """The attribute names that hold THIS sandbox's peak state.
+
+        (peak, peak_set_at, pnl_baseline, balance_read_rejected)
+
+        The LIVE names are the ones `main` shipped and the ones the
+        existing tests read and write directly, so they are NOT renamed:
+        the peak subsystem is made mode-aware by LOOKING UP the names
+        instead, which keeps ONE implementation serving both sandboxes
+        rather than two copies that can drift apart.
+        """
+        if self._normalize_mode(mode) == "paper":
+            return (
+                "_paper_peak_equity",
+                "_paper_peak_equity_set_at",
+                "_paper_balance_pnl_baseline",
+                "_paper_balance_read_rejected",
+            )
+        return (
+            "_peak_equity",
+            "_peak_equity_set_at",
+            "_balance_pnl_baseline",
+            "_balance_read_rejected",
+        )
+
+    @staticmethod
+    def _guard_state_scope_unknown_affects_live(scope: str) -> bool:
+        """Does an UNKNOWN-SCOPE latch close the LIVE gate?
+
+        A latch whose scope is "live" (or "both") does: the LIVE sandbox's
+        own numbers could not be read, so the LIVE gate fails closed.
+
+        A latch whose scope is "paper" does NOT: a corrupt PAPER payload
+        says nothing about the LIVE sandbox's numbers, and halting REAL
+        trading because a paper day's stamp was unreadable is exactly the
+        cross-sandbox leak this branch exists to close.
+        """
+        return str(scope or "").strip().lower() in ("live", "both")
+
+    def published_account_snapshot(self) -> Dict[str, Any]:
+        """The account-level numbers the controller publishes.
+
+        A controller with NO api key is a PAPER-ONLY controller: there is no
+        live account behind it, so the numbers it publishes are the PAPER
+        sandbox's -- the paper wallet's balance, the paper day's PnL, the
+        paper loss streak and the PAPER gate. A controller WITH an api key
+        publishes the LIVE sandbox's.
+
+        The API reads the paper portfolio from exactly those paper-only
+        published keys (the key suffix is the api_key_id, and a paper-only
+        controller has none) and the live portfolio from the live ones, so
+        the published numbers must be the numbers of the sandbox the
+        controller actually trades. Publishing the LIVE sandbox's numbers
+        for a paper-only controller would report a $0.00 balance and a
+        zero loss streak while the paper gate was actually blocked.
+        """
+        mode = "paper" if self.api_key_id is None else "live"
+        stats = self._mode_stats(mode)
+        return {
+            "current_balance": stats.current_balance,
+            "today_pnl": stats.today_pnl,
+            "consecutive_losses": stats.consecutive_losses,
+            "is_trading_allowed": self._is_mode_trading_allowed(mode),
+        }
 
     def apply_user_settings(self, user_settings: Dict[str, Any]) -> None:
         """Applies fresh user settings in-place without recreating RiskManager."""
@@ -678,6 +1061,33 @@ class RiskManager:
             "maxConsecutiveLosses",
             "max_consecutive_losses",
             default=config.DEFAULT_MAX_CONSECUTIVE_LOSSES,
+        )
+        # The PAPER sandbox's own limits, refreshed with the rest of the
+        # settings and DEFAULTING TO THE LIVE VALUES, so a settings refresh
+        # can never leave the paper gate looser than the live one.
+        self.paper_max_drawdown_threshold = (
+            _get_float(
+                paper_rm_settings,
+                "maxDrawdown",
+                "max_drawdown",
+                default=self.max_drawdown_threshold * 100.0,
+            )
+            / 100.0
+        )
+        self.paper_daily_max_loss_threshold = (
+            _get_float(
+                paper_rm_settings,
+                "dailyMaxLossPercent",
+                "daily_max_loss_percent",
+                default=self.daily_max_loss_threshold * 100.0,
+            )
+            / 100.0
+        )
+        self.paper_max_consecutive_losses = _get_int(
+            paper_rm_settings,
+            "maxConsecutiveLosses",
+            "max_consecutive_losses",
+            default=self.max_consecutive_losses,
         )
         self.max_concurrent_trades = _get_int(
             rm_settings,
@@ -819,14 +1229,65 @@ class RiskManager:
         await self.initialize_balance()
         logger.info(f"Async initialization complete for user_id: {self.user_id}.")
 
+    async def _initialize_paper_balance(self) -> None:
+        """Start-up for a keyless PAPER account (no live executor).
+
+        The paper wallet's balance is the account's balance, the paper
+        counters are the account's counters and the PAPER gate is the
+        account's gate. The live start-up machinery is NOT run here: it
+        exists to install the LIVE opening balance and to re-baseline the
+        LIVE day, and neither has anything to do with paper money.
+        """
+        success_fetch = await self.update_balance(mode="paper")
+        if not success_fetch:
+            logger.error(
+                "Failed to initialize the PAPER balance. Paper trading is disabled."
+            )
+            self._paper_is_trading_allowed = False
+            self._paper_global_gate_disable_reason = (
+                "paper balance could not be fetched at start-up — "
+                "paper trading disabled"
+            )
+            # The operator-facing reason too. The LIVE start-up path publishes
+            # its equivalent (`_trading_disabled_reason =
+            # _global_gate_disable_reason`), and before the paper/live split
+            # this same branch served BOTH kinds of account, so a keyless
+            # paper account used to get a reason. Without this line the gate
+            # would be closed with no explanation at all, because the live
+            # sandbox of a keyless account is never consulted.
+            self._trading_disabled_reason = self._paper_global_gate_disable_reason
+            return
+        self._check_and_reset_paper_daily_stats()
+        self._anchor_paper_start_of_day_base(self.paper_stats.current_balance)
+        # A successful start-up read re-opens the PAPER gate, exactly as the
+        # live start-up re-opens the LIVE gate (see `initialize_balance`): the
+        # gate must not stay closed because of a failure that has since
+        # healed. The limit check below closes it again if a limit really is
+        # breached.
+        if not self._emergency_stop_active and not self._guard_state_is_unknown():
+            self._paper_is_trading_allowed = True
+            self._paper_global_gate_disable_reason = None
+            self._paper_last_disable_reason = None
+        self._check_risk_limits(mode="paper")
+
     async def initialize_balance(self):
         logger.info("Initializing balance for RiskManager...")
+        # A keyless PAPER account has no live executor (bot_runner.py:563
+        # passes `executor=None, paper_executor=paper_executor`), so the
+        # paper executor IS its account. Its balance, its counters and its
+        # gate belong to the PAPER sandbox: the LIVE start-up machinery
+        # below installs the LIVE opening balance and re-baselines the LIVE
+        # day, and running it against paper money would put the paper
+        # wallet's balance into the live sandbox's base.
+        if self.executor is None:
+            await self._initialize_paper_balance()
+            return
         # BEFORE the first balance read: whether this account has EVER traded
         # decides whether the balance we are about to read may be installed as
         # today's OPENING balance. Resolving it after the read would be too
         # late -- the balance may already have been captured.
         await self._resolve_has_traded_before()
-        success_fetch = await self.update_balance()
+        success_fetch = await self.update_balance(mode="live")
 
         if success_fetch and self.stats.current_balance > 0:
             # The logic for resetting daily statistics remains the same, as it does not depend on the user
@@ -849,8 +1310,12 @@ class RiskManager:
             )
             # A LOST state is unknown in exactly the same way an unreadable
             # one is: the counters are not zero, they are UNKNOWN. They must
-            # not be re-baselined, and the gate must not be re-opened.
+            # not be re-baselined, and the gate must not be re-opened. A state
+            # whose SCOPE could not be read is unknown in the same way too.
             guard_state_lost = bool(getattr(self, "_guard_state_lost", False))
+            guard_state_scope_unknown = bool(
+                getattr(self, "_guard_state_scope_unknown", False)
+            )
 
             # The opening balance is re-derived on its OWN condition: it must
             # belong to the day we are initializing FOR. It is deliberately NOT
@@ -917,6 +1382,7 @@ class RiskManager:
                 guard_state_unverifiable
                 or guard_state_restored_today
                 or guard_state_lost
+                or guard_state_scope_unknown
             ):
                 # The trading-guard state was restored from Redis on this very
                 # start, OR it could not be read at all. Re-baselining the
@@ -996,9 +1462,20 @@ class RiskManager:
                 "[InitializeBalance] Trading disabled: failed to fetch balance."
             )
 
-    async def update_balance(self) -> bool:
-        """Updates the current USDT balance from the executor (thread-safe)."""
+    async def update_balance(self, mode: Optional[str] = None) -> bool:
+        """Updates the current USDT balance from the executor (thread-safe).
+
+        `mode` says which sandbox the balance belongs to. It defaults to
+        the sandbox of the BALANCE SOURCE: a keyless PAPER account has no
+        live executor, so the paper executor IS its account and its balance
+        belongs to the paper sandbox. A dual-mode account has a live
+        executor, so its balance is the LIVE balance.
+        """
         log_prefix = "[RiskManager:UpdateBalance]"
+        if mode is None:
+            mode = "live" if self.executor is not None else "paper"
+        mode = self._normalize_mode(mode)
+        stats = self._mode_stats(mode)
         async with self._balance_lock:
             try:
                 # A paper-only account (no API key) is constructed with
@@ -1017,11 +1494,19 @@ class RiskManager:
                 #
                 # The paper executor is the real balance source for those
                 # accounts; it was being passed in and then ignored.
-                source = self.executor if self.executor is not None else self.paper_executor
+                #
+                # The source follows the SANDBOX: the live sandbox's balance
+                # comes from the live executor and the paper sandbox's from
+                # the paper executor. With the default mode this is exactly
+                # the old rule -- a keyless paper account has no live
+                # executor, so its mode is "paper" and the paper executor is
+                # its account.
+                source = self.executor if mode == "live" else self.paper_executor
                 if source is None:
                     logger.error(
-                        f"{log_prefix} No live executor and no paper_executor available "
-                        f"for user_id={self.user_id}; cannot fetch balance."
+                        f"{log_prefix} No {'live' if mode == 'live' else 'paper'} "
+                        f"executor available for user_id={self.user_id}; cannot "
+                        f"fetch balance."
                     )
                     return False
 
@@ -1058,12 +1543,12 @@ class RiskManager:
                     # Check for abnormally low balance if the previous one was significantly higher
                     # Suppose the balance should not drop by more than 90% in one call if it was not close to zero
                     if (
-                        self.stats.current_balance > 10
-                        and current_total_usdt < self.stats.current_balance * 0.1
+                        stats.current_balance > 10
+                        and current_total_usdt < stats.current_balance * 0.1
                         and current_total_usdt < self.min_balance_threshold / 2
                     ):
                         logger.warning(
-                            f"{log_prefix} Detected anomalously low new balance (${current_total_usdt:.2f}) compared to previous (${self.stats.current_balance:.2f}). "
+                            f"{log_prefix} Detected anomalously low new balance (${current_total_usdt:.2f}) compared to previous (${stats.current_balance:.2f}). "
                             f"This might be a temporary API issue. NOT UPDATING BALANCE THIS TIME."
                         )
                         # THE GUARD IS NOT RELAXED -- the read is still refused.
@@ -1076,34 +1561,64 @@ class RiskManager:
                         # drawdown check fails CLOSED until a credible balance
                         # is read. The latch clears itself on the next
                         # credible read.
-                        self._balance_read_rejected = True
+                        # The flag records that THIS sandbox's balance is
+                        # not one the server trusts, and THAT sandbox's
+                        # drawdown is measured against it. A PAPER read must
+                        # never make the LIVE gate fail closed -- a paper
+                        # wallet's bad read says nothing about the live
+                        # account's money.
+                        _, _, _, rejected_attr = self._peak_state_attrs(mode)
+                        setattr(self, rejected_attr, True)
                         # Retry logic can be added here or the update can simply be skipped
                         return False  # Return False to signal a possible data issue
 
-                    # This read was accepted, so the balance is credible again.
-                    self._balance_read_rejected = False
+                    # This read was accepted, so THIS sandbox's balance is
+                    # credible again. For the same reason as above, each
+                    # sandbox's flag is its OWN: a credible PAPER read must
+                    # not re-open a LIVE gate that a refused LIVE read
+                    # closed, and a credible LIVE read must not re-open a
+                    # PAPER gate that a refused PAPER read closed.
+                    _, _, _, rejected_attr = self._peak_state_attrs(mode)
+                    setattr(self, rejected_attr, False)
 
                     if (
-                        abs(current_total_usdt - self.stats.current_balance) > 1e-9
+                        abs(current_total_usdt - stats.current_balance) > 1e-9
                     ):  # 1e-9 for float comparison
                         logger.info(
-                            f"{log_prefix} Balance updated: Previous=${self.stats.current_balance:.2f}, New=${current_total_usdt:.2f} (Free: {free_bal:.2f}, Locked: {locked_bal:.2f})"
+                            f"{log_prefix} Balance updated: Previous=${stats.current_balance:.2f}, New=${current_total_usdt:.2f} (Free: {free_bal:.2f}, Locked: {locked_bal:.2f})"
                         )
-                        self.stats.current_balance = current_total_usdt
-                        # The balance now reflects the day's realised PnL as it
-                        # stands, so that is what the PnL baseline is.
-                        self._set_balance_pnl_baseline()
+                        stats.current_balance = current_total_usdt
+                        if mode == "paper":
+                            # The paper sandbox's own opening balance: the
+                            # first balance observed for the day IS the
+                            # paper wallet's opening balance (upstream
+                            # anchors it the same way, upstream
+                            # `bot_module/risk_manager.py:1698`).
+                            self._paper_balance_known = True
+                            self._anchor_paper_start_of_day_base(current_total_usdt)
+                        # The balance now reflects the day's realised PnL as
+                        # it stands, so that is what the PnL baseline is --
+                        # for THIS sandbox. The paper wallet's realised PnL
+                        # is not the live wallet's, so each sandbox keeps its
+                        # own baseline.
+                        self._set_balance_pnl_baseline(mode=mode)
                     else:
                         logger.debug(
-                            f"{log_prefix} Balance unchanged: ${self.stats.current_balance:.2f}"
+                            f"{log_prefix} Balance unchanged: ${stats.current_balance:.2f}"
                         )
 
                     # A balance the server has just read is the only evidence it
-                    # has about the account's high-water mark -- and an
+                    # has about THAT sandbox's high-water mark -- and an
                     # UNCHANGED balance is still an observation of it. The peak
                     # only ever rises, so observing it again can never lower
                     # the limit.
-                    self._observe_balance_for_peak(current_total_usdt)
+                    #
+                    # The high-water mark belongs to the sandbox the balance
+                    # came from. A PAPER balance is a different wallet, and
+                    # folding it into the live peak would let paper money
+                    # move the live drawdown limit -- the very thing this
+                    # branch exists to prevent.
+                    self._observe_balance_for_peak(current_total_usdt, mode=mode)
 
                     # A successful balance read is the only trustworthy evidence
                     # available about whether the global gate should be open, so
@@ -1171,12 +1686,15 @@ class RiskManager:
                     # timer cannot clear a counter inside the same day. The
                     # emergency-stop latch is still checked before the gate is
                     # re-opened.
-                    self._check_and_reset_daily_stats()
-                    self._check_risk_limits()
+                    if mode == "paper":
+                        self._check_and_reset_paper_daily_stats()
+                    else:
+                        self._check_and_reset_daily_stats()
+                    self._check_risk_limits_for_mode(mode)
                     return True
                 else:
                     logger.warning(
-                        f"{log_prefix} USDT balance data not found in account info from executor. Current known balance: ${self.stats.current_balance:.2f}"
+                        f"{log_prefix} USDT balance data not found in account info from executor. Current known balance: ${stats.current_balance:.2f}"
                     )
                     # If there is no USDT but there are other assets, this could also be a problem for a USDT bot.
                     # If self.stats.current_balance is already 0 or very small, then this might be normal.
@@ -1286,9 +1804,7 @@ class RiskManager:
             self._account_history_resolved = True
         else:
             self._account_has_traded_before = await self._has_traded_before()
-            self._account_history_resolved = (
-                self._account_has_traded_before is not None
-            )
+            self._account_history_resolved = self._account_has_traded_before is not None
         logger.info(
             "[RiskGuard] History check for user_id=%s: has_traded_before=%s "
             "(None = unknown).",
@@ -1338,8 +1854,7 @@ class RiskManager:
             # a fact about the start of the day; it is never restated.
             return False
         logger.info(
-            "[RiskGuard] Capturing the opening balance $%.8f for UTC day %s "
-            "(%s).",
+            "[RiskGuard] Capturing the opening balance $%.8f for UTC day %s " "(%s).",
             self.stats.current_balance,
             day_str,
             "the account has never traded, so its balance cannot contain "
@@ -1444,6 +1959,39 @@ class RiskManager:
                         "today's PnL and loss streak are still unknown. "
                         "Trading stays DISABLED until the day rolls over."
                     )
+            # A state whose SCOPE could not be read heals at the UTC rollover
+            # too, and for the same reason: a new UTC day starts the day's PnL
+            # and the loss streak at zero by definition, so whatever the
+            # unreadable payload held belonged to the day that just ended. It
+            # cannot heal on a re-read, because re-reading finds the same
+            # unreadable stamp.
+            if getattr(self, "_guard_state_scope_unknown", False):
+                # Only a STRICTLY LATER day releases this latch, for the same
+                # reason as the lost-state latch above: a fresh process sees
+                # its first day-key change on the very same start that set it.
+                if getattr(self, "_guard_state_scope_unknown_day_str", "") and (
+                    current_day_str_utc > self._guard_state_scope_unknown_day_str
+                ):
+                    logger.critical(
+                        "[RiskGuard] The persisted trading-guard state's day stamp "
+                        f"could not be read on UTC day "
+                        f"{self._guard_state_scope_unknown_day_str}; the rollover "
+                        f"to {current_day_str_utc} resets the day's PnL and the "
+                        "loss streak to zero, so the account is no longer trading "
+                        "on unknown numbers. Trading is released for the new day."
+                    )
+                    self._guard_state_scope_unknown = False
+                    self._guard_state_scope_unknown_day_str = ""
+                    self._guard_state_scope_unknown_scope = ""
+                else:
+                    logger.critical(
+                        "[RiskGuard] The persisted trading-guard state's day stamp "
+                        "could not be read and UTC day "
+                        f"{current_day_str_utc} is not past "
+                        f"{self._guard_state_scope_unknown_day_str or 'unknown'}, "
+                        "so today's PnL and loss streak are still unknown. "
+                        "Trading stays DISABLED until the day rolls over."
+                    )
             self.stats.today_pnl = 0.0
             # The day's PnL restarts at zero, so the balance now reflects zero
             # of today's realised PnL. The HIGH-WATER MARK is NOT reset here:
@@ -1489,7 +2037,9 @@ class RiskManager:
         # base that already belongs to today.
         self._capture_first_boot_base(current_day_str_utc)
 
-    async def apply_funding_pnl(self, symbol: str, funding_pnl: float) -> bool:
+    async def apply_funding_pnl(
+        self, symbol: str, funding_pnl: float, mode: Optional[str] = None
+    ) -> bool:
         """Record a FUNDING charge against the day's PnL.
 
         Funding is a CARRY COST, not a trade: the paper wallet is debited (or
@@ -1504,19 +2054,41 @@ class RiskManager:
         payment is not a losing trade, and counting it could falsely trip the
         max-consecutive-losses guard) and it is not a trade timestamp.
 
+        `mode` says which sandbox the funding belongs to. A PAPER funding
+        charge must land in the PAPER counters: it is simulated money, and
+        the LIVE daily-loss gate is what stands between the account and
+        real money. The paper executor -- the only caller -- therefore says
+        `mode="paper"` explicitly, because the money it charges was debited
+        from the PAPER wallet whether or not the account also has a live
+        executor.
+
+        With no explicit mode the sandbox follows the ACCOUNT, exactly as
+        `update_balance()` does: a keyless PAPER account has no live
+        executor, so the paper executor IS its account and its funding
+        belongs to the paper sandbox -- which is also the sandbox the
+        controller publishes for it.
+
         Returns True when the funding IS in today's PnL. The caller needs
         that distinction: the close subtracts the funding that was ALREADY
         reported, so a funding that never reached this counter must NOT be
         subtracted -- otherwise the close would report it a second time, or
         the gate would never hear about it at all.
         """
-        self._check_and_reset_daily_stats()
+        if mode is None:
+            mode = "live" if self.executor is not None else "paper"
+        mode = self._normalize_mode(mode)
+        stats = self._mode_stats(mode)
+        if mode == "paper":
+            self._check_and_reset_paper_daily_stats()
+        else:
+            self._check_and_reset_daily_stats()
         amount = float(funding_pnl or 0.0)
-        self.stats.today_pnl += amount
+        stats.today_pnl += amount
         logger.info(
             f"[RiskManager:Funding] Funding for {symbol}: "
             f"{amount:+.8f} USDT. "
-            f"GlobalTodayPnL={self.stats.today_pnl:.8f} "
+            f"GlobalTodayPnL={stats.today_pnl:.8f} "
+            f"(mode: {mode}) "
             f"(the consecutive-loss streak is unchanged: a funding payment is "
             f"a carry cost, not a losing trade)."
         )
@@ -1524,7 +2096,7 @@ class RiskManager:
         # a failure would reach the caller as "not applied", and the close
         # would then report the same funding a second time.
         try:
-            self._check_risk_limits()
+            self._check_risk_limits_for_mode(mode)
         except Exception as exc:
             logger.error(
                 f"[RiskManager:Funding] The limit check failed after the "
@@ -1542,19 +2114,38 @@ class RiskManager:
         return True
 
     async def update_trade_result(
-        self, symbol: str, pnl: float, exit_reason: Optional[str] = None
+        self,
+        symbol: str,
+        pnl: float,
+        exit_reason: Optional[str] = None,
+        mode: str = "live",
     ):
-        self._check_and_reset_daily_stats()
-        self.stats.today_pnl += pnl
-        self.stats.last_trade_time = time.time()
-        if pnl <= 0:
-            self.stats.consecutive_losses += 1
+        """Book a CLOSED trade into the sandbox that owns it.
+
+        `mode` says which sandbox the trade belongs to: "live" (real money)
+        or "paper" (simulated). Upstream `risk_manager.py:915`-`:936` takes
+        the same argument, for the same reason: a PAPER loss must not be
+        added to the LIVE counters, because those counters are what
+        `_check_risk_limits()` uses to decide whether REAL money may trade.
+        The default is "live" so an existing caller that forgets the argument
+        cannot accidentally book a loss into the paper sandbox.
+        """
+        mode = self._normalize_mode(mode)
+        stats = self._mode_stats(mode)
+        if mode == "paper":
+            self._check_and_reset_paper_daily_stats()
         else:
-            self.stats.consecutive_losses = 0
+            self._check_and_reset_daily_stats()
+        stats.today_pnl += pnl
+        stats.last_trade_time = time.time()
+        if pnl <= 0:
+            stats.consecutive_losses += 1
+        else:
+            stats.consecutive_losses = 0
         logger.info(
-            f"Global PnL Updated: PnL={pnl:.2f}, GlobalTodayPnL={self.stats.today_pnl:.2f}, GlobalConsecLosses={self.stats.consecutive_losses}"
+            f"Global PnL Updated: PnL={pnl:.2f}, GlobalTodayPnL={stats.today_pnl:.2f}, GlobalConsecLosses={stats.consecutive_losses} (mode: {mode})"
         )
-        self._check_risk_limits()
+        self._check_risk_limits_for_mode(mode)
 
         # Persist the guard state NOW, not on the controller's next periodic
         # tick: the streak is what closes the gate, so a process that dies
@@ -1570,21 +2161,28 @@ class RiskManager:
             exit_reason is not None and "stop" in exit_reason.lower() and not is_be
         )
 
+        # THE STOP HISTORY BELONGS TO THE SANDBOX THAT TOOK THE LOSS.
+        # The auto-blacklist rules count these stops and write the symbol
+        # into the account-level blacklist, which the LIVE gate consults:
+        # one shared history let a PAPER stop-loss blacklist a real-money
+        # symbol, and a PAPER win ERASE the live stop history (which
+        # resets the live auto-blacklist counter with simulated money).
+        stop_timestamps = self._stop_timestamps_for(mode)
         if is_stop_loss:
             # Adding stop timestamp
-            if symbol not in self._symbol_stop_timestamps:
-                self._symbol_stop_timestamps[symbol] = []
-            self._symbol_stop_timestamps[symbol].append(time.time())
+            if symbol not in stop_timestamps:
+                stop_timestamps[symbol] = []
+            stop_timestamps[symbol].append(time.time())
             logger.debug(
-                f"[AutoBlacklist:{symbol}] Stop recorded. Total stops: {len(self._symbol_stop_timestamps[symbol])}"
+                f"[AutoBlacklist:{symbol}] Stop recorded. Total stops: {len(stop_timestamps[symbol])}"
             )
         elif pnl > 0 or is_be:
             # On a PROFITABLE trade or BE (break-even), clear the stop history
-            if symbol in self._symbol_stop_timestamps:
-                self._symbol_stop_timestamps[symbol] = []
+            if symbol in stop_timestamps:
+                stop_timestamps[symbol] = []
 
         # Checking auto-blocking rules
-        await self._check_and_apply_auto_blacklist_rules(symbol)
+        await self._check_and_apply_auto_blacklist_rules(symbol, mode=mode)
 
     async def update_symbol_strategy_performance(
         self,
@@ -1815,6 +2413,16 @@ class RiskManager:
         self._emergency_stop_reason = reason
         self._emergency_stop_operator_initiated = bool(operator_initiated)
         self._is_trading_allowed = False
+        # THE KILL SWITCH IS AN ACCOUNT-LEVEL CONTROL, NOT A PER-SANDBOX
+        # LIMIT, so it closes BOTH gates.
+        #
+        # It has to: a controller with no api key is a PAPER-ONLY controller
+        # and publishes the PAPER gate, so leaving the paper gate open would
+        # report "trading allowed" on the dashboard while the operator's stop
+        # was engaged -- and the paper strategies would keep running. The
+        # live path is the same: `is_symbol_trading_allowed()` checks the
+        # latch before the mode's gate, for every mode.
+        self._paper_is_trading_allowed = False
         self._trading_disabled_reason = f"EMERGENCY STOP active ({reason})"
         logger.critical(f"EMERGENCY STOP engaged: {reason}")
 
@@ -1842,12 +2450,23 @@ class RiskManager:
         # still in force"). This keeps the operator path consistent for the
         # state this change introduced, and leaves its documented behaviour
         # for everything else untouched.
-        if (
+        guard_state_holds_the_gate = (
             self._guard_state_restored
             or self._guard_state_unverified
             or getattr(self, "_guard_state_lost", False)
-        ):
+            or getattr(self, "_guard_state_scope_unknown", False)
+        )
+        if guard_state_holds_the_gate:
             self._check_risk_limits()
+            # THE PAPER GATE IS RELEASED ON THE SAME CONDITION, AND IN THE
+            # SAME WAY: re-judged against the paper counters, which close it
+            # again if a paper limit really is in force, and which fail CLOSED
+            # if the guard state is unknown for the paper counters too.
+            self._check_risk_limits(mode="paper")
+        else:
+            # The kill switch is account-level, so it closed the PAPER gate as
+            # well; the operator's clear releases it.
+            self._paper_is_trading_allowed = True
         logger.warning("EMERGENCY STOP cleared. New entries re-enabled.")
 
     def release_unverified_emergency_stop(self) -> bool:
@@ -1905,6 +2524,11 @@ class RiskManager:
 
         Returns None only if the gate has never refused anything since this
         RiskManager was created.
+
+        The reason is the ACCOUNT's reason, whichever sandbox that account
+        trades: a keyless PAPER account's gate is the PAPER gate (see
+        `published_account_snapshot()`), and the paths that close it publish
+        their reason here too.
         """
         return getattr(self, "_trading_disabled_reason", None)
 
@@ -1912,12 +2536,23 @@ class RiskManager:
         """Record why the gate is refusing, for the log line and the API."""
         self._trading_disabled_reason = reason
 
-    async def is_symbol_trading_allowed(self, symbol: str) -> bool:
+    async def is_symbol_trading_allowed(self, symbol: str, mode: str = "live") -> bool:
         """
         Checks if trading is allowed for the given symbol.
         Includes checking the global flag and the user's blacklist.
         The blacklist is checked "on the fly" from the DB - changes are applied without a restart.
+
+        `mode` says which sandbox the question is about: "live" (real
+        money) or "paper" (simulated). The GLOBAL risk gate is per sandbox
+        (upstream `bot_module/risk_manager.py:1163` takes the same
+        argument), so a PAPER loss cannot refuse a LIVE symbol and a LIVE
+        loss cannot refuse a PAPER symbol.
+
+        The emergency stop and the blacklist stay SHARED: they are operator
+        and account level controls, not per-sandbox limits, and upstream
+        keeps them shared too.
         """
+        mode = self._normalize_mode(mode)
         # 0. Emergency stop latch. Checked before everything else so that no
         # other path can re-enable trading while an emergency stop is active.
         if self._emergency_stop_active:
@@ -1930,13 +2565,18 @@ class RiskManager:
             )
             return False
 
-        # 1. Check global flag (drawdown, consecutive losses, etc.)
-        if not self._is_trading_allowed:
+        # 1. Check the global flag for THIS sandbox (drawdown, consecutive
+        #    losses, etc.). The two sandboxes have separate counters,
+        #    separate thresholds and separate gates, so this is where the
+        #    paper/live isolation is enforced.
+        if not self._is_mode_trading_allowed(mode):
             self._set_trading_disabled_reason(
-                getattr(self, "_global_gate_disable_reason", None)
+                self._mode_disable_reason(mode)
                 or "trading disabled globally by the risk manager (reason not recorded)"
             )
-            logger.debug(f"[Blacklist:{symbol}] Trading globally disabled")
+            logger.debug(
+                f"[Blacklist:{symbol}] Trading globally disabled (mode: {mode})"
+            )
             return False
 
         # 2. Checking the blacklist (on-the-fly from the DB)
@@ -1965,6 +2605,18 @@ class RiskManager:
                             coin_symbol = coin.get("symbol", "").upper()
 
                             if coin_symbol == symbol.upper():
+                                # An entry that CARRIES a mode applies to
+                                # that sandbox only: an entry written for
+                                # the PAPER sandbox must not block a LIVE
+                                # signal, or a paper loss would close the
+                                # live gate. A mode-LESS entry (legacy, or
+                                # added by the operator through the API)
+                                # applies to BOTH sandboxes, exactly as it
+                                # always did.
+                                if not self._blacklist_entry_applies_to_mode(
+                                    coin, mode
+                                ):
+                                    continue
                                 until_val = (
                                     coin.get("until")
                                     if isinstance(coin, dict)
@@ -2107,9 +2759,17 @@ class RiskManager:
                         f"[AutoBlacklist:{symbol}] Failed to send notification: {e}"
                     )
 
-    async def _check_and_apply_auto_blacklist_rules(self, symbol: str):
-        """Checks auto-blacklist rules and adds the symbol to the blacklist when triggered."""
-        stop_timestamps = self._symbol_stop_timestamps.get(symbol, [])
+    async def _check_and_apply_auto_blacklist_rules(self, symbol: str, mode: str = "live"):
+        """Checks auto-blacklist rules and adds the symbol to the blacklist when triggered.
+
+        `mode` says WHICH sandbox's stop history is counted: the LIVE one
+        or the PAPER one. The rule writes into the account-level
+        blacklist, which the LIVE gate consults, so a PAPER stop must
+        never count towards the LIVE account's auto-blacklist -- a
+        simulated loss could otherwise blacklist a real-money symbol.
+        """
+        stop_map = self._stop_timestamps_for(mode)
+        stop_timestamps = stop_map.get(symbol, [])
         if not stop_timestamps:
             return  # No stops - nothing to check
 
@@ -2166,10 +2826,14 @@ class RiskManager:
                         f"[AutoBlacklist:{symbol}] Rule triggered! {stops_count} stops within {within_period or 'all time'} >= {rule_consecutive_stops}. Duration: {duration}"
                     )
                     await self._auto_add_to_blacklist(
-                        symbol, duration, stops_count, within_period=within_period
+                        symbol,
+                        duration,
+                        stops_count,
+                        within_period=within_period,
+                        mode=mode,
                     )
                     # After adding, clear the stop history
-                    self._symbol_stop_timestamps[symbol] = []
+                    stop_map[symbol] = []
                     break  # Applying only the first triggered rule
         except Exception as e:
             logger.error(
@@ -2183,8 +2847,16 @@ class RiskManager:
         duration: str,
         consecutive_stops: int,
         within_period: Optional[str] = None,
+        mode: str = "live",
     ):
-        """Adds a symbol to the blacklist automatically based on a rule."""
+        """Adds a symbol to the blacklist automatically based on a rule.
+
+        `mode` says WHICH sandbox's stops triggered the rule. The blacklist
+        is ONE account-level list, so the entry needs a mode dimension:
+        an entry written for the PAPER sandbox must not block a LIVE
+        signal, or a paper loss would close the live gate.
+        """
+        mode = self._normalize_mode(mode)
         if not self.db_session or not crud or not self.user_id:
             logger.error(
                 f"[AutoBlacklist:{symbol}] Cannot add to blacklist: DB session or user_id missing"
@@ -2230,11 +2902,36 @@ class RiskManager:
             blacklist_data = ensure_dict(rm_settings.get("blacklist", {}))
             coins = blacklist_data.get("coins", [])
 
-            # Checking if the symbol has already been added
+            # WHICH SANDBOX THIS ENTRY IS FOR.
+            #
+            # A LIVE auto-blacklist entry keeps NO mode key, exactly as it
+            # has always been written: a mode-less entry applies to BOTH
+            # sandboxes, so the LIVE behaviour -- and the shape of the
+            # record the operator sees -- does not change.
+            #
+            # A PAPER auto-blacklist entry carries `"mode": "paper"`, so it
+            # applies to the PAPER sandbox ONLY.
+            entry_mode = "paper" if mode == "paper" else None
+
+            # Checking if the symbol has already been added FOR THIS SANDBOX.
+            #
+            # An existing entry is only REPLACED when its scope is the SAME
+            # scope. Replacing a mode-less (legacy or operator-added) entry
+            # with a PAPER-scoped one would stop it from blocking LIVE --
+            # a weakening of a live control -- and replacing a PAPER-scoped
+            # entry with a LIVE one would stop it from blocking PAPER. So a
+            # differently-scoped entry is left ALONE and the new one is
+            # APPENDED beside it.
             existing_idx = None
             for i, coin in enumerate(coins):
                 coin = ensure_dict(coin)
-                if coin.get("symbol", "").upper() == symbol.upper():
+                if coin.get("symbol", "").upper() != symbol.upper():
+                    continue
+                coin_mode = coin.get("mode")
+                coin_scope = (
+                    str(coin_mode).strip().lower() if coin_mode else None
+                )
+                if coin_scope == entry_mode:
                     existing_idx = i
                     break
 
@@ -2244,6 +2941,8 @@ class RiskManager:
                 "reason": reason,
                 "addedAt": now.isoformat(),
             }
+            if entry_mode:
+                new_coin["mode"] = entry_mode
 
             if existing_idx is not None:
                 coins[existing_idx] = new_coin
@@ -2252,7 +2951,10 @@ class RiskManager:
                 )
             else:
                 coins.append(new_coin)
-                logger.info(f"[AutoBlacklist:{symbol}] Added new blacklist entry")
+                logger.info(
+                    f"[AutoBlacklist:{symbol}] Added new blacklist entry"
+                    + (f" (mode: {entry_mode})" if entry_mode else "")
+                )
 
             # Save back
             blacklist_data["coins"] = coins
@@ -2320,6 +3022,25 @@ class RiskManager:
             return stamp == self._current_utc_day_str()
         return True
 
+    def _check_risk_limits_for_mode(self, mode: str) -> None:
+        """Evaluate the limits of ONE sandbox, without changing the LIVE call.
+
+        `_check_risk_limits()` gained the `mode` argument with the paper/live
+        split, but the LIVE branch is still exactly the code that was there
+        before, and it is still called with NO argument. That is deliberate:
+        `_check_risk_limits()`'s default mode IS "live", so the call is
+        behaviourally identical, and a caller that overrides the method with
+        the old zero-argument signature (a test double, a subclass) keeps
+        working. Passing `mode="live"` to such an override raises TypeError,
+        and because the limit check is wrapped in a broad `except`, that
+        failure is swallowed and reported as "the balance could not be
+        fetched" -- which is how a limit check silently stops running.
+        """
+        if self._normalize_mode(mode) == "paper":
+            self._check_risk_limits(mode="paper")
+        else:
+            self._check_risk_limits()
+
     # ------------------------------------------------------------------
     # THE HIGH-WATER MARK (the peak) for the peak-to-trough drawdown
     # ------------------------------------------------------------------
@@ -2344,30 +3065,47 @@ class RiskManager:
     # A peak that is UNKNOWN is never read as "no drawdown": it fails CLOSED,
     # exactly like the unknown opening balance.
 
-    def _set_balance_pnl_baseline(self) -> None:
-        """Remember the `today_pnl` that `stats.current_balance` reflects.
+    def _set_balance_pnl_baseline(self, mode: str = "live") -> None:
+        """Remember the `today_pnl` that THIS sandbox's balance reflects.
 
         Set at every point where the balance and the day's PnL are known to
         describe the same instant: a balance read, a restore of the persisted
         state, and the UTC rollover (where the day's PnL restarts at zero).
-        """
-        self._balance_pnl_baseline = float(getattr(self.stats, "today_pnl", 0.0) or 0.0)
 
-    def _known_peak_candidates(self, observed_balance: float) -> float:
+        The baseline belongs to ONE sandbox: the paper wallet's realised PnL
+        is not the live wallet's, so the two baselines are separate state.
+        """
+        stats = self._mode_stats(mode)
+        _, _, baseline_attr, _ = self._peak_state_attrs(mode)
+        setattr(
+            self,
+            baseline_attr,
+            float(getattr(stats, "today_pnl", 0.0) or 0.0),
+        )
+
+    def _known_peak_candidates(
+        self, observed_balance: float, mode: str = "live"
+    ) -> float:
         """The highest balance the server can VOUCH for right now.
 
         That is the balance that was just read, plus today's opening balance
         when it is usable -- it is a real balance the server observed, and a
         higher high-water mark is a tighter limit, never a looser one.
+
+        The opening balance is the one of THIS sandbox: the paper wallet's
+        opening balance is not evidence about the live account's money.
         """
         candidates = [float(observed_balance)]
-        base = float(getattr(self.stats, "start_of_day_balance", 0.0) or 0.0)
-        stamp = getattr(self.stats, "start_of_day_day_str", None)
+        stats = self._mode_stats(mode)
+        base = float(getattr(stats, "start_of_day_balance", 0.0) or 0.0)
+        stamp = getattr(stats, "start_of_day_day_str", None)
         if base > 1e-9 and stamp and stamp == self._current_utc_day_str():
             candidates.append(base)
         return max(candidates)
 
-    def _expire_stale_peak(self, replacement: Optional[float] = None) -> bool:
+    def _expire_stale_peak(
+        self, replacement: Optional[float] = None, mode: str = "live"
+    ) -> bool:
         """Expire a high-water mark that has outlived the window.
 
         The peak expires `DRAWDOWN_PEAK_WINDOW_DAYS` (7 days, the owner's
@@ -2380,8 +3118,9 @@ class RiskManager:
         Returns True when a stale peak was expired.
         """
         now = time.time()
-        peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
-        peak_at = float(getattr(self, "_peak_equity_set_at", 0.0) or 0.0)
+        peak_attr, peak_at_attr, _, _ = self._peak_state_attrs(mode)
+        peak = float(getattr(self, peak_attr, 0.0) or 0.0)
+        peak_at = float(getattr(self, peak_at_attr, 0.0) or 0.0)
         if peak <= 1e-9 or peak_at <= 0:
             return False
         age_seconds = now - peak_at
@@ -2395,10 +3134,10 @@ class RiskManager:
             "no longer counted."
         )
         if replacement is None:
-            replacement = self._drawdown_trough_balance()
+            replacement = self._drawdown_trough_balance(mode=mode)
         if replacement is not None and float(replacement) > 1e-9:
-            self._peak_equity = float(replacement)
-            self._peak_equity_set_at = now
+            setattr(self, peak_attr, float(replacement))
+            setattr(self, peak_at_attr, now)
             logger.info(
                 f"[RiskManager:Peak] The high-water mark for the new window is "
                 f"${float(replacement):.2f} (the balance as it stands now)."
@@ -2406,11 +3145,11 @@ class RiskManager:
         else:
             # No credible balance to start the new window from: the peak is
             # UNKNOWN, and an unknown peak fails CLOSED.
-            self._peak_equity = 0.0
-            self._peak_equity_set_at = 0.0
+            setattr(self, peak_attr, 0.0)
+            setattr(self, peak_at_attr, 0.0)
         return True
 
-    def _observe_balance_for_peak(self, balance: float) -> bool:
+    def _observe_balance_for_peak(self, balance: float, mode: str = "live") -> bool:
         """Fold a freshly OBSERVED balance into the high-water mark.
 
         Returns True when the peak changed.
@@ -2419,6 +3158,11 @@ class RiskManager:
         not lower the high-water mark. It is lowered only by the window
         expiry, which is the one moment the account's high-water mark is
         allowed to be forgotten.
+
+        The balance observed is the one of THIS sandbox: a PAPER balance
+        must never raise the LIVE high-water mark, because the peak is the
+        denominator of the drawdown ratio and simulated money would move
+        the live drawdown limit.
         """
         try:
             balance = float(balance)
@@ -2428,46 +3172,50 @@ class RiskManager:
             return False
 
         now = time.time()
-        candidate = self._known_peak_candidates(balance)
+        peak_attr, peak_at_attr, _, _ = self._peak_state_attrs(mode)
+        candidate = self._known_peak_candidates(balance, mode=mode)
         # An expired peak is not a peak: the new window starts here.
-        expired = self._expire_stale_peak(replacement=candidate)
+        expired = self._expire_stale_peak(replacement=candidate, mode=mode)
 
-        peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
+        peak = float(getattr(self, peak_attr, 0.0) or 0.0)
         if peak <= 1e-9:
-            self._peak_equity = candidate
-            self._peak_equity_set_at = now
+            setattr(self, peak_attr, candidate)
+            setattr(self, peak_at_attr, now)
             logger.info(
                 f"[RiskManager:Peak] The account's high-water mark is "
                 f"${candidate:.2f} (it was not known before)."
             )
             return True
         if candidate > peak:
-            self._peak_equity = candidate
-            self._peak_equity_set_at = now
+            setattr(self, peak_attr, candidate)
+            setattr(self, peak_at_attr, now)
             return True
         return expired
 
-    def _usable_peak_equity(self) -> Optional[float]:
+    def _usable_peak_equity(self, mode: str = "live") -> Optional[float]:
         """The account's high-water mark, or None when there is not one.
 
         None means UNKNOWN, and an unknown peak must never be read as a
         zero drawdown.
         """
-        peak = float(getattr(self, "_peak_equity", 0.0) or 0.0)
+        peak_attr, _, _, _ = self._peak_state_attrs(mode)
+        peak = float(getattr(self, peak_attr, 0.0) or 0.0)
         if not math.isfinite(peak) or peak <= 1e-9:
             return None
         return peak
 
-    def _drawdown_trough_balance(self) -> Optional[float]:
+    def _drawdown_trough_balance(self, mode: str = "live") -> Optional[float]:
         """The balance the drawdown is measured DOWN TO.
 
         None when the balance is not a number the server trusts: either no
         balance has been read yet, or the last read was REJECTED as a
         suspected bad API read.
         """
-        if getattr(self, "_balance_read_rejected", False):
+        _, _, baseline_attr, rejected_attr = self._peak_state_attrs(mode)
+        if getattr(self, rejected_attr, False):
             return None
-        balance = float(getattr(self.stats, "current_balance", 0.0) or 0.0)
+        stats = self._mode_stats(mode)
+        balance = float(getattr(stats, "current_balance", 0.0) or 0.0)
         if not math.isfinite(balance) or balance <= 1e-9:
             return None
         # THE BALANCE IS STALE EXACTLY WHEN A TRADE CLOSES.
@@ -2478,15 +3226,31 @@ class RiskManager:
         # closes. Without this the peak-to-trough limit would UNDER-TRIP at
         # precisely the moment the loss is realised, and would only catch up
         # at the next balance read.
-        unreflected = float(getattr(self.stats, "today_pnl", 0.0) or 0.0) - float(
-            getattr(self, "_balance_pnl_baseline", 0.0) or 0.0
+        unreflected = float(getattr(stats, "today_pnl", 0.0) or 0.0) - float(
+            getattr(self, baseline_attr, 0.0) or 0.0
         )
         trough = balance + unreflected
         if not math.isfinite(trough):
             return None
         return trough
 
-    def _check_risk_limits(self):  # Global limits
+    def _check_risk_limits(self, mode: str = "live"):  # Global limits
+        """Evaluate the global risk limits for ONE sandbox.
+
+        `mode` selects the sandbox: "live" (real money) or "paper"
+        (simulated). The two are judged against SEPARATE counters, SEPARATE
+        thresholds and SEPARATE gates, so a PAPER loss can never close the
+        LIVE gate, and a LIVE loss can never close the PAPER gate.
+
+        The LIVE branch below is the code that was here before this argument
+        existed, unchanged: it is not loosened, not tightened and not
+        re-ordered. The PAPER branch delegates to `_check_paper_risk_limits`,
+        which mirrors it against the paper counters.
+        """
+        mode = self._normalize_mode(mode)
+        if mode == "paper":
+            self._check_paper_risk_limits()
+            return
         # A risk limit may only be treated as "within range" when the numbers
         # it is computed from are KNOWN. If the guard state could not be read
         # at start-up then the loss streak and the day's PnL are unknown, so
@@ -2498,6 +3262,10 @@ class RiskManager:
             self._global_gate_disable_reason = RISK_GUARD_UNVERIFIED_REASON
             if not getattr(self, "_emergency_stop_active", False):
                 self._trading_disabled_reason = RISK_GUARD_UNVERIFIED_REASON
+            # The persisted state carries the paper counters too, so it is
+            # unknown for the paper sandbox as well. The PAPER gate is closed
+            # on the same trigger -- this does not touch the live path.
+            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_UNVERIFIED_REASON)
             return
         if getattr(self, "_guard_state_lost", False):
             # The guard state is GONE, not merely unreadable. Today's PnL and
@@ -2509,7 +3277,45 @@ class RiskManager:
             self._global_gate_disable_reason = RISK_GUARD_STATE_LOST_REASON
             if not getattr(self, "_emergency_stop_active", False):
                 self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
+            # The persisted state carries the paper counters too, so it is
+            # lost for the paper sandbox as well. The PAPER gate is closed on
+            # the same trigger -- this does not touch the live path.
+            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_STATE_LOST_REASON)
             return
+        if getattr(self, "_guard_state_scope_unknown", False):
+            # The guard state was READ but its SCOPE could not be: the day
+            # stamp it carries is missing, null or unreadable, so it is not
+            # known whether it holds today's numbers or yesterday's. Today's
+            # PnL and the loss streak cannot be shown to be within limits, so
+            # the gate stays closed. This heals itself at the UTC day rollover
+            # (see `_check_and_reset_daily_stats`), which is the one moment
+            # the day's counters restart at zero by definition.
+            #
+            # SCOPE-AWARE. A latch whose scope is "paper" says NOTHING about
+            # the LIVE sandbox's numbers -- those were read -- so it does NOT
+            # close the LIVE gate: halting REAL trading because a PAPER
+            # payload's day stamp was unreadable is the cross-sandbox leak
+            # this branch exists to close. The LIVE limits are still
+            # evaluated below, exactly as they are on any other evaluation.
+            scope = getattr(self, "_guard_state_scope_unknown_scope", "")
+            if self._guard_state_scope_unknown_affects_live(scope):
+                self._is_trading_allowed = False
+                self._global_gate_disable_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+                if not getattr(self, "_emergency_stop_active", False):
+                    self._trading_disabled_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+                # The persisted state carries the paper counters too, so its scope
+                # is unknown for the paper sandbox as well. The PAPER gate is
+                # closed on the same trigger -- this does not touch the live path.
+                self._close_paper_gate_for_unknown_guard_state(
+                    RISK_GUARD_SCOPE_UNKNOWN_REASON
+                )
+                return
+            # A PAPER-scoped fault: the PAPER gate closes, and the LIVE
+            # limits are evaluated below against the LIVE counters, which
+            # were read and are known.
+            self._close_paper_gate_for_unknown_guard_state(
+                RISK_GUARD_SCOPE_UNKNOWN_REASON
+            )
         should_be_allowed = True
         disable_reason = ""
         if self.stats.current_balance < self.min_balance_threshold:
@@ -2656,6 +3462,362 @@ class RiskManager:
                 )
                 self._is_trading_allowed = True
 
+    def _close_paper_gate_for_unknown_guard_state(self, reason: str) -> None:
+        """Close the PAPER gate because the persisted guard state is UNKNOWN.
+
+        The persisted guard state carries BOTH sandboxes (the live counters
+        at the top level and the paper counters under the "paper" key), so
+        "the state could not be read" or "the state was lost" is a fact
+        about the PAPER counters too. A paper-only account has no live
+        counters to protect, so without this its paper gate would stay OPEN
+        while the persisted state was unknown -- a weakening of the
+        fail-closed behaviour this fork relies on.
+        """
+        if self._paper_is_trading_allowed:
+            logger.critical(f"Paper trading disabled! Reason: {reason}")
+        self._paper_is_trading_allowed = False
+        self._paper_global_gate_disable_reason = reason
+
+    def _paper_daily_loss_base_is_usable(self) -> bool:
+        """Can the paper sandbox's daily-loss / drawdown ratios be computed?
+
+        The paper sandbox has its OWN opening balance, anchored on the paper
+        wallet's balance (see `_anchor_paper_start_of_day_base`). It is
+        stamped with the UTC day it belongs to, exactly like the live base,
+        and the same rules apply: a base of zero cannot be divided by, and a
+        base stamped with a day that is not TODAY measures the day's loss
+        against the wrong denominator.
+        """
+        if self.paper_stats.start_of_day_balance <= 1e-9:
+            return False
+        stamp = self.paper_stats.start_of_day_day_str
+        if stamp:
+            return stamp == self._current_utc_day_str()
+        return True
+
+    def _anchor_paper_start_of_day_base(self, balance: float) -> bool:
+        """Install the PAPER wallet's balance as the paper day's opening balance.
+
+        The paper sandbox's own base, written once per UTC day and never
+        restated from a mid-session balance. It is anchored when the day's
+        balance is first observed; from then on the day's paper loss is
+        measured against the denominator that was in force when the day
+        started.
+        """
+        amount = float(balance or 0.0)
+        if amount <= 1e-9:
+            return False
+        current_day_str = self._current_utc_day_str()
+        if (
+            self.paper_stats.start_of_day_day_str == current_day_str
+            and self.paper_stats.start_of_day_balance > 1e-9
+        ):
+            return False
+        self.paper_stats.start_of_day_balance = amount
+        self.paper_stats.start_of_day_day_str = current_day_str
+        return True
+
+    def _check_and_reset_paper_daily_stats(self) -> None:
+        """Roll the PAPER sandbox over to the new UTC day.
+
+        Deliberately SEPARATE from `_check_and_reset_daily_stats()`: that
+        function owns the live sandbox's counters, its opening-balance
+        provenance and the lost-state latch, and the paper sandbox must not
+        inherit any of them. A paper day starts at zero paper PnL and a zero
+        paper loss streak, and the paper opening balance is re-anchored from
+        the paper wallet.
+        """
+        _, current_day_str_utc = self._get_current_day_start_info()
+        if self.paper_stats.last_known_day_str == current_day_str_utc:
+            return
+        logger.info(
+            "[RiskManager:PaperDailyReset] New trading day detected (UTC): %s. "
+            "The PAPER sandbox's day counters restart at zero.",
+            current_day_str_utc,
+        )
+        self.paper_stats.today_pnl = 0.0
+        # The day's PnL restarts at zero, so the paper balance now reflects
+        # zero of today's realised PnL. The PAPER high-water mark is NOT
+        # reset here: it is not a day quantity, and clearing it every
+        # midnight would collapse the paper peak-to-trough limit back into
+        # the paper daily-loss limit.
+        self._set_balance_pnl_baseline(mode="paper")
+        self.paper_stats.consecutive_losses = 0
+        self.paper_stats.last_known_day_str = current_day_str_utc
+        # The paper wallet's balance at the rollover IS the day's opening
+        # balance, so the base is dropped and re-anchored from it.
+        self.paper_stats.start_of_day_balance = 0.0
+        self.paper_stats.start_of_day_day_str = ""
+        self._anchor_paper_start_of_day_base(self.paper_stats.current_balance)
+        self._release_paper_scope_unknown_latch_at_rollover(current_day_str_utc)
+        self._release_paper_lost_latch_at_rollover(current_day_str_utc)
+
+    def _release_paper_lost_latch_at_rollover(self, current_day_str_utc) -> None:
+        """Release the LOST latch at the PAPER day rollover -- keyless accounts only.
+
+        THE SAME HOLE, ONE LATCH OVER. The LOST latch ("the persisted guard state
+        VANISHED for an account that has traded before") had ONE release site:
+        the LIVE rollover (`_check_and_reset_daily_stats`). A keyless PAPER
+        account has no live executor, so `initialize_balance` returns before the
+        live start-up machinery and EVERY rollover it ever runs is the PAPER one
+        -- it can never reach that release site.
+
+        Measured on the code before this fix: a keyless paper-only account whose
+        guard key vanished (a Redis outage) kept `_guard_state_lost = True` at
+        the UTC rollover, kept its PAPER gate closed, and `save_state` refused
+        to re-persist while the latch held -- so the guard key was NEVER
+        re-created and the account re-latched on every restart and never traded
+        again. A dual-mode account in the same state recovered at the live
+        rollover. Before the paper/live split there was ONE daily reset that
+        EVERY account ran, so the split introduced this.
+
+        The release rule is the one the live path already uses, for the same
+        reason: a new UTC day starts the day's PnL and the loss streak at zero
+        BY DEFINITION, so whatever was lost belonged to the day that just ended.
+        It is restricted to an account with NO live executor, so it can never
+        open a LIVE gate: such an account cannot trade live at all.
+
+        It is a STRICTLY later day only. A fresh process sees its first day-key
+        change on the very same start that set the latch, so releasing on any
+        day change would clear the latch on the start that set it.
+        """
+        if getattr(self, "executor", None) is not None:
+            # This account HAS a live sandbox: the live rollover owns the LOST
+            # latch, exactly as it did before the paper/live split.
+            return
+        if not getattr(self, "_guard_state_lost", False):
+            return
+        lost_day_str = getattr(self, "_guard_state_lost_day_str", "")
+        if not lost_day_str or current_day_str_utc <= lost_day_str:
+            logger.critical(
+                "[RiskGuard] The trading-guard state was lost on UTC day "
+                f"{lost_day_str or 'unknown'}, and the rollover to "
+                f"{current_day_str_utc} is not strictly past it, so today's PnL "
+                "and loss streak are still unknown. Paper trading stays DISABLED."
+            )
+            return
+        logger.critical(
+            "[RiskGuard] The trading-guard state was lost on UTC day "
+            f"{lost_day_str}; the rollover to {current_day_str_utc} resets the "
+            "day's PnL and the loss streak to zero, so this account is no longer "
+            "trading on unknown numbers. Paper trading is released for the new "
+            "day."
+        )
+        self._guard_state_lost = False
+        self._guard_state_lost_day_str = ""
+
+    def _release_paper_scope_unknown_latch_at_rollover(self, current_day_str_utc) -> None:
+        """Release a PAPER-scoped unknown-scope latch at the PAPER day rollover.
+
+        The unknown-scope latch has ONE release site, the LIVE rollover
+        (`_check_and_reset_daily_stats`). A keyless PAPER account has no live
+        executor, so `initialize_balance` returns before the live start-up
+        machinery and EVERY rollover it ever runs is the PAPER one -- it can
+        never reach the release site. Its paper gate therefore stayed closed
+        for the life of the process, and because `save_state` refuses to write
+        while the scope is unknown, the unreadable payload survived every
+        restart: the account was bricked, not merely paused for a day.
+
+        The same reasoning that releases the LIVE latch applies here: a new UTC
+        day starts the day's PnL and the loss streak at zero by definition, so
+        whatever the unreadable payload held belonged to the day that just
+        ended. The release is therefore on a STRICTLY LATER day only, exactly
+        as the LIVE one is.
+
+        It is released ONLY for a PAPER-scoped latch, and ONLY for an account
+        with no live executor. A LIVE-scoped latch is left alone, because the
+        PAPER rollover does not restart the LIVE day counters; and an account
+        that HAS a live sandbox keeps its single release site, so this adds no
+        second, looser path to opening a live gate.
+        """
+        if not getattr(self, "_guard_state_scope_unknown", False):
+            return
+        if getattr(self, "_guard_state_scope_unknown_scope", "") != "paper":
+            return
+        if getattr(self, "executor", None) is not None:
+            return
+        unknown_day_str = getattr(self, "_guard_state_scope_unknown_day_str", "")
+        if not unknown_day_str or current_day_str_utc <= unknown_day_str:
+            logger.critical(
+                "[RiskGuard] The persisted PAPER sandbox state's day stamp could "
+                f"not be read on UTC day {unknown_day_str or 'unknown'}, and the "
+                f"rollover to {current_day_str_utc} is not strictly past it, so "
+                "today's paper PnL and the paper loss streak are still unknown. "
+                "Paper trading stays DISABLED."
+            )
+            return
+        logger.critical(
+            "[RiskGuard] The persisted PAPER sandbox state's day stamp could not "
+            f"be read on UTC day {unknown_day_str}; the rollover to "
+            f"{current_day_str_utc} resets the paper day's PnL and the paper loss "
+            "streak to zero, so this account is no longer trading on unknown "
+            "numbers. Paper trading is released for the new day."
+        )
+        self._guard_state_scope_unknown = False
+        self._guard_state_scope_unknown_day_str = ""
+        self._guard_state_scope_unknown_scope = ""
+
+    def _check_paper_risk_limits(self) -> None:
+        """Evaluate the PAPER sandbox's limits against the PAPER counters.
+
+        The mirror of the live `_check_risk_limits()`: the same three
+        limits, the same fail-closed behaviour when the numbers are unknown,
+        and the same emergency-stop semantics -- but measured against
+        `self.paper_stats` and the paper thresholds, and writing to the
+        PAPER gate. A PAPER breach closes the PAPER gate and nothing else.
+        """
+        stats = self.paper_stats
+        max_dd, max_daily_loss, max_consec = self._mode_thresholds("paper")
+
+        # THE LATCHES FIRST -- EXACTLY AS THE LIVE PATH CHECKS THEM.
+        #
+        # The persisted guard state carries both sandboxes, so an unknown or
+        # lost state is unknown for the paper counters too. Fail CLOSED.
+        #
+        # These checks used to come AFTER the "the paper balance is not known
+        # yet" early return below, so a lost or unverifiable guard state left
+        # the PAPER gate OPEN while the balance was still unknown -- the
+        # paper path failed OPEN where the live path fails closed, in the
+        # same function family. The order is now the live order: the
+        # latches decide, and only then is the balance's absence allowed to
+        # leave the gate exactly as it is.
+        if getattr(self, "_guard_state_unverified", False):
+            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_UNVERIFIED_REASON)
+            return
+        if getattr(self, "_guard_state_lost", False):
+            self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_STATE_LOST_REASON)
+            return
+        if getattr(self, "_guard_state_scope_unknown", False):
+            # The persisted state's SCOPE could not be read, so the paper
+            # counters are unknown exactly like the live ones. Fail CLOSED.
+            self._close_paper_gate_for_unknown_guard_state(
+                RISK_GUARD_SCOPE_UNKNOWN_REASON
+            )
+            return
+
+        if not getattr(self, "_paper_balance_known", False):
+            # The PAPER wallet's balance has not been read in this process
+            # yet. It is UNKNOWN, not zero, and the limits cannot be judged
+            # against an unknown number -- so they are NOT judged, and the
+            # gate is left exactly as it is. Judging them here would close
+            # the paper gate for the wrong reason ("balance $0.00 < min"),
+            # and the controller consults that gate before the balance is
+            # refreshed, which would stop paper trading until the next
+            # restart.
+            return
+
+        should_be_allowed = True
+        disable_reason = ""
+        if stats.current_balance < self.min_balance_threshold:
+            should_be_allowed = False
+            disable_reason = (
+                f"[PAPER] Balance (${stats.current_balance:.2f}) < min "
+                f"(${self.min_balance_threshold:.2f})"
+            )
+        else:
+            if not self._paper_daily_loss_base_is_usable():
+                should_be_allowed = False
+                disable_reason = f"[PAPER] {RISK_GUARD_BASE_UNKNOWN_REASON}"
+            else:
+                # THE PEAK-TO-TROUGH DRAWDOWN -- THE SAME MEASURE THE LIVE
+                # GATE USES, against the PAPER wallet's OWN high-water mark.
+                #
+                # The paper `maxDrawdown` used to be computed with the SAME
+                # expression as the paper daily loss, so the daily-loss limit
+                # was always the tighter of the two and the drawdown limit
+                # could never be the limit that fired -- and it read 0%
+                # whenever the day was profitable, so a paper wallet 12%
+                # below its high-water mark went on trading. It is the very
+                # defect `main`'s peak-to-trough rewrite fixed for the LIVE
+                # gate.
+                #
+                # The peak is the PAPER wallet's own high-water mark, observed
+                # only from the PAPER balance read, so a paper balance can
+                # never move the LIVE limit and the live peak can never be
+                # inherited by the paper sandbox. It is in-process state: it
+                # is not persisted, so a restart re-establishes it from the
+                # paper wallet's own balance.
+                #
+                # An EXPIRED peak is not counted, and an UNKNOWN peak is
+                # never read as "no drawdown": it fails CLOSED, exactly like
+                # the live branch above.
+                self._expire_stale_peak(mode="paper")
+                peak = self._usable_peak_equity(mode="paper")
+                trough = self._drawdown_trough_balance(mode="paper")
+                if peak is None or trough is None:
+                    should_be_allowed = False
+                    if getattr(self, "_paper_balance_read_rejected", False):
+                        disable_reason = (
+                            f"[PAPER] {RISK_GUARD_BALANCE_REJECTED_REASON}"
+                        )
+                    else:
+                        disable_reason = f"[PAPER] {RISK_GUARD_PEAK_UNKNOWN_REASON}"
+                else:
+                    drawdown_pct = max(0.0, (peak - trough) / peak)
+                    if drawdown_pct >= max_dd:
+                        should_be_allowed = False
+                        disable_reason = (
+                            f"[PAPER] Max drawdown ({drawdown_pct * 100:.2f}%) >= "
+                            f"limit ({max_dd * 100:.2f}%) "
+                            f"[peak ${peak:.2f}, trough ${trough:.2f}]"
+                        )
+                daily_loss_pct = (
+                    abs(stats.today_pnl / stats.start_of_day_balance)
+                    if stats.today_pnl < 0
+                    else 0
+                )
+                if daily_loss_pct >= max_daily_loss:
+                    should_be_allowed = False
+                    disable_reason = (
+                        f"[PAPER] Daily loss ({daily_loss_pct * 100:.2f}%) >= "
+                        f"limit ({max_daily_loss * 100:.2f}%)"
+                    )
+            if stats.consecutive_losses >= max_consec:
+                should_be_allowed = False
+                disable_reason = (
+                    f"[PAPER] Max consec losses ({stats.consecutive_losses}) >= "
+                    f"limit ({max_consec})"
+                )
+        if not should_be_allowed:
+            if self._paper_is_trading_allowed:
+                logger.critical(f"Paper trading disabled! Reason: {disable_reason}")
+                self._paper_is_trading_allowed = False
+                self._paper_last_disable_reason = disable_reason
+                if self.telegram_notifier and self.loop_from_controller:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            self.telegram_notifier.risk_manager_alert(
+                                reason=disable_reason,
+                                alert_type="TRADE_DISABLED",
+                                current_balance=stats.current_balance,
+                                daily_pnl=stats.today_pnl,
+                                chat_id=self.user_telegram_chat_id,
+                                api_key_name=self.api_key_name,
+                            ),
+                            self.loop_from_controller,
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to schedule Telegram notification: {e}")
+            self._paper_global_gate_disable_reason = disable_reason
+        else:
+            self._paper_global_gate_disable_reason = None
+            if self._emergency_stop_active:
+                # The latch owns the gate while it is engaged; it is released
+                # only by clear_emergency_stop() or by the start-up self-heal.
+                # This mirrors the LIVE branch above exactly: without it, the
+                # balance update on a new UTC day would re-open the PAPER gate
+                # while the operator's kill switch was still pulled, and
+                # `published_account_snapshot()` would then publish "trading
+                # allowed" during an emergency stop.
+                pass
+            elif not self._paper_is_trading_allowed:
+                logger.info(
+                    "Paper risk limits are now within acceptable range. "
+                    "Re-enabling paper trading."
+                )
+                self._paper_is_trading_allowed = True
+                self._paper_last_disable_reason = None
+
     async def assess_signal(
         self,
         signal: StrategySignal,
@@ -2669,20 +3831,23 @@ class RiskManager:
             f"{log_prefix} --- STARTING SIGNAL ASSESSMENT (Mode: {mode.upper()}) ---"
         )
 
-        # BLACKLIST CHECK (on-the-fly)
-        # Check the blacklist at an early stage to avoid wasting resources on further checks
-        if not await self.is_symbol_trading_allowed(signal.symbol):
-            logger.warning(
-                f"{log_prefix} Signal REJECTED. Reason: Symbol is in blacklist or trading globally disabled."
-            )
-            return False, None, 0.0, "SYMBOL_BLACKLISTED"
-
         current_balance_val = 0.0
         risk_per_trade_base = 0.0
         max_stop_distance_pct_to_use = 0.0
         balance_updated_successfully = False
 
         if mode == "paper":
+            # THE PAPER BALANCE IS READ BEFORE THE GATE IS CONSULTED.
+            #
+            # The PAPER gate is judged against the PAPER wallet, and the
+            # paper wallet's balance is only known once it has been read.
+            # Judging it afterwards would evaluate the gate against a
+            # balance it has never seen (0.0), which closes the paper gate
+            # on the very first signal of the process -- and then nothing
+            # could re-open it, because the balance is only read on the very
+            # path the closed gate blocks. Upstream avoids the same
+            # deadlock by evaluating the paper limits inside the paper branch
+            # (upstream `bot_module/risk_manager.py:1695`-`:1700`).
             try:
                 paper_balances = await self.paper_executor.get_account_balance()
                 usdt_balance_data = (
@@ -2694,6 +3859,23 @@ class RiskManager:
                 risk_per_trade_base = self.paper_risk_per_trade
                 max_stop_distance_pct_to_use = self.paper_max_stop_distance_pct
                 balance_updated_successfully = True
+                # The PAPER wallet's balance belongs to the PAPER sandbox.
+                # It must never be written into `self.stats`, which is the
+                # LIVE account's balance.
+                self.paper_stats.current_balance = current_balance_val
+                self._paper_balance_known = True
+                self._check_and_reset_paper_daily_stats()
+                self._anchor_paper_start_of_day_base(current_balance_val)
+                # The PAPER wallet's balance has just been read, so it is an
+                # OBSERVATION of the PAPER high-water mark, and this is the
+                # instant the paper day's PnL baseline is taken at -- the
+                # same treatment the LIVE branch below gives its balance.
+                # Without this the PAPER peak would stay UNKNOWN on this
+                # path and the paper drawdown would fail CLOSED on every
+                # signal.
+                self._set_balance_pnl_baseline(mode="paper")
+                self._observe_balance_for_peak(current_balance_val, mode="paper")
+                self._check_risk_limits(mode="paper")
                 logger.info(
                     f"{log_prefix} Using PAPER settings. Balance: ${current_balance_val:.2f}, Risk/Trade: {risk_per_trade_base * 100:.2f}%"
                 )
@@ -2702,7 +3884,21 @@ class RiskManager:
                     f"{log_prefix} Failed to get paper balance: {e}", exc_info=True
                 )
                 return False, None, 0.0, "PAPER_BALANCE_FETCH_FAILED"
-        else:  # live
+
+        # BLACKLIST CHECK (on-the-fly)
+        # Check the blacklist at an early stage to avoid wasting resources on further checks
+        #
+        # The gate is consulted for THIS MODE: the live sandbox and the
+        # paper sandbox have separate counters, separate thresholds and
+        # separate gates, so a paper loss cannot refuse a live signal and a
+        # live loss cannot refuse a paper signal.
+        if not await self.is_symbol_trading_allowed(signal.symbol, mode=mode):
+            logger.warning(
+                f"{log_prefix} Signal REJECTED. Reason: Symbol is in blacklist or trading globally disabled."
+            )
+            return False, None, 0.0, "SYMBOL_BLACKLISTED"
+
+        if mode != "paper":  # live
             self._check_and_reset_daily_stats()
             if executor_override is not None and executor_override is not self.executor:
                 try:
@@ -2892,7 +4088,7 @@ class RiskManager:
             )
             return False, None, initial_base_risk_usd_planned, "EMERGENCY_STOP"
 
-        if not self._is_trading_allowed:
+        if not self._is_mode_trading_allowed(mode):
             logger.warning(
                 f"{log_prefix} Signal REJECTED. Reason: Trading disabled globally by portfolio risk limits."
             )
@@ -3566,6 +4762,33 @@ class RiskManager:
                 )
                 return
 
+            if getattr(self, "_guard_state_scope_unknown", False):
+                # The persisted state was READ but its SCOPE could not be: the
+                # day stamp it carries is missing, null or unreadable, so it
+                # is not known whether it holds today's numbers or yesterday's.
+                # The in-memory counters are the zeros this process was born
+                # with, so writing them now would LAUNDER an unknown state
+                # into a payload -- and the next start-up would read that
+                # payload as "the streak really is empty" and OPEN the gate.
+                #
+                # This is the same hazard as the lost-state branch above, in
+                # its other form: that one cannot be re-read (there is nothing
+                # left to read), this one cannot be BELIEVED (what was read
+                # does not say which day it belongs to). Either way, nothing is
+                # persisted while the scope is unknown, and the next start-up
+                # detects it again and fails closed.
+                logger.critical(
+                    "[RiskGuard] NOT persisting the trading-guard state: its day "
+                    "stamp could not be read on UTC day "
+                    f"{self._guard_state_scope_unknown_day_str or 'unknown'}, so "
+                    "it is not known whether it holds today's numbers or "
+                    "yesterday's, and the in-memory counters are UNKNOWN, not "
+                    "zero. Writing them would make the next start-up read the "
+                    "loss as an empty streak and open the gate. The "
+                    "unknown-scope latch holds until the UTC day rolls over."
+                )
+                return
+
             if not self.redis_client:
                 logger.critical(
                     "[RiskGuard] No redis_client; the trading-guard state will "
@@ -3575,8 +4798,7 @@ class RiskManager:
 
             payload = {
                 "version": RISK_STATE_VERSION,
-                "day_str": self.stats.last_known_day_str
-                or self._current_utc_day_str(),
+                "day_str": self.stats.last_known_day_str or self._current_utc_day_str(),
                 "consecutive_losses": int(self.stats.consecutive_losses),
                 "today_pnl": float(self.stats.today_pnl),
                 "start_of_day_balance": float(self.stats.start_of_day_balance),
@@ -3609,6 +4831,33 @@ class RiskManager:
                     getattr(self, "_peak_equity_set_at", 0.0) or 0.0
                 ),
                 "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                # THE PAPER SANDBOX'S STATE, IN THE SAME VALUE, UNDER THE SAME
+                # KEY.
+                #
+                # The key is `f"{redis_state_key}:{user_id}:{api_key_id}"` --
+                # per user and per api key, and NOT per mode. Adding a mode
+                # dimension to the KEY would mean the state that is already
+                # persisted under the old key is no longer found, which
+                # silently RESETS the trading guard for every account on
+                # deploy. So both sandboxes' state lives in ONE value: the
+                # LIVE counters keep their existing top-level names (so a
+                # payload written before this change is still read correctly,
+                # with no reset), and the PAPER counters sit under "paper".
+                #
+                # A payload that predates this change has no "paper" key; the
+                # paper counters then start at zero, which is CORRECT -- the
+                # paper sandbox was never persisted before.
+                "paper": {
+                    "day_str": self.paper_stats.last_known_day_str or "",
+                    "consecutive_losses": int(self.paper_stats.consecutive_losses),
+                    "today_pnl": float(self.paper_stats.today_pnl),
+                    "start_of_day_balance": float(
+                        self.paper_stats.start_of_day_balance
+                    ),
+                    "start_of_day_day_str": (
+                        self.paper_stats.start_of_day_day_str or ""
+                    ),
+                },
             }
             try:
                 await asyncio.wait_for(
@@ -3743,6 +4992,7 @@ class RiskManager:
         return bool(
             getattr(self, "_guard_state_unverified", False)
             or getattr(self, "_guard_state_lost", False)
+            or getattr(self, "_guard_state_scope_unknown", False)
         )
 
     def _mark_guard_state_lost(self) -> None:
@@ -3767,6 +5017,124 @@ class RiskManager:
         self._global_gate_disable_reason = RISK_GUARD_STATE_LOST_REASON
         if not self._emergency_stop_active:
             self._trading_disabled_reason = RISK_GUARD_STATE_LOST_REASON
+
+    def _mark_persisted_value_unknown(self, scope: str, what: str) -> None:
+        """Fail closed on a persisted guard VALUE that could not be read.
+
+        "KEEP THE IN-MEMORY VALUE" IS ONLY FAIL-CLOSED IF THE IN-MEMORY VALUE
+        IS A MEASUREMENT. At start-up it is not: the counters are the ZEROS
+        this process was born with, so "keep them" means "the loss streak is
+        zero" -- and the streak guard and the daily-loss guard then measure
+        NOTHING and `_check_risk_limits()` re-opens the gate on them. That is
+        the fail-open this whole restore exists to prevent, reached through
+        the one path that looked like the careful one.
+
+        So an unreadable persisted value is UNKNOWN, and unknown must never be
+        more permissive than known. The gate fails CLOSED, the state is NOT
+        re-persisted (writing the in-memory counters would LAUNDER an unknown
+        state into a payload -- see `save_state`), and the operator is told
+        WHY at CRITICAL, because a guard that silently refuses to trade is
+        itself a fault.
+
+        The latch is the SAME one the unreadable-SCOPE case uses, and it is
+        released at the UTC day rollover of the sandbox that raised it --
+        which is the one moment the day's counters restart at zero by
+        definition, so whatever the unreadable payload held belonged to the
+        day that just ended. `scope` says which sandbox's numbers are
+        unknown: "live" or "paper".
+        """
+        self._mark_guard_state_scope_unknown(scope)
+        logger.critical(
+            "[RiskGuard] The persisted %s could NOT be read, so that sandbox's "
+            "loss streak and day's PnL are UNKNOWN, not zero. The gate fails "
+            "CLOSED and the state is NOT re-persisted until the UTC day rolls "
+            "over, which is the one moment the day's counters restart at zero "
+            "by definition.",
+            what,
+        )
+
+    def _mark_guard_state_scope_unknown(self, scope: str = "live") -> None:
+        """Latch the fail-closed state for a persisted state that CANNOT BE
+        BELIEVED.
+
+        The state was READ, but it cannot be trusted: either the day stamp it
+        carries cannot be read (the field is missing, null, or not a readable
+        string), so it is not known whether the payload holds today's numbers
+        or yesterday's; OR one of its VALUES cannot be read, so the number the
+        guard would measure is not known at all (see
+        `_mark_persisted_value_unknown`). Both are the same fact for the
+        gate: today's PnL and the loss streak cannot be shown to be within
+        limits.
+
+        "Unknown day" is NOT "another day". Yesterday's numbers must not be
+        resurrected, and today's must not be assumed, so the counters cannot be
+        shown to be within limits: the gate closes and stays closed, and the
+        state is not re-persisted (writing the in-memory counters would
+        LAUNDER an unknown state into a payload -- see `save_state`).
+
+        The latch is released at the UTC day rollover (see
+        `_check_and_reset_daily_stats`), which is the one moment the day's
+        counters restart at zero by definition -- but ONLY on a rollover to a
+        STRICTLY LATER day than the day the scope became unreadable, for the
+        same reason the lost state's latch is that strict.
+
+        `scope` says WHICH sandbox's day stamp could not be read ("live" or
+        "paper"). It is recorded so that the PAPER rollover can release a
+        PAPER-scoped latch for an account that has no live sandbox behind it
+        -- see `_check_and_reset_paper_daily_stats`. It never widens what a
+        rollover may release: the LIVE rollover releases any scope, and the
+        PAPER rollover releases only a PAPER scope, and only for an account
+        with no live executor.
+
+        SCOPE-AWARE. A PAPER-scoped fault closes the PAPER gate and NOT the
+        LIVE gate: the LIVE sandbox's own numbers were read, so they are
+        known, and halting REAL trading because a PAPER payload's day stamp
+        was unreadable is the cross-sandbox leak this branch exists to
+        close. A LIVE-scoped fault (and a "both" scope, which is what two
+        disagreeing scopes become) closes the LIVE gate exactly as before.
+
+        This is the PAPER/LIVE-parity twin of `_mark_guard_state_lost`: both
+        sandboxes must fail closed on an unreadable scope, and they must do it
+        through the same mechanism, so the two cannot drift apart.
+        """
+        scope = str(scope or "live").strip().lower()
+        if scope not in ("live", "paper", "both"):
+            # An unreadable scope is UNKNOWN, and unknown must never be more
+            # permissive than known: it closes BOTH gates.
+            scope = "both"
+        self._guard_state_scope_unknown = True
+        self._guard_state_scope_unknown_day_str = self._current_utc_day_str()
+        # WHICH sandbox's scope could not be read. "both" is the conservative
+        # answer when the two do not agree: neither rollover may then release
+        # the latch on the other's behalf.
+        previous_scope = getattr(self, "_guard_state_scope_unknown_scope", "")
+        if previous_scope and previous_scope != scope:
+            self._guard_state_scope_unknown_scope = "both"
+        else:
+            self._guard_state_scope_unknown_scope = scope
+        if self._guard_state_scope_unknown_affects_live(
+            self._guard_state_scope_unknown_scope
+        ):
+            self._is_trading_allowed = False
+            self._global_gate_disable_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+            if not self._emergency_stop_active:
+                self._trading_disabled_reason = RISK_GUARD_SCOPE_UNKNOWN_REASON
+        else:
+            logger.critical(
+                "[RiskGuard] The persisted PAPER sandbox state's scope could not "
+                "be read, so the PAPER counters are unknown and paper trading "
+                "stays DISABLED. The LIVE sandbox's own counters were read, so "
+                "the LIVE gate is NOT closed: a paper fault must never halt "
+                "real money."
+            )
+        # The persisted guard state carries BOTH sandboxes, so an unreadable
+        # scope is a fact about the PAPER counters too (see
+        # `_close_paper_gate_for_unknown_guard_state`). The PAPER gate is
+        # closed here and not only through `_check_risk_limits`, because that
+        # path leaves the paper gate alone while the paper balance is not yet
+        # known -- and "the paper balance is not known yet" is not a reason to
+        # leave the paper gate open on an unknown state.
+        self._close_paper_gate_for_unknown_guard_state(RISK_GUARD_SCOPE_UNKNOWN_REASON)
 
     async def _has_traded_before(self) -> Optional[bool]:
         """Has THIS controller ever successfully persisted a guard state?
@@ -3836,6 +5204,28 @@ class RiskManager:
             return None, "the persisted payload is not a JSON object"
         return payload, None
 
+    def _is_paper_only_account(self) -> bool:
+        """Is this controller an account with NO live account behind it?
+
+        TWO independent facts must BOTH say so, and each of them is already
+        used elsewhere in this file:
+
+        * `api_key_id is None` -- the controller was built without an API key
+          (`bot_runner.py` builds the paper-only controller with
+          `api_key_id=None`, and the controller copies it onto the risk
+          manager), so `published_account_snapshot()` publishes the PAPER
+          sandbox's numbers for it, and the guard state it persists belongs
+          to that account alone.
+        * `self.executor is None` -- there is no live exchange executor, so
+          this controller cannot have made a LIVE trade at all.
+          `initialize_balance()` uses the same fact to decide that the LIVE
+          start-up machinery does not apply to it.
+
+        When the two disagree the answer is "there might be a live account",
+        so the conservative answer -- NOT paper-only -- is used.
+        """
+        return self.api_key_id is None and getattr(self, "executor", None) is None
+
     def _restore_persisted_peak(self, payload: Dict[str, Any]) -> None:
         """Restore the account's high-water mark from the persisted payload.
 
@@ -3902,108 +5292,181 @@ class RiskManager:
         self._peak_equity = peak
         self._peak_equity_set_at = peak_set_at if peak_set_at > 0 else time.time()
 
-    def _apply_persisted_guard_state(self, payload: Dict[str, Any]) -> bool:
-        """Apply a persisted guard state to this RiskManager.
+    def _paper_payload_for_restore(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """The PAPER section of a payload, or the LEGACY top level for a
+        paper-only account.
 
-        Returns True when a state was applied, False when it was discarded
-        because it belongs to a previous UTC day.
+        A payload written BEFORE the paper/live split has no "paper" key: it
+        carried ONE sandbox of counters, at the TOP LEVEL. For a LIVE
+        account those top-level counters are (at worst) a mix of the live and
+        the paper counters, and they stay in the LIVE sandbox -- that is the
+        safe direction for real money.
+
+        For a KEYLESS PAPER-ONLY account they are something else entirely:
+        the account cannot make a LIVE trade, so the shared counters it
+        persisted were ITS OWN counters -- its paper loss streak and its
+        paper day's PnL. Restoring them into the LIVE sandbox put them where
+        nothing reads them: the PAPER sandbox started at zero,
+        `_initialize_paper_balance()` opened the PAPER gate on those zeros,
+        and the next `save_state()` wrote the zeros back -- so the loss
+        streak that was blocking the account was lost.
+
+        That is the production incident this whole restore exists to
+        prevent (`controller.py`: "a routine deploy moved consecutive_losses
+        from 10 to 0 and the gate from blocked to allowed"), reproduced by
+        the deploy that carried the split -- for exactly the account class
+        that has no live sandbox to hold the streak.
+
+        So for a paper-only account the legacy top level IS the paper
+        section, and it is restored into the sandbox that account trades.
         """
-        # THE HIGH-WATER MARK IS RESTORED FIRST, BEFORE THE DAY CHECK.
-        #
-        # The peak is NOT a day quantity: it is the account's high-water mark
-        # and it must SURVIVE the UTC rollover, so a payload written
-        # yesterday still carries a usable peak. Restoring it after the day
-        # check would discard the peak of every account whose payload was
-        # written on an earlier day -- which is exactly the account that
-        # needs it most.
-        self._restore_persisted_peak(payload)
-
-        current_day_str = self._current_utc_day_str()
-        persisted_day_str = str(payload.get("day_str") or "")
-        if persisted_day_str != current_day_str:
-            # The daily rollover resets the loss streak and the day's PnL at
-            # the UTC day boundary. A previous day's numbers must not be
-            # resurrected: doing so would re-block an account whose streak
-            # was legitimately cleared, and would carry a stale PnL into a
-            # new day.
-            logger.info(
-                "[RiskGuard] Discarding the persisted trading-guard state: it "
-                "belongs to UTC day %r and today is %r. The daily rollover "
-                "clears the loss streak and the day's PnL at the UTC day "
-                "boundary.",
-                persisted_day_str,
-                current_day_str,
-            )
-            # A previous-day payload PROVES this account has traded, so its
-            # live balance is a MID-DAY balance and cannot be today's opening
-            # balance. Any base already stamped with TODAY's day key that is
-            # UNBACKED is therefore invalidated here -- otherwise this early
-            # return leaves a mid-day base in force with the gate open on it.
-            # The review panel measured exactly that: base=865.23,
-            # usable=True, trading ALLOWED=True, the gate reading 0.0000%
-            # against a true 4.4188% loss.
+        paper_payload = payload.get("paper")
+        if isinstance(paper_payload, dict):
+            return paper_payload
+        if "paper" in payload:
+            # THE KEY IS THERE, BUT IT DOES NOT CARRY A SECTION: null, a list,
+            # a string. `payload.get("paper")` cannot tell that apart from an
+            # ABSENT key, and the difference matters: an absent key is a
+            # payload written before the split, while a key that is present
+            # and unreadable is CORRUPTION -- the paper section existed and
+            # its contents cannot be read, so the paper scope is UNKNOWN and
+            # the paper gate must fail CLOSED. Reading it as "the paper
+            # sandbox was never persisted" would restore the paper counters as
+            # ZEROS and re-open a gate that was closed.
             #
-            # A base this process VOUCHED for is kept: one captured at a
-            # genuine UTC rollover, one captured for an account that had never
-            # traded, and one restored from a payload that says it belongs to
-            # today. Those ARE the day's opening balance, and dropping them
-            # would leave the account with no denominator at all. An UNBACKED
-            # base -- a capture made while the persisted state could not be
-            # read -- is a GUESS and is dropped.
-            if (
-                getattr(self.stats, "start_of_day_day_str", None) == current_day_str
-                and self._opening_base_is_unbacked()
-            ):
-                logger.critical(
-                    "[RiskGuard] Invalidating the opening balance: the "
-                    "persisted state belongs to UTC day %r, so it proves this "
-                    "account has traded and today's opening balance is "
-                    "UNKNOWN. The base stamped with today's day key ($%.8f) "
-                    "is unbacked -- it was not captured at a UTC rollover, not "
-                    "restored from a payload that says it belongs to today, "
-                    "and not captured for an account that has never traded -- "
-                    "so it is dropped and the daily-loss gate fails CLOSED.",
-                    persisted_day_str,
-                    float(self.stats.start_of_day_balance or 0.0),
-                )
-                self.stats.start_of_day_balance = 0.0
-                self.stats.start_of_day_day_str = ""
-                self._start_of_day_base_provenance = None
-                # Re-evaluate the gate: it must not stay OPEN on a base that
-                # has just been invalidated.
-                self._check_risk_limits()
-            # The account has traded, so its live balance is a mid-day balance
-            # and must never be installed as today's opening balance.
-            self._account_has_traded_before = True
-            self._account_history_resolved = True
-            return False
+            # An empty section is returned so that the scope check -- the ONE
+            # place that decides "readable" -- sees it and fails closed.
+            return {"day_str": None}
+        if not self._is_paper_only_account():
+            return None
+        return {
+            "day_str": payload.get("day_str"),
+            "consecutive_losses": payload.get("consecutive_losses"),
+            "today_pnl": payload.get("today_pnl"),
+            "start_of_day_balance": payload.get("start_of_day_balance"),
+            "start_of_day_day_str": payload.get("start_of_day_day_str"),
+        }
 
-        try:
-            consecutive_losses = int(payload.get("consecutive_losses") or 0)
-        except (TypeError, ValueError):
-            consecutive_losses = 0
-        try:
-            today_pnl = float(payload.get("today_pnl") or 0.0)
-        except (TypeError, ValueError):
-            today_pnl = 0.0
+    def _paper_payload_scope_is_readable(self, paper_payload: Dict[str, Any]) -> bool:
+        """Can the PERSISTED PAPER section's scope be read?
+
+        The paper sandbox carries its OWN day stamp in its OWN section of the
+        payload, so its scope is a SEPARATE question from the live section's
+        -- and it must stay answerable even when the live section short-
+        circuits the restore (see `_apply_persisted_guard_state`).
+
+        False means UNKNOWN: the paper counters cannot be shown to be within
+        limits, so the paper gate must fail closed.
+
+        The ONE exception is a FACT rather than a corruption: `save_state`
+        writes the paper day stamp as "" when the paper sandbox has never been
+        persisted, so an EMPTY stamp on a section whose counters are all
+        READABLE and zero is the "never persisted" marker. A MISSING or
+        unreadable counter is NOT a zero -- it is an unknown value -- so the
+        marker is only a fact when every counter is readable *and* zero.
+        """
+        raw_paper_day_str = paper_payload.get("day_str")
+        paper_counters = {
+            name: _read_persisted_number(paper_payload, name, cast)
+            for name, cast in (
+                ("consecutive_losses", int),
+                ("today_pnl", float),
+                ("start_of_day_balance", float),
+            )
+        }
+        paper_counters_are_zero = all(
+            value is not None and value == 0 for value in paper_counters.values()
+        )
+        if not isinstance(raw_paper_day_str, str):
+            return False
+        if raw_paper_day_str.strip() == "":
+            return paper_counters_are_zero
+        # A non-blank stamp that is NOT a calendar day cannot be compared with
+        # today's stamp, so it is UNREADABLE -- not "another day". Reading it
+        # as "another day" would discard the paper counters, restore them as
+        # ZEROS and re-open the PAPER gate on them.
+        return _day_str_is_a_calendar_day(raw_paper_day_str)
+
+    def _apply_persisted_live_guard_state(
+        self, payload: Dict[str, Any], current_day_str: str
+    ) -> None:
+        """Restore the LIVE sandbox's counters from the payload's live section.
+
+        The live section is the TOP LEVEL of the payload, so a payload written
+        before the paper/live split still restores the live state correctly --
+        there is NO guard reset on deploy.
+        """
+        # A PERSISTED VALUE THAT IS MISSING, NULL OR NOT A NUMBER IS NOT A
+        # ZERO.
+        #
+        # `payload.get("today_pnl") or 0.0` cannot tell those apart from a
+        # genuine zero: a MISSING field yields None, `None or 0.0` is 0.0, and
+        # a field that is present but NULL yields the same 0.0. So a partial
+        # or corrupt payload restored as "no loss today" and "no loss streak"
+        # -- which DISCARDS the numbers the guard was blocking on and RE-OPENS
+        # a gate that was closed. The day's PnL is a REAL-MONEY control: read
+        # as 0.0 it measures no loss at all, so the daily-loss gate stops
+        # measuring and a previously blocked account is free to trade again.
+        #
+        # An unreadable value is UNKNOWN, and unknown must never be more
+        # permissive than known. So the in-memory value stays IN FORCE: the
+        # streak is never lowered, and the day's PnL is not overwritten. A
+        # value that IS readable is used exactly as it always was. See
+        # `_read_persisted_number`.
+        raw_consecutive_losses = payload.get("consecutive_losses")
+        raw_today_pnl = payload.get("today_pnl")
+        persisted_consecutive_losses = _read_persisted_number(
+            payload, "consecutive_losses", int
+        )
+        persisted_today_pnl = _read_persisted_number(payload, "today_pnl", float)
         try:
             start_of_day_balance = float(payload.get("start_of_day_balance") or 0.0)
         except (TypeError, ValueError):
             start_of_day_balance = 0.0
 
-        # The streak only ever grows within a UTC day (it is reset by a win
-        # or by the daily rollover), so the higher of the persisted and the
-        # in-memory value is the conservative -- and, after a failed restore,
-        # the more likely correct -- one.
-        self.stats.consecutive_losses = max(
-            0,
-            consecutive_losses,
-            int(self.stats.consecutive_losses or 0),
-        )
-        self.stats.today_pnl = today_pnl
-        # The balance this process holds (if it has read one) and the day's
-        # PnL now describe the same instant, so the PnL the balance already
-        # reflects is the restored one. See `_set_balance_pnl_baseline`.
+        if persisted_consecutive_losses is None:
+            logger.critical(
+                "[RiskGuard] The persisted LIVE loss streak could NOT be read "
+                "(present=%s, value=%r, UTC day %s). The in-memory LIVE streak "
+                "(%d) stays IN FORCE, so a streak-triggered block is not lost.",
+                "consecutive_losses" in payload,
+                raw_consecutive_losses,
+                current_day_str,
+                int(self.stats.consecutive_losses or 0),
+            )
+            self._mark_persisted_value_unknown("live", "the LIVE loss streak")
+        else:
+            # The streak only ever grows within a UTC day (it is reset by a win
+            # or by the daily rollover), so the higher of the persisted and the
+            # in-memory value is the conservative -- and, after a failed restore,
+            # the more likely correct -- one.
+            self.stats.consecutive_losses = max(
+                0,
+                persisted_consecutive_losses,
+                int(self.stats.consecutive_losses or 0),
+            )
+
+        if persisted_today_pnl is None:
+            logger.critical(
+                "[RiskGuard] The persisted LIVE day's PnL could NOT be read "
+                "(present=%s, value=%r, UTC day %s). The in-memory LIVE day's "
+                "PnL (%.2f) stays IN FORCE: restoring it as 0.0 would measure "
+                "NO LOSS TODAY and open the daily-loss gate wider.",
+                "today_pnl" in payload,
+                raw_today_pnl,
+                current_day_str,
+                float(self.stats.today_pnl or 0.0),
+            )
+            self._mark_persisted_value_unknown("live", "the LIVE day's PnL")
+        else:
+            self.stats.today_pnl = persisted_today_pnl
+
+        # The balance this process holds (if it has read one) and the
+        # day's PnL now describe the same instant, so the PnL the balance
+        # already reflects is the restored one. See
+        # `_set_balance_pnl_baseline`.
         self._set_balance_pnl_baseline()
 
         # THE BASE MUST CARRY ITS OWN DAY. `day_str` above describes the STREAK
@@ -4088,11 +5551,423 @@ class RiskManager:
         self.stats.last_known_day_str = current_day_str
         self._guard_state_restored = True
 
+    def _apply_persisted_paper_guard_state(
+        self, paper_payload: Optional[Dict[str, Any]], current_day_str: str
+    ) -> None:
+        """Restore the PAPER sandbox's counters from the payload's paper section.
+
+        The paper section carries its OWN day stamp, so its scope is a SEPARATE
+        question from the live section's -- and it must stay answerable even
+        when the live section short-circuits the restore (see
+        `_apply_persisted_guard_state`).
+        """
+        if paper_payload is None:
+            # Nothing was ever persisted for the PAPER sandbox (a payload written
+            # before the paper/live split), so there is nothing to restore. The
+            # paper counters stay at the process-born zeros, which is CORRECT for
+            # a LIVE account -- and, for a KEYLESS PAPER-ONLY account, the legacy
+            # top level is projected onto the paper section by
+            # `_paper_payload_for_restore` instead.
+            return
+        raw_paper_day_str = paper_payload.get("day_str")
+        paper_day_str = (
+            str(raw_paper_day_str) if raw_paper_day_str is not None else ""
+        )
+        # THE PAPER TWIN OF THE LIVE SCOPE CHECK ABOVE.
+        #
+        # "Unknown day" is NOT "another day": a paper day stamp that
+        # cannot be read leaves it unknown whether the paper counters are
+        # today's or yesterday's. Discarding them silently restores the
+        # paper streak and the paper day's PnL as ZEROS and re-opens the
+        # PAPER gate on them -- at INFO level, so nobody sees it. The
+        # PAPER path must fail closed here exactly as the LIVE path does.
+        #
+        # ONE EXCEPTION, and it is a FACT rather than a corruption:
+        # `save_state` writes the PAPER day stamp as "" when the paper
+        # sandbox has never been persisted (`self.paper_stats
+        # .last_known_day_str or ""`), so an EMPTY paper day stamp on a
+        # section that carries NO state at all is the "the paper sandbox
+        # was never persisted" marker, and the paper counters really are
+        # zero. That is not an unknown scope and it must not be treated as
+        # one -- it would block every account that never paper-traded.
+        #
+        # Anything else -- a missing stamp, a null stamp, a stamp that is
+        # not a string, or an EMPTY stamp on a section that DOES carry
+        # state -- leaves the scope UNKNOWN.
+        paper_scope_is_readable = self._paper_payload_scope_is_readable(
+            paper_payload
+        )
+        if not paper_scope_is_readable:
+            self._mark_guard_state_scope_unknown("paper")
+            logger.critical(
+                "[RiskGuard] The persisted PAPER sandbox state has an "
+                "UNREADABLE day stamp (present=%s, value=%r), so it is NOT "
+                "known whether it holds today's numbers or yesterday's. "
+                "'Unknown day' is NOT 'another day': discarding it would "
+                "restore the paper loss streak and the paper day's PnL as "
+                "ZEROS and re-open a gate that was closed. The PAPER "
+                "counters cannot be shown to be within limits, so paper "
+                "trading stays DISABLED (fail-closed) until the UTC day "
+                "rolls over.",
+                "day_str" in paper_payload,
+                raw_paper_day_str,
+            )
+            self._check_risk_limits(mode="paper")
+        elif paper_day_str == current_day_str:
+            raw_paper_consecutive_losses = paper_payload.get("consecutive_losses")
+            raw_paper_today_pnl = paper_payload.get("today_pnl")
+            # A MISSING or NULL field is UNREADABLE, not a zero -- the same
+            # rule the LIVE path above uses, and for the same reason:
+            # `int(None or 0)` is 0, so a partial payload would silently
+            # restore as "no loss today" and "no loss streak".
+            paper_consecutive_losses = _read_persisted_number(
+                paper_payload, "consecutive_losses", int
+            )
+            paper_today_pnl = _read_persisted_number(
+                paper_payload, "today_pnl", float
+            )
+            try:
+                paper_start_of_day_balance = float(
+                    paper_payload.get("start_of_day_balance") or 0.0
+                )
+            except (TypeError, ValueError):
+                paper_start_of_day_balance = 0.0
+
+            # A PERSISTED VALUE THAT CANNOT BE READ IS NOT A ZERO.
+            #
+            # The LIVE path above already decided what a corrupt persisted
+            # value means, and it decided it in the CONSERVATIVE
+            # direction: the streak keeps the higher of the persisted and
+            # the in-memory value, and a day's PnL that cannot be read
+            # must not become "no loss today". The PAPER path must not
+            # decide it differently -- a corrupt payload that silently
+            # restores as zero DISCARDS the in-memory streak and the day's
+            # PnL, and a streak-triggered paper block is LOST with it.
+            # That is the defect class this whole change exists to kill:
+            # the guard state says one thing and the money says another.
+            #
+            # A value that is MISSING or NULL is unreadable in exactly the
+            # same way a value that is not a number is: the payload does
+            # not say what the day's PnL or the streak was, so it cannot
+            # be read as "no loss today" either.
+            #
+            # So an unreadable value leaves the in-memory value IN FORCE,
+            # and it is logged at CRITICAL: an unreadable persisted paper
+            # state is an OPERATIONAL event, not a debug line.
+            if paper_consecutive_losses is None:
+                logger.critical(
+                    "[RiskGuard] The persisted PAPER loss streak could NOT be "
+                    "read (present=%s, value=%r, UTC day %s). The in-memory "
+                    "PAPER streak (%d) stays IN FORCE, so a streak-triggered "
+                    "paper block is not lost.",
+                    "consecutive_losses" in paper_payload,
+                    raw_paper_consecutive_losses,
+                    current_day_str,
+                    int(self.paper_stats.consecutive_losses or 0),
+                )
+                self._mark_persisted_value_unknown(
+                    "paper", "the PAPER loss streak"
+                )
+            else:
+                # The streak only ever grows within a UTC day (it is reset
+                # by a win or by the daily rollover), so the higher of the
+                # persisted and the in-memory value is the conservative --
+                # and, after a failed restore, the more likely correct --
+                # one. Exactly the rule the LIVE path uses.
+                self.paper_stats.consecutive_losses = max(
+                    0,
+                    paper_consecutive_losses,
+                    int(self.paper_stats.consecutive_losses or 0),
+                )
+
+            if paper_today_pnl is None:
+                logger.critical(
+                    "[RiskGuard] The persisted PAPER day's PnL could NOT be "
+                    "read (present=%s, value=%r, UTC day %s). The in-memory "
+                    "PAPER day's PnL (%.2f) stays IN FORCE: discarding it "
+                    "would measure nothing at all and open the gate wider.",
+                    "today_pnl" in paper_payload,
+                    raw_paper_today_pnl,
+                    current_day_str,
+                    float(self.paper_stats.today_pnl or 0.0),
+                )
+                self._mark_persisted_value_unknown("paper", "the PAPER day's PnL")
+            else:
+                self.paper_stats.today_pnl = paper_today_pnl
+            # THE PAPER OPENING BALANCE MUST CARRY ITS OWN DAY, exactly
+            # like the LIVE one.
+            #
+            # `paper_payload.get("start_of_day_day_str") or current_day_str`
+            # reads an ABSENT stamp as "today" -- and a base with no day
+            # of its own is UNKNOWN, not today's. A base that may already
+            # contain today's PnL becomes the DENOMINATOR of today's loss
+            # ratio, and the ratio then reads LOW and UNDER-TRIPS: the
+            # denominator already contains the loss it is supposed to
+            # measure. The LIVE path refuses exactly this (it restores the
+            # base only when the payload says which day the base belongs
+            # to and that day is today), so the PAPER path must not
+            # decide it differently.
+            #
+            # So the persisted PAPER base is installed ONLY when its own
+            # day stamp says today. Otherwise it is refused AND the one in
+            # force is dropped, because neither can be shown to be today's
+            # opening balance: the PAPER opening balance is UNKNOWN, and
+            # the PAPER daily-loss gate fails CLOSED until the paper
+            # wallet's own balance establishes one.
+            persisted_paper_base_day_str = str(
+                paper_payload.get("start_of_day_day_str") or ""
+            )
+            paper_base_is_from_today = (
+                persisted_paper_base_day_str == current_day_str
+                and paper_start_of_day_balance > 1e-9
+            )
+            if paper_base_is_from_today:
+                self.paper_stats.start_of_day_balance = paper_start_of_day_balance
+                self.paper_stats.start_of_day_day_str = current_day_str
+            else:
+                logger.critical(
+                    "[RiskGuard] NOT restoring the persisted PAPER start-of-day "
+                    "balance ($%.2f): it belongs to UTC day %r and today is %s. "
+                    "A base with no day stamp of its own is UNKNOWN, not "
+                    "today's: it may already contain today's PnL, and "
+                    "measuring the day's loss against a denominator that "
+                    "contains it reads LOW and under-trips. The PAPER opening "
+                    "balance stays UNKNOWN and the PAPER daily-loss gate "
+                    "fails CLOSED until the paper wallet's own balance "
+                    "establishes one.",
+                    paper_start_of_day_balance,
+                    persisted_paper_base_day_str or "UNKNOWN (no day stamp)",
+                    current_day_str,
+                )
+                self.paper_stats.start_of_day_balance = 0.0
+                self.paper_stats.start_of_day_day_str = ""
+            self.paper_stats.last_known_day_str = current_day_str
+            # The guard state WAS read and applied, so the operator's "clear the
+            # emergency stop" path must re-judge the gates against it instead of
+            # re-enabling them unconditionally.
+            self._guard_state_restored = True
+        else:
+            logger.info(
+                "[RiskGuard] Discarding the persisted PAPER sandbox state: it "
+                "belongs to UTC day %r and today is %r. The paper counters "
+                "restart at zero, exactly like the live ones.",
+                paper_day_str,
+                current_day_str,
+            )
+
+
+    def _apply_persisted_guard_state(self, payload: Dict[str, Any]) -> bool:
+        """Apply a persisted guard state to this RiskManager.
+
+        Returns True when a state was applied, False when it was discarded
+        because it belongs to a previous UTC day.
+        """
+        # THE HIGH-WATER MARK IS RESTORED FIRST, BEFORE THE DAY CHECK.
+        #
+        # The peak is NOT a day quantity: it is the account's high-water
+        # mark and it must SURVIVE the UTC rollover, so a payload written
+        # yesterday still carries a usable peak. Restoring it after the day
+        # check would discard the peak of every account whose payload was
+        # written on an earlier day -- which is exactly the account that
+        # needs it most.
+        self._restore_persisted_peak(payload)
+
+        current_day_str = self._current_utc_day_str()
+        raw_day_str = payload.get("day_str")
+        persisted_day_str = str(raw_day_str) if raw_day_str is not None else ""
+        # "ANOTHER DAY" AND "UNKNOWN DAY" ARE DIFFERENT FACTS.
+        #
+        # A day stamp that reads as a PREVIOUS day means the payload holds
+        # yesterday's numbers: they must be discarded, because the daily
+        # rollover legitimately cleared the streak and the day's PnL.
+        #
+        # A day stamp that CANNOT BE READ -- missing, null, or not a readable
+        # string -- means something else entirely: it is NOT known whether the
+        # payload holds today's numbers or yesterday's. The `or ""` idiom
+        # below cannot tell the two apart (a missing field yields None, and
+        # `None or ""` is ""), so an unreadable stamp was silently read as
+        # "belongs to another day": the WHOLE persisted state was discarded,
+        # the counters restored as ZEROS, and a gate that was CLOSED re-opened
+        # -- at INFO level, so the operator never saw it happen. That is the
+        # same fail-open this whole change exists to kill: the guard state
+        # says one thing and the money says another.
+        #
+        # So an unreadable scope is an UNKNOWN state, and unknown must never
+        # be more permissive than known. The state is not applied at all (we
+        # cannot tell which day's numbers these are), the gate fails CLOSED,
+        # and the operator is told WHY at CRITICAL.
+        # A day stamp that is a NON-BLANK string but NOT a calendar day --
+        # "unknown", "2026-13-45", "yesterday" -- is unreadable too, and for
+        # the same reason: it cannot be compared with today's stamp, so it is
+        # not known which day's numbers the payload holds. Reading it as
+        # "another day" would discard the persisted counters, restore them as
+        # ZEROS and re-open a gate that was closed -- the same fail-open the
+        # missing/null stamp was fixed for, reached through a third door.
+        day_scope_is_readable = _day_str_is_a_calendar_day(raw_day_str)
+        if not day_scope_is_readable:
+            self._mark_guard_state_scope_unknown("live")
+            logger.critical(
+                "[RiskGuard] The persisted trading-guard state has an UNREADABLE "
+                "day stamp (present=%s, value=%r), so it is NOT known whether it "
+                "holds today's numbers or yesterday's. 'Unknown day' is NOT "
+                "'another day': discarding it would restore the loss streak and "
+                "the day's PnL as ZEROS and re-open a gate that was closed. "
+                "Today's PnL and the loss streak cannot be shown to be within "
+                "limits, so trading stays DISABLED (fail-closed) until the UTC "
+                "day rolls over.",
+                "day_str" in payload,
+                raw_day_str,
+            )
+            # Re-evaluate both gates against the unknown state, so neither is
+            # left open on the process-born zero counters.
+            self._check_risk_limits()
+            self._check_risk_limits(mode="paper")
+            return False
+        # THE PAPER SECTION OF THE PAYLOAD. For an account with no live
+        # sandbox behind it, a payload WITHOUT a "paper" key is a LEGACY
+        # payload whose top level WAS that account's own state -- see
+        # `_paper_payload_for_restore`.
+        paper_payload = self._paper_payload_for_restore(payload)
+        if persisted_day_str != current_day_str:
+            # The daily rollover resets the loss streak and the day's PnL at
+            # the UTC day boundary. A previous day's numbers must not be
+            # resurrected: doing so would re-block an account whose streak
+            # was legitimately cleared, and would carry a stale PnL into a
+            # new day.
+            logger.info(
+                "[RiskGuard] Discarding the persisted trading-guard state: it "
+                "belongs to UTC day %r and today is %r. The daily rollover "
+                "clears the loss streak and the day's PnL at the UTC day "
+                "boundary.",
+                persisted_day_str,
+                current_day_str,
+            )
+            # A previous-day payload PROVES this account has traded, so its
+            # live balance is a MID-DAY balance and cannot be today's opening
+            # balance. Any base already stamped with TODAY's day key that is
+            # UNBACKED is therefore invalidated here -- otherwise this early
+            # return leaves a mid-day base in force with the gate open on it.
+            # The review panel measured exactly that: base=865.23,
+            # usable=True, trading ALLOWED=True, the gate reading 0.0000%
+            # against a true 4.4188% loss.
+            #
+            # A base this process VOUCHED for is kept: one captured at a
+            # genuine UTC rollover, one captured for an account that had never
+            # traded, and one restored from a payload that says it belongs to
+            # today. Those ARE the day's opening balance, and dropping them
+            # would leave the account with no denominator at all. An UNBACKED
+            # base -- a capture made while the persisted state could not be
+            # read -- is a GUESS and is dropped.
+            if (
+                getattr(self.stats, "start_of_day_day_str", None) == current_day_str
+                and self._opening_base_is_unbacked()
+            ):
+                logger.critical(
+                    "[RiskGuard] Invalidating the opening balance: the "
+                    "persisted state belongs to UTC day %r, so it proves this "
+                    "account has traded and today's opening balance is "
+                    "UNKNOWN. The base stamped with today's day key ($%.8f) "
+                    "is unbacked -- it was not captured at a UTC rollover, not "
+                    "restored from a payload that says it belongs to today, "
+                    "and not captured for an account that has never traded -- "
+                    "so it is dropped and the daily-loss gate fails CLOSED.",
+                    persisted_day_str,
+                    float(self.stats.start_of_day_balance or 0.0),
+                )
+                self.stats.start_of_day_balance = 0.0
+                self.stats.start_of_day_day_str = ""
+                self._start_of_day_base_provenance = None
+                # Re-evaluate the gate: it must not stay OPEN on a base that
+                # has just been invalidated.
+                self._check_risk_limits()
+            # The account has traded, so its live balance is a mid-day balance
+            # and must never be installed as today's opening balance.
+            self._account_has_traded_before = True
+            self._account_history_resolved = True
+            # The PAPER sandbox's scope is a SEPARATE question, and this early
+            # return must not hide it.
+            #
+            # The paper section carries its OWN day stamp, so it can be
+            # UNREADABLE even when the live section says "another day" -- and
+            # an unreadable paper scope is unknown, not another day. Skipping
+            # it left the paper counters at the process-born zeros, and the
+            # PAPER gate then re-opened on them at the next paper balance
+            # update. A readable paper stamp still means what it always
+            # meant: another day, discarded.
+            # THE PAPER SANDBOX'S OWN STATE IS RESTORED ON ITS OWN SCOPE.
+            #
+            # The paper section carries its OWN day stamp, so the live
+            # section belonging to another UTC day says NOTHING about it. The
+            # early return above used to only SCOPE-CHECK the paper
+            # sub-payload and then return: a paper section stamped TODAY was
+            # never applied and never latched, so the paper counters
+            # restarted at zero, the PAPER gate opened on them, and the next
+            # `save_state()` wrote the zeros back -- the paper block was
+            # lost.
+            #
+            # So the paper state is applied HERE, by the same rules as in the
+            # main path below: its own day stamp decides whether it is
+            # applied, and an unreadable one fails closed.
+            self._apply_persisted_paper_guard_state(paper_payload, current_day_str)
+            # The PAPER gate is re-evaluated against the paper counters that
+            # were just restored. Without this the early return left the
+            # PAPER gate on whatever it was, so a paper streak that breaches
+            # the limit would not close it until the next balance refresh.
+            self._check_risk_limits(mode="paper")
+            return False
+
+        # THE LIVE COUNTERS.
+        #
+        # An account with NO live sandbox behind it has no live counters to
+        # restore: for it the payload's live section is a PLACEHOLDER (and, in
+        # a payload written before the paper/live split, it holds that
+        # account's PAPER numbers -- see `_paper_payload_for_restore`). The
+        # account's own guard state is the PAPER section, restored below.
+        if self._is_paper_only_account():
+            logger.critical(
+                "[RiskGuard] This account has NO live sandbox behind it "
+                "(api_key_id=%r, live executor present=%s), so the persisted "
+                "LIVE section is NOT restored into the LIVE sandbox: it is a "
+                "placeholder for an account that cannot trade live. This "
+                "account's own guard state is the PAPER section.",
+                self.api_key_id,
+                getattr(self, "executor", None) is not None,
+            )
+        else:
+            self._apply_persisted_live_guard_state(payload, current_day_str)
+
+
+        # THE PAPER SANDBOX'S OWN STATE, restored from the SAME payload.
+        # It lives under the "paper" key, so the LIVE counters above keep
+        # their existing top-level names and a payload written before this
+        # change still restores the live state correctly -- there is NO
+        # guard reset on deploy. A payload without a "paper" key simply
+        # leaves the paper counters at zero, which is correct: the paper
+        # sandbox was never persisted before.
+        # THE PAPER SANDBOX'S OWN STATE, restored from the SAME payload.
+        #
+        # CORRECTION (2026-11-02): the comment this replaces ended "A payload
+        # without a 'paper' key simply leaves the paper counters at zero, which
+        # is correct: the paper sandbox was never persisted before." That was
+        # FALSE for exactly one account class -- a KEYLESS PAPER-ONLY
+        # account. Before this change there was ONE sandbox of counters and it
+        # was persisted at the TOP LEVEL of the payload, so for such an
+        # account the top-level counters WERE its paper loss streak and its
+        # paper day's PnL. Leaving the paper counters at zero therefore
+        # DISCARDED the streak that was blocking the account: the PAPER gate
+        # opened on the zeros and the next `save_state()` wrote them back.
+        # `_paper_payload_for_restore()` now reads the legacy top level as the
+        # paper section for that account class.
+        self._apply_persisted_paper_guard_state(paper_payload, current_day_str)
+
         # Re-evaluate the gate against the restored numbers. The start-up
         # path re-opened the gate on the way in (initialize_balance resets
         # the counters and the gate); this closes it again when the restored
         # streak still breaches the limit.
         self._check_risk_limits()
+        # The PAPER gate is re-evaluated against the PAPER counters, which
+        # were restored from the same payload.
+        self._check_risk_limits(mode="paper")
         if not self._is_trading_allowed and not self._emergency_stop_active:
             if self._global_gate_disable_reason:
                 self._trading_disabled_reason = self._global_gate_disable_reason
