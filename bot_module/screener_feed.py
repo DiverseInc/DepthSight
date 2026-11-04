@@ -210,6 +210,15 @@ def _invalid_url_message(text: str) -> str:
     )
 
 
+def _no_host_message(text: str) -> str:
+    return (
+        f"MAIN_APP_WS_URL ('{text}') is a ws:// or wss:// URL with NO "
+        "HOST, so it names nothing to connect to. A WebSocket endpoint "
+        "needs the host of this fork's own screener service "
+        f"(for example wss://{FORK_OWN_DOMAIN}/ws/main)."
+    )
+
+
 def _upstream_url_message(text: str, host: str) -> str:
     return (
         f"MAIN_APP_WS_URL ('{text}') points at the UPSTREAM DepthSight-Pro "
@@ -228,13 +237,17 @@ def describe_ws_url_problem(url: Any) -> Optional[str]:
     Pure -- it takes the URL, not the config module, so the rules are testable
     without importing anything.
 
-    The three bad states, in the order they are checked:
+    The four bad states, in the order they are checked:
 
     * MISSING   -- empty.  This fork ships NO default on purpose (see the
       module docstring), so an empty value means "the operator has not
       configured the feed", and that must be NAMED, not defaulted away.
     * NOT-A-WS  -- the scheme is not ws:// or wss://, so the client is not
       talking to a WebSocket at all.
+    * NO-HOST   -- the scheme IS ws:// or wss://, but the URL names NO
+      HOST, so there is nothing to connect to.  The NOT-A-WS check is
+      a SCHEME PREFIX test, so "ws://" and "ws:///ws/main" used to
+      pass it.
     * UPSTREAM  -- the host is one of the upstream's reserved hostnames.
     """
     text = url.strip() if isinstance(url, str) else ""
@@ -242,6 +255,8 @@ def describe_ws_url_problem(url: Any) -> Optional[str]:
         return _missing_url_message()
     if not text.lower().startswith(("ws://", "wss://")):
         return _invalid_url_message(text)
+    if not ws_url_host(text):
+        return _no_host_message(text)
     if is_upstream_depthsight_url(text):
         return _upstream_url_message(text, ws_url_host(text))
     return None

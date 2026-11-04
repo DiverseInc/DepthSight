@@ -42,12 +42,14 @@ logger = logging.getLogger(__name__)
 
 try:
     from bot_module import config as bot_config
+    from bot_module.screener_feed import ws_url_host
 except ImportError:  # pragma: no cover - the bot package is always present
     # The bot's config module could not be imported in this process. There is
     # then no screener WebSocket feed here either, so this deployment cannot
     # deliver the regime data. This is the same answer the API's own
     # MockConfig fallback produced before this module existed.
     bot_config = None  # type: ignore[assignment]
+    ws_url_host = None  # type: ignore[assignment]
 
 __all__ = [
     "arms_breakeven_on_regime_change",
@@ -100,7 +102,7 @@ def screener_feed_can_deliver_regime_data() -> bool:
 
       1. SYMBOL_SOURCE_MODE == "MAIN_APP"   (data_consumer.py:453, 456)
       2. MAIN_APP_WS_ENABLED is true         (data_consumer.py:463)
-      3. MAIN_APP_WS_URL is a ws:// / wss:// URL
+      3. MAIN_APP_WS_URL is a ws:// / wss:// URL THAT NAMES A HOST
                                             (data_consumer.py:519-522)
 
     (The `websockets` import at data_consumer.py:520 is a packaging
@@ -129,4 +131,11 @@ def screener_feed_can_deliver_regime_data() -> bool:
     ws_url = getattr(bot_config, "MAIN_APP_WS_URL", "")
     if not isinstance(ws_url, str) or not ws_url:
         return False
-    return ws_url.startswith(("ws://", "wss://"))
+    if not ws_url.startswith(("ws://", "wss://")):
+        return False
+    # A ws:// URL that names NO HOST cannot deliver anything: there is
+    # no host to connect to, and the consumer refuses to start against
+    # it (bot_module/screener_feed.py rejects the same URL).  This is
+    # the SAME rule the shared guard applies, asked here so the two
+    # cannot drift apart.
+    return bool(ws_url_host(ws_url))

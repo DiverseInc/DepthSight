@@ -455,6 +455,49 @@ def test_the_shared_rule_accepts_a_legitimate_host():
     )
 
 
+def test_the_shared_rule_refuses_a_websocket_url_with_no_host():
+    """A ws:// URL that names NO HOST is not a WebSocket endpoint.
+
+    The NOT-A-WS check is a SCHEME PREFIX test, so 'ws://' and
+    'ws:///ws/main' used to pass it: they look like WebSocket URLs, and they
+    name no host at all. There is nothing to connect to, so the feed
+    reconnects forever against an empty address while the deployment keeps
+    looking healthy -- the exact failure this guard exists to prevent.
+    """
+    rules = _shared_rules()
+
+    for url in ("ws://", "ws:///ws/main", "wss://"):
+        problem = rules.describe_ws_url_problem(url)
+
+        assert problem is not None, (
+            f"a WebSocket URL with NO HOST must be reported as a problem. "
+            f"Got: {url!r}"
+        )
+        assert "MAIN_APP_WS_URL" in problem, (
+            f"the message must name the env var. Got: {problem!r}"
+        )
+        assert "host" in problem.lower(), (
+            f"the message must NAME the bad state (no host). Got: {problem!r}"
+        )
+
+
+async def test_a_hostless_websocket_url_makes_the_feed_undeliverable(feed_env):
+    """A ws:// URL with NO HOST cannot deliver the regime data.
+
+    The predicate answers "can THIS deployment deliver the regime data?".
+    A URL that names no host cannot: there is no host to connect to, and the
+    consumer refuses to start against it. Answering True would arm a
+    regime-change stop against a feed that can never deliver.
+    """
+    feed_env(source_mode="MAIN_APP", ws_enabled=True, ws_url="ws://")
+
+    assert screener_feed_can_deliver_regime_data() is False, (
+        "a WebSocket URL with no host cannot deliver the regime data, so the "
+        "predicate must say so -- otherwise a protection that can never fire "
+        "is armed silently"
+    )
+
+
 # ---------------------------------------------------------------------------
 # (a) the regime-change stop must not be armed on a feed that cannot deliver
 # ---------------------------------------------------------------------------
