@@ -1103,8 +1103,21 @@ class StrategyInfo(StrategyRunRequest):  # For response
     status_detail: Optional[str] = Field(
         None,
         description=(
-            "Why this strategy reports status='cannot_trade', when it does. "
-            "Set by the bot at instance creation; absent for every other status."
+            "Why this strategy reports a non-running status, when it does. "
+            "Set by the bot: 'cannot_trade' when the engine detected a config "
+            "that can never signal, 'blocked' when the strategy's resolved "
+            "symbol pool is empty (the symbol source is unavailable). Absent "
+            "for a healthy running strategy."
+        ),
+    )
+    status_reason_code: Optional[str] = Field(
+        None,
+        description=(
+            "Machine-readable cause behind status='blocked': "
+            "'symbol_source_unavailable' (the screener feed is providing no "
+            "symbols), 'no_symbols_configured' (the strategy has an empty "
+            "symbol list), 'unknown_symbol_mode'. Lets the UI translate the "
+            "reason. None for every other status."
         ),
     )
 

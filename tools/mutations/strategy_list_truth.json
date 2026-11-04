@@ -1,0 +1,48 @@
+{
+  "pytest_target": "tests/test_strategy_list_tells_the_truth.py",
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "A: the publisher stops consulting the RESOLVED symbol pool",
+      "file": "bot_module/controller.py",
+      "needle": "            _pool_mode, _pool_symbols, _pool_mode_known = (\n                self._resolve_symbol_pool_for_strategy(config_dict)\n            )\n            symbols_str, _symbol_scope_reason, _symbol_scope_code = _derive_symbol_scope(\n                _pool_mode, _pool_symbols, _pool_mode_known\n            )",
+      "replace": "            _pool_mode, _pool_symbols, _pool_mode_known = (\n                self._resolve_symbol_pool_for_strategy(config_dict)\n            )\n            symbols_str = \"Dynamic (All)\"\n            _symbol_scope_reason = None\n            _symbol_scope_code = None"
+    },
+    {
+      "label": "B: an empty-pool strategy is labelled 'Dynamic (All)' again",
+      "file": "bot_module/controller.py",
+      "needle": "    return (\n        NO_SYMBOLS_LABEL,\n        \"Symbol source unavailable: the screener feed is providing no symbols \"",
+      "replace": "    return (\n        \"Dynamic (All)\",\n        \"Symbol source unavailable: the screener feed is providing no symbols \""
+    },
+    {
+      "label": "C: the blocked state flips back to running",
+      "file": "bot_module/controller.py",
+      "needle": "    if symbol_scope_reason:\n        return \"blocked\"",
+      "replace": "    if False:  # mutant: the blocked state is never reached\n        return \"blocked\""
+    },
+    {
+      "label": "D: the reason degrades to the mode name",
+      "file": "bot_module/controller.py",
+      "needle": "        \"Symbol source unavailable: the screener feed is providing no symbols \"",
+      "replace": "        \"Dynamic: \""
+    },
+    {
+      "label": "E: the dashboard renders a blocked strategy in the green RUNNING colour",
+      "file": "frontend/src/components/dashboard/TopStrategiesTable.tsx",
+      "needle": "\t\tcase STRATEGY_STATUS_BLOCKED:\n\t\t\treturn BLOCKED_BADGE_CLASS;",
+      "replace": "\t\tcase STRATEGY_STATUS_BLOCKED:\n\t\t\treturn \"bg-green-500 hover:bg-green-600\";"
+    },
+    {
+      "label": "F: the shared blocked badge turns green again",
+      "file": "frontend/src/lib/strategyStatus.ts",
+      "needle": "export const BLOCKED_BADGE_CLASS =\n\t\"bg-amber-500 hover:bg-amber-600 text-white\";",
+      "replace": "export const BLOCKED_BADGE_CLASS =\n\t\"bg-green-500 hover:bg-green-600 text-white\";"
+    },
+    {
+      "label": "G: the PWA renders a blocked strategy as Active",
+      "file": "pwa/screens/StrategiesScreen.tsx",
+      "needle": "isBlocked ? \"bg-[hsl(var(--warning))] text-[hsl(var(--primary-foreground))]\" : isRunning ?",
+      "replace": "isRunning ?"
+    }
+  ]
+}
