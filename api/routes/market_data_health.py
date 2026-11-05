@@ -90,12 +90,18 @@ def _classify(seconds: Optional[float], timeframe: str) -> str:
 
 
 def _split_symbols(s: str) -> List[str]:
-    """Static-mode strategies store symbols as "BTCUSDT, ETHUSDT" or
-    'Dynamic (All)'. Return a clean list of UC symbols when possible.
+    """Static-mode strategies store symbols as "BTCUSDT, ETHUSDT".
+    Return a clean list of UC symbols when possible.
+
+    The other published labels are NOT symbol lists and must never be
+    mistaken for one: "Dynamic (All)" (a screener-fed strategy) and
+    "No symbols" (the publisher's honest label for a strategy whose
+    resolved pool is empty). Parsing either as a symbol would tag a
+    stream with a symbol that does not exist.
     """
     if not isinstance(s, str):
         return []
-    if "Dynamic" in s:
+    if "Dynamic" in s or s.strip() in ("No symbols", "None"):
         return []
     parts = [p.strip().upper().replace("/", "").replace(":", "") for p in s.split(",")]
     return [p for p in parts if p]

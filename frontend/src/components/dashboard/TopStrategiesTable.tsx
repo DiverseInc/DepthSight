@@ -26,6 +26,12 @@ import {
 } from "@/components/ui/table";
 import { usePortfolioMode } from "@/context/PortfolioModeContext";
 import { useStrategies } from "@/lib/api";
+import {
+	BLOCKED_BADGE_CLASS,
+	STRATEGY_STATUS_BLOCKED,
+	blockedReasonI18nKey,
+} from "@/lib/strategyStatus";
+import type { StrategyData } from "@/types/api";
 
 const getStatusBadgeVariant = (status: string) => {
 	switch (status.toLowerCase()) {
@@ -45,6 +51,11 @@ const getStatusBadgeVariant = (status: string) => {
 		// Red, not grey: it is broken, not merely idle.
 		case "cannot_trade":
 			return "bg-red-500 hover:bg-red-600";
+		// Scoped to no symbols: the strategy is running, but it cannot trade
+		// because its symbol source is unavailable. Amber -- blocked, not
+		// working, and not a crash either.
+		case STRATEGY_STATUS_BLOCKED:
+			return BLOCKED_BADGE_CLASS;
 		default:
 			return "bg-gray-500 hover:bg-gray-600";
 	}
@@ -116,6 +127,14 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 		} catch {
 			return t("common:na");
 		}
+	};
+
+	// The reason a strategy is blocked, in the customer's language when the
+	// bot published a reason code, and in the bot's own words otherwise.
+	const statusReason = (strategy: StrategyData): string | undefined => {
+		const key = blockedReasonI18nKey(strategy.status_reason_code);
+		if (key) return t(key);
+		return strategy.status_detail || undefined;
 	};
 
 	if (isError) {
@@ -208,7 +227,7 @@ export const TopStrategiesTable: React.FC<{ topN?: number }> = ({
 										{strategy.symbol}
 									</TableCell>
 									<TableCell className="text-center">
-										<Badge className={getStatusBadgeVariant(strategy.status)} title={strategy.status_detail || undefined}>
+										<Badge className={getStatusBadgeVariant(strategy.status)} title={statusReason(strategy)}>
 											{strategy.status.replace(/_/g, " ").toUpperCase()}
 										</Badge>
 									</TableCell>
