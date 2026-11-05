@@ -50,7 +50,18 @@ export default defineConfig({
 		// otherwise pull in a SECOND React instance, and the hooks would
 		// break with "Cannot read properties of null (reading 'useContext')".
 		// `dedupe` makes one React serve the whole test run.
-		dedupe: ["react", "react-dom", "react-i18next"],
+		//
+		// `@tanstack/react-query` is in the list for the same reason, and
+		// one step further on: the PWA has its OWN copy of it, and that
+		// copy imports React from the PWA's own node_modules. Dedupe only
+		// the package the hook imports -- so without this entry the PWA's
+		// React Query would still pull in the PWA's React.
+		dedupe: [
+			"react",
+			"react-dom",
+			"react-i18next",
+			"@tanstack/react-query",
+		],
 	},
 	test: {
 		environment: "node",

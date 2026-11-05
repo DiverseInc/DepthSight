@@ -30,6 +30,12 @@
     "    exercised by the repository's only frontend runner. That is a real",
     "    behavioural test of the PWA's decision, not a grep of its source.",
     "  * frontend/src/features/hft-dashboard/* -- the HFT dashboard equivalents.",
+    "  * pwa/lib/useOracleAvailability.ts -- the PWA's own hook. It used to ask",
+    "    the server ONCE per mount and never again, so its answer could DRIFT",
+    "    from the server: an open screen could not light up on the day a model",
+    "    was deployed. The hook now re-asks on an interval and on foreground, and",
+    "    src/__tests__/pwaOracleAvailability.test.tsx is what proves it -- by",
+    "    mounting the REAL hook and watching the fake clock pass.",
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/oracle_availability_frontend.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
@@ -58,7 +64,8 @@
     "test",
     "--",
     "src/__tests__/oracleAvailability.test.tsx",
-    "src/__tests__/pwaOracleCapability.test.ts"
+    "src/__tests__/pwaOracleCapability.test.ts",
+    "src/__tests__/pwaOracleAvailability.test.tsx"
   ],
   "timeout_s": 900,
   "mutations": [
@@ -91,6 +98,18 @@
       "file": "frontend/src/features/hft-dashboard/components/OracleScanner.tsx",
       "needle": "oracleSymbols.length > 0 ? \"Receiving\" : \"No signal\"",
       "replace": "oracleSymbols.length > 0 ? \"Active\" : \"Active\""
+    },
+    {
+      "label": "P: the PWA stops re-asking the server, so its answer drifts again",
+      "file": "pwa/lib/useOracleAvailability.ts",
+      "needle": "\t\trefetchInterval: ORACLE_AVAILABILITY_REFRESH_MS,\n",
+      "replace": "\t\trefetchInterval: false, // MUTANT: never ask again\n"
+    },
+    {
+      "label": "Q: the PWA stops re-asking when the app comes back to the foreground",
+      "file": "pwa/lib/useOracleAvailability.ts",
+      "needle": "\t\trefetchOnWindowFocus: true,\n",
+      "replace": "\t\trefetchOnWindowFocus: false, // MUTANT: never re-ask\n"
     }
   ]
 }
