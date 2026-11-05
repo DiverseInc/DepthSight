@@ -205,3 +205,22 @@ def test_local_project_files_path_is_preserved():
     text = _script_text()
     assert 'if [ -f "deploy.sh" ] && [ -d "api" ]; then' in text
     assert "Detected local project files" in text
+
+
+def test_readme_one_click_deploy_points_at_this_fork():
+    """The README must not send a customer to UPSTREAM's deploy script.
+
+    Our deploy.sh clones THIS fork and refuses to continue if the URL points
+    anywhere else. A README that curls UPSTREAM's script bypasses that fix
+    entirely: the customer would install upstream's product, with upstream's
+    branding and upstream's pricing, and our guard would never run.
+    """
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    upstream = "raw.githubusercontent.com/DepthSight-Pro/DepthSight"
+    fork = "raw.githubusercontent.com/DiverseInc/DepthSight"
+    assert upstream not in readme, (
+        "README.md still points the one-click deploy at UPSTREAM's deploy.sh"
+    )
+    assert fork in readme, (
+        "README.md must point the one-click deploy at THIS fork's deploy.sh"
+    )
