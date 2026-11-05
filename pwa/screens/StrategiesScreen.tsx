@@ -31,11 +31,26 @@ const StrategyItem: React.FC<StrategyItemProps> = ({
 	const { id, name, isRunning, runningInstance } = strategy;
 	const pnl = runningInstance?.pnl ?? 0;
 	const pnlPositive = pnl >= 0;
+	// A strategy whose RESOLVED symbol pool is empty is running but cannot
+	// trade. It must not be rendered as a green "Active" badge: the customer
+	// would be told it is trading while it is scoped to no symbol at all.
+	const isBlocked =
+		(runningInstance?.status ?? "").toLowerCase() === "blocked";
 	const symbol =
 		runningInstance?.symbol ??
 		strategy.config_data?.name?.split("•")[0].trim() ??
 		"N/A";
 	const { t } = useTranslation("pwa-common");
+	const blockedReason = (() => {
+		const code = runningInstance?.status_reason_code;
+		if (code === "symbol_source_unavailable")
+			return t("strategies.blocked.symbolSourceUnavailable");
+		if (code === "no_symbols_configured")
+			return t("strategies.blocked.noSymbolsConfigured");
+		if (code === "unknown_symbol_mode")
+			return t("strategies.blocked.unknownSymbolMode");
+		return runningInstance?.status_detail ?? null;
+	})();
 	return (
 		<div className="p-4 bg-[hsl(var(--card))] rounded-xl mb-3 shadow-sm">
 			<div className="flex items-center">
@@ -46,14 +61,21 @@ const StrategyItem: React.FC<StrategyItemProps> = ({
 					<div className="text-sm text-[hsl(var(--muted-foreground))]">
 						{symbol}
 					</div>
+					{isBlocked && blockedReason && (
+						<div className="text-xs mt-1 text-[hsl(var(--muted-foreground))]">
+							{blockedReason}
+						</div>
+					)}
 				</div>
 				<div className="flex flex-col items-end gap-2">
 					<span
-						className={`px-3 py-1 rounded-full text-xs font-medium ${isRunning ? "bg-[hsl(var(--profit))] text-[hsl(var(--primary-foreground))]" : "bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]"}`}
+						className={`px-3 py-1 rounded-full text-xs font-medium ${isBlocked ? "bg-[hsl(var(--warning))] text-[hsl(var(--primary-foreground))]" : isRunning ? "bg-[hsl(var(--profit))] text-[hsl(var(--primary-foreground))]" : "bg-[hsl(var(--secondary))] text-[hsl(var(--secondary-foreground))]"}`}
 					>
-						{isRunning
-							? t("strategies.status.running")
-							: t("strategies.status.stopped")}
+						{isBlocked
+							? t("strategies.status.blocked")
+							: isRunning
+								? t("strategies.status.running")
+								: t("strategies.status.stopped")}
 					</span>
 					{isRunning && (
 						<span
