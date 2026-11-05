@@ -1099,7 +1099,20 @@ export interface RunningStrategy {
 	strategy_name: string;
 	symbol: string;
 	market_type: string;
-	status: "running";
+	/**
+	 * The status the bot publishes. Known values: "running", "in_position",
+	 * "cannot_trade", "blocked". "blocked" means the strategy is running but
+	 * scoped to NO symbols -- it cannot trade until its symbol source
+	 * provides some. It must never be rendered as a green "running" badge.
+	 */
+	status: string;
+	/** Why the strategy is not running normally, in the bot's own words. */
+	status_detail?: string | null;
+	/** Machine-readable cause behind status "blocked", so the UI can translate it. */
+	status_reason_code?: string | null;
+	/** The RESOLVED symbol pool. Empty when the strategy is blocked. */
+	symbols?: string[] | null;
+	symbol_selection_mode?: string | null;
 	pnl: number;
 	open_positions: number;
 	started_at: string;

@@ -80,6 +80,11 @@ import {
 	oracleDefaultConfidencePercent,
 } from "@/lib/oracleCapability";
 import { useAccountStore } from "@/stores/accountStore";
+import {
+	BLOCKED_BADGE_CLASS,
+	blockedReasonI18nKey,
+	isBlockedStrategyStatus,
+} from "@/lib/strategyStatus";
 import type {
 	StrategyConfig,
 	StrategyConfigCreatePayload,
@@ -105,6 +110,11 @@ const getStatusColor = (status: string | undefined) => {
 		return "bg-slate-400 hover:bg-slate-500 text-white";
 	if (s === "error" || s === "failed")
 		return "bg-red-500 hover:bg-red-600 text-white";
+	// Scoped to no symbols: the strategy is running but cannot trade because
+	// its symbol source is unavailable. Amber -- blocked, not working, and
+	// not a crash either.
+	if (isBlockedStrategyStatus(s))
+		return BLOCKED_BADGE_CLASS;
 	return "bg-slate-400 hover:bg-slate-500 text-white";
 };
 
@@ -137,6 +147,13 @@ const StrategyCard = forwardRef<
 		const strategyClass =
 			strategy.strategy_name || strategy.config_data?.strategy_name || null;
 		const riskSettings = strategy.config_data?.risk_settings;
+		// Why a blocked strategy is blocked, in the customer's language when the
+		// bot published a reason code, and in the bot's own words otherwise.
+		const statusReason = (() => {
+			const key = blockedReasonI18nKey(strategy.status_reason_code);
+			if (key) return t(key);
+			return strategy.status_detail || undefined;
+		})();
 
 		return (
 			<TooltipProvider>
@@ -160,7 +177,10 @@ const StrategyCard = forwardRef<
 									</CardDescription>
 								</div>
 								<div className="flex flex-col gap-1 items-end flex-shrink-0">
-									<Badge className={getStatusColor(strategy.status)}>
+									<Badge
+										className={getStatusColor(strategy.status)}
+										title={statusReason}
+									>
 										{strategy.status?.toUpperCase() || "STOPPED"}
 									</Badge>
 									<Badge
@@ -231,11 +251,19 @@ const StrategyCard = forwardRef<
 									    so every FIXED strategy was mislabelled
 									    "Dynamic" -- claiming a screener-feed dependency
 									    it does not have, while actually holding a
-									    pinned symbol. */}
-									{(strategy.symbol_selection_mode || "").toUpperCase() ===
-									"DYNAMIC"
-										? "Dynamic"
-										: strategy.symbols?.join(", ") || "N/A"}
+									    pinned symbol.
+
+									    A BLOCKED strategy is the other half of the
+									    same lie: it is scoped to NO symbols, so
+									    "Dynamic" would claim a scope it does not
+									    have. It shows the label the bot published
+									    ("No symbols") instead. */}
+									{isBlockedStrategyStatus(strategy.status)
+										? strategy.symbol || "N/A"
+										: (strategy.symbol_selection_mode || "").toUpperCase() ===
+											"DYNAMIC"
+											? "Dynamic"
+											: strategy.symbols?.join(", ") || "N/A"}
 								</span>
 							</div>
 

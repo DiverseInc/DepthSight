@@ -140,8 +140,14 @@
 		}
 	},
 	"strategies": {
+		"blocked": {
+			"symbolSourceUnavailable": "Symbol source unavailable: the screener feed is providing no symbols for this strategy, so it is scoped to nothing and cannot trade until the feed recovers.",
+			"noSymbolsConfigured": "No symbols are configured for this strategy, so it is scoped to nothing and cannot trade.",
+			"unknownSymbolMode": "This strategy uses a symbol selection mode the engine does not understand, so no symbols can be resolved and it cannot trade."
+		},
 		"status": {
 			"running": "Active",
+			"blocked": "Blocked",
 			"stopped": "Saved"
 		},
 		"run": "Run",
