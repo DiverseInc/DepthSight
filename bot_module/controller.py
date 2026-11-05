@@ -207,6 +207,24 @@ def _derive_symbol_scope(
     )
 
 
+def _symbol_selection_mode_of(config_dict: Dict[str, Any]) -> str:
+    """The symbol-selection mode of a strategy payload. 'DYNAMIC' when unset.
+
+    This MUST be the only place that reads the mode out of a payload, so
+    the engine (which resolves the symbol pool from it) and the guards
+    (which refuse a strategy the deployment cannot feed) cannot disagree
+    about which mode a strategy is in.  `symbol_selection_mode` rides on
+    the payload as a TOP-LEVEL key (the API puts it there), and an unset
+    mode means DYNAMIC -- the same default the engine has always used.
+
+    It is a MODULE-LEVEL function on purpose, not a method: the resolver
+    is also exercised against a stub that is not a TradingController
+    (tests/test_strategy_list_tells_the_truth.py), and a method would make
+    that stub depend on an attribute it has no reason to have.
+    """
+    return str(config_dict.get("symbol_selection_mode") or "DYNAMIC").strip().upper()
+
+
 class ActivePositionMap(dict):
     """
     Stores live positions by market-aware key while preserving legacy symbol-only
@@ -2456,26 +2474,18 @@ class TradingController:
                 "Fix the feed, or turn the option off."
             )
 
-        # A DYNAMIC-mode strategy needs a symbol source. This deployment's
-        # screener feed CONFIGURATION is wrong when the feed is switched on
-        # but its URL is missing or unusable (the UNSAFE PAIRING -- the
-        # consumer refuses to start, so nothing would ever deliver symbols),
-        # or when the URL names the UPSTREAM DepthSight-Pro deployment.
+        # A DYNAMIC-mode strategy needs a symbol source, and this deployment
+        # may not have one: the screener feed can be switched OFF, switched
+        # on but unusable, or pointed at a host that cannot serve the bot's
+        # 'active_pairs_update' message (the UPSTREAM's reserved hostname, or
+        # THIS fork's own frontend socket -- see
+        # bot_module/screener_feed.py).
         #
-        # In both cases a DYNAMIC strategy started here would have ZERO
-        # symbols: it would report "running", subscribe to nothing, match
-        # nothing, and never trade. That is the failure mode the product's
-        # own configuration notes call the worst one, because it looks
-        # healthy.
-        #
-        # The SAFE pairing -- the feed switched OFF with an empty URL -- is
-        # NOT refused here. Whether DYNAMIC may be used at all is decided by
-        # the established rules: SYMBOL_SELECTION_ALLOW_DYNAMIC (false by
-        # default, and it already refuses a DYNAMIC start at the API with a
-        # 503) and the CRITICAL outage alarm in the consumer's disabled-feed
-        # branch. Refusing here as well would make this guard "always
-        # refuse everything", which is what
-        # tests/test_safety_guard_regressions.py exists to prevent.
+        # In every one of those cases a DYNAMIC strategy started here would
+        # have ZERO symbols: it would report "running", subscribe to nothing,
+        # match nothing, and never trade. That is the failure mode the
+        # product's own configuration notes call the worst one, because it
+        # looks healthy.
         #
         # The mode is read through `_symbol_selection_mode_of`, the SAME helper
         # the symbol-pool resolver uses, so this guard and the engine cannot
@@ -2484,24 +2494,41 @@ class TradingController:
         # The API route (`POST /api/v1/strategies`) asks the same question
         # and refuses with a 503. This Redis command channel is a second way
         # in, and it has to refuse too.
-        _sel_mode = self._symbol_selection_mode_of(payload)
+        #
+        # A REHYDRATE REPLAY is exempt, and deliberately so: the replayed
+        # strategy was already approved by the API and was running before
+        # this restart, so refusing it would make the user's running strategy
+        # VANISH after a restart -- a worse regression than a strategy that
+        # cannot pick NEW symbols. It is NOT refused silently: it is
+        # CRITICAL-logged, exactly like the replayed regime arming above.
+        _sel_mode = _symbol_selection_mode_of(payload)
         if _sel_mode == "DYNAMIC":
             _dynamic_problem = screener_feed_misconfigured(
                 getattr(config, "SYMBOL_SOURCE_MODE", "MAIN_APP"),
                 getattr(config, "MAIN_APP_WS_URL", ""),
                 getattr(config, "MAIN_APP_WS_ENABLED", False),
             )
-            if _dynamic_problem:
+            if _dynamic_problem and not is_rehydrate:
                 logger.critical(
                     f"{log_prefix} REFUSED to start: this strategy is "
-                    "DYNAMIC-mode and this deployment's screener feed is "
-                    "MISCONFIGURED. %s A DYNAMIC strategy started here would "
+                    "DYNAMIC-mode and this deployment's screener feed CANNOT "
+                    "DELIVER A SYMBOL. %s A DYNAMIC strategy started here would "
                     "have zero symbols -- it would report 'running' and never "
                     "trade. Fix the feed, or launch the strategy with "
                     "explicit symbols (STATIC/FIXED).",
                     _dynamic_problem,
                 )
                 return
+            if _dynamic_problem:
+                logger.critical(
+                    f"{log_prefix} REPLAYED a DYNAMIC-mode strategy on a "
+                    "deployment whose screener feed CANNOT DELIVER A SYMBOL. "
+                    "%s It was NOT refused: it was already approved and was "
+                    "running before this restart, and refusing it would make "
+                    "the strategy vanish. It can pick NO new symbols until "
+                    "the feed works again. Fix the feed.",
+                    _dynamic_problem,
+                )
 
         async with self.instances_lock:
             if config_id in self.running_strategy_instances:
@@ -7276,19 +7303,6 @@ class TradingController:
             min_candles_required=_derived or None,
         )
 
-    @staticmethod
-    def _symbol_selection_mode_of(config_dict: Dict[str, Any]) -> str:
-        """The symbol-selection mode of a strategy payload. 'DYNAMIC' when unset.
-
-        This MUST be the only place that reads the mode out of a payload, so
-        the engine (which resolves the symbol pool from it) and the guards
-        (which refuse a strategy the deployment cannot feed) cannot disagree
-        about which mode a strategy is in.  `symbol_selection_mode` rides on
-        the payload as a TOP-LEVEL key (the API puts it there), and an unset
-        mode means DYNAMIC -- the same default the engine has always used.
-        """
-        return str(config_dict.get("symbol_selection_mode") or "DYNAMIC").strip().upper()
-
     def _resolve_symbol_pool_for_strategy(
         self, config_dict: Dict[str, Any]
     ) -> Tuple[str, List[str], bool]:
@@ -7312,7 +7326,7 @@ class TradingController:
                     (see ``api/routes/onboarding.py``). It used to fall through
                     every branch and yield an empty list.
         """
-        mode = self._symbol_selection_mode_of(config_dict)
+        mode = _symbol_selection_mode_of(config_dict)
 
         if mode == "DYNAMIC":
             global_mode = self.symbol_selection_config.mode

@@ -30,7 +30,17 @@ WHAT THIS FILE PINS
 * (b) an UPSTREAM host in ``MAIN_APP_WS_URL`` is rejected at startup;
 * (c) ``MAIN_APP_WS_ENABLED`` defaults to ``false`` when the env var is unset;
 * (d) the env override actually wins over the default;
-* (e) a legitimate non-upstream host is ACCEPTED -- no false positive.
+* (e) a legitimate non-upstream host is ACCEPTED -- no false positive;
+* (f) THIS fork's OWN frontend socket (``/ws``, ``/ws/main``) is REFUSED as a
+      feed -- it is the frontend's token-authenticated route, it speaks the
+      frontend's messages, and nothing in this repository publishes the bot's
+      ``active_pairs_update`` message, so it can never deliver a symbol.  It
+      is the URL this fork used to ship in ``.env.example``;
+* (g) a DYNAMIC start is REFUSED when the feed is switched OFF: there is then
+      no symbol source at all, and there is no automatic fallback to the
+      static list;
+* (h) a rehydrate REPLAY of an already-running DYNAMIC strategy is NOT
+      refused -- it must not vanish on restart -- but it is CRITICAL-logged.
 
 Every test drives the REAL production code: the real ``bot_module.config``
 module, the real ``DataConsumer.start``, the real API route, and the real
@@ -67,6 +77,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # This fork's own screener WebSocket.  The route in this repository is /ws,
 # with /ws/main as an alias (api/websocket_server.py).
 FORK_OWN_WS_URL = "wss://depthsight.diverseinc.net/ws/main"
+
+# A screener service the OPERATOR controls: a host that publishes the bot's
+# "active_pairs_update" message.  THIS is what a working feed looks like.
+#
+# FORK_OWN_WS_URL is NOT one, and cannot be: it is this fork's own frontend
+# socket, which is token-authenticated, speaks the frontend's messages, and
+# has no publisher of "active_pairs_update" anywhere in this repository.  The
+# bot now REFUSES it as a feed -- see bot_module/screener_feed.py.
+OPERATOR_PUBLISHER_WS_URL = "wss://screener.my-own-domain.example/ws/bot/"
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +230,15 @@ def _controller(redis_client=None, get_db_session=None):
     return controller
 
 
-def _start_command(*, symbol_selection_mode: str | None = "DYNAMIC"):
-    """A ``START_STRATEGY`` command in the exact envelope the API publishes."""
+def _start_command(
+    *, symbol_selection_mode: str | None = "DYNAMIC", rehydrate: bool = False
+):
+    """A ``START_STRATEGY`` command in the exact envelope the API publishes.
+
+    ``rehydrate`` marks a REPLAY of a strategy that was already approved and
+    was running before the bot restarted; the listener passes it straight
+    through to the handler (controller.py:1568).
+    """
     payload = {
         "user_id": 1,
         "id": CONFIG_ID,
@@ -222,7 +248,10 @@ def _start_command(*, symbol_selection_mode: str | None = "DYNAMIC"):
     }
     if symbol_selection_mode is not None:
         payload["symbol_selection_mode"] = symbol_selection_mode
-    return {"command": "START_STRATEGY", "payload": payload}
+    command = {"command": "START_STRATEGY", "payload": payload}
+    if rehydrate:
+        command["rehydrate"] = True
+    return command
 
 
 async def _deliver(controller, command):
@@ -380,6 +409,83 @@ async def test_symbol_source_mode_defaults_to_main_app(reloaded_config):
     )
 
 
+def test_the_shipped_env_example_advertises_no_feed_that_cannot_deliver():
+    """(i) The SHIPPED default must be correct.
+
+    This fork used to ship ``MAIN_APP_WS_URL=wss://depthsight.diverseinc.net/ws/main``
+    in ``.env.example``.  That URL is THIS fork's own FRONTEND socket: it is
+    token-authenticated (api/websocket_server.py:228-230), it forwards Redis
+    messages as ``{"topic", "payload"}`` (:187-191) while the bot only
+    understands ``{"type": "active_pairs_update", "data": [...]}``
+    (data_consumer.py:3476-3478), and nothing in this repository publishes
+    that message at all.  An operator who copied the shipped default got a
+    feed that connects and delivers NO SYMBOL -- so a DYNAMIC strategy
+    reported "running" and never traded.
+
+    The shipped default must therefore be FAIL-CLOSED: it must not advertise
+    a URL the bot cannot speak to, and a DYNAMIC strategy on the shipped
+    configuration must be REFUSED rather than started into a silent no-op.
+
+    This reads the real ``.env.example`` -- the file an operator actually
+    copies -- and not the source default, because the source default and the
+    shipped example can drift apart.
+    """
+    env_text = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+    values = {}
+    for raw_line in env_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+
+    url = values.get("MAIN_APP_WS_URL", "")
+    enabled = values.get("MAIN_APP_WS_ENABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    rules = _shared_rules()
+
+    # This fork ships NO screener URL: it runs no screener service
+    # (docker-compose.yml has none), so there is no correct URL to ship.
+    # The upstream's reserved hostname and this fork's own frontend socket
+    # are the two that used to be shipped here; neither can deliver a symbol.
+    assert url == "", (
+        ".env.example must not advertise a MAIN_APP_WS_URL: this fork runs no "
+        "screener service, and the URL it used to ship "
+        "(wss://depthsight.diverseinc.net/ws/main) is the FRONTEND's "
+        f"token-authenticated socket, which cannot deliver a symbol to the "
+        f"bot. Got {url!r}."
+    )
+    assert not rules.is_fork_own_frontend_ws_url(url), (
+        ".env.example must never advertise this fork's own frontend socket as "
+        f"the screener feed. Got {url!r}."
+    )
+    assert not rules.is_upstream_depthsight_url(url), (
+        ".env.example must never advertise the UPSTREAM's reserved hostname as "
+        f"the screener feed. Got {url!r}."
+    )
+
+    # The feed is OFF by default, and the shipped default is therefore
+    # REFUSED: a DYNAMIC strategy cannot start against it.
+    assert enabled is False, (
+        ".env.example must leave MAIN_APP_WS_ENABLED=false: the shipped "
+        "default has no screener behind it, so switching the feed on would "
+        "start a reconnect storm against nothing."
+    )
+    problem = rules.screener_feed_misconfigured("MAIN_APP", url, enabled)
+    assert problem is not None, (
+        "the SHIPPED default must be fail-closed: with no screener URL and the "
+        "feed off, a DYNAMIC strategy must be REFUSED, not started into a "
+        "strategy with zero symbols that reports 'running' and never trades."
+    )
+    assert "MAIN_APP_WS_ENABLED" in problem, (
+        f"the refusal must name the switch the operator has to flip. Got: {problem!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # the shared rules in bot_module/screener_feed.py
 # ---------------------------------------------------------------------------
@@ -441,11 +547,18 @@ def test_the_shared_rule_refuses_a_url_that_is_not_a_websocket():
 
 
 def test_the_shared_rule_accepts_a_legitimate_host():
-    """A legitimate host must not be reported as a problem."""
+    """A legitimate host must not be reported as a problem.
+
+    This is the URL rule: it asks "is this a usable WebSocket URL?".  It is
+    NOT the question "can this feed deliver a symbol to the bot?" -- that
+    one is ``screener_feed_misconfigured``, and it refuses this fork's own
+    frontend socket (see the next test).
+    """
     rules = _shared_rules()
 
     assert rules.describe_ws_url_problem(FORK_OWN_WS_URL) is None, (
-        "this fork's own domain must be accepted"
+        "this fork's own domain is a well-formed WebSocket URL and must not "
+        "be mistaken for the upstream's"
     )
     assert rules.describe_ws_url_problem(
         "wss://screener.mycompany-depthsight.pro/ws/main"
@@ -479,6 +592,160 @@ def test_the_shared_rule_refuses_a_websocket_url_with_no_host():
         assert "host" in problem.lower(), (
             f"the message must NAME the bad state (no host). Got: {problem!r}"
         )
+
+
+def test_the_shared_rule_refuses_this_forks_own_frontend_socket():
+    """THIS fork's own frontend socket cannot deliver a symbol to the bot.
+
+    api/websocket_server.py serves /ws (:221) and /ws/main (:390) as an
+    alias.  That route is the FRONTEND's socket: it closes every connection
+    that carries no "?token=" (:228-230) and the bot's screener client
+    sends no token (data_consumer.py:3414-3437); it forwards Redis messages
+    as {"topic", "payload"} (:187-191) while the bot only understands
+    {"type", "active_pairs_update", "data"} (data_consumer.py:3476-3478);
+    and nothing in this repository publishes that message at all.
+
+    So the URL this fork used to SHIP in .env.example
+    (wss://depthsight.diverseinc.net/ws/main) is a DEAD feed: a DYNAMIC
+    strategy pointed at it reports "running" and never trades.
+    """
+    rules = _shared_rules()
+
+    for url in (
+        "wss://depthsight.diverseinc.net/ws/main",
+        "wss://depthsight.diverseinc.net/ws",
+        "wss://depthsight.diverseinc.net/ws/main/",
+        "wss://depthsight.diverseinc.net:8443/ws/main",
+    ):
+        problem = rules.screener_feed_misconfigured("MAIN_APP", url, True)
+
+        assert problem is not None, (
+            "this fork's own frontend socket must be refused as a feed: it "
+            f"can never deliver a symbol. Got: {url!r}"
+        )
+        assert "MAIN_APP_WS_URL" in problem, (
+            f"the message must name the env var. Got: {problem!r}"
+        )
+        assert "frontend" in problem.lower(), (
+            "the message must NAME the bad state (it is the frontend's "
+            f"socket). Got: {problem!r}"
+        )
+
+
+def test_the_shared_rule_accepts_an_operator_owned_publisher():
+    """An operator's own screener host must NOT be refused -- no false positive."""
+    rules = _shared_rules()
+
+    assert rules.screener_feed_misconfigured(
+        "MAIN_APP", OPERATOR_PUBLISHER_WS_URL, True
+    ) is None, (
+        "a host the operator controls must be accepted: refusing it would "
+        "be a false positive"
+    )
+    assert rules.screener_feed_misconfigured(
+        "MAIN_APP", "wss://screener.my-own-domain.example/ws/main", True
+    ) is None, (
+        "the fork's own frontend socket is refused by HOST AND PATH, so an "
+        "operator's own host on the same path is still accepted"
+    )
+    assert rules.screener_feed_misconfigured(
+        "MAIN_APP", "wss://depthsight.diverseinc.net/ws/bot/", True
+    ) is None, (
+        "only the fork's own two frontend routes are refused: another path on "
+        "the same host may be the operator's own screener, reverse-proxied"
+    )
+
+
+def test_the_shared_rule_refuses_a_feed_that_is_switched_off():
+    """A switched-off feed has NO symbol source at all.
+
+    The bot's DYNAMIC symbol pool is _last_known_symbols_from_consumer
+    (controller.py:7216) and that set is filled ONLY by the screener feed's
+    "active_pairs_update" message.  With the feed off there is no fallback to
+    the static list, so a DYNAMIC strategy started here has ZERO symbols: it
+    reports "running" and never trades.
+    """
+    rules = _shared_rules()
+
+    problem = rules.screener_feed_misconfigured("MAIN_APP", "", False)
+
+    assert problem is not None, (
+        "a DYNAMIC start with the feed switched off must be refused: there "
+        "is no symbol source and no fallback to the static list"
+    )
+    assert "MAIN_APP_WS_ENABLED" in problem, (
+        f"the message must name the switch that is off. Got: {problem!r}"
+    )
+
+
+def test_the_shared_rule_refuses_an_unusable_url_even_when_the_feed_is_off():
+    """A URL that is set but unusable is wrong in BOTH pairings.
+
+    The URL rules used to be asked only when the feed was switched ON, so
+    "the feed is off" was a way to smuggle an unusable URL past the guard.
+    It is the cause the moment the feed is switched on, and it is the wrong
+    configuration right now.
+    """
+    rules = _shared_rules()
+
+    for url in ("https://screener.my-own-domain.example/ws/bot/", "ws://"):
+        problem = rules.screener_feed_misconfigured("MAIN_APP", url, False)
+
+        assert problem is not None, (
+            "an unusable URL must be refused whatever the enabled flag says. "
+            f"Got: {url!r}"
+        )
+        assert "ws://" in problem, (
+            f"the message must say what a WebSocket URL looks like. "
+            f"Got: {problem!r}"
+        )
+
+
+def test_the_regime_predicate_refuses_this_forks_own_frontend_socket(feed_env):
+    """The regime predicate must handle the same special cases as the guard.
+
+    It answers "can THIS deployment deliver the regime data?" and the regime
+    data arrives with the bot's "active_pairs_update" message -- so a feed
+    pointed at the frontend's socket cannot deliver it either, and a regime
+    stop armed against it would be inert from the first second.
+    """
+    feed_env(source_mode="MAIN_APP", ws_enabled=True, ws_url=FORK_OWN_WS_URL)
+
+    assert screener_feed_can_deliver_regime_data() is False, (
+        "this fork's own frontend socket cannot deliver the regime data, so "
+        "the predicate must say so -- otherwise a protection that can never "
+        "fire is armed silently"
+    )
+
+
+def test_the_regime_predicate_still_accepts_an_operator_owned_publisher(feed_env):
+    """No false positive: an operator's own screener still counts."""
+    feed_env(source_mode="MAIN_APP", ws_enabled=True, ws_url=OPERATOR_PUBLISHER_WS_URL)
+
+    assert screener_feed_can_deliver_regime_data() is True, (
+        "an operator's own screener can deliver the regime data: refusing it "
+        "would disarm a protection that WOULD have worked"
+    )
+
+
+def test_the_regime_predicate_refuses_the_upstream(feed_env):
+    """The upstream's reserved hostname cannot deliver the regime data.
+
+    The shared symbol guard refuses it, so the regime predicate must refuse
+    it too: AGENTS.md requires duplicated predicates to handle the same
+    special cases, and a regime stop armed against the upstream is inert
+    from the first second.
+    """
+    feed_env(
+        source_mode="MAIN_APP",
+        ws_enabled=True,
+        ws_url="wss://screener.depthsight.pro/ws/bot/",
+    )
+
+    assert screener_feed_can_deliver_regime_data() is False, (
+        "the upstream's deployment is not this fork and answers HTTP 525, so "
+        "it cannot deliver the regime data"
+    )
 
 
 async def test_a_hostless_websocket_url_makes_the_feed_undeliverable(feed_env):
@@ -814,9 +1081,19 @@ async def test_the_api_still_launches_a_dynamic_strategy_with_a_working_feed(
     feed_env,
     monkeypatch,
 ):
-    """(e) A working feed must NOT be refused -- no false positive."""
+    """(e) A working feed must NOT be refused -- no false positive.
+
+    A working feed is a host the OPERATOR controls that publishes the bot's
+    "active_pairs_update" message.  It is NOT this fork's own frontend
+    socket: that route is token-authenticated, speaks the frontend's
+    messages, and has no publisher of "active_pairs_update" in this
+    repository -- so it can never deliver a symbol (measured; see
+    test_the_shared_rule_refuses_this_forks_own_frontend_socket).
+    """
     monkeypatch.setattr(bot_config, "SYMBOL_SELECTION_ALLOW_DYNAMIC", True)
-    feed_env(source_mode="MAIN_APP", ws_enabled=True, ws_url=FORK_OWN_WS_URL)
+    feed_env(
+        source_mode="MAIN_APP", ws_enabled=True, ws_url=OPERATOR_PUBLISHER_WS_URL
+    )
 
     cfg = await _make_config(
         db_session,
@@ -835,20 +1112,25 @@ async def test_the_api_still_launches_a_dynamic_strategy_with_a_working_feed(
     )
 
 
-async def test_the_api_still_launches_a_dynamic_strategy_with_the_feed_disabled(
+async def test_the_api_refuses_a_dynamic_strategy_when_the_feed_is_disabled(
     authenticated_client: AsyncClient,
     db_session,
     pro_user,
     feed_env,
     monkeypatch,
 ):
-    """(e) The SAFE pairing must NOT be refused -- no false positive.
+    """(g) A switched-off feed has NO symbol source -- refuse it.
 
-    MAIN_APP_WS_ENABLED=false with an empty MAIN_APP_WS_URL is the pairing
-    this deployment should run. Whether DYNAMIC may be used at all is
-    decided by SYMBOL_SELECTION_ALLOW_DYNAMIC (set to true here, as an
-    operator who has their own screener would) and by the consumer's
-    CRITICAL outage alarm.
+    MAIN_APP_WS_ENABLED=false means nothing can deliver a symbol: the bot's
+    DYNAMIC symbol pool is filled ONLY by the screener feed's
+    "active_pairs_update" message (controller.py:7216), and there is no
+    automatic fallback to the static list.  A DYNAMIC strategy accepted here
+    would report "running" with ZERO symbols and never trade -- the failure
+    mode that looks healthy.
+
+    SYMBOL_SELECTION_ALLOW_DYNAMIC is set to true here, because an operator
+    who enables DYNAMIC is exactly the operator who hits this: they flipped
+    the switch and pointed the feed at nothing.
     """
     monkeypatch.setattr(bot_config, "SYMBOL_SELECTION_ALLOW_DYNAMIC", True)
     feed_env(source_mode="MAIN_APP", ws_enabled=False, ws_url="")
@@ -863,10 +1145,91 @@ async def test_the_api_still_launches_a_dynamic_strategy_with_the_feed_disabled(
 
     response = await _launch(authenticated_client, cfg.id)
 
-    assert response.status_code == 202, (
-        "the SAFE pairing must not be refused by the feed guard: refusing it "
-        "would be a false positive. Got "
-        f"{response.status_code}: {response.text}"
+    assert response.status_code == 503, (
+        "a DYNAMIC strategy must be refused while the screener feed is "
+        "switched off: there is no symbol source and no fallback to the "
+        f"static list. Got {response.status_code}: {response.text}"
+    )
+    body = response.json()
+    assert "MAIN_APP_WS_ENABLED" in body["error"], (
+        f"the 503 must name the switch that is off. Got: {body!r}"
+    )
+
+
+async def test_the_api_refuses_a_dynamic_strategy_pointed_at_this_forks_own_socket(
+    authenticated_client: AsyncClient,
+    db_session,
+    pro_user,
+    feed_env,
+    monkeypatch,
+):
+    """(f) This fork's own frontend socket cannot deliver a symbol.
+
+    wss://depthsight.diverseinc.net/ws/main is the URL this fork used to
+    SHIP in .env.example.  It is the frontend's token-authenticated socket
+    and nothing in this repository publishes the bot's "active_pairs_update"
+    message, so a DYNAMIC strategy pointed at it would report "running" and
+    never trade.
+    """
+    monkeypatch.setattr(bot_config, "SYMBOL_SELECTION_ALLOW_DYNAMIC", True)
+    feed_env(source_mode="MAIN_APP", ws_enabled=True, ws_url=FORK_OWN_WS_URL)
+
+    cfg = await _make_config(
+        db_session,
+        user_id=pro_user.id,
+        name="dynamic-pointed-at-the-forks-own-socket",
+        mode="DYNAMIC",
+        config_data={"strategy_name": "VisualBuilderStrategy", "params": {}},
+    )
+
+    response = await _launch(authenticated_client, cfg.id)
+
+    assert response.status_code == 503, (
+        "a DYNAMIC strategy must be refused while MAIN_APP_WS_URL points at "
+        "this fork's own frontend socket: it can never deliver a symbol. "
+        f"Got {response.status_code}: {response.text}"
+    )
+    body = response.json()
+    assert "frontend" in body["error"].lower(), (
+        f"the 503 must name the bad state. Got: {body!r}"
+    )
+
+
+async def test_the_api_refuses_a_dynamic_strategy_with_the_feed_on_and_no_url(
+    authenticated_client: AsyncClient,
+    db_session,
+    pro_user,
+    feed_env,
+    monkeypatch,
+):
+    """(a) The UNSAFE PAIRING: the feed is on but there is no URL.
+
+    The consumer refuses to start in that state, so nothing would ever
+    deliver a symbol -- and a DYNAMIC strategy accepted here would report
+    "running" with ZERO symbols and never trade.
+    """
+    monkeypatch.setattr(bot_config, "SYMBOL_SELECTION_ALLOW_DYNAMIC", True)
+    feed_env(source_mode="MAIN_APP", ws_enabled=True, ws_url="")
+
+    cfg = await _make_config(
+        db_session,
+        user_id=pro_user.id,
+        name="dynamic-with-the-feed-on-and-no-url",
+        mode="DYNAMIC",
+        config_data={"strategy_name": "VisualBuilderStrategy", "params": {}},
+    )
+
+    response = await _launch(authenticated_client, cfg.id)
+
+    assert response.status_code == 503, (
+        "a DYNAMIC strategy must be refused while MAIN_APP_WS_ENABLED is on "
+        "and MAIN_APP_WS_URL is empty: the consumer refuses to start, so "
+        f"nothing would ever deliver a symbol. Got {response.status_code}: "
+        f"{response.text}"
+    )
+    body = response.json()
+    assert "MAIN_APP_WS_URL" in body["error"], (
+        f"the 503 must name the env var. Got: {body!r}"
     )
 
 
@@ -992,35 +1355,110 @@ async def test_the_bot_refuses_to_start_a_dynamic_strategy_when_the_url_points_a
     )
 
 
-async def test_the_bot_still_starts_a_dynamic_strategy_when_the_feed_is_disabled(
+async def test_the_bot_refuses_a_dynamic_strategy_when_the_feed_is_disabled(
     created_strategies, feed_env, caplog
 ):
-    """(C) The SAFE pairing is not refused -- no false positive.
+    """(g) A switched-off feed has NO symbol source -- refuse it.
 
-    MAIN_APP_WS_ENABLED=false with an empty MAIN_APP_WS_URL is the pairing
-    this deployment should run: there is no feed to misconfigure, the
-    consumer keeps its market data, and whether DYNAMIC may be used at all
-    is decided by SYMBOL_SELECTION_ALLOW_DYNAMIC and by the consumer's
-    CRITICAL outage alarm. A guard that refused here too would be "always
-    refuse everything".
+    The bot's DYNAMIC symbol pool is filled ONLY by the screener feed's
+    "active_pairs_update" message (controller.py:7216), and there is no
+    automatic fallback to the static list.  A DYNAMIC strategy accepted here
+    would report "running" with ZERO symbols and never trade.
+
+    This is the Redis door, so it is a second way in besides the API's 503:
+    both ask the same predicate, and both must fail in the same direction.
     """
     feed_env(source_mode="MAIN_APP", ws_enabled=False, ws_url="")
 
     controller = _controller()
 
-    await _deliver(controller, _start_command(symbol_selection_mode="DYNAMIC"))
+    with caplog.at_level(logging.CRITICAL, logger="bot_module.controller"):
+        await _deliver(controller, _start_command(symbol_selection_mode="DYNAMIC"))
+
+    assert created_strategies == [], (
+        "a DYNAMIC strategy must not be started while the screener feed is "
+        "switched off: there is no symbol source and no fallback to the "
+        "static list. Got " + repr(created_strategies)
+    )
+    assert "MAIN_APP_WS_ENABLED" in caplog.text, (
+        "the refusal must name the switch that is off -- a refusal that only "
+        "exists in a return statement is not an operation. Log: " + caplog.text
+    )
+
+
+async def test_the_bot_refuses_a_dynamic_strategy_pointed_at_this_forks_own_socket(
+    created_strategies, feed_env, caplog
+):
+    """(f) This fork's own frontend socket cannot deliver a symbol.
+
+    wss://depthsight.diverseinc.net/ws/main is the URL this fork used to
+    SHIP in .env.example.  It is the frontend's token-authenticated socket
+    and nothing in this repository publishes the bot's "active_pairs_update"
+    message, so a DYNAMIC strategy pointed at it would report "running" and
+    never trade.
+    """
+    feed_env(source_mode="MAIN_APP", ws_enabled=True, ws_url=FORK_OWN_WS_URL)
+
+    controller = _controller()
+
+    with caplog.at_level(logging.CRITICAL, logger="bot_module.controller"):
+        await _deliver(controller, _start_command(symbol_selection_mode="DYNAMIC"))
+
+    assert created_strategies == [], (
+        "a DYNAMIC strategy must not be started while MAIN_APP_WS_URL points "
+        "at this fork's own frontend socket: it can never deliver a symbol. "
+        "Got " + repr(created_strategies)
+    )
+    assert "frontend" in caplog.text.lower(), (
+        "the refusal must name the bad state. Log: " + caplog.text
+    )
+
+
+async def test_the_bot_still_replays_a_dynamic_strategy_when_the_feed_cannot_deliver(
+    created_strategies, feed_env, caplog
+):
+    """(h) A rehydrate REPLAY is exempt from the refusal -- but not silent.
+
+    The replayed strategy was already approved by the API and was running
+    before this restart, so refusing it would make the user's running
+    strategy VANISH after a restart -- a worse regression than a strategy
+    that cannot pick new symbols.  It is exempt, and it is CRITICAL-logged,
+    exactly like the replayed regime arming.
+    """
+    feed_env(source_mode="MAIN_APP", ws_enabled=False, ws_url="")
+
+    controller = _controller()
+
+    with caplog.at_level(logging.CRITICAL, logger="bot_module.controller"):
+        await _deliver(
+            controller,
+            _start_command(symbol_selection_mode="DYNAMIC", rehydrate=True),
+        )
 
     assert created_strategies == ["VisualBuilderStrategy"], (
-        "the SAFE pairing (the feed switched off, the URL empty) must not be "
-        "refused. Got " + repr(created_strategies)
+        "a replayed strategy must not vanish on restart. Got "
+        + repr(created_strategies)
+    )
+    assert "REPLAYED" in caplog.text, (
+        "the replay must be LOUD: it is exempt from the refusal, so nothing "
+        "else would say that its feed cannot deliver. Log: " + caplog.text
     )
 
 
 async def test_the_bot_still_starts_a_dynamic_strategy_with_a_working_feed(
     created_strategies, feed_env
 ):
-    """(e) A working feed must NOT be refused -- no false positive."""
-    feed_env(source_mode="MAIN_APP", ws_enabled=True, ws_url=FORK_OWN_WS_URL)
+    """(e) A working feed must NOT be refused -- no false positive.
+
+    A working feed is a host the OPERATOR controls that publishes the bot's
+    "active_pairs_update" message.  It is NOT this fork's own frontend
+    socket: that route is token-authenticated, speaks the frontend's
+    messages, and has no publisher of "active_pairs_update" in this
+    repository -- so it can never deliver a symbol (measured).
+    """
+    feed_env(
+        source_mode="MAIN_APP", ws_enabled=True, ws_url=OPERATOR_PUBLISHER_WS_URL
+    )
 
     controller = _controller()
 

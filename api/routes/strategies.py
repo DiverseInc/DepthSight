@@ -787,23 +787,25 @@ async def start_strategy_instance(
             ),
         )
 
-    # Refuse DYNAMIC when THIS deployment's screener feed is MISCONFIGURED.
+    # Refuse DYNAMIC when THIS deployment's screener feed CANNOT DELIVER A SYMBOL.
     #
     # The guard above asks whether DYNAMIC is ENABLED on this deployment. This
-    # one asks whether the feed's CONFIGURATION is wrong: the feed may be
-    # switched on but its URL missing or unusable (the consumer then refuses
-    # to start, so nothing would ever deliver symbols), or the URL may name
-    # the UPSTREAM DepthSight-Pro deployment's reserved hostname
-    # (screener.depthsight.pro), which is not this fork and answers HTTP 525.
+    # one asks whether the feed can actually deliver a symbol: it may be
+    # switched OFF (nothing would ever deliver one), switched on but with its
+    # URL missing or unusable (the consumer then refuses to start, so nothing
+    # would ever deliver symbols), or pointed at a host that cannot serve the
+    # bot's 'active_pairs_update' message at all -- the UPSTREAM's reserved
+    # hostname (screener.depthsight.pro, which is not this fork and answers
+    # HTTP 525), or THIS fork's own frontend socket (/ws and /ws/main), which
+    # is token-authenticated and speaks the frontend's messages.
     #
-    # In both cases a dynamic strategy started here would have zero symbols:
-    # it reports "running", and never trades. Refusing here turns that into an
-    # error the operator can act on.
+    # In every one of those cases a dynamic strategy started here would have
+    # zero symbols: it reports "running", and never trades. Refusing here
+    # turns that into an error the operator can act on.
     #
-    # The SAFE pairing -- the feed switched OFF with an empty URL -- is NOT
-    # refused here. Whether DYNAMIC may be used at all is decided by
-    # SYMBOL_SELECTION_ALLOW_DYNAMIC (the guard above) and by the consumer's
-    # CRITICAL outage alarm.
+    # The rules live in bot_module/screener_feed.py and the bot's Redis
+    # command channel asks the SAME predicate, so the two doors cannot drift
+    # apart.
     if _resolved_mode == "DYNAMIC":
         _dynamic_problem = _screener_feed_misconfigured(
             getattr(bot_config, "SYMBOL_SOURCE_MODE", "MAIN_APP"),

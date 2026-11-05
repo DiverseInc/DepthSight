@@ -220,6 +220,13 @@ async def test_e2e_signal_approved_on_companion_density(
         "mode": "paper",
         "config_data": {"strategy_name": "VolumeBreakout", "params": {}},
         "use_ml_confirmation": False,
+        # The symbol mode is EXPLICIT.  This test is about the orderbook
+        # density decision, not about where the symbols come from: with no
+        # mode the engine reads the strategy as DYNAMIC (controller.py:7185)
+        # and the screener-feed guard then refuses it on a deployment whose
+        # feed is off, so the instance would never start and the test would
+        # fail for a reason that has nothing to do with it.
+        "symbol_selection_mode": "STATIC",
     }
     await controller._handle_start_strategy_command(mock_config_payload)
 

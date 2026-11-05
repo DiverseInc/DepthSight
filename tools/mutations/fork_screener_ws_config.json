@@ -21,6 +21,17 @@
     "refuse deployments that WOULD have worked, or stop it refusing the ones",
     "that would not. Both directions must be caught.",
     "",
+    "ROUND 2 INVERTED F11.  It used to pin 'the SAFE pairing (feed off,",
+    "URL empty) is NOT misconfigured', which was true then and is FALSE",
+    "now: with the feed switched off there is no symbol source at all (the",
+    "DYNAMIC symbol pool is filled only by the feed's 'active_pairs_update'",
+    "message, controller.py:7216) and there is no fallback to the static",
+    "list, so a DYNAMIC strategy started there reports 'running' and never",
+    "trades.  The guarantee is now the OPPOSITE one -- the feed-off pairing",
+    "MUST be refused -- and F11 is the mutant that takes it away again.",
+    "The delivery rules added in round 2 have their own spec:",
+    "tools/mutations/screener_ws_delivery_guard.json.",
+    "",
     "Run with:  python tools/mutation_harness.py tools/mutations/fork_screener_ws_config.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
     "read a file that is mid-mutation and report on code that does not exist."
@@ -49,8 +60,8 @@
     {
       "label": "F4: the shared rules stop recognising the UPSTREAM's host",
       "file": "bot_module/screener_feed.py",
-      "needle": "    if is_upstream_depthsight_url(text):\n",
-      "replace": "    if False:  # MUTANT: the upstream's host is accepted\n"
+      "needle": "    return ws_url_host(url) in UPSTREAM_DEPTHSIGHT_HOSTS\n",
+      "replace": "    return False  # MUTANT: the upstream's host is never recognised\n"
     },
     {
       "label": "F5: a URL that is not a WebSocket is accepted",
@@ -89,10 +100,10 @@
       "replace": "    return \"depthsight.pro\" in ws_url_host(url)  # MUTANT: substring match\n"
     },
     {
-      "label": "F11: FALSE POSITIVE - the SAFE pairing (feed off, URL empty) is treated as misconfigured",
+      "label": "F11: the feed-OFF pairing (MAIN_APP_WS_ENABLED=false) is NOT refused, so a DYNAMIC strategy starts with ZERO symbols and never trades",
       "file": "bot_module/screener_feed.py",
       "needle": "    if not ws_enabled:\n",
-      "replace": "    if False:  # MUTANT: the safe pairing is treated as wrong\n"
+      "replace": "    if not ws_enabled:\n        return None  # MUTANT: the feed-off pairing is not refused\n"
     },
     {
       "label": "F12: FALSE POSITIVE - the refusal no longer points at THIS fork's own domain",
@@ -107,10 +118,22 @@
       "replace": "    return None  # MUTANT: the unsafe pairing is not refused\n"
     },
     {
-      "label": "F14: the upstream pointer is no longer caught by the guard's own predicate",
+      "label": "F14: the Origin header names the UPSTREAM's reserved hostname again, so the upstream accepts this fork's connection",
       "file": "bot_module/screener_feed.py",
-      "needle": "    if is_upstream_depthsight_url(text):\n        return _upstream_url_message(text, ws_url_host(text))\n",
-      "replace": "    if False:  # MUTANT: the upstream pointer is not caught here\n        return _upstream_url_message(text, ws_url_host(text))\n"
+      "needle": "    if is_upstream_depthsight_url(text):\n        # Never name the UPSTREAM's reserved hostname, not even when the\n",
+      "replace": "    if False:  # MUTANT: the Origin header names the upstream's host again\n        # Never name the UPSTREAM's reserved hostname, not even when the\n"
+    },
+    {
+      "label": "F15: .env.example advertises this fork's OWN frontend socket as the screener feed again -- the URL this fork shipped, which cannot deliver a symbol",
+      "file": ".env.example",
+      "needle": "MAIN_APP_WS_URL=\n",
+      "replace": "MAIN_APP_WS_URL=wss://depthsight.diverseinc.net/ws/main\n"
+    },
+    {
+      "label": "F16: .env.example switches the screener feed ON by default, with no URL behind it",
+      "file": ".env.example",
+      "needle": "MAIN_APP_WS_ENABLED=false\n",
+      "replace": "MAIN_APP_WS_ENABLED=true\n"
     }
   ]
 }

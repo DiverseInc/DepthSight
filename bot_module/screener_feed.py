@@ -11,7 +11,7 @@ inherited the upstream's screener WebSocket URL as a HARDCODED default::
 never controlled that DNS, the upstream's deployment does not serve this fork's
 symbols, and the hostname answers HTTP 525 (measured 2026-11-02).
 
-Three facts make that default unusable here, and none of them are guesses:
+Four facts make that default unusable here, and none of them are guesses:
 
 1. The fork's own deployment is ``depthsight.diverseinc.net``.  Its
    ``caddy.config`` has exactly ONE host block, and the public screener page
@@ -22,6 +22,17 @@ Three facts make that default unusable here, and none of them are guesses:
 3. ``filtered_pairs:update`` (``MAIN_APP_SYMBOL_UPDATE_TOPIC``) is a DEAD
    reference here: the producer was the upstream's separate screener service,
    which this fork does not run.
+4. That ``/ws`` route is the FRONTEND's socket, not the bot's symbol feed.
+   ``api/websocket_server.py:228-230`` closes every connection that carries
+   no ``?token=``, and the bot's screener client sends no token
+   (``bot_module/data_consumer.py:3414-3437``).  Even with a token the
+   shapes disagree: the server forwards Redis messages as ``{"topic": ...,
+   "payload": ...}`` (``:187-191``) while the bot only understands
+   ``{"type": "active_pairs_update", "data": [...]}``
+   (``data_consumer.py:3476-3478``).  So the URL this fork shipped in
+   ``.env.example`` -- ``wss://depthsight.diverseinc.net/ws/main`` -- cannot
+   deliver a symbol to the bot, and a DYNAMIC strategy pointed at it would
+   report "running" and never trade.
 
 So the inherited default could only ever produce a reconnect storm against a
 host that can never work, while a DYNAMIC-mode strategy started, reported
@@ -54,8 +65,10 @@ regime_feed.py`` already follows for the regime-change stop.
 FAIL CLOSED
 -----------
 Every function here either returns ``None`` ("there is no problem") or returns
-a message that says what is wrong AND what to set.  Nothing in here is allowed
-to make a deployment MORE permissive than it was before.
+a message that says what is wrong AND what to set.  Every rule here makes a
+deployment STRICTER than it was, never more permissive: a DYNAMIC-mode
+strategy must never be reported "running" against a feed that cannot deliver
+symbols.
 """
 
 from __future__ import annotations
@@ -69,8 +82,11 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "UPSTREAM_DEPTHSIGHT_HOSTS",
     "FORK_OWN_DOMAIN",
+    "FORK_OWN_WS_PATHS",
     "ws_url_host",
+    "ws_url_path",
     "is_upstream_depthsight_url",
+    "is_fork_own_frontend_ws_url",
     "describe_ws_url_problem",
     "screener_feed_misconfigured",
     "ws_origin_header",
@@ -94,6 +110,29 @@ UPSTREAM_DEPTHSIGHT_HOSTS: FrozenSet[str] = frozenset(
 # This fork's own public domain.  Named in the messages so the operator has
 # something concrete to point the feed at.
 FORK_OWN_DOMAIN = "depthsight.diverseinc.net"
+
+# This fork's own FRONTEND WebSocket routes.
+#
+# api/websocket_server.py:221 serves "/ws" and :390 serves "/ws/main" as an
+# ALIAS of it.  Neither can deliver a symbol to the bot:
+#
+#   * :228-230 closes every connection that carries no "?token=", and the
+#     bot's screener client sends no token (data_consumer.py:3414-3437);
+#   * :187-191 forwards Redis messages as {"topic": ..., "payload": ...},
+#     while the bot only understands {"type": "active_pairs_update",
+#     "data": [...]} (data_consumer.py:3476-3478);
+#   * and nothing in this repository publishes "active_pairs_update" at all
+#     -- the producer was the upstream's separate screener service, which
+#     this fork does not run.
+#
+# So a feed URL pointing here is a DEAD feed, and this fork used to SHIP one:
+# .env.example pointed MAIN_APP_WS_URL at
+# wss://depthsight.diverseinc.net/ws/main.
+#
+# EXACT paths on THIS fork's own host only: an operator who runs their own
+# screener service on their own host, on any path, must not be refused by
+# this.  A path this fork does not serve is left alone for the same reason.
+FORK_OWN_WS_PATHS: FrozenSet[str] = frozenset({"/ws", "/ws/main"})
 
 
 # ---------------------------------------------------------------- pure helpers
@@ -187,17 +226,62 @@ def is_upstream_depthsight_url(url: Any) -> bool:
     return ws_url_host(url) in UPSTREAM_DEPTHSIGHT_HOSTS
 
 
+def ws_url_path(url: Any) -> str:
+    """The PATH of a WebSocket URL: lower-cased, no trailing slash.
+
+    Pure.  ``""`` when the URL names no path at all.  The trailing slash is
+    dropped because ``/ws/main/`` is the same route as ``/ws/main`` for the
+    purpose of "is this the fork's own frontend socket", and the case is
+    dropped because a path is case-sensitive on the wire but this comparison
+    only asks "is this one of the fork's own two routes".
+    """
+    if not isinstance(url, str):
+        return ""
+    candidate = url.strip()
+    if not candidate:
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        # A malformed URL is not a path.  Never raises: this runs at startup.
+        return ""
+    path = (parsed.path or "").strip()
+    if not path:
+        return ""
+    return path.rstrip("/").lower()
+
+
+def is_fork_own_frontend_ws_url(url: Any) -> bool:
+    """True when the URL points at THIS fork's own frontend WebSocket route.
+
+    That endpoint is the FRONTEND's socket -- it is token-authenticated, it
+    speaks the frontend's ``{"topic", "payload"}`` messages, and nothing in
+    this repository publishes the bot's ``active_pairs_update`` message -- so
+    it can NEVER deliver a symbol to the bot.  A feed pointed at it is a dead
+    feed, and a DYNAMIC strategy pointed at it would report "running" and
+    never trade.
+
+    The host must match EXACTLY and the path must be one of the fork's own
+    two routes: an operator who runs their own screener service on their own
+    host, on any path, must not be refused by this.
+    """
+    return (
+        ws_url_host(url) == FORK_OWN_DOMAIN
+        and ws_url_path(url) in FORK_OWN_WS_PATHS
+    )
+
+
 def _missing_url_message() -> str:
     return (
         "MAIN_APP_WS_URL is not set. This fork deliberately ships NO "
         "default screener URL, because the upstream DepthSight-Pro "
         "deployment's host is not this fork's deployment. Set "
-        "MAIN_APP_WS_URL to this fork's own screener WebSocket endpoint "
-        f"(for example wss://{FORK_OWN_DOMAIN}/ws/main), or point it at "
-        "your own screener. Until then this deployment has NO symbol "
-        "source in MAIN_APP mode: there is no automatic fallback to the "
-        "static list, so a DYNAMIC-mode strategy would start and silently "
-        "never trade."
+        "MAIN_APP_WS_URL to the WebSocket URL of a screener service YOU "
+        "control -- a host that publishes 'active_pairs_update' -- and "
+        "switch the feed on with MAIN_APP_WS_ENABLED=true. Until then this "
+        "deployment has NO symbol source in MAIN_APP mode: there is no "
+        "automatic fallback to the static list, so a DYNAMIC-mode strategy "
+        "would start and silently never trade."
     )
 
 
@@ -205,8 +289,8 @@ def _invalid_url_message(text: str) -> str:
     return (
         f"MAIN_APP_WS_URL ('{text}') is not a ws:// or wss:// URL, so it "
         "is not a WebSocket endpoint. The screener feed needs the "
-        "WebSocket URL of this fork's own screener service "
-        f"(for example wss://{FORK_OWN_DOMAIN}/ws/main)."
+        "WebSocket URL of a screener service you control -- a host that "
+        "publishes 'active_pairs_update'."
     )
 
 
@@ -214,8 +298,8 @@ def _no_host_message(text: str) -> str:
     return (
         f"MAIN_APP_WS_URL ('{text}') is a ws:// or wss:// URL with NO "
         "HOST, so it names nothing to connect to. A WebSocket endpoint "
-        "needs the host of this fork's own screener service "
-        f"(for example wss://{FORK_OWN_DOMAIN}/ws/main)."
+        "needs the host of a screener service you control -- a host that "
+        "publishes 'active_pairs_update'."
     )
 
 
@@ -225,9 +309,40 @@ def _upstream_url_message(text: str, host: str) -> str:
         f"deployment ('{host}'), NOT this fork. That hostname is the "
         "upstream's reserved name: this fork never controlled that DNS, it "
         "is not this fork's deployment, and it answers HTTP 525. Point "
-        "MAIN_APP_WS_URL at this fork's own domain "
-        f"(for example wss://{FORK_OWN_DOMAIN}/ws/main) or at your own "
-        "screener."
+        "MAIN_APP_WS_URL at a screener service you control -- a host that "
+        "publishes 'active_pairs_update'. Do not point it at this fork's "
+        f"own frontend socket (wss://{FORK_OWN_DOMAIN}/ws/main) either: "
+        "that route is the frontend's token-authenticated WebSocket and it "
+        "cannot deliver a symbol to the bot."
+    )
+
+
+def _fork_own_feed_message(text: str) -> str:
+    return (
+        f"MAIN_APP_WS_URL ('{text}') points at THIS fork's own frontend "
+        f"WebSocket ({FORK_OWN_DOMAIN}/ws or /ws/main). That endpoint "
+        "cannot deliver a symbol to the bot: it is the FRONTEND's socket, "
+        "it closes every connection that carries no browser token (the bot "
+        "sends none), it speaks the frontend's {'topic', 'payload'} "
+        "messages, and nothing in this repository publishes the bot's "
+        "'active_pairs_update' message at all. A DYNAMIC strategy pointed "
+        "at it would report 'running' and never trade. Point MAIN_APP_WS_URL "
+        "at a screener service you control -- a host that publishes "
+        "'active_pairs_update' -- or launch the strategy with explicit "
+        "symbols (STATIC/FIXED)."
+    )
+
+
+def _feed_disabled_message() -> str:
+    return (
+        "MAIN_APP_WS_ENABLED is false, so this deployment has NO screener "
+        "feed running and NOTHING can deliver a symbol. There is no "
+        "automatic fallback to the static list: a DYNAMIC-mode strategy "
+        "started here would have ZERO symbols, report 'running' and never "
+        "trade. Switch the feed on (MAIN_APP_WS_ENABLED=true) and point "
+        "MAIN_APP_WS_URL at a screener service that publishes "
+        "'active_pairs_update', or launch the strategy with explicit "
+        "symbols (STATIC/FIXED)."
     )
 
 
@@ -265,36 +380,68 @@ def describe_ws_url_problem(url: Any) -> Optional[str]:
 def screener_feed_misconfigured(
     source_mode: Any, ws_url: Any, ws_enabled: Any
 ) -> Optional[str]:
-    """Why the screener feed's CONFIGURATION is wrong here, else ``None``.
+    """Why this deployment's screener feed CANNOT deliver a symbol, else ``None``.
 
-    Pure.  "Wrong" means one of TWO things:
+    Pure.  "Wrong" means any of FOUR things:
 
-    1. THE UNSAFE PAIRING -- the feed is switched ON but its URL is missing
-       or unusable.  The consumer refuses to start, so nothing would ever
-       deliver symbols, and a DYNAMIC-mode strategy would run with ZERO
-       symbols: it reports "running" and never trades.  This pairing is the
-       one the guard has to refuse, loudly, at startup.
-
-    2. THE UPSTREAM POINTER -- the URL names the UPSTREAM DepthSight-Pro
+    1. THE UPSTREAM POINTER -- the URL names the UPSTREAM DepthSight-Pro
        deployment.  That is wrong in ANY pairing: this fork never controlled
        that DNS, the host is not this fork's deployment, and it answers 525.
 
-    NOT wrong: the feed switched OFF with an empty URL.  That is the SAFE
-    pairing.  There is no feed to misconfigure, the consumer keeps its
-    market data, and whether DYNAMIC symbol selection may be used at all is
-    decided by the ESTABLISHED rules -- ``SYMBOL_SELECTION_ALLOW_DYNAMIC``
-    (which defaults to false and already refuses a DYNAMIC start at the API
-    with a 503) and the CRITICAL outage alarm in the consumer's
-    disabled-feed branch.  Refusing a DYNAMIC start here as well would make
-    the guard "always refuse everything", which is exactly what
-    ``tests/test_safety_guard_regressions.py`` exists to prevent.
+    2. THE FORK'S OWN FRONTEND SOCKET -- the URL names THIS fork's own
+       frontend WebSocket route (``/ws`` or ``/ws/main``).  That endpoint is
+       the FRONTEND's socket: it is token-authenticated, it speaks the
+       frontend's ``{"topic", "payload"}`` messages, and nothing in this
+       repository publishes the bot's ``active_pairs_update`` message.  So it
+       is a DEAD feed in ANY pairing -- and it is the URL this fork used to
+       ship in ``.env.example``.
+
+    3. THE FEED IS OFF -- ``MAIN_APP_WS_ENABLED`` is false.  With the feed
+       off there is NO symbol source at all.  The bot's DYNAMIC symbol pool
+       is ``_last_known_symbols_from_consumer`` (controller.py:7216), and
+       that set is filled ONLY by the feed's ``active_pairs_update`` message
+       (data_consumer.py:3508 -> ``controller.start_managing_symbol``, whose
+       only production caller is the feed).  There is no automatic fallback
+       to the static list, so a DYNAMIC strategy started here has ZERO
+       symbols: it reports "running" and never trades.
+
+    4. THE UNSAFE PAIRING -- the feed is switched ON but its URL is missing
+       or unusable (empty, hostless, or not a ws:// / wss:// URL).  The
+       consumer refuses to start, so nothing would ever deliver symbols.
+
+    A URL that IS set must be usable in BOTH pairings: it is the cause the
+    moment the feed is switched on, and it is the wrong configuration right
+    now.
+
+    NOT wrong: anything at all when ``SYMBOL_SOURCE_MODE`` is not
+    ``MAIN_APP`` -- a STATIC_LIST or JSON_FILE deployment gets its symbols
+    from the config, with no WebSocket involved.
+
+    This guard is asked ONLY about a DYNAMIC-mode start, so refusing here
+    never touches a STATIC, FIXED or STATIC_LIST strategy.
+
+    The CONSUMER keeps asking the narrower question -- "can I open a socket
+    to this URL?", which is ``describe_ws_url_problem`` -- and that is
+    deliberate.  A dead feed there produces a reconnect storm and the
+    consumer's CRITICAL outage alarm, which is loud; refusing to start the
+    whole consumer would take the MARKET DATA down over a screener
+    misconfiguration.  The two rules answer two different questions, and
+    this one is the stricter of the two where it counts: a strategy.
     """
     if str(source_mode or "").strip().upper() != "MAIN_APP":
         return None
     text = ws_url.strip() if isinstance(ws_url, str) else ""
     if is_upstream_depthsight_url(text):
         return _upstream_url_message(text, ws_url_host(text))
+    if is_fork_own_frontend_ws_url(text):
+        return _fork_own_feed_message(text)
     if not ws_enabled:
-        # The SAFE pairing: the feed is off and the URL is empty.
-        return None
+        # The feed is switched OFF: nothing can deliver a symbol at all.
+        # A URL that is set but unusable is named first, because it is the
+        # cause the moment the feed is switched on.
+        if text:
+            _url_problem = describe_ws_url_problem(text)
+            if _url_problem is not None:
+                return _url_problem
+        return _feed_disabled_message()
     return describe_ws_url_problem(text)

@@ -158,6 +158,14 @@ def _start_payload(**overrides):
         "user_id": 1,
         "id": "0123456789abcdef0123456789abcdef",
         "config_data": {"strategy_name": "VisualBuilderStrategy"},
+        # The symbol mode is EXPLICIT, so that the guard under test HERE --
+        # the paper/live API-key guard -- is what decides every outcome in
+        # this file.  With no mode the engine reads a strategy as DYNAMIC
+        # (controller.py:7185), and the screener-feed guard then refuses it
+        # on a deployment whose feed is off.  That would MASK the key guard:
+        # the positive controls would fail, and the negative controls would
+        # pass for the wrong reason (a refusal they did not ask for).
+        "symbol_selection_mode": "STATIC",
     }
     payload.update(overrides)
     return payload
