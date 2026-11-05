@@ -85,6 +85,7 @@ from sqlalchemy import select
 from api import models
 from bot_module import config as bot_config
 from bot_module.controller import ActivePositionMap, TradingController
+from bot_module.symbol_selection import SymbolSelectionConfig
 
 
 USER_ID = 1
@@ -327,8 +328,34 @@ def _build_controller(db_session, counter, strategies):
     controller._positions_dict_lock = asyncio.Lock()
     controller._active_positions = ActivePositionMap()
     controller.instances_lock = asyncio.Lock()
-    controller.running_strategy_instances = strategies
+    # The publisher resolves the scope from the strategy's START PAYLOAD
+    # (controller.py:2571 stores `(instance, payload)`), not from the
+    # database row. The seeded strategies are STATIC with one symbol
+    # (_seed_strategy_config), so the payload carries the same scope.
+    # setdefault, so a test that sets another mode keeps it.
+    scoped = {}
+    for _config_id, (_instance, _payload) in strategies.items():
+        _payload = dict(_payload)
+        _payload.setdefault("symbol_selection_mode", "STATIC")
+        _payload.setdefault("symbols", ["ETHUSDT"])
+        scoped[_config_id] = (_instance, _payload)
+    controller.running_strategy_instances = scoped
     controller.rm = _FakeRiskManager()
+    # The publisher reads the user's symbol-selection config when it builds
+    # the published state: bot_module/controller.py:3758 publishes
+    # `self.symbol_selection_config.model_dump()`. That line is on MAIN,
+    # not only on this branch. This stub is built with __new__ (which skips
+    # __init__), so every attribute the production code reads has to be set
+    # here -- without it the whole file dies with "TradingController object
+    # has no attribute 'symbol_selection_config'". The default mode is
+    # STATIC (bot_module/symbol_selection.py:7), which is the mode the
+    # seeded strategies below use.
+    controller.symbol_selection_config = SymbolSelectionConfig()
+    # The DYNAMIC path of _resolve_symbol_pool_for_strategy reads these two
+    # (controller.py:7257-7260). The real controller holds them as SETS
+    # (see tests/test_controller_oracle_e2e.py:445-446).
+    controller.currently_managed_symbols = set()
+    controller._last_known_symbols_from_consumer = set()
 
     async def _get_db_session():
         yield _CountingSession(db_session, counter)

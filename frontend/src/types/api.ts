@@ -66,12 +66,19 @@ export interface StrategyData {
 	market_type: string;
 	status: string;
 	/**
-	 * Present only when `status` is "cannot_trade" -- the engine detected at
-	 * instance start that this strategy can never signal (e.g. its config uses
-	 * the legacy `blocks` shape, which the trading engine does not read).
+	 * Present only when `status` is "cannot_trade" or "blocked" -- the engine
+	 * detected at instance start that this strategy can never signal (e.g. its
+	 * config uses the legacy `blocks` shape, which the trading engine does not
+	 * read), or the strategy's resolved symbol pool is empty.
 	 * Carries the human-readable reason so the UI can explain, not just colour.
 	 */
 	status_detail?: string | null;
+	/**
+	 * Machine-readable cause behind `status: "blocked"`, so the UI can
+	 * TRANSLATE the reason instead of showing the bot's English sentence:
+	 *   "symbol_source_unavailable" | "no_symbols_configured" | "unknown_symbol_mode"
+	 */
+	status_reason_code?: string | null;
 	/**
 	 * The strategy's PnL. Null means UNKNOWN -- the bot could not read the
 	 * number (the database was unreachable). It is never a fake 0.0.
