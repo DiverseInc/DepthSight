@@ -35,6 +35,65 @@ performance_result/
 
 # Security and local configs
 gcp_key.json
+
+# A COPY of the live environment file.
+#
+# The live file itself is matched by the `*.env` rule above, but that rule
+# only matches a name ENDING in `.env`. Every other name that holds the same
+# plaintext secrets was therefore committable, and three of them were found
+# sitting in a working tree in 2026-11-03: `.env.save`, a stale credential
+# rotation copy, and a scratch file. The rules below close the CLASS of copies
+# that KEEP the `.env` prefix, rather than the three names that happened to
+# be observed.
+#
+# ALL THREE SEPARATORS ARE COVERED: `.env.*` (DOT), `.env_*` (UNDERSCORE) and
+# `.env-*` (HYPHEN). `.env_backup` and `.env_staging` match NEITHER `.env.*`
+# NOR `*.env`, so they were still committable after the `.env.*` rule went in.
+# MEASURED 2026-11-03 (`git check-ignore --no-index`): both returned "not
+# ignored". MEASURED 2026-11-04 BY THE REVIEW PANEL: the HYPHEN separator was
+# STILL a hole -- `.env-backup`, `.env-copy` and `.env-20261103` all returned
+# "not ignored", so `git add -A` still swept them into a PUBLIC commit.
+#
+# WHAT THESE RULES CANNOT DO, STATED PLAINLY: a copy RENAMED so that it no
+# longer STARTS with `.env` (`prod.env.bak`, `copy-of-env.txt`) is outside what
+# ANY name-based rule can catch. The guarantee is about the class of copies
+# that keep the `.env` prefix with one of the three separators above -- NOT
+# about every filename a human could choose, and NOT a promise that no
+# credential copy can ever be committed.
+#
+# THE NEGATIONS ARE ANCHORED TO THE FILES THEY MEAN. An unanchored
+# `!.env.production` re-opens `.env.production` at EVERY level -- including
+# the repository ROOT, where `deploy.sh` (deploy.sh:63) treats it as one of
+# the four canonical live env filenames (`.env .env.example .env.local
+# .env.production`). MEASURED 2026-11-03: with the unanchored negation,
+# `.env.production`, `subdir/.env.production` and `deploy/.env.production`
+# were all committable -- the rule re-opened the exact class it claimed to
+# close, in the one directory where that name holds live production secrets.
+# The root file is NOT tracked (measured: `git ls-files` lists no root
+# `.env.production`), so ignoring it un-tracks nothing.
+#
+# The tracked templates are negated so they stay addable: `.env.example` and
+# the public build values in `frontend/.env.production` and
+# `pwa/.env.production` are deliberately tracked and must not be ignored.
+# A tracked file is unaffected by an ignore rule either way, but a NEW file
+# with one of those names would be silently un-addable, so they are negated
+# explicitly. `!.env.example` stays UNANCHORED on purpose: an `.env.example`
+# is a template wherever it sits, and `frontend/.env.example` and
+# `pwa/.env.example` are tracked too.
+.env.*
+.env_*
+.env-*
+!.env.example
+!frontend/.env.production
+!pwa/.env.production
+
+# The third untracked file found in the 2026-11-03 production checkout was a
+# scratch file of unknown content, at the root of the tree. Unlike the two
+# `.env` copies it matches no environment-file class, so it is named
+# explicitly. It is left unanchored so the rule also covers the file if it is
+# ever copied into a subdirectory; nothing tracked in this repository is named
+# `check.txt`, so the rule cannot un-track anything.
+check.txt
 .vscode/
 docker-compose.legacy.yml
 .agent/
