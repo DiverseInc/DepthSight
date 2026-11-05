@@ -548,3 +548,228 @@ class TestTheManagedHeadline:
                 "the headline claims Everything in Professional, but the %s quota "
                 "is %r against Professional's %r" % (key, mine, value)
             )
+
+
+# ---------------------------------------------------------------------------
+# 8. The $499 tier is a MONTHLY service: it is never sold as a one-off.
+# ---------------------------------------------------------------------------
+class _ReachedPaymentCreation(Exception):
+    """Raised by the payment-creation stub: the request got that far."""
+
+
+def _install_plans_config(monkeypatch, config) -> None:
+    """Point the plans module AND the payments route at `config`.
+
+    `api/routes/payments.py` imports `plans_config` by name, so patching
+    `api.plans.plans_config` alone would NOT change the route's view of the
+    billing mode. Both have to be patched, or the test would prove nothing
+    about the route.
+    """
+    monkeypatch.setattr(plans_module, "plans_config", config)
+
+    from api.routes import payments as payments_module
+
+    monkeypatch.setattr(payments_module, "plans_config", config)
+
+
+def _config_in_mode(tmp_path, mode: str) -> PlansConfig:
+    """The real config, with `billing.mode` set to `mode`."""
+    source = yaml.safe_load(PLANS_CONFIG.read_text(encoding="utf-8"))
+    source["billing"]["mode"] = mode
+    path = tmp_path / ("plans_config_%s.yml" % mode)
+    path.write_text(
+        yaml.safe_dump(source, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return PlansConfig(path)
+
+
+class TestTheManagedTierIsNeverSoldAsAOneOffLicence:
+    """The catalog declares `billing.lifetime.enabled: false` for Managed.
+
+    That declaration has to be ENFORCED, not just documented. Before this
+    fix a customer could pay $499 ONCE in a one-off deployment and be cut
+    off after 30 days, believing they had bought a licence:
+
+      * `PlansConfig.get_effective_plan_price` falls back to the MONTHLY
+        price when the billing mode carries no price of its own, so the
+        purchase is priced at $499;
+      * the Bitcart invoice carries no recurring field, so that invoice is
+        ONE-OFF (api/routes/payments.py:135-142);
+      * `_is_lifetime_payment` is False for it -- the tier has no one-off
+        price to match -- so `_get_payment_plan_expires_at` grants exactly
+        the monthly period, 30 days (api/depthsight_api.py:485-500).
+
+    So the server refuses the purchase, and the billing page does not offer
+    the tier in a mode it is not sold in.
+    """
+
+    @pytest.fixture
+    def lifetime_config(self, tmp_path) -> PlansConfig:
+        return _config_in_mode(tmp_path, "lifetime")
+
+    @pytest.fixture
+    def monthly_config(self, tmp_path) -> PlansConfig:
+        return _config_in_mode(tmp_path, "monthly")
+
+    @staticmethod
+    async def _no_slots(db, plan_name, plan_config):
+        """Stands in for the lifetime-seat lookup: no database in a unit test."""
+        return None
+
+    @pytest.fixture
+    def payments_module(self, monkeypatch):
+        """The payments router, with the seat lookup stubbed out."""
+        from api.routes import payments as module
+        import api.depthsight_api as depthsight_api
+
+        monkeypatch.setattr(
+            depthsight_api, "_get_lifetime_slots_for_plan", self._no_slots
+        )
+        return module
+
+    def test_the_catalog_still_declares_the_one_off_block_as_switched_off(
+        self, raw_plans
+    ):
+        """The fix enforces the declaration; it does not change it."""
+        assert raw_plans["managed"]["billing"]["lifetime"] == {"enabled": False}
+        assert "price_usd" not in raw_plans["managed"]["billing"]["lifetime"]
+
+    def test_the_switched_off_mode_is_not_available_for_purchase(self, lifetime_config):
+        assert (
+            lifetime_config.is_billing_mode_available("managed", "lifetime") is False
+        )
+        assert (
+            lifetime_config.is_billing_mode_available("managed", "monthly") is True
+        )
+
+    def test_the_tiers_that_sell_a_one_off_are_still_available(self, lifetime_config):
+        """The guard must not over-block the tiers that DO sell one."""
+        for tier in ("standard", "pro"):
+            assert (
+                lifetime_config.is_billing_mode_available(tier, "lifetime") is True
+            ), tier
+
+    def test_the_alias_cannot_be_used_to_buy_the_switched_off_tier(
+        self, lifetime_config
+    ):
+        """`premium` resolves to Managed, so it resolves to the refusal too."""
+        assert lifetime_config.is_billing_mode_available("premium", "lifetime") is False
+
+    async def test_a_one_off_purchase_of_managed_is_refused(
+        self, monkeypatch, payments_module, lifetime_config
+    ):
+        """The defect itself: a one-off $499 for a tier with no one-off price."""
+        from fastapi import HTTPException
+        from api import schemas
+
+        _install_plans_config(monkeypatch, lifetime_config)
+
+        created = []
+
+        async def _never(*args, **kwargs):
+            created.append(args)
+            raise AssertionError("a payment row was created for a refused purchase")
+
+        monkeypatch.setattr(payments_module.crud, "create_payment", _never)
+
+        class _User:
+            id = 1
+            email = "customer@example.com"
+
+        with pytest.raises(HTTPException) as excinfo:
+            await payments_module.create_payment(
+                schemas.CreatePaymentRequest(plan_name="managed"),
+                db=None,
+                current_user=_User(),
+            )
+
+        assert excinfo.value.status_code == 400
+        assert "Managed" in excinfo.value.detail
+        assert "lifetime" in excinfo.value.detail
+        assert not created, "the refused purchase still reached the database"
+
+    async def test_a_monthly_purchase_of_managed_is_not_refused(
+        self, monkeypatch, payments_module, monthly_config
+    ):
+        """The monthly sale is the product: it must still go through."""
+        from api import schemas
+
+        _install_plans_config(monkeypatch, monthly_config)
+
+        reached = []
+
+        async def _stop_here(*args, **kwargs):
+            reached.append(args)
+            raise _ReachedPaymentCreation
+
+        monkeypatch.setattr(payments_module.crud, "create_payment", _stop_here)
+
+        class _User:
+            id = 1
+            email = "customer@example.com"
+
+        with pytest.raises(_ReachedPaymentCreation):
+            await payments_module.create_payment(
+                schemas.CreatePaymentRequest(plan_name="managed"),
+                db=None,
+                current_user=_User(),
+            )
+
+        assert reached, "the monthly purchase never reached the payment creation"
+
+    async def test_a_one_off_purchase_of_a_tier_that_sells_one_is_not_refused(
+        self, monkeypatch, payments_module, lifetime_config
+    ):
+        """Standard sells a $99 one-off: the guard must let it through."""
+        from api import schemas
+
+        _install_plans_config(monkeypatch, lifetime_config)
+
+        reached = []
+
+        async def _stop_here(*args, **kwargs):
+            reached.append(args)
+            raise _ReachedPaymentCreation
+
+        monkeypatch.setattr(payments_module.crud, "create_payment", _stop_here)
+
+        class _User:
+            id = 1
+            email = "customer@example.com"
+
+        with pytest.raises(_ReachedPaymentCreation):
+            await payments_module.create_payment(
+                schemas.CreatePaymentRequest(plan_name="standard"),
+                db=None,
+                current_user=_User(),
+            )
+
+        assert reached, "a tier that sells a one-off was blocked"
+
+    async def test_the_billing_page_does_not_offer_managed_in_a_one_off_deployment(
+        self, monkeypatch, payments_module, lifetime_config
+    ):
+        """The offer and the server must agree."""
+        _install_plans_config(monkeypatch, lifetime_config)
+
+        offered = await payments_module.get_plans(db=None)
+        keys = [plan["key"] for plan in offered]
+
+        assert "managed" not in keys, (
+            "the billing page offers a tier the server refuses to sell"
+        )
+        assert "standard" in keys and "pro" in keys
+
+    async def test_the_billing_page_offers_managed_at_499_a_month(
+        self, monkeypatch, payments_module, monthly_config
+    ):
+        """The monthly sale is still offered, at the monthly price."""
+        _install_plans_config(monkeypatch, monthly_config)
+
+        offered = await payments_module.get_plans(db=None)
+        managed = next(plan for plan in offered if plan["key"] == "managed")
+
+        assert managed["price_usd"] == 499
+        assert managed["period_label"] == "month"
+        assert managed["billing"]["lifetime"]["enabled"] is False

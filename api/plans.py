@@ -126,6 +126,27 @@ class PlansConfig:
         plan = self._plans.get(self.resolve_plan_key(plan_name), {})
         return plan.get("billing", {}).get(selected_mode, {})
 
+    def is_billing_mode_available(self, plan_name: str, mode: str | None = None) -> bool:
+        """True when this plan may be PURCHASED in the given billing mode.
+
+        The catalog declares, per billing mode, whether a tier is sold at
+        all (`billing.<mode>.enabled`). A mode that is switched off must
+        never be purchasable: `get_effective_plan_price` falls back to the
+        MONTHLY price when the mode carries no price of its own, so without
+        this check a purchase in the switched-off mode would create a
+        ONE-OFF invoice for a tier that has no one-off price, and the
+        customer would be granted the monthly period for it.
+
+        A mode block with no `enabled` key is ENABLED -- the monthly blocks
+        are written that way -- and a plan with no block for the mode at all
+        is left to the caller, which decides what to do with a plan it
+        cannot price.
+        """
+        self._reload_if_changed()
+        selected_mode = mode or self.get_billing_mode()
+        billing = self.get_plan_billing(plan_name, selected_mode)
+        return bool(billing.get("enabled", True))
+
     def get_effective_plan_price(self, plan_name: str) -> float:
         self._reload_if_changed()
         mode_billing = self.get_plan_billing(plan_name)
