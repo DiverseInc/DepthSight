@@ -42,6 +42,7 @@ import {
 	claimGoogleSignInSubmission,
 	clearGoogleRedirectParams,
 	clearPendingGoogleRequest,
+	clearPendingGoogleRequestInThisTab,
 	lookupPendingGoogleRequest,
 	parseGoogleRedirect,
 } from "@/lib/googleOAuth";
@@ -61,7 +62,6 @@ export function GoogleRedirectHandler() {
 		const pending = lookupPendingGoogleRequest();
 
 		const fail = (description: string) => {
-			clearPendingGoogleRequest();
 			toast({
 				variant: "destructive",
 				title: t("toastFailureTitle"),
@@ -70,10 +70,29 @@ export function GoogleRedirectHandler() {
 			navigate("/login");
 		};
 
+		// The marker is cleared ONLY when it is provably the one that belongs
+		// to THIS response. A failure that is not ours -- a foreign
+		// credential, an unrelated page load -- must not destroy a sign-in
+		// that is still in flight: the credential that comes back for it
+		// would then find no marker and be refused, and the customer could
+		// not sign in at all.
+		const clearIfOurs = (state: string | null) => {
+			if (!state) return;
+			if (pending.kind === "found" && pending.request.state === state) {
+				clearPendingGoogleRequest();
+			}
+		};
+
 		// Nothing came back. If a sign-in was in flight, that is a failure the
 		// user must SEE -- not a silent landing on the dashboard.
 		if (payload.kind === "empty") {
 			if (pending.kind !== "found") return; // a normal page load
+			if (pending.request.expired) {
+				// An abandoned attempt. Clean the marker up, but do not report
+				// a failure for a later, unrelated visit to the site root.
+				clearPendingGoogleRequest();
+				return;
+			}
 			if (pending.request.scope !== "tab") {
 				// Another tab in this browser started the sign-in. This tab
 				// must not report a failure that is not its own, and it must
@@ -81,21 +100,27 @@ export function GoogleRedirectHandler() {
 				// sign-in still needs it to verify the credential.
 				return;
 			}
-			if (pending.request.expired) {
-				// An abandoned attempt. Clean the marker up, but do not report
-				// a failure for a later, unrelated visit to the site root.
-				clearPendingGoogleRequest();
-				return;
-			}
+			// The sign-in came back to THIS tab without a credential. It is
+			// reported once -- but the marker is NOT destroyed: the
+			// credential may still be on its way (a slow Google), and it must
+			// still be verifiable when it arrives.
+			clearPendingGoogleRequestInThisTab(pending.request.state);
 			fail(t("googleSignInFailed"));
 			return;
 		}
 
+		// A credential or an error is in the URL. Strip it FIRST, before the
+		// claim below: the ID token is a BEARER credential, so it must not
+		// stay in the address bar or in this tab's history -- not even when
+		// the claim says it has already been sent and the handler returns
+		// early.
+		clearGoogleRedirectParams(window.history, window.location);
+
 		// ONE redirect, ONE session. The one-time value is claimed BEFORE the
-		// credential is stripped from the URL, because a reload -- or a
-		// browser session restore -- can bring the credential back, and the
-		// claim is the only guard that survives both. A second claim for the
-		// same value means this credential has already been sent.
+		// credential is sent, because a reload -- or a browser session
+		// restore -- can bring the credential back, and the claim is the
+		// only guard that survives both. A second claim for the same value
+		// means this credential has already been sent.
 		if (payload.kind === "credential" && payload.state) {
 			if (!claimGoogleSignInSubmission(payload.state)) {
 				// Already sent. There is nothing left to do, and nothing to
@@ -105,11 +130,10 @@ export function GoogleRedirectHandler() {
 			}
 		}
 
-		// A credential or an error is in the URL. Strip it BEFORE doing
-		// anything else with it.
-		clearGoogleRedirectParams(window.history, window.location);
-
 		if (payload.kind === "error") {
+			// Google's error belongs to THIS sign-in only when it carries our
+			// state. Another sign-in's marker must not be destroyed.
+			clearIfOurs(payload.state);
 			fail(payload.description || t("googleSignInFailed"));
 			return;
 		}
@@ -139,7 +163,10 @@ export function GoogleRedirectHandler() {
 		}
 
 		if (pending.request.state !== payload.state) {
-			// A response that does not carry our state is not ours.
+			// A response that does not carry our state is not ours. The
+			// marker belongs to a sign-in that may still be in flight, so it
+			// is NOT cleared here: the credential that comes back for THAT
+			// sign-in must still find it.
 			fail(t("googleSignInUnverified"));
 			return;
 		}

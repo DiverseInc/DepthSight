@@ -283,6 +283,62 @@ async def test_the_one_time_value_is_spent_even_with_a_different_credential(
 
 
 @pytest.mark.asyncio
+async def test_an_over_long_one_time_value_is_refused_before_it_reaches_the_database(
+    test_client: AsyncClient,
+    google_configured,
+    valid_google_token,
+):
+    """The one-time value must fit the column that stores it.
+
+    The consumed value is written as ``nonce:`` + the one-time value into a
+    ``varchar(160)`` column (``api/models.py``). The schema used to allow 256
+    characters, so a one-time value of 155 characters or more produced a value
+    LONGER than the column: on PostgreSQL that is a DataError -- not the
+    IntegrityError ``api/google_signin.py`` catches -- so the request died as
+    an uncaught 500 instead of a clean refusal.
+
+    The bound is enforced by the schema, so the value is refused before it
+    ever reaches the database.
+    """
+    response = await test_client.post(
+        "/api/v1/auth/google",
+        json={
+            "token": f"ds-google-id-token-{uuid.uuid4().hex}",
+            "signin_nonce": "n" * 200,
+        },
+    )
+
+    assert response.status_code == 422, (
+        "an over-long one-time value must be refused by the schema, before it "
+        f"reaches the database. Got {response.status_code}: {response.text}"
+    )
+
+
+def test_the_longest_accepted_one_time_value_fits_the_column():
+    """The bound and the column cannot drift apart.
+
+    The stored value is ``nonce:`` + the one-time value, and the column is
+    ``varchar(160)``.
+    """
+    from pydantic import ValidationError
+
+    from api import google_signin, schemas
+
+    column_width = 160
+    longest = column_width - len(google_signin.NONCE_PREFIX)
+
+    # The longest value the schema accepts, and the value it stores.
+    request = schemas.GoogleLoginRequest(token="x", signin_nonce="n" * longest)
+    assert request.signin_nonce is not None
+    assert len(google_signin.nonce_value(request.signin_nonce)) <= column_width
+
+    # One character more does not fit the column, so it must be refused here
+    # and not by the database.
+    with pytest.raises(ValidationError):
+        schemas.GoogleLoginRequest(token="x", signin_nonce="n" * (longest + 1))
+
+
+@pytest.mark.asyncio
 async def test_two_different_sign_ins_are_both_accepted(
     test_client: AsyncClient,
     google_configured,

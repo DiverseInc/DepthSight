@@ -14,7 +14,9 @@
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/google_redirect_signin.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
-    "read a file that is mid-mutation and report on code that does not exist."
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "Mutants AA-AE cover the ways the Google link can be followed (a middle click, the context menu, a ctrl/cmd+click) and the rule that a failure which is not ours must not destroy a sign-in that is still in flight.",
+    "The command runs vitest with --bail=1: a mutation that makes a test fail also made vitest hang (the event loop is blocked, so even the test timeout cannot fire), and a hang leaves the harness with NO verdict. Bailing at the first failing test keeps the verdict -- a mutation is caught by ONE failing test -- and always prints the summary."
   ],
   "command": [
     "npm",
@@ -23,8 +25,10 @@
     "run",
     "test",
     "--",
-    "src/__tests__/googleRedirectSignIn.test.tsx"
+    "src/__tests__/googleRedirectSignIn.test.tsx",
+    "--bail=1"
   ],
+  "clean_tree_must_pass": true,
   "timeout_s": 180,
   "mutations": [
     {
@@ -60,7 +64,7 @@
     {
       "label": "F: the handler stops checking that the credential belongs to this sign-in request",
       "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
-      "needle": "\t\tif (pending.kind === \"unavailable\") {\n\t\t\t// The browser is blocking storage, so the marker could not be\n\t\t\t// checked at all. Say THAT, instead of calling the credential\n\t\t\t// unverified.\n\t\t\tfail(t(\"googleSignInStorageBlocked\"));\n\t\t\treturn;\n\t\t}\n\n\t\tif (pending.kind !== \"found\") {\n\t\t\t// There is no request to compare against: the marker was lost or\n\t\t\t// already cleaned up, most often because the sign-in took longer\n\t\t\t// than the window. Say that, instead of calling the credential\n\t\t\t// unverified.\n\t\t\tfail(t(\"googleSignInExpired\"));\n\t\t\treturn;\n\t\t}\n\n\t\tif (pending.request.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
+      "needle": "\t\tif (pending.kind === \"unavailable\") {\n\t\t\t// The browser is blocking storage, so the marker could not be\n\t\t\t// checked at all. Say THAT, instead of calling the credential\n\t\t\t// unverified.\n\t\t\tfail(t(\"googleSignInStorageBlocked\"));\n\t\t\treturn;\n\t\t}\n\n\t\tif (pending.kind !== \"found\") {\n\t\t\t// There is no request to compare against: the marker was lost or\n\t\t\t// already cleaned up, most often because the sign-in took longer\n\t\t\t// than the window. Say that, instead of calling the credential\n\t\t\t// unverified.\n\t\t\tfail(t(\"googleSignInExpired\"));\n\t\t\treturn;\n\t\t}\n\n\t\tif (pending.request.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours. The\n\t\t\t// marker belongs to a sign-in that may still be in flight, so it\n\t\t\t// is NOT cleared here: the credential that comes back for THAT\n\t\t\t// sign-in must still find it.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
       "replace": "\t\t// MUTANT: neither a missing marker nor a foreign state is rejected\n"
     },
     {
@@ -84,8 +88,8 @@
     {
       "label": "J: the failure path is silent, so a broken sign-in looks like a normal page load",
       "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
-      "needle": "\t\tconst fail = (description: string) => {\n\t\t\tclearPendingGoogleRequest();\n\t\t\ttoast({\n\t\t\t\tvariant: \"destructive\",\n\t\t\t\ttitle: t(\"toastFailureTitle\"),\n\t\t\t\tdescription,\n\t\t\t});\n\t\t\tnavigate(\"/login\");\n\t\t};\n",
-      "replace": "\t\tconst fail = (description: string) => {\n\t\t\tclearPendingGoogleRequest();\n\t\t\t// MUTANT: the failure is never shown to the user\n\t\t\tnavigate(\"/login\");\n\t\t};\n"
+      "needle": "\t\tconst fail = (description: string) => {\n\t\t\ttoast({\n\t\t\t\tvariant: \"destructive\",\n\t\t\t\ttitle: t(\"toastFailureTitle\"),\n\t\t\t\tdescription,\n\t\t\t});\n\t\t\tnavigate(\"/login\");\n\t\t};\n",
+      "replace": "\t\tconst fail = (description: string) => {\n\t\t\t// MUTANT: the failure is never shown to the user\n\t\t\tnavigate(\"/login\");\n\t\t};\n"
     },
     {
       "label": "K: a redirect that comes back without a credential is not reported",
@@ -102,7 +106,7 @@
     {
       "label": "M: the button does not remember the sign-in request, so the credential cannot be verified",
       "file": "frontend/src/pages/Login.tsx",
-      "needle": "\t\tif (!rememberPendingGoogleRequest(googleSignIn.state)) {\n",
+      "needle": "\t\tif (!rememberPendingGoogleRequest(googleSignIn.state, follow)) {\n",
       "replace": "\t\tif (false) {  // MUTANT: the sign-in request is not remembered\n"
     },
     {
@@ -114,7 +118,7 @@
     {
       "label": "O: the state is not compared at all, so a foreign response is accepted",
       "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
-      "needle": "\t\tif (pending.request.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
+      "needle": "\t\tif (pending.request.state !== payload.state) {\n\t\t\t// A response that does not carry our state is not ours. The\n\t\t\t// marker belongs to a sign-in that may still be in flight, so it\n\t\t\t// is NOT cleared here: the credential that comes back for THAT\n\t\t\t// sign-in must still find it.\n\t\t\tfail(t(\"googleSignInUnverified\"));\n\t\t\treturn;\n\t\t}\n",
       "replace": "\t\t// MUTANT: the state is never compared\n"
     },
     {
@@ -150,8 +154,8 @@
     {
       "label": "V: the sign-in starts even when the marker cannot be recorded, so it is guaranteed to be rejected on the way back",
       "file": "frontend/src/pages/Login.tsx",
-      "needle": "\t\tif (!rememberPendingGoogleRequest(googleSignIn.state)) {\n",
-      "replace": "\t\tif (!rememberPendingGoogleRequest(googleSignIn.state) && false) {\n"
+      "needle": "\t\tif (!rememberPendingGoogleRequest(googleSignIn.state, follow)) {\n",
+      "replace": "\t\tif (!rememberPendingGoogleRequest(googleSignIn.state, follow) && false) {\n"
     },
     {
       "label": "W: the claim never refuses a second attempt, so a reload sends the credential twice",
@@ -176,6 +180,42 @@
       "file": "frontend/src/lib/googleOAuth.ts",
       "needle": "\tclearGoogleSignInSubmission(state);\n",
       "replace": "\t// MUTANT: the previous claim is never superseded\n"
+    },
+    {
+      "label": "AA: the marker is written only on a primary click again, so a middle click or the context menu cannot sign in",
+      "file": "frontend/src/pages/Login.tsx",
+      "needle": "\tconst prepareGoogleSignIn = () => {\n\t\trememberPendingGoogleRequest(googleSignIn.state, \"shared\");\n\t};\n",
+      "replace": "\tconst prepareGoogleSignIn = () => {\n\t\tvoid googleSignIn.state;  // MUTANT: the marker is written only on a primary click\n\t};\n"
+    },
+    {
+      "label": "AB: a failure that is not ours destroys the marker, so the sign-in that is still in flight is refused",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\tconst fail = (description: string) => {\n\t\t\ttoast({\n\t\t\t\tvariant: \"destructive\",\n\t\t\t\ttitle: t(\"toastFailureTitle\"),\n\t\t\t\tdescription,\n\t\t\t});\n\t\t\tnavigate(\"/login\");\n\t\t};\n",
+      "replace": "\t\tconst fail = (description: string) => {\n\t\t\tclearPendingGoogleRequest();  // MUTANT: a failure that is not ours destroys the marker\n\t\t\ttoast({\n\t\t\t\tvariant: \"destructive\",\n\t\t\t\ttitle: t(\"toastFailureTitle\"),\n\t\t\t\tdescription,\n\t\t\t});\n\t\t\tnavigate(\"/login\");\n\t\t};\n"
+    },
+    {
+      "label": "AC: an unrelated page load destroys the marker, so the credential that comes back later is refused",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\t\tclearPendingGoogleRequestInThisTab(pending.request.state);\n",
+      "replace": "\t\t\tclearPendingGoogleRequest();  // MUTANT: the marker is destroyed by an unrelated page load\n"
+    },
+    {
+      "label": "AD: the credential stays in the address bar when it has already been sent",
+      "file": "frontend/src/components/auth/GoogleRedirectHandler.tsx",
+      "needle": "\t\t// A credential or an error is in the URL. Strip it FIRST, before the\n\t\t// claim below: the ID token is a BEARER credential, so it must not\n\t\t// stay in the address bar or in this tab's history -- not even when\n\t\t// the claim says it has already been sent and the handler returns\n\t\t// early.\n\t\tclearGoogleRedirectParams(window.history, window.location);\n\n\t\t// ONE redirect, ONE session. The one-time value is claimed BEFORE the\n\t\t// credential is sent, because a reload -- or a browser session\n\t\t// restore -- can bring the credential back, and the claim is the\n\t\t// only guard that survives both. A second claim for the same value\n\t\t// means this credential has already been sent.\n\t\tif (payload.kind === \"credential\" && payload.state) {\n\t\t\tif (!claimGoogleSignInSubmission(payload.state)) {\n\t\t\t\t// Already sent. There is nothing left to do, and nothing to\n\t\t\t\t// report: the sign-in this credential belongs to is under\n\t\t\t\t// way, and reporting a failure would be a lie.\n\t\t\t\treturn;\n\t\t\t}\n",
+      "replace": "\t\t// ONE redirect, ONE session. The one-time value is claimed BEFORE the\n\t\t// credential is sent, because a reload -- or a browser session\n\t\t// restore -- can bring the credential back, and the claim is the\n\t\t// only guard that survives both. A second claim for the same value\n\t\t// means this credential has already been sent.\n\t\tif (payload.kind === \"credential\" && payload.state) {\n\t\t\tif (!claimGoogleSignInSubmission(payload.state)) {\n\t\t\t\t// Already sent. There is nothing left to do, and nothing to\n\t\t\t\t// report: the sign-in this credential belongs to is under\n\t\t\t\t// way, and reporting a failure would be a lie.\n\t\t\t\treturn;\n\t\t\t}\n\t\t// A credential or an error is in the URL. Strip it FIRST, before the\n\t\t// claim below: the ID token is a BEARER credential, so it must not\n\t\t// stay in the address bar or in this tab's history -- not even when\n\t\t// the claim says it has already been sent and the handler returns\n\t\t// early.\n\t\tclearGoogleRedirectParams(window.history, window.location);\n\n"
+    },
+    {
+      "label": "AE: a ctrl/cmd+click claims the sign-in in the tab that stayed behind",
+      "file": "frontend/src/pages/Login.tsx",
+      "needle": "\t\t\t\t\t\t\t\t\t\t\t\tevent.ctrlKey || event.metaKey || event.shiftKey\n\t\t\t\t\t\t\t\t\t\t\t\t\t? \"shared\"\n\t\t\t\t\t\t\t\t\t\t\t\t\t: \"tab\",\n",
+      "replace": "\t\t\t\t\t\t\t\t\t\t\t\t\t\"tab\",  // MUTANT: a ctrl/cmd+click claims the sign-in in the tab that stayed behind\n"
+    },
+    {
+      "label": "AF: the keyboard's context menu does not record the sign-in, so Shift+F10 cannot sign in",
+      "file": "frontend/src/pages/Login.tsx",
+      "needle": "\tconst prepareGoogleSignInOnKey = (\n\t\tevent: KeyboardEvent<HTMLAnchorElement>,\n\t) => {\n\t\tif (!GOOGLE_LINK_KEYS.has(event.key)) return;\n\t\tprepareGoogleSignIn();\n\t};\n",
+      "replace": "\tconst prepareGoogleSignInOnKey = (\n\t\tevent: KeyboardEvent<HTMLAnchorElement>,\n\t) => {\n\t\tif (!GOOGLE_LINK_KEYS.has(event.key)) return;\n\t\t// MUTANT: the keyboard's context menu never records the sign-in\n\t};\n"
     }
   ]
 }

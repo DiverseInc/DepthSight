@@ -32,12 +32,24 @@ Three bugs this harness itself had, all of which made it report false comfort:
    its own timeout. The output now goes to a file (which no grandchild holds
    open) and the whole tree is killed, so a timeout is reported as
    INCONCLUSIVE instead of hanging or being called a kill.
+7. The `command` key let a spec name ANY program as its test runner, and the
+   verdict was that program's summary and nothing else: a command that
+   prints a failing summary without running a single test was recorded as a
+   KILL, and the run reported "RESULT: PASS -- every injected defect was
+   caught by the tests". A spec may now ask for a CLEAN-TREE BASELINE
+   ("clean_tree_must_pass": true): the command is run once before any
+   mutation, and a failure there stops the run, because a command that
+   already fails on the clean tree cannot tell the mutant from the tree it
+   started from. The same trust is the pytest path's: a spec whose pytest
+   target has a KNOWN failure on the clean tree reports every mutant as
+   caught, so the same key applies there.
 
 So: line-ending-aware needles (CRLF and LF are both tried, because this
 repo's worktree is mixed), SHA-256 revert verification against a
 pre-mutation snapshot, a pre-mutation check that the tree was not touched
-by anyone else, SKIP exits non-zero, and a result that cannot be determined
-is INCONCLUSIVE -- never a kill.
+by anyone else, an optional clean-tree baseline that a spec can ask the
+harness to enforce, SKIP exits non-zero, and a result that cannot be
+determined is INCONCLUSIVE -- never a kill.
 
 NEVER run this concurrently with a test run or a reviewer. Both will read a
 file that is mid-mutation and report on code that does not exist.
@@ -295,6 +307,16 @@ def eol_variants(text: str) -> list[bytes]:
 
 def apply(spec_path: Path) -> int:
     spec = load_spec(spec_path)
+    # A spec that injects NOTHING has nothing to catch, so a run of it would
+    # report "every injected defect was caught by the tests" about ZERO
+    # defects -- a green proof of nothing. That is the one way this harness
+    # can be made to say PASS without having been asked a question, so it is
+    # refused outright.
+    if not spec.get("mutations"):
+        print("SPEC ERROR  this spec injects NO mutations: there is nothing to catch,")
+        print("            so a run of it would report a PASS that proves nothing.")
+        print("\nRESULT: FAIL -- the spec injects no defect.")
+        return 1
     test_target = spec.get("pytest_target", "tests/")
     # A spec may name a test command instead of a pytest target. The harness
     # was written for pytest; a front-end change has no pytest target, and
@@ -315,6 +337,35 @@ def apply(spec_path: Path) -> int:
         crlf_n = originals[f].count(b"\r\n")
         print(f"  snapshot {f.name}: {len(originals[f])} bytes, {crlf_n} CRLF")
     print()
+
+    # A kill means "the tests caught THIS mutation". That needs the tests to
+    # PASS on the clean tree: a command that already fails there cannot tell
+    # the mutant from the tree it started from, so every kill it reports
+    # would be a false kill -- and the run would report a PASS.
+    #
+    # A spec that asks for the check ("clean_tree_must_pass") gets it: the
+    # command is run once on the clean tree, and a failure there stops the
+    # run before any mutant is recorded. A spec that does not ask for it is
+    # trusted, and says so -- the trust is visible in the output instead of
+    # being silent.
+    if spec.get("clean_tree_must_pass"):
+        if command:
+            rc, baseline = run_command(command, timeout)
+        else:
+            rc, baseline = run_pytest(test_target, timeout)
+        print(f"clean-tree baseline: {baseline}")
+        if summary_reports_failure(baseline):
+            print("SPEC ERROR  the test command reports a failure on the CLEAN tree,")
+            print("            so no kill can be attributed to the mutation.")
+            print("\nRESULT: FAIL -- the test command cannot tell the mutant from the clean tree.")
+            return 1
+        print()
+    elif command:
+        print("NOTE: this spec trusts its test command's summary WITHOUT a clean-tree baseline:")
+        print("      a command that already fails on the clean tree cannot be told apart")
+        print('      from one that caught the mutant. Set "clean_tree_must_pass" to true')
+        print("      to make the harness check it before it records any kill.")
+        print()
 
     survivors: list[str] = []
     expected: list[str] = []

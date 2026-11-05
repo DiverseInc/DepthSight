@@ -38,7 +38,12 @@ def _load_harness_module():
     return module
 
 
-def _run_harness(tmp_path: Path, exit_code: int, stdout: str) -> str:
+def _run_harness(
+    tmp_path: Path,
+    exit_code: int,
+    stdout: str,
+    clean_tree_must_pass: bool = False,
+) -> str:
     """Run a COPY of the harness against a one-mutation spec.
 
     The copy lives in the temporary directory, so the harness's REPO -- which
@@ -67,6 +72,8 @@ def _run_harness(tmp_path: Path, exit_code: int, stdout: str) -> str:
             }
         ],
     }
+    if clean_tree_must_pass:
+        spec["clean_tree_must_pass"] = True
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(spec), encoding="utf-8")
 
@@ -130,3 +137,79 @@ def test_no_summary_is_inconclusive_and_never_a_kill(tmp_path):
         assert "INCONCLUSIVE" in out, out
         assert "KILLED" not in out, out
         assert "SURVIVED" not in out, out
+
+
+def test_a_command_that_fails_on_the_clean_tree_cannot_record_a_kill(tmp_path):
+    """A kill has to be caused by the mutation.
+
+    A command that reports a failure on the CLEAN tree cannot tell the
+    mutant from the tree it started from, so every mutant it "catches" is a
+    false kill -- and the run reports "RESULT: PASS -- every injected defect
+    was caught by the tests" without a single test having run. A spec that
+    asks for the clean-tree baseline must therefore be refused, not passed.
+    """
+    out = _run_harness(
+        tmp_path,
+        0,
+        "Test Files  1 failed (1)\nTests  1 failed | 26 passed (27)\n",
+        clean_tree_must_pass=True,
+    )
+
+    assert "SPEC ERROR" in out, out
+    assert "KILLED" not in out, out
+    assert "RESULT: PASS" not in out, out
+
+
+def test_a_spec_without_the_baseline_says_that_it_trusts_its_command(tmp_path):
+    """The trust is visible, not silent.
+
+    A spec that does not ask for the clean-tree baseline still runs -- but
+    the output says that the harness is trusting the command's summary
+    without checking it, so nobody reads "RESULT: PASS" as more than it is.
+    """
+    out = _run_harness(tmp_path, 0, "Tests  27 passed (27)\n")
+
+    assert "clean-tree baseline" in out, out
+    assert "SURVIVED" in out, out
+    assert "KILLED" not in out, out
+
+
+def test_a_spec_that_injects_nothing_is_refused(tmp_path):
+    """A spec with no mutations cannot be asked a question.
+
+    A run of it reports "every injected defect was caught by the tests" about
+    ZERO defects -- a green proof of nothing. That is the one way this harness
+    can be made to say PASS without having been asked anything at all, so a
+    spec that injects no defect is refused outright.
+    """
+    (tmp_path / "tools").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(HARNESS, tmp_path / "tools" / "mutation_harness.py")
+    (tmp_path / "product_code.py").write_text("ORIGINAL = 1\n", encoding="utf-8")
+
+    spec = {
+        "command": [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.write('Tests  27 passed (27)\\n'); sys.exit(0)",
+        ],
+        "timeout_s": 60,
+        "mutations": [],
+    }
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(tmp_path / "tools" / "mutation_harness.py"),
+            str(spec_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    out = proc.stdout + proc.stderr
+
+    assert "SPEC ERROR" in out, out
+    assert "RESULT: PASS" not in out, out
+    assert proc.returncode != 0, out

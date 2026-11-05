@@ -285,6 +285,13 @@ beforeEach(() => {
 		"VITE_GOOGLE_CLIENT_ID",
 		"test-client-id.apps.googleusercontent.com",
 	);
+	// The URL is reset before every test. The fragment is cleared FIRST: a
+	// `replaceState` that changes the fragment as well as the path makes
+	// jsdom attempt a navigation it cannot implement, and the error it
+	// raises from a timer leaves the worker with no verdict at all -- so a
+	// test that leaves a credential in the address bar would hang the whole
+	// suite instead of failing it.
+	window.location.hash = "";
 	window.history.replaceState({}, "", "/");
 	sessionStorage.clear();
 });
@@ -384,6 +391,29 @@ describe("the redirect handler signs in on the site root", () => {
 		await waitFor(() => expect(screen.getByTestId("pathname")).toBeTruthy());
 		expect(fetchMock).not.toHaveBeenCalled();
 		expect(toastSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe("the credential never stays in the address bar", () => {
+	it("is removed even when it has already been sent", async () => {
+		rememberPendingGoogleRequest("state-abc");
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+		// The page is reloaded and the browser restores the URL with the
+		// credential still in it. The claim says it was already sent, so the
+		// handler returns early -- but it must scrub the URL FIRST: the ID
+		// token is a BEARER credential, and it must not stay in the address
+		// bar or in that tab's history.
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+		cleanup();
+		renderHandler();
+		await settle();
+
+		expect(window.location.hash).toBe("");
+		expect(window.location.href).not.toContain("google-id-token");
 	});
 });
 
@@ -758,6 +788,183 @@ describe("the handler is mounted above the router", () => {
 		expect(provider).toBeGreaterThan(-1);
 		expect(handler).toBeGreaterThan(provider);
 		expect(routes).toBeGreaterThan(handler);
+	});
+});
+
+/**
+ * The Google link can be followed in more ways than a primary click.
+ *
+ * The marker is what proves the credential belongs to a sign-in THIS browser
+ * started: a credential that arrives with no marker is REFUSED. So the marker
+ * has to exist for EVERY way the link can be followed -- a middle click, the
+ * context menu's "Open link in new tab", a ctrl/cmd+click -- and not only in
+ * the anchor's `onClick`.
+ *
+ * A middle click dispatches `pointerdown` and `auxclick`, and NO `click`.
+ * The context menu dispatches `pointerdown` and `contextmenu`, and no `click`
+ * either. A marker written only in `onClick` is missing in both cases: the
+ * customer is sent to Google, comes back with a perfectly valid credential,
+ * and it is refused -- the customer cannot sign in at all.
+ */
+describe("the Google link followed in EVERY way a browser can follow it", () => {
+	const stateOf = (link: HTMLElement) =>
+		new URL(link.getAttribute("href") || "").searchParams.get("state");
+
+	it("records the sign-in on a MIDDLE click, and accepts the credential in the new tab", async () => {
+		renderLogin();
+		const link = screen.getByTestId("google-signin");
+		const state = stateOf(link);
+
+		// A middle click: pointerdown and auxclick -- and NO click event.
+		fireEvent.pointerDown(link, { button: 1 });
+		fireEvent(
+			link,
+			new MouseEvent("auxclick", {
+				bubbles: true,
+				cancelable: true,
+				button: 1,
+			}),
+		);
+
+		// The marker is in the SHARED store: that is what the new tab reads.
+		const shared = JSON.parse(
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+		);
+		expect(shared?.state).toBe(state);
+		// This tab did not follow the link, so it must not claim the sign-in.
+		expect(sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY)).toBeNull();
+
+		// The sign-in comes back in ANOTHER tab: the per-tab store is empty.
+		window.location.hash = `#id_token=google-id-token&state=${state}`;
+		renderHandler();
+
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+	});
+
+	it("records the sign-in when the context menu opens it in a new tab", async () => {
+		renderLogin();
+		const link = screen.getByTestId("google-signin");
+		const state = stateOf(link);
+
+		// The context menu: pointerdown and contextmenu -- and NO click event.
+		fireEvent.pointerDown(link, { button: 2 });
+		fireEvent.contextMenu(link);
+
+		const shared = JSON.parse(
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+		);
+		expect(shared?.state).toBe(state);
+		expect(sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY)).toBeNull();
+
+		window.location.hash = `#id_token=google-id-token&state=${state}`;
+		renderHandler();
+
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+	});
+
+	it("records the sign-in on a ctrl/cmd+click, which opens a new tab", async () => {
+		renderLogin();
+		const link = screen.getByTestId("google-signin");
+		const state = stateOf(link);
+
+		// ctrl+click (cmd+click on a Mac) opens a new tab. The browser still
+		// dispatches a click event, with the modifier held down.
+		fireEvent.pointerDown(link, { button: 0, ctrlKey: true });
+		fireEvent.click(link, { button: 0, ctrlKey: true });
+
+		const shared = JSON.parse(
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+		);
+		expect(shared?.state).toBe(state);
+		// The tab the user stayed in is not the one that follows the link, so
+		// it must not claim the sign-in: a sign-in it is not following is
+		// not a failure it may report.
+		expect(sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY)).toBeNull();
+
+		window.location.hash = `#id_token=google-id-token&state=${state}`;
+		renderHandler();
+
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+	});
+
+	it("records the sign-in when the KEYBOARD's context menu opens it in a new tab", async () => {
+		renderLogin();
+		const link = screen.getByTestId("google-signin");
+		const state = stateOf(link);
+
+		// Shift+F10 (or the Menu key) opens the keyboard's context menu: a
+		// keydown, and NO click event. "Open link in new tab" from that menu
+		// follows the link exactly like the mouse's one does.
+		fireEvent.keyDown(link, { key: "F10", shiftKey: true });
+
+		const shared = JSON.parse(
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+		);
+		expect(shared?.state).toBe(state);
+		// The tab the user stayed in is not the one that follows the link, so
+		// it must not claim the sign-in.
+		expect(sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY)).toBeNull();
+
+		window.location.hash = `#id_token=google-id-token&state=${state}`;
+		renderHandler();
+
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+	});
+});
+
+/**
+ * A sign-in that is in flight must survive anything that is NOT it.
+ *
+ * The marker is the proof that the credential belongs to a sign-in this
+ * browser started. A failure that is not ours -- a foreign credential that
+ * lands on the origin, an unrelated page load -- used to destroy that proof,
+ * so the credential that came back afterwards was refused and the customer
+ * could not sign in.
+ */
+describe("a sign-in in flight is not destroyed by something else", () => {
+	it("survives a foreign credential that lands on the origin", async () => {
+		// A sign-in is in flight: the marker is in both stores.
+		rememberPendingGoogleRequest("state-abc");
+
+		// Something else lands on the origin with a credential that is NOT
+		// ours: a plain link, a cross-site redirect, a pasted URL.
+		window.location.hash =
+			"#id_token=foreign-token&state=someone-elses-state";
+		renderHandler();
+
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		// The foreign credential is refused.
+		expect(fetchMock).not.toHaveBeenCalled();
+
+		// The sign-in this browser started is still in flight.
+		expect(readPendingGoogleRequest()?.state).toBe("state-abc");
+
+		// And the credential that comes back for it is accepted.
+		cleanup();
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+	});
+
+	it("survives a page load with no credential at all", async () => {
+		// The user clicked Google and is on their way to it. They land back
+		// on the site -- the root, a sub-route -- before the credential
+		// arrives, or the credential arrives in another tab.
+		rememberPendingGoogleRequest("state-abc");
+
+		renderHandler();
+		await settle();
+
+		expect(readPendingGoogleRequest()?.state).toBe("state-abc");
+
+		cleanup();
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 	});
 });
 

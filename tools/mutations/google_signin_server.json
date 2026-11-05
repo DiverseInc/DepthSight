@@ -10,9 +10,11 @@
     "",
     "Run with:  python tools/mutation_harness.py tools/mutations/google_signin_server.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
-    "read a file that is mid-mutation and report on code that does not exist."
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "Mutant S8 covers the bound on the one-time value: it must be refused by the schema, before it reaches the column that stores it."
   ],
   "pytest_target": "tests/test_google_signin_security.py",
+  "clean_tree_must_pass": true,
   "timeout_s": 900,
   "mutations": [
     {
@@ -56,6 +58,12 @@
       "file": "api/google_signin.py",
       "needle": "    except IntegrityError:\n        # One of the values was already consumed. This attempt is a replay.\n        await db.rollback()\n        return False\n",
       "replace": "    except IntegrityError:\n        # One of the values was already consumed. This attempt is a replay.\n        await db.rollback()\n        return True  # MUTANT: a replay is accepted\n"
+    },
+    {
+      "label": "S8: the one-time value is accepted again when it does not fit the column, so the request dies as a 500",
+      "file": "api/schemas.py",
+      "needle": "    signin_nonce: Optional[str] = Field(default=None, max_length=154)\n",
+      "replace": "    signin_nonce: Optional[str] = Field(default=None, max_length=256)  # MUTANT\n"
     }
   ]
 }

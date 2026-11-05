@@ -4,7 +4,7 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation } from "@tanstack/react-query";
 import { Eye, EyeOff, Loader2, Sparkles } from "lucide-react";
 import { useMemo, useState } from "react";
-import type { MouseEvent } from "react";
+import type { KeyboardEvent, MouseEvent } from "react";
 import { useForm } from "react-hook-form";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
@@ -38,7 +38,18 @@ import {
 	createGoogleAuthorizeRequest,
 	getGoogleClientId,
 	rememberPendingGoogleRequest,
+	type GoogleSignInFollow,
 } from "@/lib/googleOAuth";
+
+/**
+ * The keys that can follow the Google link.
+ *
+ * Enter and Space activate the link (and fire `click` as well), but Shift+F10
+ * -- or the Menu key -- opens the KEYBOARD's context menu, whose "Open link
+ * in new tab" follows the link exactly like the mouse's one does, and
+ * dispatches no `click` event at all.
+ */
+const GOOGLE_LINK_KEYS = new Set(["Enter", " ", "F10", "ContextMenu"]);
 
 // Validation schema for the login form
 const loginSchema = (t: (key: string) => string) =>
@@ -125,12 +136,55 @@ export default function LoginPage() {
 		[googleClientId],
 	);
 
-	const startGoogleSignIn = (event: MouseEvent<HTMLAnchorElement>) => {
+	// The marker has to exist for EVERY way the link can be followed -- not
+	// only for a primary click:
+	//
+	//   * a middle click dispatches `pointerdown` and `auxclick`, and NO
+	//     `click` event: the sign-in opens in a new tab,
+	//   * the context menu's "Open link in new tab" dispatches `pointerdown`
+	//     and `contextmenu`, and no `click` event either,
+	//   * a ctrl/cmd+click opens a new tab, and the browser still dispatches
+	//     a `click` event -- with the modifier held down,
+	//   * the KEYBOARD's context menu (Shift+F10, or the Menu key) dispatches
+	//     `keydown` and no click event at all.
+	//
+	// A marker written only in `onClick` is missing in every one of those
+	// cases: the customer is sent to Google, comes back with a perfectly
+	// valid credential, and it is REFUSED -- because a credential that
+	// arrives with no marker is treated as a login CSRF attempt.
+	//
+	// `pointerdown`, `auxclick` and `keydown` are a best-effort pre-write:
+	// they must never cancel the interaction. The `click` handler is the
+	// authoritative one, and it is the one that fails loudly.
+	//
+	// The marker is deliberately NOT written when the page renders. A marker
+	// that exists without the customer having touched the button keeps a
+	// sign-in "live" for as long as it lasts, which widens the window in
+	// which a state is accepted -- and the state is what proves a response
+	// belongs to a sign-in this browser started.
+	const prepareGoogleSignIn = () => {
+		rememberPendingGoogleRequest(googleSignIn.state, "shared");
+	};
+
+	// The keyboard can follow the link too. Enter and Space also fire
+	// `click`, but the keyboard's context menu does not, and its "Open link
+	// in new tab" follows the link exactly like the mouse's one does.
+	const prepareGoogleSignInOnKey = (
+		event: KeyboardEvent<HTMLAnchorElement>,
+	) => {
+		if (!GOOGLE_LINK_KEYS.has(event.key)) return;
+		prepareGoogleSignIn();
+	};
+
+	const startGoogleSignIn = (
+		event: MouseEvent<HTMLAnchorElement>,
+		follow: GoogleSignInFollow,
+	) => {
 		// If the marker cannot be written, the sign-in CANNOT be verified when
 		// it comes back -- so it must not start at all. Say so, loudly,
 		// instead of sending the user to Google only to reject them on the
 		// way back.
-		if (!rememberPendingGoogleRequest(googleSignIn.state)) {
+		if (!rememberPendingGoogleRequest(googleSignIn.state, follow)) {
 			event.preventDefault();
 			toast({
 				variant: "destructive",
@@ -283,7 +337,20 @@ export default function LoginPage() {
 								<div className="flex justify-center w-full my-2">
 									<a
 										href={googleSignIn.url}
-										onClick={startGoogleSignIn}
+										onPointerDown={prepareGoogleSignIn}
+										onAuxClick={prepareGoogleSignIn}
+										onKeyDown={prepareGoogleSignInOnKey}
+										onClick={(event) =>
+											startGoogleSignIn(
+												event,
+												// ctrl/cmd/shift+click opens a NEW tab, so this
+												// tab is not the one that follows the link: it
+												// must not claim the sign-in.
+												event.ctrlKey || event.metaKey || event.shiftKey
+													? "shared"
+													: "tab",
+											)
+										}
 										data-testid="google-signin"
 										className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md border border-border/60 bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 									>

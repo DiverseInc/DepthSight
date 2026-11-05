@@ -313,16 +313,43 @@ export type PendingGoogleLookup =
 export const PENDING_MAX_AGE_MS = 15 * 60 * 1000;
 
 /**
+ * Where the browser is going to follow the Google link.
+ *
+ * "tab"    -- THIS tab follows the link: a plain click, or the keyboard.
+ *             Both stores are written. The per-tab copy says "this tab
+ *             started the sign-in", which is what lets that tab report a
+ *             sign-in that came back without a credential -- and what keeps
+ *             two tabs signing in at the same time apart.
+ *
+ * "shared" -- the link may be followed SOMEWHERE ELSE: a middle click, the
+ *             context menu's "Open link in new tab", a ctrl/cmd+click.
+ *             Only the shared copy is written, because a tab that is NOT
+ *             following the link must not claim the sign-in: the per-tab
+ *             copy is what says "this tab started the sign-in", and a tab
+ *             that did not follow it has no failure of its own to report.
+ *             The shared copy is enough for the verification, because it is
+ *             what the tab the sign-in comes back in reads.
+ */
+export type GoogleSignInFollow = "tab" | "shared";
+
+/**
  * Remember that a sign-in is in flight, so the credential that comes back can
  * be tied to this request.
  *
- * Returns FALSE when NEITHER store could be written: the browser is blocking
- * storage (private mode with storage disabled, blocked third-party storage, a
- * hardened profile). The caller MUST then fail loudly. A sign-in whose marker
- * cannot be recorded is a sign-in that is guaranteed to be rejected on the way
- * back, and it must never start silently.
+ * `follow` says where the browser is going to follow the link -- see
+ * `GoogleSignInFollow`.
+ *
+ * Returns FALSE when the marker could not be written where it is NEEDED:
+ * the browser is blocking that store (private mode with storage disabled,
+ * blocked third-party storage, a hardened profile). The caller MUST then
+ * fail loudly. A sign-in whose marker cannot be recorded is a sign-in that
+ * is guaranteed to be rejected on the way back, and it must never start
+ * silently.
  */
-export const rememberPendingGoogleRequest = (state: string): boolean => {
+export const rememberPendingGoogleRequest = (
+	state: string,
+	follow: GoogleSignInFollow = "tab",
+): boolean => {
 	const payload = JSON.stringify({
 		state,
 		nonce: randomToken(),
@@ -341,13 +368,15 @@ export const rememberPendingGoogleRequest = (state: string): boolean => {
 	} catch {
 		// The shared store is unavailable. The per-tab store is the fallback.
 	}
-	try {
-		// The PER-TAB copy: this is what lets THIS tab report a sign-in that
-		// came back without a credential.
-		sessionStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
-		stored = true;
-	} catch {
-		// The per-tab store is unavailable too.
+	if (follow === "tab") {
+		try {
+			// The PER-TAB copy: this is what lets THIS tab report a sign-in
+			// that came back without a credential.
+			sessionStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
+			stored = true;
+		} catch {
+			// The per-tab store is unavailable too.
+		}
 	}
 	return stored;
 };
@@ -441,6 +470,40 @@ export const clearPendingGoogleRequest = (): void => {
 	} catch {
 		// Nothing to clear.
 	}
+	try {
+		sessionStorage.removeItem(GOOGLE_OAUTH_PENDING_KEY);
+	} catch {
+		// Nothing to clear.
+	}
+};
+
+/**
+ * Drop the PER-TAB copy of the marker, keeping the SHARED one.
+ *
+ * The shared copy is what makes the sign-in verifiable in another tab -- and
+ * in this tab too, once the per-tab copy is gone. So the per-tab copy can be
+ * dropped without losing the verification, AS LONG AS the shared copy really
+ * carries the same request. When it does not (another tab's sign-in, or the
+ * shared store could not be written at all), the per-tab copy is the only
+ * proof there is and it stays.
+ *
+ * It is used when a failure is reported: the sign-in is not going to be
+ * reported twice, but the credential may still be on its way and it must
+ * still be verifiable when it arrives.
+ */
+export const clearPendingGoogleRequestInThisTab = (state: string): void => {
+	let sharedCarriesIt = false;
+	try {
+		const raw = localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);
+		const parsed = raw
+			? (JSON.parse(raw) as { state?: unknown })
+			: null;
+		sharedCarriesIt = parsed?.state === state;
+	} catch {
+		// The shared store cannot be read: the per-tab copy is the only
+		// proof there is, so it stays.
+	}
+	if (!sharedCarriesIt) return;
 	try {
 		sessionStorage.removeItem(GOOGLE_OAUTH_PENDING_KEY);
 	} catch {
