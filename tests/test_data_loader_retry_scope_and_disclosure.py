@@ -73,12 +73,24 @@ class _LogCapture(logging.Handler):
     logger (bot_module/logger_setup.py:53), so pytest's ``caplog`` never
     sees these records.  The disclosure has to be FOUND in a log, so the
     test puts a handler on the logger itself.
+
+    The logger's LEVEL is set for the capture as well, and the level it
+    had is restored when the capture is closed.  The disclosure is
+    written at WARNING (bot_module/data_loader.py:
+    log_klines_window_coverage), and a logger left at ERROR swallows a
+    WARNING before the record is ever made - so a level another test
+    module left behind would make this test report an empty log for a
+    disclosure that WAS written.  The level is set here for the same
+    reason ``caplog.at_level`` sets it: the test says what it needs to
+    see, instead of inheriting whatever the session happens to hold.
     """
 
     def __init__(self, logger):
         super().__init__(level=logging.DEBUG)
         self.records = []
         self.logger = logger
+        self._previous_level = logger.level
+        logger.setLevel(logging.DEBUG)
         logger.addHandler(self)
 
     def emit(self, record):
@@ -86,6 +98,7 @@ class _LogCapture(logging.Handler):
 
     def close(self):
         self.logger.removeHandler(self)
+        self.logger.setLevel(self._previous_level)
         super().close()
 
     @property

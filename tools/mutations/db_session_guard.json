@@ -22,6 +22,11 @@
     "",
     "A15 makes the guard swallow a file it cannot parse.",
     "",
+    "A16 and A17 remove the virtual-environment rule: the guard then scans an",
+    "environment in the worktree, so third-party code is reported as our leak",
+    "and a third-party non-UTF-8 test file is reported as a file we cannot",
+    "read.  The rule has to survive the class of environments, not one name.",
+    "",
     "Run with:  python tools/mutation_harness.py tools/mutations/db_session_guard.json",
     "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
     "read a file that is mid-mutation and report on code that does not exist."
@@ -32,8 +37,8 @@
     {
       "label": "GAP1: the guard stops scanning the api package",
       "file": "tools/db_session_guard.py",
-      "needle": "        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)\n",
-      "replace": "        dirnames[:] = sorted(\n            d for d in dirnames if d not in SKIP_DIR_NAMES and d != \"api\"\n        )\n"
+      "needle": "        dirnames[:] = sorted(\n            d for d in dirnames if not is_skipped_dir(Path(dirpath) / d)\n        )\n",
+      "replace": "        dirnames[:] = sorted(\n            d for d in dirnames if not is_skipped_dir(Path(dirpath) / d) and d != \"api\"\n        )\n"
     },
     {
       "label": "GAP1: the guard stops scanning the repo root",
@@ -148,6 +153,18 @@
       "file": "tools/db_session_guard.py",
       "needle": "                and (after is None or (lineno is not None and lineno > after))\n",
       "replace": "                and True  # MUTANT: a close before the acquisition counts\n"
+    },
+    {
+      "label": "the guard scans a virtual environment again (the NAME rule is gone)",
+      "file": "tools/db_session_guard.py",
+      "needle": "    if name in VENV_DIR_NAMES or name.startswith(VENV_DIR_PREFIXES):\n        return True\n",
+      "replace": "    if False:  # MUTANT: the virtualenv name rule is gone\n        return True\n"
+    },
+    {
+      "label": "the guard scans a virtual environment again (the MARKER rule is gone)",
+      "file": "tools/db_session_guard.py",
+      "needle": "    return (path / VENV_MARKER_FILE).is_file()\n",
+      "replace": "    return False  # MUTANT: the virtualenv marker rule is gone\n"
     }
   ]
 }
