@@ -1,0 +1,89 @@
+{
+  "_comment": [
+    "Mutations that put the DEAD-FEED hole back into the symbol guard.",
+    "",
+    "PR #54 round 2 measured three things in code, not by argument:",
+    "",
+    "  1. THIS fork's OWN frontend socket (/ws, /ws/main) cannot deliver a",
+    "     symbol to the bot.  api/websocket_server.py:228-230 closes every",
+    "     connection that carries no ?token= and the bot's screener client",
+    "     sends none (data_consumer.py:3414-3437); the server forwards Redis",
+    "     messages as {'topic','payload'} (:187-191) while the bot only",
+    "     understands {'type':'active_pairs_update','data':[...]}",
+    "     (data_consumer.py:3476-3478); and nothing in this repository",
+    "     publishes that message at all.  The URL this fork SHIPPED in",
+    "     .env.example was exactly that URL, and the guard accepted it.",
+    "  2. A feed that is switched OFF has NO symbol source at all: the",
+    "     DYNAMIC symbol pool is filled only by the feed's",
+    "     'active_pairs_update' message (controller.py:7216), and there is",
+    "     no automatic fallback to the static list.",
+    "  3. A URL that is set but unusable is wrong in BOTH pairings: it is",
+    "     the cause the moment the feed is switched on.",
+    "",
+    "Every mutant below must be KILLED by the tests named in pytest_target.",
+    "The target is a LIST OF TEST NODES, not the whole file, so a kill is",
+    "attributable to the mutant and not to some unrelated failure.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/screener_ws_delivery_guard.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_fork_screener_ws_config.py::test_the_shared_rule_refuses_this_forks_own_frontend_socket tests/test_fork_screener_ws_config.py::test_the_shared_rule_accepts_an_operator_owned_publisher tests/test_fork_screener_ws_config.py::test_the_shared_rule_refuses_a_feed_that_is_switched_off tests/test_fork_screener_ws_config.py::test_the_shared_rule_refuses_an_unusable_url_even_when_the_feed_is_off tests/test_fork_screener_ws_config.py::test_the_regime_predicate_refuses_this_forks_own_frontend_socket tests/test_fork_screener_ws_config.py::test_the_regime_predicate_refuses_the_upstream tests/test_fork_screener_ws_config.py::test_the_regime_predicate_still_accepts_an_operator_owned_publisher tests/test_fork_screener_ws_config.py::test_the_bot_refuses_a_dynamic_strategy_when_the_feed_is_disabled tests/test_fork_screener_ws_config.py::test_the_bot_refuses_a_dynamic_strategy_pointed_at_this_forks_own_socket tests/test_fork_screener_ws_config.py::test_the_bot_still_replays_a_dynamic_strategy_when_the_feed_cannot_deliver",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "D1: this fork's OWN frontend socket is accepted as a feed again (the URL this fork shipped)",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    if is_fork_own_frontend_ws_url(text):\n        return _fork_own_feed_message(text)\n",
+      "replace": "    if False:  # MUTANT: this fork's own frontend socket is accepted\n        return _fork_own_feed_message(text)\n"
+    },
+    {
+      "label": "D2: FALSE POSITIVE - the fork's own socket check becomes a PATH-ONLY check, so an operator's own host on /ws/main is refused",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    return (\n        ws_url_host(url) == FORK_OWN_DOMAIN\n        and ws_url_path(url) in FORK_OWN_WS_PATHS\n    )\n",
+      "replace": "    return ws_url_path(url) in FORK_OWN_WS_PATHS  # MUTANT: path only\n"
+    },
+    {
+      "label": "D3: FALSE POSITIVE - the fork's own socket check becomes a HOST-ONLY check, so ANY path on the fork's own host is refused",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    return (\n        ws_url_host(url) == FORK_OWN_DOMAIN\n        and ws_url_path(url) in FORK_OWN_WS_PATHS\n    )\n",
+      "replace": "    return ws_url_host(url) == FORK_OWN_DOMAIN  # MUTANT: host only\n"
+    },
+    {
+      "label": "D4: the path comparison stops dropping the trailing slash, so '/ws/main/' slips past",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    return path.rstrip(\"/\").lower()\n",
+      "replace": "    return path.lower()  # MUTANT: the trailing slash is not dropped\n"
+    },
+    {
+      "label": "D5: the feed-off refusal names the wrong thing, so the operator is not told which switch is off",
+      "file": "bot_module/screener_feed.py",
+      "needle": "        return _feed_disabled_message()\n",
+      "replace": "        return _upstream_url_message(text, ws_url_host(text))  # MUTANT: the wrong message\n"
+    },
+    {
+      "label": "D6: the regime predicate accepts this fork's own frontend socket again",
+      "file": "bot_module/regime_feed.py",
+      "needle": "    if is_fork_own_frontend_ws_url(ws_url):\n        return False\n",
+      "replace": "    if False:  # MUTANT: the fork's own socket is accepted\n        return False\n"
+    },
+    {
+      "label": "D7: the regime predicate accepts the UPSTREAM's reserved hostname again",
+      "file": "bot_module/regime_feed.py",
+      "needle": "    if is_upstream_depthsight_url(ws_url):\n        return False\n",
+      "replace": "    if False:  # MUTANT: the upstream is accepted\n        return False\n"
+    },
+    {
+      "label": "D8: the rehydrate exemption is gone, so a RUNNING strategy vanishes on restart",
+      "file": "bot_module/controller.py",
+      "needle": "            if _dynamic_problem and not is_rehydrate:\n",
+      "replace": "            if _dynamic_problem:  # MUTANT: the rehydrate exemption is gone\n"
+    },
+    {
+      "label": "D9: the refusal never fires, so a DYNAMIC strategy starts against a feed that cannot deliver a symbol",
+      "file": "bot_module/controller.py",
+      "needle": "            if _dynamic_problem and not is_rehydrate:\n",
+      "replace": "            if False and _dynamic_problem:\n"
+    }
+  ]
+}

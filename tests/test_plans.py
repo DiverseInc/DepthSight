@@ -62,7 +62,12 @@ class TestUserPlans:
             id="existing_config_id",
             name="Mocked Strategy",
             config_data={"param": 1},
-            symbol_selection_mode="DYNAMIC",
+            # The symbol mode is EXPLICIT, and it is STATIC: this file is
+            # about PLAN enforcement, not about where the symbols come from.
+            # With the default DYNAMIC mode a launch needs a screener feed,
+            # and this deployment has none, so the API refuses it (503)
+            # before the plan rules are even reached.
+            symbol_selection_mode="STATIC",
             symbols=None,
             use_ml_confirmation=False,
             user_id=1,
