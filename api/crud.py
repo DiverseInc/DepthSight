@@ -279,6 +279,42 @@ async def get_payment_by_bitcart_id(
     return result.scalars().first()
 
 
+async def get_open_payment_for_plan(
+    db: AsyncSession, user_id: int, plan_name: str
+) -> Optional[models.Payment]:
+    """The customer's OPEN (still unpaid) invoice for a tier, if there is one.
+
+    "Open" is the payment status this module already uses: `create_payment`
+    writes `PENDING`, and an invoice stays `PENDING` until it is paid, it
+    expires or it fails. There is no second notion of pending anywhere --
+    this query reuses the one that is already there.
+    """
+    result = await db.execute(
+        select(models.Payment)
+        .filter(
+            models.Payment.user_id == user_id,
+            models.Payment.plan_name == plan_name,
+            models.Payment.status == "PENDING",
+        )
+        .order_by(models.Payment.created_at.desc())
+    )
+    return result.scalars().first()
+
+
+async def lock_customer_billing(db: AsyncSession, user_id: int) -> None:
+    """Take the customer's row lock for the rest of the current transaction.
+
+    Two renewals for the SAME customer that run at the same time must not
+    both see "no open invoice" and both create one. The lock is taken on
+    the USER row, so every renewal for this customer queues behind it, and
+    the second one then sees the invoice the first one created. It is
+    released when the transaction commits or rolls back.
+    """
+    await db.execute(
+        select(models.User.id).where(models.User.id == user_id).with_for_update()
+    )
+
+
 async def get_lifetime_payment_slot_counts(
     db: AsyncSession,
     plan_name: str,

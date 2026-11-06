@@ -1,0 +1,74 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees of the Managed AUTO-RENEWAL",
+    "(owner decision 2026-11-06).",
+    "",
+    "The payment provider has NO provider-side recurring, so WE issue the",
+    "next 30-day invoice ourselves: invoice N is paid -> the plan extends ->",
+    "invoice N+1 is issued -> ...",
+    "",
+    "A removes the renewal entirely (the webhook stops issuing the next",
+    "invoice). B removes the IDEMPOTENCY GUARD, so a replayed confirmation",
+    "issues a SECOND invoice for the same period. C removes the",
+    "Managed-only restriction, so every tier starts renewing. D removes the",
+    "'the tier must still be ACTIVE' guard, so a tier that has been switched",
+    "off still gets invoiced. E replaces the CURRENT effective price with the",
+    "tier's headline price, so a repriced tier is renewed at the old price.",
+    "F breaks the order_id -> payment -> customer mapping the provider's",
+    "webhook uses to resolve the invoice back to the customer. G drops a",
+    "failed renewal from ERROR to INFO, so a customer who is NOT invoiced",
+    "becomes invisible in the logs.",
+    "",
+    "Every one of these must be KILLED by tests/test_managed_auto_renew.py.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/managed_auto_renew.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_managed_auto_renew.py tests/test_managed_499_tier.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the paid Managed period never issues its renewal invoice",
+      "file": "api/routes/webhooks.py",
+      "needle": "            await issue_renewal_invoice(db, payment=payment, user=user)\n        except Exception as exc:\n",
+      "replace": "            pass  # MUTANT: the renewal invoice is never issued\n        except Exception as exc:\n"
+    },
+    {
+      "label": "B: the idempotency guard is removed, so a replayed event issues a second invoice",
+      "file": "api/routes/payments.py",
+      "needle": "        if open_payment is not None:\n",
+      "replace": "        if False:\n"
+    },
+    {
+      "label": "C: every tier renews, not just the Managed one",
+      "file": "api/routes/payments.py",
+      "needle": "        if plan_key not in AUTO_RENEW_PLANS:\n",
+      "replace": "        if False:\n"
+    },
+    {
+      "label": "D: a tier that has been switched off is still invoiced",
+      "file": "api/routes/payments.py",
+      "needle": "    if not plan_config or not plan_config.get(\"active\", False):\n        raise HTTPException(status_code=400, detail=\"Plan not found or is not active.\")\n",
+      "replace": "    if False:\n        raise HTTPException(status_code=400, detail=\"Plan not found or is not active.\")\n"
+    },
+    {
+      "label": "E: the renewal is charged at the tier's headline price instead of the current effective price",
+      "file": "api/routes/payments.py",
+      "needle": "    price_usd = plans_config.get_effective_plan_price(plan_name)\n",
+      "replace": "    price_usd = float(plan_config.get(\"price_usd\", 0))\n"
+    },
+    {
+      "label": "F: the renewal invoice's order_id no longer resolves back to the customer",
+      "file": "api/routes/payments.py",
+      "needle": "            \"order_id\": str(payment.id),\n",
+      "replace": "            \"order_id\": str(user_id),\n"
+    },
+    {
+      "label": "G: a renewal that could not be issued is logged below ERROR",
+      "file": "api/routes/payments.py",
+      "needle": "        logger.error(\n            \"Failed to issue the renewal invoice for customer %s on tier '%s': %s\",\n            user.id,\n            payment.plan_name,\n            exc.detail,\n",
+      "replace": "        logger.info(\n            \"Failed to issue the renewal invoice for customer %s on tier '%s': %s\",\n            user.id,\n            payment.plan_name,\n            exc.detail,\n"
+    }
+  ]
+}

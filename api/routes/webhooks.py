@@ -127,6 +127,29 @@ async def bitcart_webhook(
                 exc,
                 exc_info=True,
             )
+
+        # --- AUTO-RENEWAL (owner decision, 2026-11-06) ---
+        # The Managed service renews itself: invoice N is paid -> the plan
+        # extends by its period (already committed above) -> invoice N+1 is
+        # issued. The customer always has the next invoice in front of them
+        # and nobody has to invoice by hand.
+        #
+        # It runs LAST and it can never fail this webhook: the period the
+        # customer just paid for is already recorded and committed, so a
+        # renewal that cannot be issued must not take the confirmation --
+        # or the service the customer paid for -- down with it.
+        try:
+            from .payments import issue_renewal_invoice
+
+            await issue_renewal_invoice(db, payment=payment, user=user)
+        except Exception as exc:
+            logger.error(
+                "Failed to run the auto-renewal for user_id=%s after payment %s: %s",
+                user.id,
+                payment.id,
+                exc,
+                exc_info=True,
+            )
         return {"status": "ok"}
 
     except HTTPException as e:
