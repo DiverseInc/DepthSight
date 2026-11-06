@@ -1,0 +1,145 @@
+{
+  "_comment": [
+    "Mutations that re-introduce the FABRICATED ORACLE, one at a time.",
+    "Every mutation must be caught by the tests in this spec's pytest target:",
+    "  tests/test_oracle_availability.py         -- the server must report the REAL state",
+    "  tests/test_pwa_oracle_honesty.py           -- the PWA must not fabricate one",
+    "  tests/test_oracle_confidence_threshold.py  -- the threshold must not vanish",
+    "  tests/test_web_oracle_honesty.py           -- the WEB client must not fabricate one",
+    "",
+    "The fiction being re-introduced, in its original form:",
+    "  const canUseOracle = true; // Oracle is available to everyone",
+    "  const [oracleConfidence, setOracleConfidence] = useState(95);",
+    "  const regime = parseInt(formData.oracleRegime || \"1\", 10);",
+    "  const confidence = formData.oracleConfidence || 95;",
+    "on a deployment whose api container logs, once per worker:",
+    "  WARNING [api.simulation_router:122] - Oracle model not found at",
+    "  /app/data/oracle_model.joblib",
+    "",
+    "AND, just as bad, the SILENT weakening of the guard:",
+    "  min_confidence_raw = (self.symbol_selection_config.oracle_confidence or 0.0)",
+    "  ... if s.get(\"oracle_confidence\", 0.0) >= min_confidence",
+    "which turned a '>= 0.95' filter into '>= 0.0' -- a filter that admits",
+    "EVERY symbol, with nothing said about it.",
+    "",
+    "The server-side mutants matter as much as the client-side ones: a hard-coded",
+    "False in the endpoint would also 'pass' the unavailable case while keeping",
+    "the oracle switched off forever. Both directions are pinned.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/oracle_availability_truth.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_oracle_availability.py tests/test_pwa_oracle_honesty.py tests/test_oracle_confidence_threshold.py tests/test_web_oracle_honesty.py",
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "A: the server says the oracle is NEVER available (a constant False)",
+      "file": "api/simulation_router.py",
+      "needle": "        return get_oracle() is not None\n",
+      "replace": "        return False  # MUTANT: the oracle is never available\n"
+    },
+    {
+      "label": "B: the server says the oracle is ALWAYS available (a constant True)",
+      "file": "api/simulation_router.py",
+      "needle": "        return get_oracle() is not None\n",
+      "replace": "        return True  # MUTANT: the oracle is always available\n"
+    },
+    {
+      "label": "C: the endpoint ignores the server and always answers False",
+      "file": "api/routes/capabilities.py",
+      "needle": "        oracle_available = oracle_model_available()\n",
+      "replace": "        oracle_available = False  # MUTANT\n"
+    },
+    {
+      "label": "D: the endpoint ignores the server and always answers True",
+      "file": "api/routes/capabilities.py",
+      "needle": "        oracle_available = oracle_model_available()\n",
+      "replace": "        oracle_available = True  # MUTANT\n"
+    },
+    {
+      "label": "E: the endpoint FAILS OPEN when the probe errors",
+      "file": "api/routes/capabilities.py",
+      "needle": "        oracle_available = False\n",
+      "replace": "        oracle_available = True  # MUTANT: fail open\n"
+    },
+    {
+      "label": "F: the PWA hard-codes the oracle as available again",
+      "file": "pwa/components/LaunchStrategyModal.tsx",
+      "needle": "\tconst { oracleAvailable: canUseOracle, defaultConfidence } =\n\t\tuseOracleAvailability();\n",
+      "replace": "\tconst canUseOracle = true; // MUTANT: Oracle is available to everyone\n"
+    },
+    {
+      "label": "G: the PWA defaults the oracle confidence back to 95",
+      "file": "pwa/components/LaunchStrategyModal.tsx",
+      "needle": "\tconst [oracleConfidence, setOracleConfidence] = useState<number | undefined>(\n\t\tundefined,\n\t);\n",
+      "replace": "\tconst [oracleConfidence, setOracleConfidence] = useState(95); // MUTANT\n"
+    },
+    {
+      "label": "H: the PWA launch payload invents a 95% confidence again",
+      "file": "pwa/screens/StrategiesScreen.tsx",
+      "needle": "\t\t\t\t\t\t\t: { regime: settings.regime, confidence: settings.confidence };\n",
+      "replace": "\t\t\t\t\t\t\t: { regime: settings.regime, confidence: settings.confidence || 95 }; // MUTANT\n"
+    },
+    {
+      "label": "I: the PWA launch payload invents oracle regime 1 again",
+      "file": "pwa/screens/StrategiesScreen.tsx",
+      "needle": "\t\t\t\t\tparams.oracle_regime = settings.regime;\n",
+      "replace": "\t\t\t\t\tparams.oracle_regime = settings.regime ?? 1; // MUTANT\n"
+    },
+    {
+      "label": "J: the strategy editor preselects oracle regime 1 again",
+      "file": "pwa/screens/EditorScreen.tsx",
+      "needle": "value={oracleRegime !== null && oracleRegime !== undefined ? String(oracleRegime) : \"\"}",
+      "replace": "value={oracleRegime !== null && oracleRegime !== undefined ? String(oracleRegime) : \"1\"} // MUTANT"
+    },
+    {
+      "label": "K: the PWA switches the symbol-selection mode behind the customer's back",
+      "file": "pwa/components/LaunchStrategyModal.tsx",
+      "needle": "\t\tif (oracleLaunchRefusal(savedMode, canUseOracle) === \"ORACLE_UNAVAILABLE\") {\n",
+      "replace": "\t\tif (false) { // MUTANT: the mode is substituted instead\n"
+    },
+    {
+      "label": "L: the SERVER reads an absent or zero confidence as NO threshold",
+      "file": "bot_module/symbol_selection.py",
+      "needle": "    if raw is None or raw <= 0:\n        return DEFAULT_ORACLE_CONFIDENCE_PERCENT / 100.0\n",
+      "replace": "    if raw is None or raw <= 0:\n        return 0.0  # MUTANT: 'not chosen' becomes 'no threshold'\n"
+    },
+    {
+      "label": "M: the SERVER's declared threshold is changed (a new number, silently)",
+      "file": "bot_module/symbol_selection.py",
+      "needle": "DEFAULT_ORACLE_CONFIDENCE_PERCENT: float = 95.0\n",
+      "replace": "DEFAULT_ORACLE_CONFIDENCE_PERCENT: float = 50.0  # MUTANT: a new threshold value\n"
+    },
+    {
+      "label": "N: the server keeps claiming a model whose file has been deleted",
+      "file": "api/simulation_router.py",
+      "needle": "        if isinstance(loaded, _LoadedOracle) and not loaded.path.exists():\n",
+      "replace": "        if False and isinstance(loaded, _LoadedOracle) and not loaded.path.exists():\n"
+    },
+    {
+      "label": "O: the server-side default assumes the oracle exists again",
+      "file": "api/hft_router.py",
+      "needle": "    use_oracle: bool = Field(default_factory=_oracle_available_default)\n",
+      "replace": "    use_oracle: bool = True  # MUTANT: the old assumption\n"
+    },
+    {
+      "label": "P: the WEB client invents a 95% confidence threshold again",
+      "file": "frontend/src/components/strategies/LaunchStrategyModal.tsx",
+      "needle": "\tconst defaultConfidence = oracleDefaultConfidencePercent(capabilities);\n",
+      "replace": "\tconst defaultConfidence = 95; // MUTANT: the client invents a threshold\n"
+    },
+    {
+      "label": "Q: the WEB client stops asking the server what it can do",
+      "file": "frontend/src/components/strategies/LaunchStrategyModal.tsx",
+      "needle": "\tconst { data: capabilities } = useOracleAvailability();\n",
+      "replace": "\tconst { data: capabilities } = { data: { oracleAvailable: true } }; // MUTANT: nobody asked\n"
+    },
+    {
+      "label": "R: the WEB client decides the oracle's availability from the customer's plan",
+      "file": "frontend/src/components/strategies/LaunchStrategyModal.tsx",
+      "needle": "\tconst canUseOracle = oracleEntitled && oracleAvailable;\n",
+      "replace": "\tconst canUseOracle = oracleEntitled; // MUTANT: the plan decides the availability\n"
+    }
+  ]
+}

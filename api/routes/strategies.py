@@ -660,6 +660,36 @@ async def delete_saved_strategy_configuration(
     return None
 
 
+# EVERY spelling of a dynamic symbol-selection mode, not just "DYNAMIC".
+#
+# The API takes `symbol_selection_mode` as a FREE STRING
+# (api/schemas.py:1109), while the runtime vocabulary is a strict Literal:
+# "STATIC" / "DYNAMIC_NATR" / "DYNAMIC_ORACLE"
+# (bot_module/symbol_selection.py:82). The guard used to match the exact
+# string "DYNAMIC" only, so "DYNAMIC_NATR" and "DYNAMIC_ORACLE" walked
+# straight through it -- and the bot's symbol-pool resolver
+# (bot_module/controller.py:7271) returns an EMPTY symbol list for any mode it
+# does not recognise. Such a strategy starts, reports "running" and never
+# trades: the exact failure this guard exists to prevent.
+#
+# So the refusal covers every mode that asks for a dynamic symbol pool. It
+# fails CLOSED (an unrecognised DYNAMIC_* spelling is refused, never started)
+# and STATIC / FIXED -- the modes the onboarding wizard creates -- are left
+# exactly as they were.
+DYNAMIC_SYMBOL_SELECTION_MODE_PREFIX = "DYNAMIC"
+
+
+def _is_dynamic_symbol_selection_mode(mode: Any) -> bool:
+    """True when `mode` asks for a dynamically selected symbol pool.
+
+    The mode is normalised the way the guard normalises it (strip + upper), so
+    " dynamic_oracle " is treated exactly like "DYNAMIC_ORACLE".
+    """
+    return str(mode or "").strip().upper().startswith(
+        DYNAMIC_SYMBOL_SELECTION_MODE_PREFIX
+    )
+
+
 @strategies_router.post(
     "",
     status_code=status.HTTP_202_ACCEPTED,
@@ -765,11 +795,19 @@ async def start_strategy_instance(
     # -- no symbols to subscribe to, none to match. Refusing here turns that
     # into an immediate, explanatory error the user can act on.
     #
+    # EVERY dynamic spelling is refused, not only the exact string "DYNAMIC":
+    # the runtime's own modes are "DYNAMIC_NATR" and "DYNAMIC_ORACLE"
+    # (bot_module/symbol_selection.py:82), and the bot's symbol-pool resolver
+    # returns NO symbols for a mode it does not recognise
+    # (bot_module/controller.py:7271) -- so a "DYNAMIC_ORACLE" strategy that
+    # got past this guard started, reported "running", and never traded. The
+    # request's mode is a free string, so a caller can name any of them.
+    #
     # Operators who run their own screener set
     # SYMBOL_SELECTION_ALLOW_DYNAMIC=true. STATIC and FIXED (the mode the
     # onboarding wizard creates) are unaffected.
     _resolved_mode = str(symbol_selection_mode or "").strip().upper()
-    if _resolved_mode == "DYNAMIC" and not getattr(
+    if _is_dynamic_symbol_selection_mode(_resolved_mode) and not getattr(
         bot_config, "SYMBOL_SELECTION_ALLOW_DYNAMIC", False
     ):
         raise HTTPException(
@@ -778,7 +816,9 @@ async def start_strategy_instance(
                 "Dynamic symbol selection is not available on this deployment. "
                 "It requires a reachable symbol screener, and there is no "
                 "automatic fallback, so a dynamic strategy would start and then "
-                "never trade. Choose an explicit symbol instead (STATIC/FIXED), "
+                "never trade. This applies to every dynamic mode, including "
+                "DYNAMIC, DYNAMIC_NATR and DYNAMIC_ORACLE. Choose an explicit "
+                "symbol instead (STATIC/FIXED), "
                 "or set SYMBOL_SELECTION_ALLOW_DYNAMIC=true if you have your own "
                 "screener running."
             ),

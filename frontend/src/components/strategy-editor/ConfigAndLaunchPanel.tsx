@@ -75,6 +75,7 @@ import {
 	fetchSymbolSelectionSettings,
 	updateSymbolSelectionSettings as updateSymbolSelectionSettingsApi,
 	useConfig,
+	useOracleAvailability,
 	useRunBacktest,
 	useSaveStrategyConfig,
 	useSendTradingViewTestSignal,
@@ -85,6 +86,10 @@ import {
 	useTradingViewWebhookStatus,
 	useUpdateStrategyConfig,
 } from "@/lib/api";
+import {
+	effectiveOracleConfidence,
+	oracleDefaultConfidencePercent,
+} from "@/lib/oracleCapability";
 import { hasProPlanAccess } from "@/lib/strategyRestrictions";
 import { cn } from "@/lib/utils";
 // State, API & Types
@@ -142,10 +147,40 @@ export const ConfigAndLaunchPanel = memo(
 			min_foundation_weight_threshold,
 		} = store;
 
-		// Permissions
+		// TWO AXES, and they must not be conflated.
+		//
+		// The ENTITLEMENT says whether this CUSTOMER may use the oracle at
+		// all: it is a paid feature, so admins and Pro users have it.
+		//
+		// The AVAILABILITY says whether this DEPLOYMENT has a model to
+		// filter with, and only the SERVER knows that. The old line was an
+		// entitlement check wearing the label of an availability check:
+		//
+		//     const canUseOracle = isAdmin || hasPrecisionAccess;
+		//
+		// so an entitled customer on a deployment whose api container logs
+		// "Oracle model not found at /app/data/oracle_model.joblib" was
+		// offered an oracle filter that could not exist.
 		const isAdmin = user?.role === "admin";
 		const hasPrecisionAccess = hasProPlanAccess(user?.plan);
-		const canUseOracle = isAdmin || hasPrecisionAccess;
+		const oracleEntitled = isAdmin || hasPrecisionAccess;
+		const { data: capabilities } = useOracleAvailability();
+		const oracleAvailable = capabilities?.oracleAvailable === true;
+		const canUseOracle = oracleEntitled && oracleAvailable;
+		// The server's DECLARED confidence threshold, in percent. The
+		// client shows it and sends it back; it never makes one up.
+		const defaultConfidence = oracleDefaultConfidencePercent(capabilities);
+
+		// The confidence the customer SEES and the one that is SENT: their
+		// own choice when they made one, otherwise the server's DECLARED
+		// threshold. The store starts at 0, and 0 does NOT mean "no
+		// threshold" -- the server reads it as the declared default -- so
+		// the customer must SEE that default.
+		const effectiveConfidence = effectiveOracleConfidence(
+			oracleConfidence,
+			defaultConfidence,
+		);
+
 
 		// API & Multi-account
 		const { mutate: runBacktest, isPending: isBacktesting } = useRunBacktest();
@@ -248,13 +283,32 @@ export const ConfigAndLaunchPanel = memo(
 		const { mutate: sendTradingViewTestSignal } =
 			useSendTradingViewTestSignal();
 
-		// Force STATIC mode for non-pro users
+		// Force STATIC mode for customers who may not use dynamic selection
+		// at all (the ENTITLEMENT axis), and collapse the ORACLE mode when
+		// this deployment has no oracle model (the AVAILABILITY axis):
+		// there is nothing to filter on, so the server would refuse the
+		// launch anyway. The reason is stated on screen below -- the mode
+		// does not change behind the customer's back.
 		useEffect(() => {
 			if (isAuthLoading) return;
-			if (!canUseOracle && symbol_selection_mode !== "STATIC") {
+			if (!oracleEntitled && symbol_selection_mode !== "STATIC") {
+				setStrategyField("symbol_selection_mode", "STATIC");
+				return;
+			}
+			if (
+				oracleEntitled &&
+				!oracleAvailable &&
+				symbol_selection_mode === "DYNAMIC_ORACLE"
+			) {
 				setStrategyField("symbol_selection_mode", "STATIC");
 			}
-		}, [canUseOracle, symbol_selection_mode, setStrategyField, isAuthLoading]);
+		}, [
+			oracleEntitled,
+			oracleAvailable,
+			symbol_selection_mode,
+			setStrategyField,
+			isAuthLoading,
+		]);
 
 		useEffect(() => {
 			fetchSymbolSelectionSettings()
@@ -534,7 +588,7 @@ export const ConfigAndLaunchPanel = memo(
 					min_natr,
 					oracle_regime:
 						oracleRegime === null ? undefined : (oracleRegime as 0 | 1 | 2),
-					oracle_confidence: oracleConfidence,
+					oracle_confidence: effectiveConfidence ?? undefined,
 					max_concurrent_symbols,
 				});
 			} catch (e) {
@@ -547,7 +601,7 @@ export const ConfigAndLaunchPanel = memo(
 			else if (symbol_selection_mode === "DYNAMIC_ORACLE")
 				configData.oracle_settings = {
 					regime: oracleRegime,
-					confidence: oracleConfidence,
+					confidence: effectiveConfidence,
 				};
 
 			if (symbol_selection_mode !== "STATIC")
@@ -572,7 +626,7 @@ export const ConfigAndLaunchPanel = memo(
 				use_ml_confirmation: use_ml_confirmation,
 				foundation_weights: useFoundationWeights ? foundationWeights : null,
 				oracle_regime: oracleRegime,
-				oracle_confidence: oracleConfidence,
+				oracle_confidence: effectiveConfidence ?? undefined,
 			};
 
 			const performDeploy = (configId: string) => {
@@ -799,15 +853,15 @@ export const ConfigAndLaunchPanel = memo(
 												disabled={
 													isAnythingLoading ||
 													isTradingViewWebhookMode ||
-													!canUseOracle
+													!oracleEntitled
 												}
 											>
 												<SelectTrigger
-													className={cn(!canUseOracle && "opacity-80")}
+													className={cn(!oracleEntitled && "opacity-80")}
 												>
 													<div className="flex items-center justify-between w-full pr-2">
 														<SelectValue />
-														{!canUseOracle && (
+														{!oracleEntitled && (
 															<div className="px-1.5 py-0.5 bg-violet-600 text-[8px] font-bold text-white rounded uppercase ml-2">
 																Pro
 															</div>
@@ -818,25 +872,27 @@ export const ConfigAndLaunchPanel = memo(
 													<SelectItem value={"STATIC" as string}>
 														{t("configPanel.symbolSelectionModeStatic")}
 													</SelectItem>
-													{canUseOracle && (
+													{oracleEntitled && (
 														<>
 															<SelectItem value={"DYNAMIC_NATR" as string}>
 																{t(
 																	"configPanel.symbolSelectionModeDynamicNatr",
 																)}
 															</SelectItem>
-															<SelectItem value={"DYNAMIC_ORACLE" as string}>
-																{t(
-																	"configPanel.symbolSelectionModeDynamicOracle",
-																)}
-															</SelectItem>
+															{canUseOracle && (
+																<SelectItem value={"DYNAMIC_ORACLE" as string}>
+																	{t(
+																		"configPanel.symbolSelectionModeDynamicOracle",
+																	)}
+																</SelectItem>
+															)}
 														</>
 													)}
 												</SelectContent>
 											</Select>
 										</div>
 									</TooltipTrigger>
-									{!canUseOracle && (
+									{!oracleEntitled && (
 										<TooltipContent side="top">
 											<p className="text-xs">
 												{t("configPanel.dynamicSelectionProOnly") ||
@@ -845,6 +901,18 @@ export const ConfigAndLaunchPanel = memo(
 										</TooltipContent>
 									)}
 								</Tooltip>
+
+								{/* THE ORACLE IS NOT AVAILABLE ON THIS DEPLOYMENT: say so,
+								    plainly. The mode above collapsed to STATIC because of it,
+								    and the customer is told why rather than left to guess. */}
+								{oracleEntitled && !oracleAvailable && (
+									<p className="text-xs text-muted-foreground">
+										{t(
+											"configPanel.oracleUnavailable",
+											"Oracle filter unavailable: this server has no oracle model deployed.",
+										)}
+									</p>
+								)}
 
 								{symbol_selection_mode === "DYNAMIC_NATR" && (
 									<div className="space-y-2">
@@ -891,12 +959,12 @@ export const ConfigAndLaunchPanel = memo(
 										</Select>
 										<div className="flex justify-between text-xs">
 											<Label>Min Confidence</Label>
-											<span>{oracleConfidence}%</span>
+											<span>{effectiveConfidence ?? 0}%</span>
 										</div>
 										<Slider
 											min={0}
 											max={100}
-											value={[oracleConfidence]}
+											value={[effectiveConfidence ?? 0]}
 											onValueChange={(v) => setOracleConfidence(v[0])}
 										/>
 									</div>

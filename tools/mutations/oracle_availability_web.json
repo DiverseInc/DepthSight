@@ -1,0 +1,125 @@
+{
+  "_comment": [
+    "Mutations that re-introduce the FABRICATED ORACLE in the decision",
+    "modules and in the PWA's launch modal, one at a time.",
+    "",
+    "This spec has no pytest target: the code it mutates is TypeScript, and its",
+    "tests are run by vitest. The harness accepts a 'command' for exactly that",
+    "case and keeps every other guarantee it already had -- snapshot before and",
+    "SHA-256 revert verification after.",
+    "",
+    "THE SKIP RULE, PRECISELY (this comment used to overclaim):",
+    "",
+    "  * A NEEDLE that is not found in the file is a SKIPPED MUTANT. A skipped",
+    "    mutant is a FAILURE -- the run exits non-zero -- so a spec that has",
+    "    drifted can never be mistaken for a clean run. That rule IS kept on",
+    "    this path.",
+    "",
+    "  * A vitest run in which EVERY TEST IS SKIPPED is a different thing, and",
+    "    it used to be reported as 'mutant SURVIVED': vitest exits 0, the",
+    "    harness found the 'Tests N skipped' summary and read it as a pass.",
+    "    That was a false green. The harness now reports an all-skipped run as",
+    "    BROKEN and aborts (rc=3), so the run exits 2. The rule lives in",
+    "    tools/mutation_harness.py:summary_ran_no_test() and is pinned by",
+    "    tests/test_mutation_harness_skip.py.",
+    "",
+    "What is covered here and NOT in oracle_availability_truth.json:",
+    "  * frontend/src/lib/oracleCapability.ts -- the WEB client's decision",
+    "    module. The web client is a separate application from the PWA and",
+    "    cannot import its product code, so it has its own module; the test",
+    "    that PROVES the two agree runs both against the same inputs.",
+    "  * pwa/lib/oracleCapability.ts -- the PWA's own decision module.",
+    "  * pwa/components/LaunchStrategyModal.tsx -- the launch that used to",
+    "    substitute DYNAMIC_NATR for a saved DYNAMIC_ORACLE strategy.",
+    "",
+    "ALSO COVERED HERE, AND ALSO IN oracle_availability_truth.json (the two",
+    "specs run different runners, so the same defect is caught twice):",
+    "  * pwa/screens/StrategiesScreen.tsx -- the launch PAYLOAD. The truth",
+    "    spec asserts it at SOURCE level, because the PWA screen cannot be",
+    "    imported by the pytest path at all. Here it is asserted as",
+    "    BEHAVIOUR: src/__tests__/pwaStrategiesPayload.test.tsx renders the",
+    "    screen and reads the payload the SERVER RECEIVES.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/oracle_availability_web.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "",
+    "RUN IT WITH PYTHONUTF8=1 ON WINDOWS.",
+    "The harness's `run_command` calls subprocess.run(..., text=True) with no",
+    "encoding, so it decodes the child's output with the LOCALE encoding --",
+    "cp1252 on a default Windows box. vitest writes UTF-8 (its box-drawing and",
+    "check glyphs) and cp1252 cannot decode byte 0x9d, so the reader thread",
+    "raised UnicodeDecodeError, no output was captured, the harness found no",
+    "test summary and ABORTED with rc=3. MEASURED: with PYTHONUTF8=1 the same",
+    "command decodes the output intact and the 'Test Files' summary is read.",
+    "That is why the harness file is NOT patched for this: the environment",
+    "setting fixes it, so the harness stays byte-identical to the commit it",
+    "was taken from.",
+    "",
+    "    $env:PYTHONUTF8='1'",
+    "    python tools/mutation_harness.py tools/mutations/oracle_availability_web.json"
+  ],
+  "command": [
+    "npm",
+    "--prefix",
+    "frontend",
+    "run",
+    "test",
+    "--",
+    "src/__tests__/webOracleCapability.test.ts",
+    "src/__tests__/pwaOracleCapability.test.ts",
+    "src/__tests__/pwaOracleLaunch.test.tsx",
+    "src/__tests__/pwaStrategiesPayload.test.tsx"
+  ],
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "R: the WEB client invents a 95% threshold when the server declares none",
+      "file": "frontend/src/lib/oracleCapability.ts",
+      "needle": "\tif (\n\t\ttypeof defaultConfidence === \"number\" &&\n\t\tNumber.isFinite(defaultConfidence) &&\n\t\tdefaultConfidence > 0\n\t) {\n\t\treturn defaultConfidence;\n\t}\n",
+      "replace": "\treturn 95; // MUTANT: the client invents a threshold\n"
+    },
+    {
+      "label": "S: the WEB client says the oracle is usable whenever the server answered at all",
+      "file": "frontend/src/lib/oracleCapability.ts",
+      "needle": "\treturn capability?.oracleAvailable === true;\n",
+      "replace": "\treturn capability != null; // MUTANT: any answer means available\n"
+    },
+    {
+      "label": "T: the WEB client invents oracle regime 1",
+      "file": "frontend/src/lib/oracleCapability.ts",
+      "needle": "\tif (regime === null || regime === undefined || regime === \"\") {\n\t\treturn null;\n\t}\n",
+      "replace": "\tif (regime === null || regime === undefined || regime === \"\") {\n\t\treturn 1; // MUTANT: the client invents a regime\n\t}\n"
+    },
+    {
+      "label": "U: the PWA sends 0 again, and the server reads 0 as NO threshold",
+      "file": "pwa/lib/oracleCapability.ts",
+      "needle": "\tif (\n\t\ttypeof defaultConfidence === \"number\" &&\n\t\tNumber.isFinite(defaultConfidence) &&\n\t\tdefaultConfidence > 0\n\t) {\n\t\treturn defaultConfidence;\n\t}\n",
+      "replace": "\treturn 0; // MUTANT: the client sends 0 and the server reads it as 'no threshold'\n"
+    },
+    {
+      "label": "V: the PWA switches the symbol-selection mode behind the customer's back",
+      "file": "pwa/components/LaunchStrategyModal.tsx",
+      "needle": "\t\tif (oracleLaunchRefusal(savedMode, canUseOracle) === \"ORACLE_UNAVAILABLE\") {\n",
+      "replace": "\t\tif (false) { // MUTANT: the mode is substituted instead\n"
+    },
+    {
+      "label": "W: the client no longer refuses a saved oracle strategy when the oracle is gone",
+      "file": "frontend/src/lib/oracleCapability.ts",
+      "needle": "\tif (savedMode === \"DYNAMIC_ORACLE\" && !oracleAvailable) {\n\t\treturn \"ORACLE_UNAVAILABLE\";\n\t}\n",
+      "replace": "\tif (false) {\n\t\treturn \"ORACLE_UNAVAILABLE\";\n\t}\n"
+    },
+    {
+      "label": "X: the PWA's launch PAYLOAD invents a 95% confidence again",
+      "file": "pwa/screens/StrategiesScreen.tsx",
+      "needle": "\t\t\t\t\t\t\t: { regime: settings.regime, confidence: settings.confidence };\n",
+      "replace": "\t\t\t\t\t\t\t: { regime: settings.regime, confidence: settings.confidence || 95 }; // MUTANT\n"
+    },
+    {
+      "label": "Y: the PWA's launch PAYLOAD invents oracle regime 1 again",
+      "file": "pwa/screens/StrategiesScreen.tsx",
+      "needle": "\t\t\t\t\tparams.oracle_regime = settings.regime;\n",
+      "replace": "\t\t\t\t\tparams.oracle_regime = settings.regime ?? 1; // MUTANT\n"
+    }
+  ]
+}
