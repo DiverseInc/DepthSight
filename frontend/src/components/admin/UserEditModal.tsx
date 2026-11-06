@@ -24,6 +24,7 @@ import { Switch } from "@/components/ui/switch";
 import { useAuth } from "@/context/AuthContext";
 import { useToast } from "@/hooks/use-toast";
 import { useAdminUpdateUser } from "@/lib/api";
+import { canonicalPlanKey } from "@/lib/plans";
 import type { AdminUser, AdminUserUpdatePayload } from "@/types/api";
 
 interface UserEditModalProps {
@@ -33,7 +34,7 @@ interface UserEditModalProps {
 }
 
 type FormValues = {
-	plan: "free" | "standard" | "pro";
+	plan: "free" | "standard" | "pro" | "managed";
 	isActive: boolean;
 	role: "admin" | "user" | "affiliate";
 	affiliateCommissionRate: number;
@@ -62,7 +63,8 @@ export const UserEditModal: React.FC<UserEditModalProps> = ({
 	useEffect(() => {
 		if (user) {
 			reset({
-				plan: user.plan,
+				// A legacy plan key is shown as the tier it belongs to today.
+				plan: canonicalPlanKey(user.plan) as FormValues["plan"],
 				isActive: user.isActive,
 				role: user.role,
 				affiliateCommissionRate: (user.affiliateCommissionRate || 0) * 100,
@@ -132,7 +134,10 @@ export const UserEditModal: React.FC<UserEditModalProps> = ({
 							name="plan"
 							control={control}
 							render={({ field }) => (
-								<Select onValueChange={field.onChange} value={field.value}>
+								<Select
+									onValueChange={field.onChange}
+									value={canonicalPlanKey(field.value)}
+								>
 									<SelectTrigger>
 										<SelectValue />
 									</SelectTrigger>
@@ -140,6 +145,7 @@ export const UserEditModal: React.FC<UserEditModalProps> = ({
 										<SelectItem value="free">Free</SelectItem>
 										<SelectItem value="standard">Standard</SelectItem>
 										<SelectItem value="pro">Pro</SelectItem>
+										<SelectItem value="managed">Managed</SelectItem>
 									</SelectContent>
 								</Select>
 							)}

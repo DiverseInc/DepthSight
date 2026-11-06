@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 WSL_PY = "$HOME/dstest/bin/python"
+
+# vitest (and the other runners) colour their output; the escape codes have
+# to come off before a summary line can be recognised.
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def sha256(p: Path) -> str:
@@ -100,6 +105,50 @@ def run_pytest(target: str, timeout: int = 1800) -> tuple[int, str]:
     return proc.returncode, summary
 
 
+def run_vitest(target: str, timeout: int = 1800) -> tuple[int, str]:
+    """Run the frontend's vitest suite on the HOST that owns node_modules.
+
+    The frontend's dependencies are installed for Windows, so vitest has to
+    run on the host, not inside WSL. The summary is read from STDOUT only:
+    a stray "error" in stderr would otherwise look like a failing test.
+
+    A missing summary means vitest did not actually run. Reporting that as
+    "no failures" would be exactly the false green this harness exists to
+    prevent.
+    """
+    frontend = REPO / "frontend"
+    vitest = frontend / "node_modules" / "vitest" / "vitest.mjs"
+    if not vitest.exists():
+        return 3, (
+            "NO VITEST -- frontend/node_modules/vitest/vitest.mjs is not "
+            "installed, so the frontend tests could not be run."
+        )
+
+    proc = subprocess.run(
+        ["node", str(vitest), "run", *target.split()],
+        cwd=str(frontend),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+    summary = ""
+    for line in reversed((proc.stdout or "").splitlines()):
+        # vitest colours its summary, so the codes have to come off before
+        # the line can be recognised.
+        stripped = ANSI_ESCAPE.sub("", line).strip()
+        if stripped.startswith("Tests ") or stripped.startswith("Test Files "):
+            summary = stripped
+            break
+
+    if not summary:
+        return 3, (
+            "NO VITEST SUMMARY -- vitest did not run. Output:\n"
+            + ((proc.stdout or "") + (proc.stderr or ""))[-400:]
+        )
+    return proc.returncode, summary
+
+
 def eol_variants(text: str) -> list[bytes]:
     """The text in BOTH line-ending forms: CRLF first, then LF.
 
@@ -119,13 +168,20 @@ def apply(spec_path: Path) -> int:
     spec = load_spec(spec_path)
     test_target = spec.get("pytest_target", "tests/")
     timeout = spec.get("timeout_s", 1800)
+    # A spec that guards a FRONTEND guarantee names the vitest file instead.
+    # The frontend's dependencies are installed for the host, so the vitest
+    # runner has to run there and not under WSL.
+    vitest_target = spec.get("vitest_target")
 
     # Snapshot every file the spec touches BEFORE anything is modified.
     files = sorted({REPO / m["file"] for m in spec["mutations"]})
     originals = {f: f.read_bytes() for f in files}
     digests = {f: hashlib.sha256(b).hexdigest() for f, b in originals.items()}
 
-    print(f"spec: {spec_path.name}   pytest target: {test_target}")
+    if vitest_target:
+        print(f"spec: {spec_path.name}   vitest target: {vitest_target}")
+    else:
+        print(f"spec: {spec_path.name}   pytest target: {test_target}")
     for f in files:
         crlf_n = originals[f].count(b"\r\n")
         print(f"  snapshot {f.name}: {len(originals[f])} bytes, {crlf_n} CRLF")
@@ -153,7 +209,10 @@ def apply(spec_path: Path) -> int:
                 continue
 
             rel.write_bytes(originals[rel].replace(needle, repl, 1))
-            rc, summary = run_pytest(test_target, timeout)
+            if vitest_target:
+                rc, summary = run_vitest(vitest_target, timeout)
+            else:
+                rc, summary = run_pytest(test_target, timeout)
 
             if rc == 3:
                 rel.write_bytes(originals[rel])

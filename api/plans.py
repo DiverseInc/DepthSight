@@ -16,6 +16,8 @@ class PlansConfig:
         self._affiliate_program = {}
         self._block_restrictions = {}
         self._registration_trial = {}
+        self._plan_aliases = {}
+        self._deferred_permissions = set()
         self._last_mtime_ns = -1
         self._load_config(force=True)
 
@@ -37,6 +39,8 @@ class PlansConfig:
             self._affiliate_program = config.get("affiliate_program", {})
             self._block_restrictions = config.get("block_restrictions", {})
             self._registration_trial = config.get("registration_trial", {})
+            self._plan_aliases = config.get("plan_aliases", {}) or {}
+            self._deferred_permissions = set(config.get("deferred_permissions", []) or [])
             self._last_mtime_ns = current_mtime_ns
 
             if self._plans:
@@ -68,11 +72,42 @@ class PlansConfig:
     def _reload_if_changed(self) -> None:
         self._load_config(force=False)
 
+    def resolve_plan_key(self, plan_name: str) -> str:
+        """Return the canonical plan key for `plan_name`.
+
+        A legacy key -- one that is still stored on a user row or on a seeded
+        strategy template -- is mapped onto the plan that carries that tier
+        today. The alias is NOT a plan of its own: it is never sold and it
+        never appears in the catalog.
+
+        An unknown key is returned unchanged so the caller can fail closed on
+        it. A self-referencing or looping alias chain stops at the first
+        repeat, so a broken config can never hang a request.
+        """
+        self._reload_if_changed()
+        key = str(plan_name or "").strip().lower()
+        seen: set[str] = set()
+        while key in self._plan_aliases and key not in seen:
+            seen.add(key)
+            key = str(self._plan_aliases[key]).strip().lower()
+        return key
+
+    def get_plan_aliases(self) -> dict:
+        self._reload_if_changed()
+        return dict(self._plan_aliases)
+
+    def get_deferred_permissions(self) -> set:
+        """Permissions that a tier may hold but must never advertise."""
+        self._reload_if_changed()
+        return set(self._deferred_permissions)
+
     def get_plan(self, plan_name: str) -> dict:
         self._reload_if_changed()
-        return self._plans.get(plan_name, {"permissions": [], "quotas": {}})
+        key = self.resolve_plan_key(plan_name)
+        return self._plans.get(key, {"permissions": [], "quotas": {}})
 
     def get_all_plans(self) -> dict:
+        """The canonical plans. Aliases are deliberately NOT in here."""
         self._reload_if_changed()
         return self._plans
 
@@ -88,13 +123,34 @@ class PlansConfig:
     def get_plan_billing(self, plan_name: str, mode: str | None = None) -> dict:
         self._reload_if_changed()
         selected_mode = mode or self.get_billing_mode()
-        plan = self._plans.get(plan_name, {})
+        plan = self._plans.get(self.resolve_plan_key(plan_name), {})
         return plan.get("billing", {}).get(selected_mode, {})
+
+    def is_billing_mode_available(self, plan_name: str, mode: str | None = None) -> bool:
+        """True when this plan may be PURCHASED in the given billing mode.
+
+        The catalog declares, per billing mode, whether a tier is sold at
+        all (`billing.<mode>.enabled`). A mode that is switched off must
+        never be purchasable: `get_effective_plan_price` falls back to the
+        MONTHLY price when the mode carries no price of its own, so without
+        this check a purchase in the switched-off mode would create a
+        ONE-OFF invoice for a tier that has no one-off price, and the
+        customer would be granted the monthly period for it.
+
+        A mode block with no `enabled` key is ENABLED -- the monthly blocks
+        are written that way -- and a plan with no block for the mode at all
+        is left to the caller, which decides what to do with a plan it
+        cannot price.
+        """
+        self._reload_if_changed()
+        selected_mode = mode or self.get_billing_mode()
+        billing = self.get_plan_billing(plan_name, selected_mode)
+        return bool(billing.get("enabled", True))
 
     def get_effective_plan_price(self, plan_name: str) -> float:
         self._reload_if_changed()
         mode_billing = self.get_plan_billing(plan_name)
-        plan = self._plans.get(plan_name, {})
+        plan = self._plans.get(self.resolve_plan_key(plan_name), {})
         return float(mode_billing.get("price_usd", plan.get("price_usd", 0)))
 
     def get_lifetime_reservation_ttl_seconds(self) -> int:
@@ -181,7 +237,16 @@ _PERMISSION_LABELS = {
 
 # Plans that are allowed to use the `pro_only` strategy blocks.
 # Mirrors api/ai_assistant.py and api/dependencies.py.
-_PRO_BLOCK_PLANS = ("pro", "institutional")
+_PRO_BLOCK_PLANS = ("pro", "managed", "institutional")
+
+
+def plan_has_pro_block_access(plan_key: str) -> bool:
+    """True when this plan key may use the `pro_only` strategy blocks.
+
+    The key is resolved first, so a legacy alias (`premium`) is answered the
+    same way as the canonical plan it points at.
+    """
+    return plans_config.resolve_plan_key(plan_key) in _PRO_BLOCK_PLANS
 
 
 def _pluralise(subject: str, count: int) -> str:
@@ -196,7 +261,10 @@ def _pluralise(subject: str, count: int) -> str:
 
 def _quota_sentence(subject: str, period: str, value: int) -> str:
     if value == -1:
-        return f"Unlimited {subject}s"
+        # The unlimited sentence must use the SAME plural rule as every other
+        # sentence. A naive `subject + "s"` printed "AI Assistant querys" and
+        # "genetic searchs" on the pricing card.
+        return f"Unlimited {_pluralise(subject, 2)}"
     return f"{value} {_pluralise(subject, value)} per {period}"
 
 
@@ -212,7 +280,10 @@ def _duration_sentence(days: int) -> str:
 
 
 def derive_entitlements(
-    plan_key: str, plan_config: dict, all_plans: dict | None = None
+    plan_key: str,
+    plan_config: dict,
+    all_plans: dict | None = None,
+    deferred_permissions: set | None = None,
 ) -> list[dict]:
     """Build the list of things this tier does and does not include.
 
@@ -224,6 +295,8 @@ def derive_entitlements(
     permissions = list(plan_config.get("permissions", []) or [])
     limits = plan_config.get("limits", {}) or {}
     all_plans = all_plans or {}
+    if deferred_permissions is None:
+        deferred_permissions = plans_config.get_deferred_permissions()
 
     entries: list[dict] = []
 
@@ -261,6 +334,11 @@ def derive_entitlements(
     # Capabilities expressed as permissions.
     for permission, label in _PERMISSION_LABELS.items():
         code = f"permission_{permission}"
+        if permission in deferred_permissions:
+            # The tier may HOLD this capability, but it is an unfinished
+            # scaffold, so no tier advertises it -- not as included, and not
+            # as "Not included" either.
+            continue
         if permission in permissions:
             if permission == "use_ai_assistant":
                 # The AI Assistant quota is already shown above; don't repeat it.
@@ -344,7 +422,7 @@ def derive_entitlements(
         )
 
     # PRO strategy blocks.
-    has_pro_blocks = plan_key in _PRO_BLOCK_PLANS
+    has_pro_blocks = plan_has_pro_block_access(plan_key)
     entries.append(
         {
             "code": "pro_blocks",
@@ -411,6 +489,14 @@ def build_plan_catalog(include_inactive: bool = False) -> dict:
                 # Kept for the in-app billing modal. The marketing page does NOT
                 # use this copy -- it uses the derived entitlements below.
                 "features": config.get("features", []) or [],
+                # A curated HEADLINE for the pricing card. Some tiers (the
+                # managed service) hold so many entitlements that the derived
+                # label list is unreadable, so the card shows a short
+                # hand-written summary instead. It still lives in the CATALOG,
+                # so the page is still catalog-sourced, and the pricing test
+                # asserts every quantified claim in it against the raw plan.
+                "headline_bullets": config.get("headline_bullets", []) or [],
+
                 "quotas": config.get("quotas", {}) or {},
                 "permissions": config.get("permissions", []) or [],
                 "limits": config.get("limits", {}) or {},

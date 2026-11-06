@@ -92,17 +92,20 @@ def assert_local_database(force: bool = False) -> None:
 
 
 # Realistic-looking investor personas.
-# `plan` must be a REAL tier (free / standard / pro). An unknown tier falls
-# back to empty permissions and empty quotas, and an empty quota is treated
-# as UNLIMITED by api/quota_manager.py -- which would make a seeded demo
-# account an unthrottled "premium" user.
+# `plan` must be a REAL tier (free / standard / pro / managed). The legacy key
+# `premium` is also safe: it is an alias that resolves to the Managed tier
+# (see `plan_aliases` in api/plans_config.yml), so a demo account seeded on it
+# gets the real Managed entitlements instead of nothing. Any OTHER unknown
+# tier falls back to empty permissions and empty quotas, and an empty quota is
+# treated as UNLIMITED by api/quota_manager.py -- which would make a seeded
+# demo account an unthrottled "premium" user.
 DEMO_USERS = [
     # username, email, plan, days_since_join, strategy_archetype
     ("alex_trader",   "alex@example.com",     "pro",      45, "rsi_breakout"),
-    ("sarah_quant",   "sarah@example.com",   "standard", 90, "ma_crossover"),
+    ("sarah_quant",   "sarah@example.com",   "premium",  90, "ma_crossover"),
     ("mike_scalper",  "mike@example.com",    "pro",      30, "scalping"),
     ("lina_hodler",   "lina@example.com",    "free",     14, None),  # new user, no strategy yet
-    ("raj_algo",      "raj@example.com",     "standard", 120, "grid_dca"),
+    ("raj_algo",      "raj@example.com",     "premium", 120, "grid_dca"),
     ("emma_retail",   "emma@example.com",    "pro",      60, "mean_reversion"),
     ("demo_inactive", "old@example.com",     "free",     200, None),  # churned
 ]
