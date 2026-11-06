@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Mutations that undo the owner's 2026-11-06 decision: the pricing",
+    "fineprint's sentence 'Source available under AGPL v3.' is a LINK to",
+    "the AGPL-3.0 section 13 source offer at /source.",
+    "",
+    "M1 removes the anchor, restoring the plain text. This is the decision",
+    "    being reverted wholesale: the pricing block says the source is",
+    "    available but no longer takes the reader there.",
+    "M2 keeps the anchor but points it at the wrong path, so the link",
+    "    still LOOKS like an offer link and still lands nowhere.",
+    "",
+    "Both must be killed by tests/test_public_source_offer.py, which pins",
+    "the anchor's href and its exact link text, and pins the pricing",
+    "prices and tiers so that adding the link moved nothing else.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/pricing_source_link.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_public_source_offer.py tests/test_public_pricing_matches_catalog.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: the pricing fineprint's link to the source offer is removed (plain text restored)",
+      "file": "frontend/welcome.html",
+      "needle": "<a href=\"/source\">Source available under AGPL v3.</a>",
+      "replace": "Source available under AGPL v3."
+    },
+    {
+      "label": "M2: the pricing fineprint's offer link points at the wrong path",
+      "file": "frontend/welcome.html",
+      "needle": "<a href=\"/source\">Source available under AGPL v3.</a>",
+      "replace": "<a href=\"/sources\">Source available under AGPL v3.</a>"
+    }
+  ]
+}

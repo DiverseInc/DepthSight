@@ -39,7 +39,10 @@ So this file pins the offer as a whole:
   * it states the email route by which the source can be requested;
   * it says the offer covers the running service INCLUDING our
     modifications;
-  * the welcome page links to it, outside the pricing section.
+  * the welcome page links to it from the navigation and the footer, AND
+    from the pricing fineprint, where the sentence the pricing block
+    already carried -- "Source available under AGPL v3." -- is itself the
+    link to the offer (owner decision, 2026-11-06).
 
 Every assertion below reads the committed files, so removing
 frontend/source.html, or editing one of these statements out of it, turns
@@ -106,6 +109,40 @@ class _PageParser(HTMLParser):
         return _norm(" ".join(self.chunks))
 
 
+class _LinkParser(HTMLParser):
+    """The anchors in a block: each one's href and its visible text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._buf: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        # Only an anchor that is not already open starts a new one, so a
+        # tag nested inside an anchor does not throw its text away.
+        if tag == "a" and self._href is None:
+            self._href = dict(attrs).get("href") or ""
+            self._buf = []
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._href is not None:
+            self.links.append((self._href, _norm(" ".join(self._buf))))
+            self._href = None
+            self._buf = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._buf.append(data)
+
+
+def _links_to(block: str, href: str) -> list:
+    """The anchors in `block` that point at `href`, as (href, text) pairs."""
+    parser = _LinkParser()
+    parser.feed(block)
+    return [link for link in parser.links if link[0] == href]
+
+
 @pytest.fixture(scope="module")
 def page_html() -> str:
     """The raw markup of the source offer page."""
@@ -145,8 +182,9 @@ def caddy_config() -> str:
 def pricing_section(welcome_html: str) -> str:
     """The pricing block of the welcome page.
 
-    The pricing copy is owner-approved wording; the source offer must not
-    be added to it, so it is extracted here to prove the link is elsewhere.
+    The pricing copy is owner-approved wording; the only thing the source
+    offer may add to it is the link around the fineprint sentence it
+    already carried, so the block is extracted here to pin exactly that.
     """
     match = re.search(
         r"<section id=\"pricing\">.*?</section>", welcome_html, flags=re.S
@@ -431,33 +469,105 @@ class TestTheOfferIsDiscoverable:
             f"footer of the welcome page, not only somewhere else"
         )
 
-    def test_the_link_is_not_in_the_pricing_section(
-        self, welcome_html: str, pricing_section: str
-    ):
-        """The pricing copy is owner-approved wording and is not the place
-        for a licence notice; the offer must be linked from elsewhere."""
-        assert f'href="{SOURCE_PATH}"' not in pricing_section, (
-            "the source offer link must not be added to the pricing section"
-        )
-
-    def test_the_pricing_section_is_untouched_by_the_offer(self, pricing_section: str):
+    def test_the_pricing_section_gains_no_other_offer_copy(self, pricing_section: str):
         """The pricing copy is owner-approved wording and is not edited here.
 
         It already said "Source available under AGPL v3." before the offer
         existed, and that sentence is left exactly as it was: the offer is
-        linked from the navigation and the footer instead, so nothing in
-        the pricing block moves.
+        linked from the navigation and the footer, and from that one
+        sentence, so no other offer copy moves into the pricing block.
         """
         normalised = _norm(pricing_section)
         assert "Source available under AGPL v3." in normalised, (
             "the pricing fineprint is owner-approved wording and must be "
             "left exactly as it is"
         )
-        assert 'href="/source"' not in pricing_section, (
-            "the source offer link must not be added to the pricing section"
-        )
         assert "Source code" not in normalised, (
-            "the source offer link must not be added to the pricing section"
+            "no further source-offer copy may be added to the pricing section"
+        )
+
+
+# --------------------------------------------------------------------------
+# The pricing fineprint IS the link to the offer
+# --------------------------------------------------------------------------
+class TestThePricingFineprintIsTheOfferLink:
+    """The owner's decision (2026-11-06), and what it does and does not move.
+
+    The pricing block already carried the sentence "Source available under
+    AGPL v3." The owner decided that this sentence becomes a LINK to the
+    offer page at /source. The sentence itself does not change -- only the
+    anchor around it -- and no price, tier, feature, quota or entitlement
+    moves with it.
+
+    These tests pin both halves of that: the link exists and says exactly
+    what it said before, and the pricing claims around it are untouched.
+    """
+
+    def test_the_pricing_fineprint_is_a_link_to_the_source_offer(
+        self, pricing_section: str
+    ):
+        """The fineprint sentence is the offer link, and it is one link."""
+        links = _links_to(pricing_section, SOURCE_PATH)
+        assert len(links) == 1, (
+            f"the pricing section must carry exactly one link to the source "
+            f"offer; it carries {len(links)}: {links}"
+        )
+
+        href, text = links[0]
+        assert href == SOURCE_PATH, (
+            f"the pricing fineprint must link to {SOURCE_PATH}; it links to "
+            f"{href!r}"
+        )
+        assert text == "Source available under AGPL v3.", (
+            "the link text must be the sentence the pricing block already "
+            f"carried, word for word; it is {text!r}"
+        )
+
+    def test_the_pricing_fineprint_sentence_itself_is_unchanged(
+        self, pricing_section: str
+    ):
+        """Wrapping the sentence in an anchor must not reword it.
+
+        The whole fineprint paragraph is pinned, prices and all, so a
+        reworded sentence -- or a price that moved while the link was
+        added -- fails here.
+        """
+        expected = (
+            "New accounts start on the Free plan. Standard and Professional "
+            "are $30 and $100 per month — sign up, then tell us which plan "
+            "you want and we will set it up for your account. Prices are "
+            "monthly, in USD. Source available under AGPL v3."
+        )
+
+        paragraphs = re.findall(
+            r"<p class=\"fineprint\">(.*?)</p>", pricing_section, flags=re.S
+        )
+        assert paragraphs, "the pricing section has no fineprint paragraph"
+
+        texts = [_norm(re.sub(r"<[^>]+>", " ", p)) for p in paragraphs]
+        assert expected in texts, (
+            "the pricing fineprint must read exactly as it did before the "
+            f"link was added; it reads {[t for t in texts if 'AGPL' in t]}"
+        )
+
+    def test_the_pricing_tiers_and_prices_are_unchanged(self, pricing_section: str):
+        """A link was added; no tier and no price moved with it."""
+        cards = re.findall(
+            r"<div class=\"price[^\"]*\" data-plan-key=\"(?P<key>[^\"]+)\">"
+            r".*?<h3>(?P<name>[^<]+)</h3>"
+            r".*?<div class=\"amt\">\$(?P<price>\d+)",
+            pricing_section,
+            flags=re.S,
+        )
+        assert cards, "the pricing section has no pricing cards"
+
+        assert cards == [
+            ("free", "Free", "0"),
+            ("standard", "Standard", "30"),
+            ("pro", "Professional", "100"),
+        ], (
+            "the pricing section must still advertise exactly Free at $0, "
+            f"Standard at $30 and Professional at $100; it advertises {cards}"
         )
 
 
