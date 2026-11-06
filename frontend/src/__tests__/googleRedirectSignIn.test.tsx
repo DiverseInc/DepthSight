@@ -40,7 +40,7 @@ import {
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18n from "i18next";
-import { initReactI18next } from "react-i18next";
+import { initReactI18next, useTranslation } from "react-i18next";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import type React from "react";
 import loginEn from "@/locales/en/login.json";
@@ -52,25 +52,43 @@ import commonEn from "@/locales/en/common.json";
 //
 // If the login page renders <GoogleLogin> again, the popup flow is back and
 // this spy records it.
-const { toastSpy, googleLoginRendered } = vi.hoisted(() => ({
+const { toastSpy, googleLoginRendered, toastIdentity } = vi.hoisted(() => ({
 	toastSpy: vi.fn(),
 	googleLoginRendered: vi.fn(),
+	// How the mocked `useToast` hands the `toast` function back:
+	// "stable" (the default) or "unstable".
+	//
+	// The REAL hook returns the module-level `toast`, whose identity NEVER
+	// changes. A mock that returned a NEW function on every render would
+	// re-trigger every effect that depends on it -- so it would hide a real
+	// regression behind a hang. One test below turns it on deliberately, to
+	// prove the handler cannot be spun into a loop by it.
+	toastIdentity: { mode: "stable" as "stable" | "unstable" },
 }));
 
 vi.mock("@/components/ui/use-toast", async () => {
 	const actual = await vi.importActual<
 		typeof import("@/components/ui/use-toast")
 	>("@/components/ui/use-toast");
+	// The toast is recorded and then handed to the REAL one, which
+	// dispatches to the toast store. That dispatch is what re-renders the
+	// component that raised the toast -- the loop the handler must survive.
+	const recorded = (args: Parameters<typeof actual.toast>[0]) => {
+		toastSpy(args);
+		return actual.toast(args);
+	};
 	return {
 		...actual,
 		useToast: () => {
 			const toastState = actual.useToast();
 			return {
 				...toastState,
-				toast: (args: Parameters<typeof toastState.toast>[0]) => {
-					toastSpy(args);
-					return toastState.toast(args);
-				},
+				// ONE function for the whole file: a stable identity, the
+				// way the real hook behaves.
+				toast:
+					toastIdentity.mode === "unstable"
+						? (args: Parameters<typeof actual.toast>[0]) => recorded(args)
+						: recorded,
 			};
 		},
 	};
@@ -173,6 +191,20 @@ const writeAgedMarker = (
 	const payload = JSON.stringify({ state, at: Date.now() - ageMs });
 	localStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
 	sessionStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
+};
+
+/**
+ * The record of the sign-in attempt with this `state`, if it is still in
+ * flight.
+ *
+ * The lookup takes the `state` of the attempt, because a credential that
+ * comes back carries the `state` of the attempt it belongs to -- and
+ * because a browser can have SEVERAL sign-ins in flight at the same time,
+ * each of them with its own `state`.
+ */
+const pendingFor = (state: string) => {
+	const found = lookupPendingGoogleRequest(state);
+	return found.kind === "found" ? found.request : null;
 };
 
 /**
@@ -670,6 +702,87 @@ describe("a redirect without a usable credential is a VISIBLE failure", () => {
 	});
 });
 
+/**
+ * A toast RE-RENDERS the component that raised it.
+ *
+ * The redirect handler reports failures with a toast, so a toast re-runs
+ * every effect that depends on it. If the handler reported the same
+ * failure again every time its effect ran, the toast and the effect would
+ * feed each other: the re-render would run the effect again, and the tab
+ * would freeze with the CPU at 100% and no verdict at all.
+ *
+ * Two things have to hold for that to be impossible:
+ *   * the toast function the hook hands back must have a STABLE identity,
+ *     so that a re-render cannot re-trigger the effect at all, and
+ *   * the effect must be IDEMPOTENT, so the same response is reported once
+ *     even when the effect does run again.
+ */
+describe("a toast cannot spin the redirect handler", () => {
+	it("hands back the SAME toast function on every render", async () => {
+		// This is the property the handler relies on, and it is the REAL
+		// hook that is measured: the module-level `toast` in
+		// src/hooks/use-toast.ts. If it ever became a new function per
+		// render, the handler would have to hold the toast in a ref -- and
+		// this test is what would say so.
+		const actual = await vi.importActual<
+			typeof import("@/components/ui/use-toast")
+		>("@/components/ui/use-toast");
+		const seen: unknown[] = [];
+		const seenT: unknown[] = [];
+		const Probe = () => {
+			seen.push(actual.useToast().toast);
+			seenT.push(useTranslation("login").t);
+			return null;
+		};
+
+		const { rerender } = render(<Probe />);
+		rerender(<Probe />);
+		rerender(<Probe />);
+
+		expect(seen.length).toBeGreaterThanOrEqual(2);
+		expect(new Set(seen).size).toBe(1);
+		// The translator is the handler's other dependency, and it has to
+		// be stable for the same reason: a new `t` on every render would
+		// re-run the effect on every render.
+		expect(seenT.length).toBeGreaterThanOrEqual(2);
+		expect(new Set(seenT).size).toBe(1);
+	});
+
+	it("reports a failed sign-in ONCE, even when the toast hook is unstable", async () => {
+		// The worst case, turned on deliberately: the hook hands back a NEW
+		// `toast` on every render.
+		//
+		// This tab still claims the sign-in, but the SHARED copy of the
+		// marker is gone, so the failure cannot be withdrawn: the report
+		// stays on screen and the effect keeps finding the same attempt.
+		// With an unstable toast and no guard, the report re-rendered the
+		// component, the effect ran again, and the two fed each other until
+		// the tab froze.
+		toastIdentity.mode = "unstable";
+		try {
+			sessionStorage.setItem(
+				GOOGLE_OAUTH_PENDING_KEY,
+				JSON.stringify({ state: "state-abc", nonce: "n", at: Date.now() }),
+			);
+			window.location.hash = "";
+
+			renderHandler();
+			await waitFor(() =>
+				expect(toastSpy).toHaveBeenCalledWith(
+					expect.objectContaining({ variant: "destructive" }),
+				),
+			);
+			await settle();
+
+			// ONE report. Not two, and not an endless loop.
+			expect(toastSpy).toHaveBeenCalledTimes(1);
+			expect(fetchMock).not.toHaveBeenCalled();
+		} finally {
+			toastIdentity.mode = "stable";
+		}
+	});
+});
+
 describe("a sign-in that takes longer than the window", () => {
 	it("accepts a credential whose state matches a marker older than the window", async () => {
 		// A slow device, a hesitation at the consent screen, a phone in the
@@ -965,6 +1078,193 @@ describe("a sign-in in flight is not destroyed by something else", () => {
 		window.location.hash = "#id_token=google-id-token&state=state-abc";
 		renderHandler();
 		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+	});
+});
+
+/**
+ * A browser can have SEVERAL sign-ins in flight at the same time.
+ *
+ * The marker used to be a SINGLE slot, and it was wiped from BOTH stores
+ * whenever ONE sign-in was consumed or expired. That destroyed the OTHER
+ * sign-ins: the credential that came back for one of them found no record
+ * at all, was refused, and the customer could not sign in.
+ */
+describe("two sign-ins in flight at the same time", () => {
+	it("keeps the other sign-in alive when one of them completes", async () => {
+		// A ctrl/cmd+click: the sign-in is remembered in the SHARED store
+		// only, because the tab that stayed behind is not the one that
+		// follows the link.
+		rememberPendingGoogleRequest("state-shared", "shared");
+		// Another sign-in, in this tab. The SHARED store now carries BOTH.
+		rememberPendingGoogleRequest("state-tab", "tab");
+
+		// The credential of the SECOND sign-in comes back and is accepted.
+		window.location.hash = "#id_token=google-id-token&state=state-tab";
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+		// The FIRST sign-in is still in flight: its own record is still
+		// there.
+		expect(pendingFor("state-shared")?.state).toBe("state-shared");
+
+		// And the credential that comes back for it is accepted too.
+		cleanup();
+		window.location.hash = "#id_token=google-id-token&state=state-shared";
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+	});
+
+	it("matches each credential to its own attempt", async () => {
+		// Two shared-scope sign-ins: a middle click and a ctrl/cmd+click,
+		// followed somewhere else. Both are remembered in the SHARED store.
+		rememberPendingGoogleRequest("state-one", "shared");
+		rememberPendingGoogleRequest("state-two", "shared");
+
+		const nonceOne = pendingFor("state-one")?.nonce;
+		const nonceTwo = pendingFor("state-two")?.nonce;
+		expect(nonceOne).toBeTruthy();
+		expect(nonceTwo).toBeTruthy();
+		expect(nonceOne).not.toBe(nonceTwo);
+
+		// The credential of the SECOND attempt comes back first.
+		window.location.hash = "#id_token=google-id-token&state=state-two";
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+		// It carries the one-time value of ITS OWN attempt, not the other
+		// one's.
+		let body = JSON.parse(fetchMock.mock.calls[0][1].body);
+		expect(body.signin_nonce).toBe(nonceTwo);
+
+		// And the credential of the FIRST attempt is still accepted, with
+		// its own one-time value.
+		cleanup();
+		window.location.hash = "#id_token=google-id-token&state=state-one";
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+		body = JSON.parse(fetchMock.mock.calls[1][1].body);
+		expect(body.signin_nonce).toBe(nonceOne);
+	});
+
+	it("keeps a sign-in that is still valid when an aged marker is cleaned up", async () => {
+		// The marker is older than the window: a slow device, a hesitation
+		// at Google's consent screen. The credential may still be on its
+		// way -- a Google ID token is valid for about an hour, which is
+		// longer than this window.
+		writeAgedMarker("state-abc");
+		window.location.hash = "";
+
+		renderHandler();
+		await settle();
+
+		// This tab no longer claims the sign-in ...
+		expect(sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY)).toBeNull();
+		// ... but the sign-in itself is NOT destroyed: the SHARED copy --
+		// the one that makes the credential verifiable in the tab it comes
+		// back in -- is still there.
+		const shared = JSON.parse(
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+		);
+		expect(shared?.state).toBe("state-abc");
+
+		// And the credential that comes back for it is accepted.
+		cleanup();
+		window.location.hash = "#id_token=google-id-token&state=state-abc";
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+	});
+
+	it("keeps the shared copy when a page load reports a failed sign-in", async () => {
+		// The sign-in came back to THIS tab without a credential, so the
+		// failure is reported -- but the SHARED copy is not destroyed: it is
+		// what makes the credential verifiable in the tab it comes back in.
+		rememberPendingGoogleRequest("state-abc");
+		window.location.hash = "";
+
+		renderHandler();
+
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		const shared = JSON.parse(
+			localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY) || "null",
+		);
+		expect(shared?.state).toBe("state-abc");
+	});
+
+	it("refuses a credential that matches neither attempt", async () => {
+		rememberPendingGoogleRequest("state-one", "shared");
+		rememberPendingGoogleRequest("state-two", "shared");
+
+		window.location.hash = "#id_token=foreign-token&state=state-three";
+		renderHandler();
+
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+		// The message says the sign-in could not be VERIFIED -- not that it
+		// took too long: this browser IS signing in, just not with this
+		// credential.
+		expect(String(toastSpy.mock.calls[0][0].description)).toBe(
+			loginEn.googleSignInUnverified,
+		);
+		// Both sign-ins are still in flight: a foreign credential destroys
+		// neither of them.
+		expect(pendingFor("state-one")?.state).toBe("state-one");
+		expect(pendingFor("state-two")?.state).toBe("state-two");
+	});
+
+	it("refuses a credential that carries no state at all", async () => {
+		rememberPendingGoogleRequest("state-abc");
+		window.location.hash = "#id_token=google-id-token";
+
+		renderHandler();
+
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("does not destroy a sign-in that is still in flight when a foreign error lands", async () => {
+		rememberPendingGoogleRequest("state-abc");
+		window.location.hash =
+			"#error=access_denied&error_description=Denied&state=someone-elses-state";
+
+		renderHandler();
+
+		await waitFor(() =>
+			expect(toastSpy).toHaveBeenCalledWith(
+				expect.objectContaining({ variant: "destructive" }),
+			),
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+		// The sign-in this browser started is still in flight.
+		expect(readPendingGoogleRequest()?.state).toBe("state-abc");
+	});
+
+	it("still produces exactly one session per redirect", async () => {
+		rememberPendingGoogleRequest("state-one", "shared");
+		rememberPendingGoogleRequest("state-two", "shared");
+
+		window.location.hash = "#id_token=google-id-token&state=state-one";
+		renderHandler();
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+		// The page is reloaded and the browser restores the URL with the
+		// credential still in it: the claim refuses the second send.
+		window.location.hash = "#id_token=google-id-token&state=state-one";
+		cleanup();
+		renderHandler();
+		await settle();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 });
 

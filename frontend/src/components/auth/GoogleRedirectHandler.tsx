@@ -33,16 +33,17 @@
 // all, or an error from Google -- the user gets a visible failure instead of
 // a silent no-op.
 
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import { useToast } from "@/components/ui/use-toast";
 import { useGoogleLoginMutation } from "@/hooks/useGoogleLoginMutation";
 import {
 	claimGoogleSignInSubmission,
+	clearExpiredPendingGoogleRequest,
 	clearGoogleRedirectParams,
-	clearPendingGoogleRequest,
 	clearPendingGoogleRequestInThisTab,
+	clearPendingGoogleRequestRecord,
 	lookupPendingGoogleRequest,
 	parseGoogleRedirect,
 } from "@/lib/googleOAuth";
@@ -54,15 +55,72 @@ export function GoogleRedirectHandler() {
 	// `mutate` is stable across renders, unlike the whole mutation result.
 	const { mutate } = useGoogleLoginMutation();
 
+	// The toast, held in a ref so that the effect below does not depend on
+	// its IDENTITY.
+	//
+	// A toast re-renders this component, and the effect re-runs whenever one
+	// of its dependencies changes. Were `toast` a dependency and the hook
+	// handed back a NEW function on every render, the toast and the effect
+	// would feed each other: the re-render would run the effect again, and
+	// the tab would freeze with the CPU at 100%. The ref makes the effect
+	// independent of that identity, so the loop is impossible whatever the
+	// hook returns.
+	const toastRef = useRef(toast);
+	useEffect(() => {
+		toastRef.current = toast;
+	}, [toast]);
+
+	// The response this handler has already dealt with.
+	//
+	// The effect below can run more than once for the same response: a
+	// navigation changes `navigate`, and a re-render changes the render.
+	// The response must be reported ONCE and acted on ONCE -- reporting it
+	// twice is a lie, and acting on it twice sends the credential twice.
+	// Remembering it makes the effect IDEMPOTENT.
+	const handledRef = useRef<string | null>(null);
+
 	useEffect(() => {
 		const payload = parseGoogleRedirect(
 			window.location.hash,
 			window.location.search,
 		);
-		const pending = lookupPendingGoogleRequest();
+		// Every sign-in that is in flight in this browser. It is what tells
+		// "no sign-in was started here" apart from "a DIFFERENT sign-in is
+		// in flight" -- the two are refused with different messages.
+		const inFlight = lookupPendingGoogleRequest();
+		// The attempt THIS response belongs to. A credential or an error
+		// carries the `state` of the attempt it belongs to, and that is what
+		// ties it to a sign-in this browser started. When several sign-ins
+		// are in flight at the same time, each credential finds its OWN
+		// attempt -- the marker is not a single slot.
+		const pending =
+			payload.kind === "empty"
+				? inFlight
+				: lookupPendingGoogleRequest(payload.state);
+
+		// What this run is ABOUT.
+		//
+		// A credential or an error carries the `state` of the attempt it
+		// belongs to. An empty URL is about the attempt that is still in
+		// flight. Two runs that are about the same thing must not report
+		// the same thing twice -- see `handledRef` above.
+		const responseKey =
+			payload.kind === "empty"
+				? pending.kind === "found"
+					? `pending:${pending.request.state}`
+					: "pending:none"
+				: `${payload.kind}:${payload.state ?? ""}`;
+
+		// Already dealt with: the response was reported, and the attempt it
+		// belongs to was consumed or refused. Doing it again would report a
+		// failure that is not news, and -- because a toast re-renders this
+		// component -- would feed the effect its own tail.
+		if (handledRef.current === responseKey) return;
 
 		const fail = (description: string) => {
-			toast({
+			// This response is reported ONCE.
+			handledRef.current = responseKey;
+			toastRef.current({
 				variant: "destructive",
 				title: t("toastFailureTitle"),
 				description,
@@ -79,7 +137,7 @@ export function GoogleRedirectHandler() {
 		const clearIfOurs = (state: string | null) => {
 			if (!state) return;
 			if (pending.kind === "found" && pending.request.state === state) {
-				clearPendingGoogleRequest();
+				clearPendingGoogleRequestRecord(pending.request);
 			}
 		};
 
@@ -88,9 +146,15 @@ export function GoogleRedirectHandler() {
 		if (payload.kind === "empty") {
 			if (pending.kind !== "found") return; // a normal page load
 			if (pending.request.expired) {
-				// An abandoned attempt. Clean the marker up, but do not report
-				// a failure for a later, unrelated visit to the site root.
-				clearPendingGoogleRequest();
+				// An abandoned attempt. This tab's claim on it is dropped, so
+				// that a later, unrelated visit to the site root does not
+				// report a failure that is not its own. The sign-in itself is
+				// NOT destroyed: the credential may still be on its way (a
+				// Google ID token is valid for about an hour, which is longer
+				// than this window), and the age of a request is never the
+				// reason a credential that carries a matching state is
+				// refused.
+				clearExpiredPendingGoogleRequest(pending.request);
 				return;
 			}
 			if (pending.request.scope !== "tab") {
@@ -154,11 +218,16 @@ export function GoogleRedirectHandler() {
 		}
 
 		if (pending.kind !== "found") {
-			// There is no request to compare against: the marker was lost or
-			// already cleaned up, most often because the sign-in took longer
-			// than the window. Say that, instead of calling the credential
-			// unverified.
-			fail(t("googleSignInExpired"));
+			// There is no request to compare against. Either NO sign-in is in
+			// flight at all -- the marker was lost or already cleaned up,
+			// most often because the sign-in took longer than the window --
+			// or a DIFFERENT sign-in is in flight, and this response belongs
+			// to that one and not to us. Say which one it is.
+			fail(
+				inFlight.kind === "found"
+					? t("googleSignInUnverified")
+					: t("googleSignInExpired"),
+			);
 			return;
 		}
 
@@ -171,7 +240,13 @@ export function GoogleRedirectHandler() {
 			return;
 		}
 
-		clearPendingGoogleRequest();
+		// The attempt was CONSUMED. Only THAT attempt is removed, and only
+		// from the store it was found in: another sign-in that is still in
+		// flight keeps its own attempt, and the credential that comes back
+		// for it must still find it.
+		clearPendingGoogleRequestRecord(pending.request);
+		// This response is acted on ONCE.
+		handledRef.current = responseKey;
 		mutate({
 			token: payload.credential,
 			// The one-time value the server consumes exactly once. It is the
@@ -181,7 +256,7 @@ export function GoogleRedirectHandler() {
 			signin_nonce: pending.request.nonce,
 		});
 		// The mutation owns the success and failure toasts.
-	}, [mutate, navigate, t, toast]);
+	}, [mutate, navigate, t]);
 
 	return null;
 }

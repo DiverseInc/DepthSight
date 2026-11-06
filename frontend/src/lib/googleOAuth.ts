@@ -286,6 +286,36 @@ export interface PendingGoogleRequest {
 }
 
 /**
+ * ONE sign-in attempt, as it is kept in a store.
+ *
+ * A browser can have SEVERAL sign-ins in flight at the same time: a
+ * ctrl/cmd+click opens a sign-in in another tab while this tab starts one
+ * of its own. The stores therefore keep a LIST of attempts, and every
+ * attempt carries the `state` of the sign-in it belongs to.
+ */
+interface PendingAttempt {
+	state: string;
+	nonce: string;
+	at: number;
+}
+
+/**
+ * How the attempts are kept.
+ *
+ * The value under GOOGLE_OAUTH_PENDING_KEY is a JSON object:
+ *
+ *   {
+ *     "state": "...", "nonce": "...", "at": 1730000000000,
+ *     "attempts": [ { "state": "...", "nonce": "...", "at": ... } ]
+ *   }
+ *
+ * The top-level fields are the MOST RECENT attempt; "attempts" holds the
+ * EARLIER ones, oldest first. A value without "attempts" is a single
+ * attempt -- which is what the app wrote before it could hold more than
+ * one, and what a reader that knows about one attempt still understands.
+ */
+
+/**
  * The result of looking the in-flight sign-in request up.
  *
  * "missing" and "unavailable" are DIFFERENT outcomes and must not be
@@ -311,6 +341,16 @@ export type PendingGoogleLookup =
  * with a perfectly valid credential.
  */
 export const PENDING_MAX_AGE_MS = 15 * 60 * 1000;
+
+/**
+ * How many sign-in attempts a store keeps.
+ *
+ * A browser can have more than one sign-in in flight, so the marker is a
+ * LIST of attempts rather than a single slot. The list is bounded so that
+ * attempts that are never completed cannot grow it without limit -- the
+ * same bound the list of already-consumed one-time values uses.
+ */
+const MAX_PENDING_ATTEMPTS = 20;
 
 /**
  * Where the browser is going to follow the Google link.
@@ -350,63 +390,209 @@ export const rememberPendingGoogleRequest = (
 	state: string,
 	follow: GoogleSignInFollow = "tab",
 ): boolean => {
-	const payload = JSON.stringify({
+	const attempt: PendingAttempt = {
 		state,
 		nonce: randomToken(),
 		at: Date.now(),
-	});
+	};
 	let stored = false;
 	// A new attempt supersedes the previous one for this `state`: the
 	// server consumes the one-time value exactly once, so a second attempt
 	// must carry a NEW one.
 	clearGoogleSignInSubmission(state);
-	try {
-		// The SHARED copy: this is what makes the sign-in verifiable in
-		// another tab.
-		localStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
-		stored = true;
-	} catch {
-		// The shared store is unavailable. The per-tab store is the fallback.
-	}
+	// The SHARED copy: this is what makes the sign-in verifiable in
+	// another tab.
+	stored = addPendingAttempt("shared", attempt) || stored;
 	if (follow === "tab") {
-		try {
-			// The PER-TAB copy: this is what lets THIS tab report a sign-in
-			// that came back without a credential.
-			sessionStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, payload);
-			stored = true;
-		} catch {
-			// The per-tab store is unavailable too.
-		}
+		// The PER-TAB copy: this is what lets THIS tab report a sign-in
+		// that came back without a credential.
+		stored = addPendingAttempt("tab", attempt) || stored;
 	}
 	return stored;
 };
 
-const parsePendingRecord = (
-	raw: string,
+/**
+ * Add an attempt to a store.
+ *
+ * Returns FALSE when the store could not be written, which is what makes
+ * the caller fail loudly instead of starting a sign-in that can never be
+ * verified.
+ *
+ * An attempt for the SAME `state` is REPLACED: a new attempt supersedes
+ * the previous one for that state, because the server consumes the one-time
+ * value exactly once. An attempt for a DIFFERENT state is KEPT: it belongs
+ * to another sign-in that is still in flight, and destroying it would
+ * refuse that sign-in when its credential comes back.
+ */
+const addPendingAttempt = (
 	scope: PendingGoogleRequestScope,
-): PendingGoogleRequest | null => {
+	attempt: PendingAttempt,
+): boolean => {
+	const attempts = readPendingAttempts(scope);
+	if (attempts === null) return false; // the store cannot be read
+	const kept = attempts.filter((entry) => entry.state !== attempt.state);
+	kept.push(attempt);
+	return writePendingAttempts(scope, kept.slice(-MAX_PENDING_ATTEMPTS));
+};
+
+/**
+ * The attempts kept in ONE store, oldest first.
+ *
+ * Returns NULL when the store cannot be READ. That is different from
+ * "there is no attempt in it", and the two must not be confused.
+ */
+const readPendingAttempts = (
+	scope: PendingGoogleRequestScope,
+): PendingAttempt[] | null => {
 	try {
-		const parsed = JSON.parse(raw) as {
-			state?: unknown;
-			nonce?: unknown;
-			at?: unknown;
-		};
-		if (!parsed || typeof parsed.state !== "string") return null;
-		const at = typeof parsed.at === "number" ? parsed.at : 0;
-		return {
-			state: parsed.state,
-			nonce: typeof parsed.nonce === "string" ? parsed.nonce : parsed.state,
-			at,
-			expired: Date.now() - at > PENDING_MAX_AGE_MS,
-			scope,
-		};
+		const raw =
+			scope === "tab"
+				? sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY)
+				: localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);
+		return raw ? parsePendingAttempts(raw) : [];
 	} catch {
+		// The store cannot be read.
 		return null;
 	}
 };
 
 /**
+ * Write the attempts of ONE store.
+ *
+ * Returns FALSE when the store could not be written.
+ */
+const writePendingAttempts = (
+	scope: PendingGoogleRequestScope,
+	attempts: PendingAttempt[],
+): boolean => {
+	try {
+		if (attempts.length === 0) {
+			if (scope === "tab") {
+				sessionStorage.removeItem(GOOGLE_OAUTH_PENDING_KEY);
+			} else {
+				localStorage.removeItem(GOOGLE_OAUTH_PENDING_KEY);
+			}
+			return true;
+		}
+		const newest = attempts[attempts.length - 1];
+		const earlier = attempts.slice(0, attempts.length - 1);
+		const payload: Record<string, unknown> = {
+			state: newest.state,
+			nonce: newest.nonce,
+			at: newest.at,
+		};
+		if (earlier.length > 0) payload.attempts = earlier;
+		const serialized = JSON.stringify(payload);
+		if (scope === "tab") {
+			sessionStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, serialized);
+		} else {
+			localStorage.setItem(GOOGLE_OAUTH_PENDING_KEY, serialized);
+		}
+		return true;
+	} catch {
+		// The store cannot be written.
+		return false;
+	}
+};
+
+/**
+ * Parse ONE attempt out of a stored value.
+ *
+ * Returns NULL when the value does not carry a usable attempt.
+ */
+const toPendingAttempt = (raw: unknown): PendingAttempt | null => {
+	if (!raw || typeof raw !== "object") return null;
+	const parsed = raw as {
+		state?: unknown;
+		nonce?: unknown;
+		at?: unknown;
+	};
+	if (typeof parsed.state !== "string") return null;
+	const at = typeof parsed.at === "number" ? parsed.at : 0;
+	return {
+		state: parsed.state,
+		nonce: typeof parsed.nonce === "string" ? parsed.nonce : parsed.state,
+		at,
+	};
+};
+
+/**
+ * Parse the attempts out of a stored value, oldest first.
+ *
+ * A value that cannot be read at all holds NO attempt -- not an attempt
+ * that is broken, and not one that may be discarded because of its age.
+ */
+const parsePendingAttempts = (raw: string): PendingAttempt[] => {
+	try {
+		const parsed = JSON.parse(raw) as {
+			state?: unknown;
+			nonce?: unknown;
+			at?: unknown;
+			attempts?: unknown;
+		};
+		if (!parsed || typeof parsed.state !== "string") return [];
+		const attempts: PendingAttempt[] = [];
+		if (Array.isArray(parsed.attempts)) {
+			for (const attempt of parsed.attempts) {
+				const record = toPendingAttempt(attempt);
+				if (record) attempts.push(record);
+			}
+		}
+		const newest = toPendingAttempt(parsed);
+		if (newest) attempts.push(newest);
+		return attempts;
+	} catch {
+		return [];
+	}
+};
+
+/**
+ * The attempt with this `state`, if the store holds one.
+ *
+ * The MOST RECENT attempt with that state wins: a new attempt supersedes
+ * the previous one for the same state.
+ */
+const findPendingAttempt = (
+	attempts: PendingAttempt[],
+	state: string,
+): PendingAttempt | null => {
+	for (let index = attempts.length - 1; index >= 0; index -= 1) {
+		if (attempts[index].state === state) return attempts[index];
+	}
+	return null;
+};
+
+/**
+ * The request as the caller sees it: the attempt, and how old it is.
+ *
+ * The age is a SOFT bound. It says the attempt is probably abandoned; it
+ * never makes it unusable, and it is never the reason a credential is
+ * rejected -- the STATE MATCH is (see GoogleRedirectHandler).
+ */
+const toPendingRequest = (
+	attempt: PendingAttempt,
+	scope: PendingGoogleRequestScope,
+): PendingGoogleRequest => {
+	return {
+		state: attempt.state,
+		nonce: attempt.nonce,
+		at: attempt.at,
+		expired: Date.now() - attempt.at > PENDING_MAX_AGE_MS,
+		scope,
+	};
+};
+
+/**
  * Look the sign-in request that is in flight up, if there is one.
+ *
+ * `state` says WHICH attempt is wanted. The credential that comes back
+ * carries the `state` of the attempt it belongs to, and that is what ties
+ * it to a sign-in this browser started. When several sign-ins are in flight
+ * at the same time, each credential finds its OWN attempt: without it, a
+ * credential could be matched to somebody else's sign-in, or refused while
+ * its own sign-in is perfectly in flight.
+ *
+ * Without a `state`, the newest attempt is returned.
  *
  * The PER-TAB copy wins: it is the one that says "this tab started the
  * sign-in", and it is the only copy that still carries that meaning when two
@@ -417,34 +603,50 @@ const parsePendingRecord = (
  * is the one that consumes it, and it is the `state` -- not the age -- that
  * decides whether a credential is accepted.
  */
-export const lookupPendingGoogleRequest = (): PendingGoogleLookup => {
-	let sharedUsable = true;
-	let sharedRaw: string | null = null;
-	try {
-		sharedRaw = localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);
-	} catch {
-		sharedUsable = false;
-	}
-
-	let tabRaw: string | null = null;
-	let tabUsable = true;
-	try {
-		tabRaw = sessionStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);
-	} catch {
-		tabUsable = false;
-	}
-
-	const tab = tabRaw ? parsePendingRecord(tabRaw, "tab") : null;
-	if (tab) return { kind: "found", request: tab };
-
-	const shared = sharedRaw ? parsePendingRecord(sharedRaw, "shared") : null;
-	if (shared) return { kind: "found", request: shared };
+export const lookupPendingGoogleRequest = (
+	state?: string | null,
+): PendingGoogleLookup => {
+	const shared = readPendingAttempts("shared");
+	const tab = readPendingAttempts("tab");
+	const sharedUsable = shared !== null;
+	const tabUsable = tab !== null;
+	const sharedAttempts = shared ?? [];
+	const tabAttempts = tab ?? [];
 
 	if (!sharedUsable && !tabUsable) {
 		return {
 			kind: "unavailable",
 			reason:
 				"This browser is blocking site storage, so the sign-in cannot be verified.",
+		};
+	}
+
+	if (state) {
+		// The attempt THIS response belongs to.
+		const tabMatch = findPendingAttempt(tabAttempts, state);
+		if (tabMatch) {
+			return { kind: "found", request: toPendingRequest(tabMatch, "tab") };
+		}
+		const sharedMatch = findPendingAttempt(sharedAttempts, state);
+		if (sharedMatch) {
+			return {
+				kind: "found",
+				request: toPendingRequest(sharedMatch, "shared"),
+			};
+		}
+		return { kind: "missing" };
+	}
+
+	// No state: the newest attempt there is.
+	const newestTab = tabAttempts[tabAttempts.length - 1];
+	if (newestTab) {
+		return { kind: "found", request: toPendingRequest(newestTab, "tab") };
+	}
+	const newestShared = sharedAttempts[sharedAttempts.length - 1];
+	if (newestShared) {
+		return {
+			kind: "found",
+			request: toPendingRequest(newestShared, "shared"),
 		};
 	}
 	return { kind: "missing" };
@@ -462,19 +664,56 @@ export const readPendingGoogleRequest = (): PendingGoogleRequest | null => {
 };
 
 /**
- * Remove the marker from BOTH stores.
+ * Remove ONE attempt from ONE store.
+ *
+ * Only the attempt with this `state` is removed, and only from the store
+ * it is named in. Another sign-in that is still in flight keeps its own
+ * attempt -- and so does the copy of THIS attempt in the other store: the
+ * `state` is what proves a credential belongs to a sign-in, and the
+ * one-time value is claimed separately (see claimGoogleSignInSubmission).
  */
-export const clearPendingGoogleRequest = (): void => {
-	try {
-		localStorage.removeItem(GOOGLE_OAUTH_PENDING_KEY);
-	} catch {
-		// Nothing to clear.
-	}
-	try {
-		sessionStorage.removeItem(GOOGLE_OAUTH_PENDING_KEY);
-	} catch {
-		// Nothing to clear.
-	}
+const removePendingAttempt = (
+	scope: PendingGoogleRequestScope,
+	state: string,
+): void => {
+	const attempts = readPendingAttempts(scope);
+	if (attempts === null) return; // the store cannot be read
+	const kept = attempts.filter((entry) => entry.state !== state);
+	if (kept.length === attempts.length) return; // nothing to remove
+	writePendingAttempts(scope, kept);
+};
+
+/**
+ * Remove the attempt that was CONSUMED (or that failed).
+ *
+ * Only that attempt is removed, and only from the store it was found in.
+ * Completing ONE sign-in must never destroy a DIFFERENT sign-in that is
+ * still in flight: the credential that comes back for it would then find
+ * no record at all and be refused.
+ */
+export const clearPendingGoogleRequestRecord = (
+	request: PendingGoogleRequest,
+): void => {
+	removePendingAttempt(request.scope, request.state);
+};
+
+/**
+ * Drop this tab's claim on an EXPIRED attempt.
+ *
+ * An attempt older than PENDING_MAX_AGE_MS is probably abandoned, and a
+ * later, unrelated visit to the site root must not report a sign-in failure
+ * for it. So the PER-TAB copy is dropped.
+ *
+ * The SHARED copy is left alone. It is what makes the credential verifiable
+ * in the tab it comes back in, and the AGE of an attempt is never a reason
+ * to refuse a credential that carries a matching state: the Google ID token
+ * is valid for about an hour, which is longer than this window.
+ */
+export const clearExpiredPendingGoogleRequest = (
+	request: PendingGoogleRequest,
+): void => {
+	if (request.scope !== "tab") return;
+	removePendingAttempt("tab", request.state);
 };
 
 /**
@@ -492,23 +731,10 @@ export const clearPendingGoogleRequest = (): void => {
  * still be verifiable when it arrives.
  */
 export const clearPendingGoogleRequestInThisTab = (state: string): void => {
-	let sharedCarriesIt = false;
-	try {
-		const raw = localStorage.getItem(GOOGLE_OAUTH_PENDING_KEY);
-		const parsed = raw
-			? (JSON.parse(raw) as { state?: unknown })
-			: null;
-		sharedCarriesIt = parsed?.state === state;
-	} catch {
-		// The shared store cannot be read: the per-tab copy is the only
-		// proof there is, so it stays.
-	}
-	if (!sharedCarriesIt) return;
-	try {
-		sessionStorage.removeItem(GOOGLE_OAUTH_PENDING_KEY);
-	} catch {
-		// Nothing to clear.
-	}
+	const shared = readPendingAttempts("shared");
+	if (shared === null) return; // the shared store cannot be read
+	if (!findPendingAttempt(shared, state)) return;
+	removePendingAttempt("tab", state);
 };
 
 /**
