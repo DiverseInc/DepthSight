@@ -138,6 +138,23 @@ class LoginResponse(BaseModel):
 
 class GoogleLoginRequest(BaseModel):
     token: str
+    # The one-time value the client generated for THIS sign-in attempt. The
+    # server consumes it exactly once, so one redirect cannot mint two
+    # sessions -- not by a remount, not by a reload, and not by a second tab
+    # that received the same redirect.
+    #
+    # It is optional so a client that does not have one (the PWA popup flow)
+    # keeps working; that client is still protected, because the credential
+    # itself is consumed by its digest.
+    #
+    # The bound is the width of the column that stores it: the consumed value
+    # is "nonce:" + this value, written into a varchar(160) column
+    # (api/models.py, GoogleSignInAttempt.value). "nonce:" is 6 characters,
+    # so 154 is what is left. A longer value was accepted by the schema and
+    # then refused by the DATABASE -- on PostgreSQL that is a DataError, not
+    # the IntegrityError the endpoint catches, so the customer got a 500
+    # instead of a clean refusal. The client generates 32 hex characters.
+    signin_nonce: Optional[str] = Field(default=None, max_length=154)
 
 
 class TokenData(BaseModel):
