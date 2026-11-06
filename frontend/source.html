@@ -100,8 +100,9 @@
       </p>
       <p class="url"><a href="https://github.com/DiverseInc/DepthSight/archive/refs/heads/main.tar.gz" target="_blank" rel="noopener">https://github.com/DiverseInc/DepthSight/archive/refs/heads/main.tar.gz</a></p>
       <p class="note">
-        We do not publish a separate release package of the build we host. The repository and the
-        archive link above are the source code of the running service.
+        We do not publish a separate release package of the build we host. The repository is the
+        source code of the running service; the archive link above is a snapshot of the tip of
+        that same branch.
       </p>
     </div>
 
@@ -119,14 +120,17 @@
       <p>
         The same number is written in the <code>VERSION</code> file at the root of the repository.
         The running service is deployed from the <code>main</code> branch of that repository, and
-        deployments move forward as we push to <code>main</code>, so <code>main</code> is the
-        published match for the code you are talking to.
+        deployments move forward as we push to <code>main</code>. The <code>main</code> branch
+        therefore always contains the code you are talking to, and it is the exact published match
+        for it once the most recent push has been deployed — that takes a few minutes after a
+        push.
       </p>
       <p class="note">
         That version number identifies the release line, not one particular commit, and the
-        running service does not print a commit id. If you need the exact commit behind the
-        deployment you are using, ask us by email (below) and we will send you the source code
-        for that commit.
+        running service does not print a commit id. The archive above is the tip of the branch, so
+        it can be a little ahead of the build you are talking to. If you need the exact commit
+        behind the deployment you are using, ask us by email (below) and we will send you the
+        source code for that commit.
       </p>
     </div>
 

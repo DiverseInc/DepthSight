@@ -34,7 +34,9 @@ So this file pins the offer as a whole:
   * it carries the repository address and a download link that works
     without a GitHub account;
   * it says which source code corresponds to the version the reader is
-    running;
+    running, and it does NOT overstate that: the branch archive is a
+    snapshot of the TIP of the branch, not of the running build, and the
+    exact commit stays on offer by email;
   * it attributes the upstream project, its licence and its CLA;
   * it states the email route by which the source can be requested;
   * it says the offer covers the running service INCLUDING our
@@ -589,3 +591,84 @@ class TestTheOfferClaimsNothingAboutPlans:
             assert word not in page_text, (
                 f"the offer page must not make a plan or quota claim ({word!r})"
             )
+
+
+# --------------------------------------------------------------------------
+# The archive is a snapshot of the tip, not of the running build
+# --------------------------------------------------------------------------
+class TestTheArchiveIsASnapshotOfTheTip:
+    """`main` moves on before the running service is redeployed.
+
+    GitHub's branch archive is a snapshot of the TIP of the branch, not a
+    history: it does not contain the tree of an earlier commit. The running
+    service is deployed from `main`, and that deploy lands a few minutes
+    after a merge -- so between the merge and its deploy the archive is the
+    NEWER tree, and the running build's tree is genuinely not in it.
+
+    So the page must not claim the archive is the published match for the
+    code the reader is talking to. What it must say instead: the branch
+    always CONTAINS that code, it is the exact published match once the most
+    recent push has been deployed, the archive can be a little ahead of the
+    build, and the exact commit is still on offer by email.
+    """
+
+    def test_the_page_does_not_call_main_the_published_match_unconditionally(
+        self, page_text: str
+    ):
+        assert "the published match for the code you are talking to" not in (
+            page_text.lower()
+        ), (
+            "`main` is only the exact published match for the code the reader "
+            "is talking to once the most recent push has been deployed; the "
+            "page must not state it unconditionally"
+        )
+
+    def test_the_page_does_not_say_the_archive_is_the_running_service(
+        self, page_text: str
+    ):
+        assert "archive link above are the source code of the running service" not in (
+            page_text.lower()
+        ), (
+            "the archive link is a snapshot of the tip of the branch, not of "
+            "the running build; the page must not claim it is the source code "
+            "of the running service"
+        )
+
+    def test_the_page_says_the_tip_can_be_ahead_of_the_running_build(
+        self, page_text: str
+    ):
+        assert "ahead of the build you are talking to" in page_text.lower(), (
+            "the page must say the archive can be a little ahead of the build "
+            "the reader is talking to"
+        )
+
+    def test_the_exact_commit_is_still_offered_by_email_next_to_that_gap(
+        self, page_html: str
+    ):
+        """The exact commit must stay on offer, in the note that states the gap.
+
+        The phrase itself already existed before the fix, so pinning it alone
+        would prove nothing. Pinning that it lives in the SAME note as the
+        "ahead of the build" statement is what makes it mean something: the
+        reader who is told the archive may be ahead is shown the remedy in
+        the same breath.
+        """
+        notes = re.findall(r"<p class=\"note\">(.*?)</p>", page_html, flags=re.S)
+        assert notes, "the source offer page has no note paragraphs"
+
+        commit_notes = [
+            n for n in notes
+            if "we will send you the source code for that commit" in _norm(n)
+        ]
+        assert commit_notes, (
+            "the page must keep offering the exact commit by email: 'we will "
+            "send you the source code for that commit'"
+        )
+        assert any(
+            "ahead of the build you are talking to" in _norm(n)
+            for n in commit_notes
+        ), (
+            "the note that offers the exact commit must also say the archive "
+            "can be ahead of the build the reader is talking to, so the "
+            "reader who sees the gap is shown the remedy"
+        )
