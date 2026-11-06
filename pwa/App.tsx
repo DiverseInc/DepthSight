@@ -13,6 +13,7 @@ import {
 	DisplayStrategy,
 	BacktestRequest,
 	BacktestKpiResults,
+	BacktestDataWindowRecord,
 	StrategyConfigDB,
 	StrategyConfigData,
 } from "./types";
@@ -273,6 +274,43 @@ const BacktestResultScreen: React.FC<BacktestResultScreenProps> = ({
 	const pnl = kpis.total_pnl || 0;
 	const pnlPositive = pnl >= 0;
 
+	// THE CUSTOMER IS TOLD WHICH WINDOW THE NUMBERS ARE ABOUT.  A backtest
+	// whose candles do not cover the whole window that was asked for is
+	// NOT a backtest of that window, and the numbers alone do not say so.
+	// The facts come from the backend; the sentence is built here, in the
+	// language the customer reads.
+	const dataWindow = kpis.data_window;
+	const dataWindowIncomplete = (dataWindow ?? []).some(
+		(record: BacktestDataWindowRecord) => record?.complete === false,
+	);
+	const dataWindowSource = (dataWindow ?? []).find(
+		(record: BacktestDataWindowRecord) => record?.source,
+	)?.source;
+	const dataWindowDiffersFromRest = (dataWindow ?? []).some(
+		(record: BacktestDataWindowRecord) => record?.differs_from_rest,
+	);
+	const dataWindowMissingDays = Array.from(
+		new Set(
+			(dataWindow ?? []).flatMap((record: BacktestDataWindowRecord) =>
+				(record?.missing_buckets ?? [])
+					.map((bucket) => (bucket?.start ?? "").slice(0, 10))
+					.filter((day) => /^\d{4}-\d{2}-\d{2}$/.test(day)),
+			),
+		),
+	).sort();
+	const dataWindowSourceText = (() => {
+		switch (dataWindowSource) {
+			case "rest_api":
+				return t("backtestResultScreen.dataWindow.sourceRestApi");
+			case "bulk_archive":
+				return t("backtestResultScreen.dataWindow.sourceBulkArchive");
+			case "local_cache":
+				return t("backtestResultScreen.dataWindow.sourceLocalCache");
+			default:
+				return dataWindowSource ?? "";
+		}
+	})();
+
 	return (
 		<div className="p-4 animate-fadeIn">
 			<div className="bg-[hsl(var(--card))] rounded-xl p-4 mb-4 shadow-sm">
@@ -284,6 +322,60 @@ const BacktestResultScreen: React.FC<BacktestResultScreenProps> = ({
 					{new Date(data.end_date).toLocaleDateString()}
 				</p>
 			</div>
+			{dataWindow && dataWindow.length > 0 && (
+				<div
+					className={
+						dataWindowIncomplete
+							? "rounded-xl p-3 mb-4 text-sm border border-amber-500/60 bg-amber-500/10"
+							: "rounded-xl p-3 mb-4 text-sm border border-[hsl(var(--border))] bg-[hsl(var(--muted))]"
+					}
+				>
+					{dataWindowIncomplete ? (
+						<>
+							<p className="font-medium text-amber-600">
+								{t("backtestResultScreen.dataWindow.incompleteTitle")}
+							</p>
+							<p className="mt-1 text-[hsl(var(--muted-foreground))]">
+								{t("backtestResultScreen.dataWindow.incompleteBody")}
+							</p>
+							<p className="mt-1 text-[hsl(var(--muted-foreground))]">
+								{dataWindowMissingDays.length > 0
+									? t(
+											"backtestResultScreen.dataWindow.missingDaysLabel",
+											{
+												days: dataWindowMissingDays
+													.map(
+														(day) =>
+															new Date(`${day}T00:00:00`).toLocaleDateString(
+																undefined,
+																{ month: "short", day: "numeric" },
+															),
+													)
+													.join(", "),
+											},
+										)
+									: t("backtestResultScreen.dataWindow.missingDaysNone")}
+							</p>
+						</>
+					) : (
+						<p className="text-[hsl(var(--muted-foreground))]">
+							{t("backtestResultScreen.dataWindow.completeBody")}
+						</p>
+					)}
+					{dataWindowSourceText && (
+						<p className="mt-1 text-[hsl(var(--muted-foreground))]">
+							{t("backtestResultScreen.dataWindow.sourceLabel", {
+								source: dataWindowSourceText,
+							})}
+						</p>
+					)}
+					{dataWindowDiffersFromRest && (
+						<p className="mt-1 text-[hsl(var(--muted-foreground))]">
+							{t("backtestResultScreen.dataWindow.differsFromRest")}
+						</p>
+					)}
+				</div>
+			)}
 			<div className="grid grid-cols-2 gap-3 mb-4">
 				<KPICard
 					icon={ICONS.Dollar}

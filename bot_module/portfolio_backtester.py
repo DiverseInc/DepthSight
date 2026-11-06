@@ -8,7 +8,11 @@ import numpy as np  # For NaN
 import asyncio
 import math  # For math.isinf
 
-from .data_loader import download_klines
+from .data_loader import (
+    attach_klines_window_coverage,
+    download_klines,
+)
+from .market_data_disclosure import attach_candles_disclosure
 from .depthsight_backtester import L2HistoricalDataReader
 from .execution_simulator import (
     simulate_market_order_execution,
@@ -1201,6 +1205,30 @@ class PortfolioBacktester:
         logger.info(f"Final Balance: ${self.current_balance:,.2f}")
 
         kpi_results = self._calculate_kpis()
+        # THE KPIs SAY WHICH WINDOW THEY ARE ABOUT.  A frame that came from
+        # the bulk archive can cover a SHORTER window than the one that was
+        # asked for; the coverage travels with the KPIs so nobody has to
+        # guess which window the numbers describe.
+        frames_by_key = {
+            f"{symbol}_{timeframe}": df
+            for (symbol, timeframe), df in self.market_data.items()
+        }
+        attach_klines_window_coverage(
+            kpi_results,
+            frames_by_key,
+            log_prefix="Portfolio data: ",
+        )
+        # THE CUSTOMER IS TOLD WHICH WINDOW THE NUMBERS ARE ABOUT.  The
+        # note above says which frames do not cover the window they were
+        # asked for; this says, for EVERY frame, where its candles came
+        # from and whether the window they cover is the one that was asked
+        # for.  A frame that covers its window is reported as COMPLETE, so
+        # the absence of a warning is a statement and not a silence.
+        attach_candles_disclosure(
+            kpi_results,
+            frames_by_key,
+            log_prefix="Portfolio data: ",
+        )
         logger.info(f"KPIs: {kpi_results}")
         return kpi_results
 

@@ -29,13 +29,42 @@ print(f"FUTURES KEY from env: {os.environ.get('BOT_BINANCE_FUTURES_API_KEY')}")
 
 STRATEGIES["VolumeBreakout"] = VolumeBreakoutStrategy
 
-logging.getLogger("bot_module.data_consumer").setLevel(logging.ERROR)
-logging.getLogger("bot_module.executor").setLevel(logging.DEBUG)
-logging.getLogger("bot_module.controller").setLevel(logging.DEBUG)
-logging.getLogger("bot_module.risk_manager").setLevel(logging.DEBUG)
-logging.getLogger("bot_module.strategy").setLevel(logging.ERROR)
-logging.getLogger("bot_module.data_loader").setLevel(logging.ERROR)
-logging.getLogger("bot_module.trade_logger").setLevel(logging.ERROR)
+# The levels these tests want, and the levels the loggers had before.
+#
+# They are applied by a MODULE fixture, not at import time: a level set
+# at import time is set for the WHOLE session - pytest imports every
+# test module before it runs the first test - and an ERROR level on the
+# loader's logger swallows the WARNING that the window-coverage
+# disclosure is written at (bot_module/data_loader.py:
+# log_klines_window_coverage), so a test that asserts on that disclosure
+# could not see it.
+_LOGGER_LEVELS_THIS_MODULE_WANTS = {
+    "bot_module.data_consumer": logging.ERROR,
+    "bot_module.executor": logging.DEBUG,
+    "bot_module.controller": logging.DEBUG,
+    "bot_module.risk_manager": logging.DEBUG,
+    "bot_module.strategy": logging.ERROR,
+    "bot_module.data_loader": logging.ERROR,
+    "bot_module.trade_logger": logging.ERROR,
+}
+_LOGGER_LEVELS_BEFORE_THIS_MODULE = {
+    name: logging.getLogger(name).level for name in _LOGGER_LEVELS_THIS_MODULE_WANTS
+}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _this_modules_log_levels():
+    """This module's own log levels, applied only while this module runs.
+
+    The levels are restored when this module is done, so the session that
+    follows sees the loggers the way it found them.
+    """
+    for name, level in _LOGGER_LEVELS_THIS_MODULE_WANTS.items():
+        logging.getLogger(name).setLevel(level)
+    yield
+    for name, level in _LOGGER_LEVELS_BEFORE_THIS_MODULE.items():
+        logging.getLogger(name).setLevel(level)
+
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

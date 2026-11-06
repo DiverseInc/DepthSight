@@ -78,6 +78,13 @@ A guard that only scanned `bot_module/` would have been blind to the command
 listener in `bot_runner.py` - one of the largest leaks this fix closed - and
 blind to `api/`, where the session factory itself lives.
 
+A VIRTUAL ENVIRONMENT inside the worktree is NOT part of that scope: it
+holds third-party source, not source this repository owns.  Scanning it
+reports other people's code as our leaks and reports their non-UTF-8 test
+files as unreadable, so the whole class of them is skipped, whatever the
+directory is called - by the name rule AND by the marker `python -m venv`
+writes, so a directory called "env" is skipped too.
+
 A file that does not parse is reported, not skipped: a guard that silently
 ignores a file it cannot read is a guard that always reports OK.
 
@@ -124,6 +131,36 @@ SKIP_DIR_NAMES = frozenset(
         "docs",
     }
 )
+
+# A virtual environment holds an INSTALLED Python environment, not source
+# this repository owns.  The name is not fixed - the list above already
+# carries ".venv" and "venv", and a developer can call theirs ".venv-test",
+# ".venv-ci" or anything else - so the whole CLASS is skipped, by a rule
+# and by the marker `python -m venv` writes, rather than by one more name
+# in the list above.
+VENV_DIR_NAMES = frozenset({"venv"})
+VENV_DIR_PREFIXES = (".venv",)
+VENV_MARKER_FILE = "pyvenv.cfg"
+
+
+def is_skipped_dir(directory) -> bool:
+    """Is this directory one the guard must not scan?
+
+    The name list above, plus every virtual environment: a directory whose
+    name is "venv" or starts with ".venv" holds third-party source, and so
+    does any directory that holds the marker ``python -m venv`` writes -
+    whatever the developer called it.  Scanning an environment reports
+    other people's code as our leaks and their non-UTF-8 test files as
+    files we could not read.
+    """
+    path = Path(directory)
+    name = path.name
+    if name in SKIP_DIR_NAMES:
+        return True
+    if name in VENV_DIR_NAMES or name.startswith(VENV_DIR_PREFIXES):
+        return True
+    return (path / VENV_MARKER_FILE).is_file()
+
 
 # Methods that only a DB session has. This is a SECONDARY signal - "the loop
 # variable is being used as a session". The PRIMARY signal is name-free: the
@@ -609,7 +646,9 @@ def scanned_files(repo: Path = REPO) -> List[Path]:
     """
     files: List[Path] = []
     for dirpath, dirnames, filenames in os.walk(repo):
-        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIR_NAMES)
+        dirnames[:] = sorted(
+            d for d in dirnames if not is_skipped_dir(Path(dirpath) / d)
+        )
         for name in sorted(filenames):
             if name.endswith(".py"):
                 files.append(Path(dirpath) / name)

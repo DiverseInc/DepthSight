@@ -263,6 +263,22 @@ export interface BacktestTrade {
 	executions?: TradeExecution[];
 }
 
+export interface BacktestDataWindowRecord {
+	data_key: string;
+	source?: string | null;
+	requested_start?: string | null;
+	requested_end?: string | null;
+	actual_start?: string | null;
+	actual_end?: string | null;
+	rows?: number | null;
+	differs_from_rest?: boolean;
+	complete?: boolean;
+	trailing_edge_short_by_seconds?: number;
+	leading_gap_seconds?: number;
+	missing_buckets?: { start: string; end: string }[];
+	reason?: string;
+}
+
 export interface BacktestKpiResults {
 	total_pnl: number;
 	sharpe_ratio: number;
@@ -270,6 +286,7 @@ export interface BacktestKpiResults {
 	max_drawdown: number;
 	trades: number;
 	total_commission?: number;
+	data_window?: BacktestDataWindowRecord[];
 }
 
 export interface BacktestRunListItemData {

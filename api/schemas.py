@@ -1327,6 +1327,15 @@ class PortfolioBacktestKPIs(
     total_slippage_usd: float
     avg_slippage_per_active_trade_usd: float
     avg_total_slippage_pct: float
+    # THE DISCLOSURE OF THE WINDOW THE NUMBERS WERE COMPUTED OVER: where
+    # the candles came from, and whether the window they cover is the
+    # window that was asked for.  A model that does not declare a field
+    # DROPS it, so without this the disclosure was computed by the
+    # backtester and then thrown away here -- and a portfolio backtest
+    # over a shorter window read like a backtest of the window that was
+    # asked for.  The single-strategy result carries the same disclosure
+    # in the same place, inside the KPI payload.
+    data_window: Optional[List[Dict[str, Any]]] = None
 
 
 class PortfolioBacktestSliceDetail(BaseModel):  # Renamed to avoid conflict

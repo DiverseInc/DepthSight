@@ -1,0 +1,163 @@
+{
+  "_comment": [
+    "Mutations that reintroduce the market-data coverage defects this branch fixed.",
+    "",
+    "E1: the loader's records of WHAT it delivered were read by NOBODY outside",
+    "    the archive module, so a backtest reported the KPIs of a shorter",
+    "    window as the KPIs of the window that was asked for.  The coverage is",
+    "    now delivered ON the KPI dict the run saves.",
+    "E2: the local cache was filed by a SECOND, hand-written copy of the venue",
+    "    predicate, and the two copies disagreed: the 'coinm' alias was filed",
+    "    under the SPOT folder while the REST path and the archive answered it",
+    "    with COIN-M candles.",
+    "E3: ONE archive file that could not be fetched collapsed the whole budget,",
+    "    so a single unlucky request destroyed a load that could have finished.",
+    "    A TIMEOUT still collapses the budget (the host is not there); a RESET",
+    "    does not (it is evidence about one request).",
+    "E5: the 451 body check accepted EITHER of Binance's phrases, so a proxy",
+    "    whose body merely said 'restricted location' armed the archive.",
+    "E6: the coverage note blamed the ARCHIVE for every gap, including the",
+    "    ones the archive never saw (a REST frame that starts late).",
+    "E7: the interior holes the archive records on the frame were dropped from",
+    "    the note, so the note returned None and the KPI payload carried",
+    "    nothing for a backtest whose only gap was a hole in the middle.",
+    "E8: the trailing edge of a frame that is not from the archive was never",
+    "    measured, so a REST or cached frame that ends before the window it",
+    "    was asked for was reported as if it covered it.",
+    "E9: the disclosure DROPPED the gap, so a backtest computed over a",
+    "    shorter window looked exactly like a backtest of the window that",
+    "    was asked for.",
+    "E10: the disclosure REPORTED a gap that is not there, so every",
+    "    backtest was announced as an incomplete one and the warning",
+    "    stopped meaning anything.",
+    "E11: the portfolio backtest stopped carrying the disclosure.",
+    "E12: the disclosure stopped saying where the candles came from, so",
+    "    the customer could not tell the archive's frame from the REST one.",
+    "E13: the portfolio KPIs stopped declaring the disclosure, so the",
+    "    closed model dropped it again and a portfolio backtest over a",
+    "    shorter window read like a backtest of the window that was asked",
+    "    for.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/market_data_coverage_honesty.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "",
+    "NOT MUTATION-COVERED, ON PURPOSE: the celery task in tasks.py cannot be",
+    "imported without a live database (it raises at import time), so its",
+    "wiring is checked in the SOURCE by the test file and the function it",
+    "calls is covered by E1-A below.  A mutation of that one line would",
+    "SURVIVE, which is why it is not in this spec."
+  ],
+  "pytest_target": "tests/test_data_loader_bulk_archive_coverage.py tests/test_data_loader_bulk_archive.py tests/test_data_loader_bulk_archive_honesty.py tests/test_backtest_data_window_disclosure.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "E1-A: the coverage is never put on the KPI dict the run saves",
+      "file": "bot_module/data_loader.py",
+      "needle": "    if isinstance(kpis, dict):\n        kpis[\"data_window\"] = list(notes)\n",
+      "replace": "    if isinstance(kpis, dict):\n        pass  # MUTANT: the coverage is dropped\n"
+    },
+    {
+      "label": "E1-B: the loader never reports what the frame actually covers",
+      "file": "bot_module/data_loader.py",
+      "needle": "    if (\n        trailing_short <= 0\n        and leading_gap <= 0\n        and not remote_failed\n        and not missing_buckets\n    ):\n        return None\n",
+      "replace": "    if True:  # MUTANT: the coverage is never reported\n        return None\n"
+    },
+    {
+      "label": "E1-B2: the leading gap is not measured, so a truncated leading month is not reported",
+      "file": "bot_module/data_loader.py",
+      "needle": "    leading_gap = _seconds_between(\n        provenance.get(\"actual_start\"), provenance.get(\"requested_start\")\n    )\n",
+      "replace": "    leading_gap = 0.0  # MUTANT: the leading edge is never measured\n"
+    },
+    {
+      "label": "E1-C: the portfolio backtest stops carrying the coverage",
+      "file": "bot_module/portfolio_backtester.py",
+      "needle": "        attach_klines_window_coverage(\n            kpi_results,\n            frames_by_key,\n            log_prefix=\"Portfolio data: \",\n        )\n",
+      "replace": "        pass  # MUTANT: the coverage is dropped\n"
+    },
+    {
+      "label": "E2: the cache is filed by the hand-written venue predicate again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    venue = config.resolve_market_venue(market_type)\n    market_folder = \"spot\" if venue == \"spot\" else \"futures\"\n",
+      "replace": "    market_folder = \"futures\" if \"futures\" in market_type else \"spot\"  # MUTANT: a second venue predicate\n"
+    },
+    {
+      "label": "E3-A: one lost request collapses the budget again",
+      "file": "bot_module/bulk_archive.py",
+      "needle": "_TRANSPORT_FAILURE_COLLAPSE_THRESHOLD = 2\n",
+      "replace": "_TRANSPORT_FAILURE_COLLAPSE_THRESHOLD = 1  # MUTANT: one failure is enough\n"
+    },
+    {
+      "label": "E3-B: a host that does not answer no longer ends the load fast",
+      "file": "bot_module/bulk_archive.py",
+      "needle": "        if _is_host_not_answering(error):\n            # The host did not answer inside the timeout it was given: it is\n",
+      "replace": "        if False and _is_host_not_answering(error):  # MUTANT: the timeout does not collapse\n            # The host did not answer inside the timeout it was given: it is\n"
+    },
+    {
+      "label": "E3-C: the second file that cannot be fetched no longer ends the load",
+      "file": "bot_module/bulk_archive.py",
+      "needle": "                failures = _note_transport_failure(url)\n                if failures >= _TRANSPORT_FAILURE_COLLAPSE_THRESHOLD:\n                    _collapse_deadline()\n                    raise\n                logger.warning(\n                    f\"Bulk archive: the daily file {url} could not be fetched. \"\n",
+      "replace": "                failures = _note_transport_failure(url)\n                logger.warning(\n                    f\"Bulk archive: the daily file {url} could not be fetched. \"\n"
+    },
+    {
+      "label": "E3-D: the file that could not be fetched is not recorded",
+      "file": "bot_module/bulk_archive.py",
+      "needle": "    _FAILED_SINCE_SUCCESS.set(failed)\n    _note_unfetchable_file(url)\n",
+      "replace": "    _FAILED_SINCE_SUCCESS.set(failed)\n"
+    },
+    {
+      "label": "E5: a 451 body that does not name Binance arms the archive again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    return _BINANCE_GEO_BLOCK_MARKER in text.lower()\n",
+      "replace": "    return \"restricted location\" in text.lower()  # MUTANT: the generic phrase is accepted as Binance's\n"
+    },
+    {
+      "label": "E6: every gap is blamed on the archive again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    if provenance.get(\"source\") == \"bulk_archive\":\n        holder = \"the archive\"\n    elif provenance.get(\"source\") == \"rest_api\":\n        holder = \"the Binance REST API\"\n    elif provenance.get(\"source\") == \"local_cache\":\n        holder = \"the local cache\"\n    else:\n        holder = \"the source\"\n",
+      "replace": "    holder = \"the archive\"  # MUTANT: the archive is blamed for every gap\n"
+    },
+    {
+      "label": "E7: the interior holes are dropped from the note again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    missing_buckets = difference.get(\"missing_buckets\")\n",
+      "replace": "    missing_buckets = []  # MUTANT: the interior holes are dropped again\n"
+    },
+    {
+      "label": "E8: the delivered trailing edge is not measured again",
+      "file": "bot_module/data_loader.py",
+      "needle": "    if trailing_short <= 0:\n        trailing_short = _delivered_trailing_short(provenance)\n",
+      "replace": "    if trailing_short <= 0:\n        trailing_short = 0.0  # MUTANT: the delivered trailing edge is not measured\n"
+    },
+    {
+      "label": "E9: the disclosure drops the gap from the result",
+      "file": "bot_module/market_data_disclosure.py",
+      "needle": "            record.update(note)\n            record[\"complete\"] = False\n",
+      "replace": "            record[\"complete\"] = True  # MUTANT: the gap is dropped\n"
+    },
+    {
+      "label": "E10: the disclosure reports a gap that is not there",
+      "file": "bot_module/market_data_disclosure.py",
+      "needle": "            record[\"complete\"] = True\n",
+      "replace": "            record[\"complete\"] = False  # MUTANT: a gap is reported where there is none\n"
+    },
+    {
+      "label": "E11: the portfolio backtest stops carrying the disclosure",
+      "file": "bot_module/portfolio_backtester.py",
+      "needle": "        attach_candles_disclosure(\n            kpi_results,\n            frames_by_key,\n            log_prefix=\"Portfolio data: \",\n        )\n",
+      "replace": "        pass  # MUTANT: the disclosure is dropped\n"
+    },
+    {
+      "label": "E12: the disclosure stops saying where the candles came from",
+      "file": "bot_module/market_data_disclosure.py",
+      "needle": "            \"source\": provenance.get(\"source\"),\n",
+      "replace": "            \"source\": None,  # MUTANT: the source is never said\n"
+    },
+    {
+      "label": "E13: the portfolio KPIs stop declaring the disclosure, so it is dropped again",
+      "file": "api/schemas.py",
+      "needle": "    data_window: Optional[List[Dict[str, Any]]] = None\n",
+      "replace": "    data_window_removed: Optional[List[Dict[str, Any]]] = None  # MUTANT: the disclosure is dropped again\n"
+    }
+  ]
+}

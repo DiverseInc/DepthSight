@@ -490,6 +490,26 @@ export interface BacktestTrade {
 	tick_size?: number;
 }
 
+// --- The disclosure of the window a backtest was computed over ---
+// The backend records, for every frame it loaded, where the candles came
+// from and whether the window they cover is the window that was asked for.
+// A frame that does not cover its window carries the days that are missing.
+export interface BacktestDataWindowRecord {
+	data_key: string;
+	source?: string | null;
+	requested_start?: string | null;
+	requested_end?: string | null;
+	actual_start?: string | null;
+	actual_end?: string | null;
+	rows?: number | null;
+	differs_from_rest?: boolean;
+	complete?: boolean;
+	trailing_edge_short_by_seconds?: number;
+	leading_gap_seconds?: number;
+	missing_buckets?: { start: string; end: string }[];
+	reason?: string;
+}
+
 // --- Final KPIs (replaces the old BacktestResultsData) ---
 export interface BacktestKpiResults {
 	total_pnl: number;
@@ -498,6 +518,7 @@ export interface BacktestKpiResults {
 	max_drawdown: number;
 	trades: number;
 	total_commission?: number;
+	data_window?: BacktestDataWindowRecord[];
 }
 
 // --- Updating the task type to match the BacktestRun model ---

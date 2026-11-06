@@ -260,6 +260,18 @@
 		"totalCommissionLabel": "Всего комиссия",
 		"descCommissionTotal": "Сумма уплаченных комиссий за все сделки"
 	},
+	"dataWindowDisclosure": {
+		"incompleteTitle": "Неполное окно данных",
+		"incompleteBody": "Свечи для этого бэктеста не покрывают весь запрошенный период, поэтому приведённые ниже числа рассчитаны по более короткому окну.",
+		"missingDaysLabel": "Отсутствуют в окне: {{days}}",
+		"missingDaysNone": "Некоторые дни окна отсутствуют.",
+		"sourceLabel": "Источник данных: {{source}}",
+		"sourceRestApi": "REST API Binance",
+		"sourceBulkArchive": "Архив Binance (bulk archive)",
+		"sourceLocalCache": "локальный кэш",
+		"differsFromRest": "Это не те свечи, которые вернул бы REST API.",
+		"completeBody": "Свечи покрывают весь запрошенный период."
+	},
 	"tradeHistoryTable": {
 		"title": "История сделок",
 		"description": "Детальный лог всех сделок, совершенных в ходе бэктеста.",
