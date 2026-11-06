@@ -61,6 +61,47 @@ else
     docker compose up -d --build
 fi
 
+# 4b. The AGPL-3.0 section 13 source offer must be reachable after a deploy.
+#
+# Caddy reads its Caddyfile only at startup, and `docker compose up -d` does
+# NOT recreate a container whose bind-mounted file changed (AGENTS.md:97-98).
+# A deploy that adds a route therefore leaves the path on the React SPA
+# catch-all, which answers 200 with the app shell instead of the offer, so
+# the BODY is checked and not just the status. If the offer is missing,
+# caddy is restarted -- that is what loads the new Caddyfile -- and the
+# check is repeated.
+echo -e "${BLUE}[*] Verifying the AGPL source offer is reachable...${NC}"
+PUBLIC_BASE_URL=""
+if [ -f .env ]; then
+    PUBLIC_BASE_URL=$(grep -E '^PUBLIC_BASE_URL=' .env 2>/dev/null | tail -1 | cut -d= -f2- || true)
+fi
+PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://depthsight.diverseinc.net}"
+
+source_offer_is_live() {
+    curl -sk --max-time 15 "$PUBLIC_BASE_URL/source" 2>/dev/null | grep -q "DiverseInc/DepthSight"
+}
+
+OFFER_LIVE=0
+for _ in 1 2 3; do
+    if source_offer_is_live; then
+        OFFER_LIVE=1
+        break
+    fi
+    sleep 5
+done
+
+if [ "$OFFER_LIVE" -eq 0 ]; then
+    echo -e "${BLUE}[*] The source offer is not being served; restarting caddy...${NC}"
+    docker compose restart caddy
+    sleep 3
+    if ! source_offer_is_live; then
+        echo -e "${RED}[!] The AGPL source offer is NOT reachable at $PUBLIC_BASE_URL/source${NC}"
+        echo -e "${RED}[!] Check 'docker compose logs caddy | tail -50'${NC}"
+        exit 1
+    fi
+fi
+echo -e "${GREEN}[+] Source offer is live at $PUBLIC_BASE_URL/source${NC}"
+
 # 5. Cleanup
 echo -e "${BLUE}[*] Cleaning up old unused Docker images to free up space...${NC}"
 docker image prune -f > /dev/null 2>&1

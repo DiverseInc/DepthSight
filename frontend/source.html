@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DepthSight — Source code offer (AGPL-3.0, section 13)</title>
+  <meta name="description" content="DepthSight is free software licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). This page is our section 13 source code offer: the complete source code of the modified version of DepthSight running on this service, free of charge." />
+  <meta name="robots" content="index, follow" />
+  <link rel="canonical" href="https://depthsight.diverseinc.net/source" />
+  <style>
+    :root{
+      --bg:#0b1220;
+      --bg-2:#0f172a;
+      --panel:#111c33;
+      --line:#1e293b;
+      --text:#e6edf7;
+      --muted:#93a4c1;
+      --brand:#22d3ee;
+      --brand-2:#38bdf8;
+      --accent:#a78bfa;
+      --radius:14px;
+      --shadow:0 14px 40px rgba(0,0,0,.35);
+      --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+      --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Inter,sans-serif;
+    }
+    *{box-sizing:border-box}
+    html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.6;-webkit-font-smoothing:antialiased}
+    a{color:var(--brand);text-decoration:none}
+    a:hover{text-decoration:underline}
+    .wrap{max-width:880px;margin:0 auto;padding:0 24px}
+    header{padding:28px 0;border-bottom:1px solid var(--line);background:var(--bg-2)}
+    .brand{display:flex;align-items:center;gap:10px;font-weight:700}
+    .brand-mark{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--brand),var(--accent));display:inline-block;position:relative}
+    .brand-mark::after{content:"";position:absolute;inset:6px;border-radius:4px;background:var(--bg-2)}
+    main{padding:56px 0 72px}
+    h1{font-size:38px;line-height:1.15;letter-spacing:-.01em;margin:0 0 14px;font-weight:800}
+    h2{font-size:22px;margin:40px 0 10px;font-weight:700}
+    p{margin:0 0 14px}
+    .lede{font-size:19px;color:var(--muted);max-width:720px}
+    .eyebrow{display:inline-block;font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--brand);margin-bottom:12px;font-weight:700}
+    .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:22px 24px;box-shadow:var(--shadow);margin:0 0 18px}
+    ul{margin:0 0 14px;padding-left:22px}
+    li{margin:0 0 8px}
+    code{font-family:var(--mono);font-size:13px;background:rgba(34,211,238,.08);color:var(--brand);padding:2px 6px;border-radius:4px}
+    .url{word-break:break-all;font-family:var(--mono);font-size:13px}
+    .note{color:var(--muted);font-size:15px}
+    .tag-row{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0 0}
+    .tag{font-family:var(--mono);font-size:12px;color:var(--brand);background:rgba(34,211,238,.08);border:1px solid rgba(34,211,238,.25);padding:5px 10px;border-radius:999px}
+    footer{padding:26px 0;border-top:1px solid var(--line);color:var(--muted);font-size:14px}
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span>DepthSight</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <div class="wrap">
+
+    <span class="eyebrow">Source code offer</span>
+    <h1>The source code of the DepthSight you are using</h1>
+
+    <p class="lede">
+      DepthSight is free software. The copy of it running on this website has been modified
+      by us, and it is offered to you here as the <b>GNU Affero General Public License v3.0
+      (AGPL-3.0)</b> requires.
+    </p>
+
+    <div class="card">
+      <p>
+        <b>In plain words:</b> because you use this service over the internet, section 13 of the
+        AGPL-3.0 obliges us to offer you the complete source code of the modified program you are
+        actually talking to. We make that offer to <b>every person who interacts with this
+        service</b>, whether or not you have an account, and we keep it open for as long as the
+        service is running.
+      </p>
+      <ul>
+        <li>You get the <b>whole source code</b>, including the changes we have made.</li>
+        <li>It is <b>free of charge</b>, and you do not need a GitHub account to download it.</li>
+        <li>It is the <b>same code that is running here</b>, not the original upstream release.</li>
+      </ul>
+    </div>
+
+    <h2>Where to get the source code</h2>
+    <div class="card">
+      <p>
+        The source code of the version running on this service lives in our public repository,
+        <a href="https://github.com/DiverseInc/DepthSight" target="_blank" rel="noopener">DiverseInc/DepthSight</a>
+        on GitHub:
+      </p>
+      <p class="url"><a href="https://github.com/DiverseInc/DepthSight" target="_blank" rel="noopener">https://github.com/DiverseInc/DepthSight</a></p>
+      <p>
+        You can download it as a single archive without a GitHub account:
+      </p>
+      <p class="url"><a href="https://github.com/DiverseInc/DepthSight/archive/refs/heads/main.tar.gz" target="_blank" rel="noopener">https://github.com/DiverseInc/DepthSight/archive/refs/heads/main.tar.gz</a></p>
+      <p class="note">
+        We do not publish a separate release package of the build we host. The repository and the
+        archive link above are the source code of the running service.
+      </p>
+    </div>
+
+    <h2>Which source code matches the version you are running</h2>
+    <div class="card">
+      <p>
+        Your instance reports its own version number, and you can read it yourself. It appears in
+        the <code>version</code> field of the status page:
+      </p>
+      <p class="url"><a href="https://depthsight.diverseinc.net/api/v1/status" target="_blank" rel="noopener">https://depthsight.diverseinc.net/api/v1/status</a></p>
+      <p>
+        and in the <code>version</code> field of the API description:
+      </p>
+      <p class="url"><a href="https://depthsight.diverseinc.net/openapi.json" target="_blank" rel="noopener">https://depthsight.diverseinc.net/openapi.json</a></p>
+      <p>
+        The same number is written in the <code>VERSION</code> file at the root of the repository.
+        The running service is deployed from the <code>main</code> branch of that repository, and
+        deployments move forward as we push to <code>main</code>, so <code>main</code> is the
+        published match for the code you are talking to.
+      </p>
+      <p class="note">
+        That version number identifies the release line, not one particular commit, and the
+        running service does not print a commit id. If you need the exact commit behind the
+        deployment you are using, ask us by email (below) and we will send you the source code
+        for that commit.
+      </p>
+    </div>
+
+    <h2>The upstream project this is built on</h2>
+    <div class="card">
+      <p>
+        DepthSight originates in the open-source project
+        <a href="https://github.com/DepthSight-Pro/DepthSight" target="_blank" rel="noopener">DepthSight-Pro/DepthSight</a>,
+        which is licensed under the <b>GNU Affero General Public License v3.0 (AGPL-3.0)</b> as
+        well. We maintain this fork and run the hosted service you are using; the relationship
+        between the two is that of a fork and its upstream.
+      </p>
+      <p>
+        Upstream also asks contributors to sign a <b>Contributor License Agreement (CLA)</b>:
+        <a href="https://github.com/DepthSight-Pro/DepthSight/blob/main/CLA.md" target="_blank" rel="noopener">DepthSight-Pro/DepthSight/blob/main/CLA.md</a>.
+        The CLA applies to contributions made to the upstream project — signing it grants DepthSight
+        a perpetual, worldwide, non-exclusive, royalty-free copyright licence (and a patent
+        licence) for those contributions, and it states that the project licence is AGPLv3. The CLA
+        does not change the terms on which we offer you this source code.
+      </p>
+      <p class="note">
+        Upstream publishes its own tagged releases on GitHub. Those are upstream's own builds and
+        are not the source code of the version running on this service.
+      </p>
+      <p>
+        The full licence text is the <code>LICENSE</code> file at the root of the repository:
+      </p>
+      <p class="url"><a href="https://github.com/DiverseInc/DepthSight/blob/main/LICENSE" target="_blank" rel="noopener">https://github.com/DiverseInc/DepthSight/blob/main/LICENSE</a></p>
+    </div>
+
+    <h2>Requesting the source code by email</h2>
+    <div class="card">
+      <p>
+        If you would rather have the source code by email, or you need the exact commit for your
+        deployment, write to us:
+      </p>
+      <p class="url"><a href="mailto:support@diverseinc.net?subject=AGPL%20source%20request">support@diverseinc.net</a></p>
+      <p>
+        Please put <b>AGPL source request</b> in the subject line and tell us the version number
+        you are running (the <code>version</code> field of the status page above). We will send
+        you the source code, free of charge.
+      </p>
+      <p class="note">
+        This offer applies for as long as this service is running. If the service is ever
+        discontinued, the source code stays published in the repository above.
+      </p>
+    </div>
+
+    <h2>What "our modifications" means</h2>
+    <div class="card">
+      <p>
+        The source code offered here is the source code of the <b>running service</b>, not the
+        original upstream release. It contains the changes we have made to the upstream code and
+        the code that is specific to running DepthSight as a hosted service — which is exactly
+        what section 13 asks us to offer.
+      </p>
+      <div class="tag-row">
+        <span class="tag">AGPL-3.0</span>
+        <span class="tag">section 13 offer</span>
+        <span class="tag">includes our modifications</span>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    DepthSight — free software under the AGPL-3.0. ·
+    <a href="https://depthsight.diverseinc.net/welcome">Home</a> ·
+    <a href="https://github.com/DiverseInc/DepthSight" target="_blank" rel="noopener">Repository</a> ·
+    <a href="mailto:support@diverseinc.net">Contact</a>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -33,6 +33,17 @@ CADDY_CONFIG = REPO_ROOT / "caddy.config"
 # this test take minutes and asserted nothing about OUR source.
 NOT_REPOSITORY_DIRS = frozenset({"node_modules", "dist", "__pycache__"})
 
+# The ONLY files Caddy may serve out of the bind-mounted frontend/ tree.
+# Each is reached through a handle that rewrites to exactly that path, so
+# no handler can walk the tree and publish the frontend source.
+PINNED_SERVED_FILES = ("/welcome.html", "/source.html")
+
+# A rewrite to one of the pinned files, and to nothing that merely starts
+# with one of them ("/source.html.bak" is not a pinned file).
+PINNED_REWRITE_RE = re.compile(
+    r"rewrite \* /(?:welcome|source)\.html(?![A-Za-z0-9])"
+)
+
 
 @pytest.fixture(scope="module")
 def config() -> str:
@@ -138,9 +149,11 @@ class TestTheServedDirectoryHoldsNothingElse:
     could reach an arbitrary path under it would publish the source -- and
     anything else that ever lands in frontend/.
 
-    Two rules keep that impossible:
+    Three rules keep that impossible:
 
       * the @welcome handler rewrites every request to /welcome.html, so it
+        can only ever return that one file;
+      * the @source handler rewrites every request to /source.html, so it
         can only ever return that one file;
       * the @ogimage handler matches three exact filenames.
 
@@ -158,15 +171,28 @@ class TestTheServedDirectoryHoldsNothingElse:
             "mounted frontend/ directory"
         )
 
+    def test_the_source_handler_can_only_serve_source_html(self, config):
+        """The AGPL section 13 offer is served the same pinned way."""
+        body = _handle_body(config, "@source")
+        assert "rewrite * /source.html" in body, (
+            "the @source handler must rewrite every request to "
+            "/source.html, so it cannot serve another file from the "
+            "mounted frontend/ directory"
+        )
+
     def test_no_handler_serves_the_mounted_directory_without_a_pinned_path(self, config):
         """A file_server with no rewrite could serve anything under the root."""
         for match in re.finditer(r"(?m)^\s*handle\s*([^\s{]*)\s*\{(?P<body>[^}]*)\}", config):
             body = match.group("body")
             if "file_server" not in body:
                 continue
-            assert "rewrite * /welcome.html" in body or "@ogimage" in match.group(1), (
+            assert (
+                PINNED_REWRITE_RE.search(body)
+                or "@ogimage" in match.group(1)
+            ), (
                 f"the handle {match.group(1)!r} serves files from the "
-                "mounted frontend/ directory without pinning the path"
+                "mounted frontend/ directory without pinning the path to "
+                f"one of {list(PINNED_SERVED_FILES)}"
             )
 
     def test_the_demo_credentials_are_not_in_the_served_directory(self):
@@ -181,8 +207,9 @@ class TestTheServedDirectoryHoldsNothingElse:
         that directory is not in the build and the image build fails on an
         import it cannot resolve. So the credentials stay in
         frontend/demo-build-flag.ts -- a file no handler can serve, because
-        the @welcome handler rewrites every request to /welcome.html and
-        @ogimage matches three exact filenames (both pinned above).
+        the @welcome handler rewrites every request to /welcome.html, the
+        @source handler rewrites every request to /source.html and
+        @ogimage matches three exact filenames (all pinned above).
 
         This test therefore pins that the flag file is the ONLY place in the
         served tree that holds them.
