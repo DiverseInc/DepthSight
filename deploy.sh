@@ -91,12 +91,55 @@ if [ -f "deploy.sh" ] && [ -d "api" ]; then
     PROJECT_DIR=$(pwd)
 else
     PROJECT_DIR="/opt/depthsight"
+    # Deploy THIS fork, never upstream. This script is inherited from upstream,
+    # so its clone URL pointed at upstream: a fresh deploy onto a box with no
+    # project files yet would silently install upstream's code and branding,
+    # and then generate our .env on top of it.
+    DEPLOY_REPO_URL="https://github.com/DiverseInc/DepthSight.git"
+    DEPLOY_REPO_SLUG="DiverseInc/DepthSight"
+
+    # Normalise a git URL to "owner/repo" so the checks below compare
+    # repositories and not URL spelling (https/ssh/git@, with or without .git).
+    repo_slug() {
+        local slug="$1"
+        slug="${slug%.git}"
+        slug="${slug#ssh://git@github.com/}"
+        slug="${slug#git@github.com:}"
+        slug="${slug#https://github.com/}"
+        slug="${slug#http://github.com/}"
+        slug="${slug%/}"
+        printf '%s' "$slug"
+    }
+
+    if [ "$(repo_slug "$DEPLOY_REPO_URL")" != "$DEPLOY_REPO_SLUG" ]; then
+        echo -e "${RED}[!] FATAL: the configured deploy URL is not ${DEPLOY_REPO_SLUG}.${NC}"
+        echo -e "${RED}[!] Refusing to deploy the wrong product.${NC}"
+        exit 1
+    fi
+
     if [ ! -d "$PROJECT_DIR/.git" ]; then
-        echo -e "${BLUE}[*] Cloning DepthSight repository...${NC}"
+        echo -e "${BLUE}[*] Cloning DepthSight repository from ${DEPLOY_REPO_URL}...${NC}"
         apt-get update && apt-get install -y git
-        git clone https://github.com/DepthSight-Pro/DepthSight.git "$PROJECT_DIR"
+        if ! git clone "$DEPLOY_REPO_URL" "$PROJECT_DIR"; then
+            echo -e "${RED}[!] FATAL: git clone of ${DEPLOY_REPO_URL} failed.${NC}"
+            echo -e "${RED}[!] Refusing to continue: DepthSight was not installed.${NC}"
+            exit 1
+        fi
     fi
     cd "$PROJECT_DIR"
+
+    # The checkout must really be this fork before .env is generated on top of
+    # it: a box that already holds another repository in /opt/depthsight would
+    # otherwise be deployed silently.
+    ACTUAL_REPO_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
+    ACTUAL_REPO_SLUG=$(repo_slug "$ACTUAL_REPO_URL")
+    if [ "$ACTUAL_REPO_SLUG" != "$DEPLOY_REPO_SLUG" ]; then
+        echo -e "${RED}[!] FATAL: ${PROJECT_DIR} is not a checkout of ${DEPLOY_REPO_SLUG}.${NC}"
+        echo -e "${RED}[!] Found origin: ${ACTUAL_REPO_URL:-<none>}${NC}"
+        echo -e "${RED}[!] Refusing to deploy the wrong product.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}[+] Deploying DepthSight from ${ACTUAL_REPO_URL}${NC}"
 fi
 
 # 4. Environment Configuration
