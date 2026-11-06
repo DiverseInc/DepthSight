@@ -46,6 +46,32 @@ export const hasProfessionalTierAccess = (plan?: string | null): boolean =>
 	(PROFESSIONAL_TIER_KEYS as readonly string[]).includes(canonicalPlanKey(plan));
 
 /**
+ * True when the customer may still be shown an upgrade prompt.
+ *
+ * The upgrade affordances in the chrome -- the "Upgrade to PRO" entry in the
+ * user menu, the amber crown on the plan badge, the amber upgrade styling
+ * and the "Upgrade plan" tooltip -- ask ONE question: "is there still a tier
+ * this customer could be sold?".
+ *
+ * The ladder is free < standard < pro < managed. The upsell sells the
+ * Professional tier, so a customer who already has Professional has nothing
+ * left to buy -- and neither has a customer on Managed, which sits ABOVE
+ * Professional and buys everything Professional includes.
+ *
+ * `hasProfessionalTierAccess` answers exactly that ("the customer is at the
+ * Professional tier or above"), and it resolves the legacy `premium` key
+ * onto `managed` first -- the frontend receives the RAW key, so a fix that
+ * only knew `managed` would still nag a legacy customer.
+ *
+ * ONE place on purpose: these affordances live in three components and they
+ * used to spell the same question three different ways (`user.plan !==
+ * "pro"`), which is how a customer on the $499 tier ended up seeing four
+ * upgrade prompts.
+ */
+export const showsUpgradePrompt = (plan?: string | null): boolean =>
+	!hasProfessionalTierAccess(plan);
+
+/**
  * The name a tier is sold under. `premium` is the legacy spelling of the
  * $499 Managed tier: a template that still asks for `premium` must show the
  * customer the name of the tier they would actually buy.

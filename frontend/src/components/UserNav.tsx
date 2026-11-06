@@ -25,6 +25,7 @@ import {
 import { Skeleton } from "@/components/ui/skeleton";
 import { useAuth } from "@/context/AuthContext";
 import { useAccountStatus } from "@/lib/api";
+import { showsUpgradePrompt } from "@/lib/plans";
 
 export function UserNav() {
 	// --- Adding 'account' namespace for quota translation ---
@@ -124,7 +125,7 @@ export function UserNav() {
 							</div>
 						)}
 
-						{!isLoading && user.plan !== "pro" && (
+						{!isLoading && showsUpgradePrompt(user.plan) && (
 							<div className="mt-3 mb-1">
 								<DropdownMenuItem asChild>
 									<Link

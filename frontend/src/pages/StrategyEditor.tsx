@@ -215,10 +215,13 @@ const StrategyEditorPage = () => {
 	// The tier the palette uses to decide whether PRO blocks are locked.
 	const userTier = useStrategyEditorStore((state) => state.userTier);
 
-	// Sync user tier from AuthContext
+	// Sync user tier from AuthContext.
+	// The tier is the CANONICAL plan key: `premium` is the legacy spelling
+	// of `managed` and the frontend receives the raw key, so it is resolved
+	// here rather than carried around as a second spelling.
 	useEffect(() => {
 		if (user?.plan) {
-			setUserTier(user.plan as "free" | "standard" | "pro");
+			setUserTier(canonicalPlanKey(user.plan) as PlanTier);
 		}
 	}, [user?.plan, setUserTier]);
 

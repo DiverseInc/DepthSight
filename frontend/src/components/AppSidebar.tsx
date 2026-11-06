@@ -49,6 +49,7 @@ import { useAuth } from "@/context/AuthContext";
 import { useAccountStatus, useSystemStatus } from "@/lib/api";
 import { apiClient } from "@/lib/apiClient";
 import { resolveHubApiUrl } from "@/lib/hubApi";
+import { showsUpgradePrompt } from "@/lib/plans";
 import { cn } from "@/lib/utils";
 
 // Define navigation item structure
@@ -320,11 +321,11 @@ export function AppSidebar() {
 												variant="outline"
 												className={cn(
 													"capitalize transition-colors w-12 px-1 flex justify-center overflow-hidden",
-													user.plan !== "pro" &&
+													showsUpgradePrompt(user.plan) &&
 														"hover:bg-amber-500/10 hover:text-amber-500 hover:border-amber-500/50 cursor-pointer",
 												)}
 											>
-												{user.plan !== "pro" && (
+												{showsUpgradePrompt(user.plan) && (
 													<Crown className="mr-0.5 h-3 w-3 shrink-0 text-amber-500" />
 												)}
 												<span className="truncate text-[10px]">
@@ -335,7 +336,7 @@ export function AppSidebar() {
 									</TooltipTrigger>
 									<TooltipContent side="right" className="flex flex-col gap-1">
 										<span>
-											{user.plan !== "pro"
+											{showsUpgradePrompt(user.plan)
 												? t("upgradePlan", "Upgrade plan")
 												: t("currentPlan", { plan: user.plan })}
 										</span>
