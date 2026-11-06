@@ -49,7 +49,7 @@ try:
         Query,
         Request,
     )
-    from contextlib import asynccontextmanager
+    from contextlib import asynccontextmanager, suppress
     from .session_manager import session_manager
     from fastapi.responses import JSONResponse, Response
     from fastapi.middleware.cors import CORSMiddleware
@@ -125,6 +125,11 @@ from .routes.notifications import notifications_router
 from .routes.public import public_router
 from .routes.registry import include_application_routers
 from .main import BodySizeLimitMiddleware
+from .system_metrics import (
+    RequestMetricsMiddleware,
+    get_metrics_redis,
+    heartbeat_loop,
+)
 from .routes.support import admin_support_router, support_router
 from .routes.users import users_extra_router
 from bot_module import data_loader
@@ -1418,7 +1423,22 @@ async def lifespan(app: FastAPI):
             f"Failed to pre-load Oracle model in worker PID {lifespan_os.getpid()}: {e}"
         )
 
-    yield
+    # The heartbeat is what turns "uptime" into a measurement instead of a
+    # guess. It runs inside this process, so a minute with no heartbeat is a
+    # minute the platform was not demonstrably up -- and, just as important,
+    # it proves the request recorder was running for the same window. It
+    # writes to Redis and never raises.
+    metrics_redis = get_metrics_redis()
+    app.state.metrics_redis = metrics_redis
+    heartbeat_task = asyncio.create_task(heartbeat_loop(metrics_redis))
+
+    try:
+        yield
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+
     print(
         f"INFO: Application lifespan shutdown in worker PID: {lifespan_os.getpid()}..."
     )
@@ -1603,6 +1623,13 @@ app.add_middleware(
 # outermost user middleware and therefore sees the raw byte stream. The cap
 # is resolved per request from MAX_REQUEST_BODY_BYTES.
 app.add_middleware(BodySizeLimitMiddleware)
+
+# Counts the requests this process handles, per minute, so the admin console
+# can publish a real request/error/response-time figure instead of a
+# constant. Added last so it is the outermost user middleware and therefore
+# measures the whole request, including the time the body-size guard spent
+# on it. It never fails a request.
+app.add_middleware(RequestMetricsMiddleware)
 
 api_router = APIRouter(prefix="/api/v1", tags=["v1"])
 

@@ -1197,10 +1197,16 @@ export interface MarketSentimentStat {
 }
 
 export interface SystemMetrics {
-	average_response_time_ms: number;
-	uptime_30_days_percent: number;
-	total_requests_24h: number;
-	error_rate_24h: number;
+	/**
+	 * Null means "not measured" -- the platform could not measure it. It is
+	 * never a zero and never a placeholder; see `notes` for the reason.
+	 */
+	average_response_time_ms: number | null;
+	uptime_30_days_percent: number | null;
+	total_requests_24h: number | null;
+	error_rate_24h: number | null;
+	/** Per-metric explanation, keyed by field name. */
+	notes?: Record<string, string>;
 }
 
 // --- Types for the Affiliate Program (Admin) ---

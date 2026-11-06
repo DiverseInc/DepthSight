@@ -2849,10 +2849,55 @@ class SystemStatus(BaseModel):
 
 
 class SystemMetrics(BaseModel):
-    average_response_time_ms: float
-    uptime_30_days_percent: float
-    total_requests_24h: int
-    error_rate_24h: float
+    """Real, measured platform metrics.
+
+    Every field is Optional and is None when the platform could not measure
+    it. None means "not measured" -- it never means zero, and it is never
+    replaced by a placeholder. A console that shows 0.00% error rate when it
+    has no idea is worse than one that says it is blind.
+
+    `notes` explains each metric: why it could not be measured, or what the
+    measurement covers. A null without a reason is indistinguishable from a
+    broken client.
+    """
+
+    average_response_time_ms: Optional[float] = Field(
+        None,
+        description=(
+            "Mean time the API took to answer the requests it handled in the "
+            "last 24 hours. Null when that cannot be measured."
+        ),
+    )
+    uptime_30_days_percent: Optional[float] = Field(
+        None,
+        description=(
+            "Share of the last 30 days in which the API process was "
+            "demonstrably alive, at one-minute resolution. Null when the "
+            "platform has not been measuring for the whole window."
+        ),
+    )
+    total_requests_24h: Optional[int] = Field(
+        None,
+        description=(
+            "Requests the API handled in the last 24 hours. Null when the "
+            "platform has not been recording for the whole window."
+        ),
+    )
+    error_rate_24h: Optional[float] = Field(
+        None,
+        description=(
+            "Percentage of those responses that were 5xx. Null when it "
+            "cannot be computed -- including when no requests were handled, "
+            "because 0/0 is not 0%."
+        ),
+    )
+    notes: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Per-metric explanation, keyed by field name: why a metric is "
+            "unmeasured, or what the measurement covers."
+        ),
+    )
 
 
 # FIX 2026-09-20: candle-flow health endpoint schemas.
