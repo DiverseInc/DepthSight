@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "Mutations that put the AGPL-3.0 source offer's two OVERSTATEMENTS back",
+    "into frontend/source.html.",
+    "",
+    "The defect (measured, reviewed on the Copilot engine): the archive",
+    "link is https://github.com/DiverseInc/DepthSight/archive/refs/heads/main.tar.gz",
+    "-- a SNAPSHOT OF THE TIP of the branch, not a history. The running",
+    "service is deployed from `main`, and the deploy lands a few minutes",
+    "AFTER a merge, so between a merge and its deploy the archive is the",
+    "NEWER tree and the running build's tree is genuinely not in it. The",
+    "page used to claim otherwise.",
+    "",
+    "M1 restores the old archive-identity claim in the 'Where to get the",
+    "    source code' note: 'the archive link above are the source code of",
+    "    the running service'. Killed by",
+    "    test_the_page_does_not_say_the_archive_is_the_running_service.",
+    "M2 restores the old unconditional published-match claim in the",
+    "    'Which source code matches the version you are running' section:",
+    "    'and it is the published match for the code you are talking to'.",
+    "    Killed by",
+    "    test_the_page_does_not_call_main_the_published_match_unconditionally.",
+    "",
+    "Both needles are SINGLE-LINE strings and each occurs EXACTLY ONCE in",
+    "frontend/source.html (asserted before use); a needle that matched two",
+    "sites would make the mutation meaningless.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/source_offer_snapshot_claim.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_public_source_offer.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: the source offer claims the archive link IS the source code of the running service (the old overstatement)",
+      "file": "frontend/source.html",
+      "needle": "the archive link above is a snapshot of the tip of",
+      "replace": "the archive link above are the source code of the running service, and so is the tip of"
+    },
+    {
+      "label": "M2: the source offer calls main the published match for the code you are talking to, unconditionally (the old overstatement)",
+      "file": "frontend/source.html",
+      "needle": "and it is the exact published match",
+      "replace": "and it is the published match for the code you are talking to"
+    }
+  ]
+}

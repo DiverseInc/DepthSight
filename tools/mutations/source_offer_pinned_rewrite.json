@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "Mutations that put the pinned-rewrite hole BACK into caddy.config.",
+    "",
+    "The defect (measured 2026-11-07, found by the Copilot engine on panel #3,",
+    "condition (f) -- 'an existing test was made permissive'): the pinned-rewrite",
+    "rule in tests/test_caddy_public_routes.py ended in a negative lookahead",
+    "`(?![A-Za-z0-9])`, which rejected only an ALPHANUMERIC suffix. It therefore",
+    "accepted a rewrite target that merely STARTS with a pinned file, and the",
+    "companion assertion `assert \"rewrite * /source.html\" in body` accepted it",
+    "too, because the traversal target CONTAINS that substring.",
+    "",
+    "So a caddy.config that rewrote the @source handler at the file holding the",
+    "demo credentials would have PASSED the whole test file. The live config",
+    "rewrote to exactly /source.html, so this was a regression-TEST gap, not a",
+    "live exposure -- but the test is what is supposed to catch the next one.",
+    "",
+    "M1 rewrites @source to /source.html/../demo-build-flag.ts -- a traversal",
+    "    into the file that holds the demo username/password. Killed by",
+    "    test_the_source_handler_can_only_serve_source_html and by",
+    "    test_no_handler_serves_the_mounted_directory_without_a_pinned_path.",
+    "M2 rewrites @source to /source.html.bak -- a sibling file that merely",
+    "    starts with the pinned name. Killed by the same two tests.",
+    "",
+    "The needle is a SINGLE-LINE string and occurs EXACTLY ONCE in caddy.config",
+    "(asserted before use); a needle that matched two sites would make the",
+    "mutation meaningless.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/source_offer_pinned_rewrite.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_caddy_public_routes.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: the @source handler rewrites through the pinned path into the demo-credentials file",
+      "file": "caddy.config",
+      "needle": "rewrite * /source.html",
+      "replace": "rewrite * /source.html/../demo-build-flag.ts"
+    },
+    {
+      "label": "M2: the @source handler rewrites to a sibling file that merely starts with the pinned name",
+      "file": "caddy.config",
+      "needle": "rewrite * /source.html",
+      "replace": "rewrite * /source.html.bak"
+    }
+  ]
+}
