@@ -36,9 +36,11 @@ So this file pins the offer as a whole:
   * it says which source code corresponds to the version the reader is
     running, and it does NOT overstate that: the branch archive is a
     snapshot of the TIP of the branch, not of the running build, and the
-    exact commit stays on offer by email;
+    exact commit of the running build is PUBLISHED -- in the `commit` field
+    of the status page, which turns it into a download URL;
   * it attributes the upstream project, its licence and its CLA;
-  * it states the email route by which the source can be requested;
+  * it states the email route by which the source can be requested, as an
+    ADDITIONAL convenience on top of the download links;
   * it says the offer covers the running service INCLUDING our
     modifications;
   * the welcome page links to it from the navigation and the footer, AND
@@ -143,6 +145,18 @@ def _links_to(block: str, href: str) -> list:
     parser = _LinkParser()
     parser.feed(block)
     return [link for link in parser.links if link[0] == href]
+
+
+def _visible_text(fragment: str) -> str:
+    """The visible text of an HTML fragment: tags stripped, entities resolved.
+
+    A raw-HTML comparison would see `<code>commit</code> field` where the
+    reader sees `commit field`, so anything about what the page SAYS has to
+    be compared against the visible text.
+    """
+    parser = _PageParser()
+    parser.feed(fragment)
+    return parser.text
 
 
 @pytest.fixture(scope="module")
@@ -609,7 +623,9 @@ class TestTheArchiveIsASnapshotOfTheTip:
     code the reader is talking to. What it must say instead: the branch
     always CONTAINS that code, it is the exact published match once the most
     recent push has been deployed, the archive can be a little ahead of the
-    build, and the exact commit is still on offer by email.
+    build, and the exact commit of the running build is published in the
+    `commit` field of the status page -- so it is a download URL, not an
+    email request.
     """
 
     def test_the_page_does_not_call_main_the_published_match_unconditionally(
@@ -642,33 +658,118 @@ class TestTheArchiveIsASnapshotOfTheTip:
             "the reader is talking to"
         )
 
-    def test_the_exact_commit_is_still_offered_by_email_next_to_that_gap(
+    def test_the_note_that_states_the_gap_also_points_at_the_exact_commit(
         self, page_html: str
     ):
-        """The exact commit must stay on offer, in the note that states the gap.
+        """The reader who is told the archive may be ahead needs the remedy.
 
-        The phrase itself already existed before the fix, so pinning it alone
-        would prove nothing. Pinning that it lives in the SAME note as the
-        "ahead of the build" statement is what makes it mean something: the
-        reader who is told the archive may be ahead is shown the remedy in
-        the same breath.
+        WHY THIS TEST WAS REWRITTEN (2026-11-07): it used to demand that the
+        email request sat in the SAME note as the "ahead of the build"
+        statement, because asking a human was the only way to get the exact
+        commit. That is no longer true and is no longer the right thing to
+        pin: the running deployment publishes its own commit in the `commit`
+        field of the status page, and the offer page turns that value into
+        the archive URL for exactly that commit. So the remedy that belongs
+        in this note is the MACHINE-READABLE one -- the `commit` field --
+        and the email route stays as an additional convenience, pinned by
+        TestTheExactCommitIsPublishedWithoutAsking.
         """
-        notes = re.findall(r"<p class=\"note\">(.*?)</p>", page_html, flags=re.S)
+        notes = [
+            _visible_text(n)
+            for n in re.findall(r"<p class=\"note\">(.*?)</p>", page_html, flags=re.S)
+        ]
         assert notes, "the source offer page has no note paragraphs"
 
-        commit_notes = [
+        gap_notes = [
             n for n in notes
-            if "we will send you the source code for that commit" in _norm(n)
+            if "ahead of the build you are talking to" in n
         ]
-        assert commit_notes, (
-            "the page must keep offering the exact commit by email: 'we will "
-            "send you the source code for that commit'"
+        assert gap_notes, (
+            "the page must keep saying the tip archive can be ahead of the "
+            "build the reader is talking to"
         )
-        assert any(
-            "ahead of the build you are talking to" in _norm(n)
-            for n in commit_notes
+        assert any("commit field" in _norm(n) for n in gap_notes), (
+            "the note that states the gap must also point at the exact commit "
+            "-- the status page's `commit` field -- so the reader who sees "
+            "the gap is shown the remedy in the same breath"
+        )
+        assert any("status page" in _norm(n) for n in gap_notes), (
+            "the note that states the gap must say WHERE the commit is "
+            "published, so the reader can fetch it without asking anyone"
+        )
+
+
+# --------------------------------------------------------------------------
+# The source of the RUNNING build, published without asking anyone
+# --------------------------------------------------------------------------
+class TestTheExactCommitIsPublishedWithoutAsking:
+    """The source of the build you are talking to must be a public URL.
+
+    THE DEFECT THIS PINS (measured 2026-11-07, Copilot, panel #3, condition
+    (a)): the offer linked the archive of the TIP of `main`, said "the
+    running service does not print a commit id", and told the reader that
+    the exact commit had to be requested BY EMAIL. That made a human the
+    load-bearing part of the section 13 offer for the one thing section 13
+    asks for: the source of the version the reader is actually talking to.
+
+    The running deployment now publishes its own commit in the `commit` field
+    of the unauthenticated status endpoint, and this page turns that value
+    into the archive URL for exactly that commit.
+    """
+
+    def test_the_page_points_at_the_commit_field_of_the_status_page(
+        self, page_text: str
+    ):
+        assert "the exact commit this running deployment was built from" in (
+            page_text.lower()
         ), (
-            "the note that offers the exact commit must also say the archive "
-            "can be ahead of the build the reader is talking to, so the "
-            "reader who sees the gap is shown the remedy"
+            "the page must say that the status page's `commit` field holds "
+            "the exact commit the running deployment was built from"
+        )
+
+    def test_the_page_gives_the_archive_url_for_that_exact_commit(
+        self, page_text: str
+    ):
+        assert (
+            "https://github.com/DiverseInc/DepthSight/archive/<commit>.tar.gz"
+            in page_text
+        ), (
+            "the page must give the archive URL for the exact commit, with "
+            "the status page's `commit` value in place of <commit>"
+        )
+
+    def test_the_page_does_not_say_the_service_does_not_print_a_commit_id(
+        self, page_text: str
+    ):
+        """It DOES print one now: the status page's `commit` field.
+
+        Leaving the old sentence in place would make the page contradict the
+        deployment it describes.
+        """
+        assert "does not print a commit id" not in page_text.lower(), (
+            "the running service DOES publish its commit id now, so the page "
+            "must not say that it does not"
+        )
+
+    def test_the_email_is_not_the_only_route_to_the_exact_commit(
+        self, page_text: str
+    ):
+        lowered = page_text.lower()
+        assert "ask us by email" not in lowered, (
+            "the exact commit must not be something the reader has to ASK "
+            "for; it is published in the status page's `commit` field"
+        )
+        assert "the commit field" in lowered, (
+            "the page must point the reader at the `commit` field"
+        )
+
+    def test_the_email_route_still_offers_the_source_of_that_commit(
+        self, page_text: str
+    ):
+        """The email offer stays -- it is a convenience, not the mechanism."""
+        assert "we will send you the source code for that commit" in (
+            page_text.lower()
+        ), (
+            "the email route must still offer the source of the exact commit "
+            "the reader is running"
         )

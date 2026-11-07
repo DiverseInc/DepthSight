@@ -52,6 +52,53 @@ git reset --hard origin/main
 find . -type f -name "*.sh" -exec sed -i 's/\r$//' {} +
 find . -type f -name "Caddyfile" -exec sed -i 's/\r$//' {} +
 
+# 3b. Record the commit this deployment is built from.
+#
+# The AGPL-3.0 section 13 offer has to point at the source of the RUNNING
+# version, and that version's commit has to be locatable from a public URL
+# with no human in the loop. .env is what docker-compose.yml hands to the
+# api service as env_file, so the value written here travels WITH the
+# container and comes back out of GET /api/v1/status as the `commit` field.
+#
+# It is written BEFORE the build on purpose: if the build fails, no new
+# container is created, the old container keeps running and keeps reporting
+# the OLD commit -- which is the truth. Writing it after the build would
+# leave .env claiming a commit that is not what is serving.
+record_deployed_commit() {
+    DEPLOYED_COMMIT=$(git rev-parse HEAD)
+    if [ ! -f .env ]; then
+        printf 'DEPLOYED_COMMIT=%s\n' "$DEPLOYED_COMMIT" > .env
+        return 0
+    fi
+    ENV_TMP=$(mktemp)
+    if grep -q '^DEPLOYED_COMMIT=' .env; then
+        # Replace the value in place, keeping that line's own line ending: a
+        # CRLF .env must not lose its carriage returns, and an LF one must
+        # not gain any.
+        awk -v sha="$DEPLOYED_COMMIT" '
+            /^DEPLOYED_COMMIT=/ {
+                line = $0
+                cr = ""
+                if (sub(/\r$/, "", line)) { cr = "\r" }
+                print "DEPLOYED_COMMIT=" sha cr
+                next
+            }
+            { print }
+        ' .env > "$ENV_TMP"
+    else
+        # Append, keeping the endings the file already has and making sure
+        # the last line is terminated before the new one goes on.
+        awk -v sha="$DEPLOYED_COMMIT" '
+            { print }
+            END { print "DEPLOYED_COMMIT=" sha }
+        ' .env > "$ENV_TMP"
+    fi
+    cat "$ENV_TMP" > .env
+    rm -f "$ENV_TMP"
+}
+
+record_deployed_commit
+
 # 4. Rebuild and Restart
 echo -e "${BLUE}[*] Rebuilding and restarting containers (this may take a few minutes)...${NC}"
 # Determine if Bitcart is running
@@ -81,6 +128,14 @@ source_offer_is_live() {
     curl -sk --max-time 15 "$PUBLIC_BASE_URL/source" 2>/dev/null | grep -q "DiverseInc/DepthSight"
 }
 
+# The rest of the site has to answer too. A caddy restart that leaves the
+# whole site down must not be reported as a successful deploy, so the root
+# is checked after the restart -- with a BOUNDED number of attempts, and a
+# loud failure when they are used up.
+site_root_is_live() {
+    curl -sk --max-time 15 -o /dev/null -w "%{http_code}" "$PUBLIC_BASE_URL/" 2>/dev/null | grep -qE "^[23][0-9][0-9]$"
+}
+
 OFFER_LIVE=0
 for _ in 1 2 3; do
     if source_offer_is_live; then
@@ -97,6 +152,22 @@ if [ "$OFFER_LIVE" -eq 0 ]; then
     if ! source_offer_is_live; then
         echo -e "${RED}[!] The AGPL source offer is NOT reachable at $PUBLIC_BASE_URL/source${NC}"
         echo -e "${RED}[!] Check 'docker compose logs caddy | tail -50'${NC}"
+        exit 1
+    fi
+    # The restart just bounced the proxy in front of the WHOLE site, so the
+    # rest of the service has to answer too. Bounded: three attempts, then a
+    # loud failure. A failed check never carries on as a success.
+    SITE_ROOT_LIVE=0
+    for _ in 1 2 3; do
+        if site_root_is_live; then
+            SITE_ROOT_LIVE=1
+            break
+        fi
+        sleep 5
+    done
+    if [ "$SITE_ROOT_LIVE" -eq 0 ]; then
+        echo -e "${RED}[!] The site root is NOT answering at $PUBLIC_BASE_URL/ after the caddy restart${NC}"
+        echo -e "${RED}[!] Check 'docker compose logs caddy | tail -50' and 'docker compose ps'${NC}"
         exit 1
     fi
 fi

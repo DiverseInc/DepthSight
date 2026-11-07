@@ -1,0 +1,79 @@
+{
+  "_comment": [
+    "Mutations that put the AGPL-3.0 section 13 'no human in the loop' defect",
+    "BACK into the branch.",
+    "",
+    "The defect (measured 2026-11-07, Copilot engine on panel #3, condition (a) --",
+    "'the downloadable archive can differ from the running version; obtaining",
+    "the exact commit depends on the email request being honored'): the offer",
+    "pointed at the archive of the TIP of `main` and told the reader that",
+    "'the running service does not print a commit id', so the ONLY way to get",
+    "the source of the build you were actually talking to was to ask a human by",
+    "email. The fix makes the running deployment publish its own commit:",
+    "update.sh records the commit it is about to build into .env, the api",
+    "serves it as the `commit` field of the unauthenticated GET /api/v1/status,",
+    "and the offer page turns that value into the archive URL for that commit.",
+    "",
+    "M1 drops the commit from the status payload (the field is still there, but",
+    "    it is always null). Killed by",
+    "    test_the_status_endpoint_reports_the_commit_the_deployment_was_built_from",
+    "    and test_the_status_endpoint_answers_when_no_commit_was_recorded.",
+    "M2 stops reading DEPLOYED_COMMIT from the environment, so the endpoint can",
+    "    never report the build it is running. Killed by",
+    "    test_the_deployed_commit_is_read_from_the_environment.",
+    "M3 removes the `commit` field from the SystemStatus schema. Killed by the",
+    "    same two endpoint tests: the response no longer carries the commit.",
+    "M4 stops the deploy script recording the commit, so the running container",
+    "    can never know which build it is. Killed by",
+    "    test_the_script_records_the_commit_from_git_rev_parse_head and by the",
+    "    behavioural tests, which run the real record_deployed_commit() and see",
+    "    an empty DEPLOYED_COMMIT.",
+    "M5 points the page back at the branch tip instead of the published commit,",
+    "    which puts the human-in-the-loop email back in charge. Killed by",
+    "    test_the_page_gives_the_archive_url_for_that_exact_commit.",
+    "",
+    "EVERY NEEDLE IS ASSERTED UNIQUE BEFORE USE: each needle below occurs",
+    "EXACTLY ONCE in its file. A needle that matched two sites would make the",
+    "mutation meaningless, because the harness replaces only the first hit.",
+    "tests/test_deployed_commit_mutation_needles.py asserts that, so the claim",
+    "is checked by the suite and not only by this comment.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/source_offer_deployed_commit.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_public_source_offer.py tests/test_update_sh_records_the_deployed_commit.py tests/test_api.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: the status endpoint stops reporting the built commit (the field is always null)",
+      "file": "api/routes/diagnostics.py",
+      "needle": "\"commit\": APP_COMMIT,",
+      "replace": "\"commit\": None,"
+    },
+    {
+      "label": "M2: the api stops reading DEPLOYED_COMMIT, so it can never report the build it is running",
+      "file": "api/routes/diagnostics.py",
+      "needle": "APP_COMMIT = (os.getenv(\"DEPLOYED_COMMIT\") or \"\").strip() or None",
+      "replace": "APP_COMMIT = None"
+    },
+    {
+      "label": "M3: the SystemStatus schema drops the commit field, so the response cannot carry it",
+      "file": "api/schemas.py",
+      "needle": "    commit: Optional[str] = Field(\n        default=None,\n        json_schema_extra={\"example\": \"a660767664d8950f4123d9ee53d2ddbbaafcbbc5\"},\n    )\n",
+      "replace": ""
+    },
+    {
+      "label": "M4: the deploy script stops recording the commit it is about to build",
+      "file": "update.sh",
+      "needle": "DEPLOYED_COMMIT=$(git rev-parse HEAD)",
+      "replace": "DEPLOYED_COMMIT=\"\""
+    },
+    {
+      "label": "M5: the offer points at the branch tip again instead of the published commit",
+      "file": "frontend/source.html",
+      "needle": "https://github.com/DiverseInc/DepthSight/archive/&lt;commit&gt;.tar.gz",
+      "replace": "https://github.com/DiverseInc/DepthSight/archive/refs/heads/main.tar.gz"
+    }
+  ]
+}

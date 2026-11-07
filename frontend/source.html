@@ -125,12 +125,19 @@
         for it once the most recent push has been deployed — that takes a few minutes after a
         push.
       </p>
+      <p>
+        The status page carries one more field, <code>commit</code>: the exact commit
+        this running deployment was built from. It is public, and getting it needs no
+        request. To get the source of the build you are talking to, copy the
+        <code>commit</code> value from the status page and put it in this URL:
+      </p>
+      <p class="url">https://github.com/DiverseInc/DepthSight/archive/&lt;commit&gt;.tar.gz</p>
       <p class="note">
-        That version number identifies the release line, not one particular commit, and the
-        running service does not print a commit id. The archive above is the tip of the branch, so
-        it can be a little ahead of the build you are talking to. If you need the exact commit
-        behind the deployment you are using, ask us by email (below) and we will send you the
-        source code for that commit.
+        The archive that URL gives you back is the exact tree of the running build. The archive
+        link further up this page is the tip of the <code>main</code> branch, so it can be a
+        little ahead of the build you are talking to; the <code>commit</code> field of the
+        status page is how you get the build you are talking to. If you would rather have it
+        sent to you, the email request below works too.
       </p>
     </div>
 
@@ -164,18 +171,20 @@
     <h2>Requesting the source code by email</h2>
     <div class="card">
       <p>
-        If you would rather have the source code by email, or you need the exact commit for your
-        deployment, write to us:
+        If you would rather have the source code by email, write to us:
       </p>
       <p class="url"><a href="mailto:support@diverseinc.net?subject=AGPL%20source%20request">support@diverseinc.net</a></p>
       <p>
         Please put <b>AGPL source request</b> in the subject line and tell us the version number
-        you are running (the <code>version</code> field of the status page above). We will send
-        you the source code, free of charge.
+        you are running (the <code>version</code> field of the status page above), and the
+        <code>commit</code> field if you want the exact build. We will send you the source code
+        for that commit, free of charge.
       </p>
       <p class="note">
-        This offer applies for as long as this service is running. If the service is ever
-        discontinued, the source code stays published in the repository above.
+        This is a convenience on top of the links above: the source of the exact build you are
+        running is already public and needs no request. This offer applies for as long as this
+        service is running. If the service is ever discontinued, the source code stays published
+        in the repository above.
       </p>
     </div>
 
