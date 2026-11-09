@@ -19,7 +19,9 @@
     "K, L and M are the LIVE-TRADING DISCLOSURE the curated headline had dropped: Managed may trade live on all six venues (allow_real_trading, api/routes/strategies.py:538-554), Standard and Professional both say so on the page, and the $499 card must say it too.",
     "K and M target the MANAGED card and carry its own preceding bullet, because the Standard and Professional cards carry a byte-identical venue line and the Standard card comes FIRST: an ambiguous needle silently mutated the wrong card. N removes the disclosure from the STANDARD card on purpose -- it is killed only by the pre-existing guard test_a_tier_that_may_trade_everywhere_says_so, which is why the harness target now includes tests/test_public_pricing_matches_catalog.py.",
     "O and P are the BILLING-MODE GUARD: the $499 Managed tier is a monthly service and its one-off block is switched off, so the server must refuse a purchase in that mode (O) and the billing page must not offer the tier there (P).",
-    "Q and R are the CURATED HEADLINE against the DERIVED ENTITLEMENTS: the headline claims unlimited optimization runs and 100 live strategies, so taking either away must make the pricing guard fail."
+    "Q and R are the CURATED HEADLINE against the DERIVED ENTITLEMENTS: the headline claims unlimited optimization runs and 100 live strategies, so taking either away must make the pricing guard fail.",
+    "S is the CATALOG AVAILABILITY GUARD: a tier the server refuses to sell in the active billing mode must not be in the catalog, so reverting the guard must put the $499 Managed tier back into the one-off catalog.",
+    "T, U and V are the CURATED HEADLINE CLASSIFICATION: every bullet is either entitlement-backed (proven from the plan) or service-copy (pinned word for word), so T (the platform stops routing to BingX), U (the service promise is reworded) and V (another tier outranks Managed in the queue) must each make the pricing guard fail."
   ],
   "pytest_target": "tests/test_managed_499_tier.py tests/test_public_pricing_matches_catalog.py",
   "timeout_s": 1800,
@@ -131,6 +133,30 @@
       "file": "api/plans_config.yml",
       "needle": "      max_live_strategies: 100\n",
       "replace": "      max_live_strategies: 50\n"
+    },
+    {
+      "label": "S: the catalog stops hiding a tier the server refuses to sell",
+      "file": "api/plans.py",
+      "needle": "        if not plans_config.is_billing_mode_available(key, billing_mode):\n            continue\n",
+      "replace": "        if False:\n            continue\n"
+    },
+    {
+      "label": "T: the platform stops routing to BingX while the card still names it",
+      "file": "bot_module/exchanges/common.py",
+      "needle": "    return (\"binance\", \"bybit\", \"gateio\", \"okx\", \"bitget\", \"kucoin\", \"bingx\")",
+      "replace": "    return (\"binance\", \"bybit\", \"gateio\", \"okx\", \"bitget\", \"kucoin\")"
+    },
+    {
+      "label": "U: the managed service promise is reworded",
+      "file": "api/plans_config.yml",
+      "needle": "      - \"We deploy, monitor and adjust your strategies within your risk limits\"\n",
+      "replace": "      - \"We deploy, monitor and adjust your strategies inside your risk limits\"\n"
+    },
+    {
+      "label": "V: the Free tier outranks Managed in the task queue",
+      "file": "api/plans_config.yml",
+      "needle": "      celery_task_priority: 9\n",
+      "replace": "      celery_task_priority: -1\n"
     }
   ]
 }

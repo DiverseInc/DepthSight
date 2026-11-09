@@ -471,6 +471,21 @@ def build_plan_catalog(include_inactive: bool = False) -> dict:
         if not include_inactive and not config.get("active", False):
             continue
 
+        # A tier the server REFUSES to sell in the ACTIVE billing mode must
+        # not be published. The public pricing API returns this catalog
+        # verbatim (api/routes/public.py:25-36), so a tier listed here is
+        # advertised on the pricing page -- while the purchase endpoint
+        # answers a purchase of it with HTTP 400
+        # (api/routes/payments.py:115-122).
+        #
+        # The $499 Managed tier is the case in point: it is a monthly
+        # service and its one-off block is switched off
+        # (`billing.lifetime.enabled: false`), so in a one-off deployment it
+        # is not sold at all. A tier that cannot be bought must not be
+        # advertised.
+        if not plans_config.is_billing_mode_available(key, billing_mode):
+            continue
+
         plan_billing = config.get("billing", {}) or {}
         effective_price = plans_config.get_effective_plan_price(key)
 

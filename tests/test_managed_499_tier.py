@@ -144,6 +144,12 @@ class TestTheManagedTierIsInTheCatalog:
 
         The catalog is rebuilt with `billing.mode` set to each mode in turn,
         so BOTH branches of `lifetimePriceFor` are exercised for real.
+
+        In a one-off deployment the tier is not merely priceless: the
+        catalog does not list it AT ALL, because the purchase endpoint
+        refuses to sell it there (api/routes/payments.py:115-122) and a tier
+        that cannot be bought must not be advertised. That is a STRONGER
+        statement than "it has no one-off price", so this test asserts it.
         """
         source = yaml.safe_load(PLANS_CONFIG.read_text(encoding="utf-8"))
         for mode in ("monthly", "lifetime"):
@@ -154,17 +160,22 @@ class TestTheManagedTierIsInTheCatalog:
                 encoding="utf-8",
             )
             monkeypatch.setattr(plans_module, "plans_config", PlansConfig(path))
-            managed = next(
-                plan
-                for plan in build_plan_catalog()["plans"]
-                if plan["key"] == "managed"
-            )
-            assert managed["billing_mode"] == mode
-            assert _lifetime_price_or_none(managed) is None, (
-                f"the Managed tier advertises a one-off price in {mode} mode"
-            )
-            # And it is still the monthly price that is charged.
-            assert managed["price_usd"] == 499
+            published = build_plan_catalog()["plans"]
+            if mode == "monthly":
+                managed = next(
+                    plan for plan in published if plan["key"] == "managed"
+                )
+                assert managed["billing_mode"] == mode
+                assert _lifetime_price_or_none(managed) is None, (
+                    f"the Managed tier advertises a one-off price in {mode} mode"
+                )
+                # And it is still the monthly price that is charged.
+                assert managed["price_usd"] == 499
+            else:
+                assert "managed" not in [plan["key"] for plan in published], (
+                    "the catalog advertises the Managed tier in a one-off "
+                    "deployment, where the purchase endpoint refuses to sell it"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +771,42 @@ class TestTheManagedTierIsNeverSoldAsAOneOffLicence:
             "the billing page offers a tier the server refuses to sell"
         )
         assert "standard" in keys and "pro" in keys
+
+    async def test_the_billing_page_does_not_trust_the_catalog_to_have_filtered(
+        self, monkeypatch, payments_module, monthly_config
+    ):
+        """The endpoint's OWN guard, tested on its own.
+
+        The catalog now drops a tier the server refuses to sell, and the
+        billing page re-checks the same rule for itself. That makes the
+        billing page's own re-check INVISIBLE through the real catalog:
+        remove it and the page is unchanged, because the tier was already
+        gone before the endpoint ever saw it.
+
+        Defence in depth is worth having, and it rots if nothing pins it. So
+        the endpoint is handed a catalog that HAS published the tier -- the
+        way a catalog without the filter would -- and has to drop it itself.
+        """
+        _install_plans_config(monkeypatch, monthly_config)
+
+        published = build_plan_catalog()
+        assert "managed" in {plan["key"] for plan in published["plans"]}, (
+            "this test needs a catalog that HAS published the Managed tier"
+        )
+        published["billing_mode"] = "lifetime"
+        monkeypatch.setattr(
+            payments_module,
+            "build_plan_catalog",
+            lambda *args, **kwargs: published,
+        )
+
+        offered = await payments_module.get_plans(db=None)
+        keys = [plan["key"] for plan in offered]
+
+        assert "managed" not in keys, (
+            "the billing page offered a tier the server refuses to sell, "
+            "because it trusted the catalog to have filtered it"
+        )
 
     async def test_the_billing_page_offers_managed_at_499_a_month(
         self, monkeypatch, payments_module, monthly_config
