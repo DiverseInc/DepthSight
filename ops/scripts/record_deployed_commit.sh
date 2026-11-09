@@ -69,6 +69,44 @@ if [ -n "$DIRTY" ]; then
     exit 1
 fi
 
+# --- the commit must be PUBLISHED ---------------------------------------------
+# The offer points a reader at
+#   https://github.com/DiverseInc/DepthSight/archive/<commit>.tar.gz
+# A commit that was never pushed has no archive there: that URL is a 404, and
+# the page's promise that the commit is public would be false. So refuse to
+# stamp a commit that no pushed ref contains.
+PUBLISHED_REFS=""
+if ! PUBLISHED_REFS=$(git branch -r --contains HEAD 2>/dev/null); then
+    echo "record_deployed_commit: REFUSING to stamp a commit that cannot be checked." >&2
+    echo >&2
+    echo "This checkout's history is too shallow to say whether the commit has" >&2
+    echo "been pushed, so the script cannot promise the reader a working" >&2
+    echo "archive URL for it. Fetch the history and deploy again:" >&2
+    echo >&2
+    echo "  git fetch --unshallow origin" >&2
+    echo >&2
+    echo "NOTHING HAS BEEN CHANGED OR DELETED BY THIS SCRIPT." >&2
+    exit 1
+fi
+
+if [ -z "$PUBLISHED_REFS" ]; then
+    echo "record_deployed_commit: REFUSING to stamp a commit that is not published." >&2
+    echo >&2
+    echo "The source offer points readers at the archive of this commit:" >&2
+    echo "  https://github.com/DiverseInc/DepthSight/archive/<commit>.tar.gz" >&2
+    echo "A commit that was never pushed has no archive there -- that URL is a" >&2
+    echo "404, and the page says the commit is public." >&2
+    echo >&2
+    echo "No pushed branch contains this commit. The pushed branches are:" >&2
+    git branch -r >&2
+    echo >&2
+    echo "  git push origin HEAD:main   # publish it, then deploy again" >&2
+    echo "  git fetch origin && git reset --hard origin/main   # or deploy a published commit" >&2
+    echo >&2
+    echo "NOTHING HAS BEEN CHANGED OR DELETED BY THIS SCRIPT." >&2
+    exit 1
+fi
+
 # --- the environment file must already exist --------------------------------
 # It holds the live secrets and is gitignored, so it is the operator's file,
 # not this script's. Creating a stub .env with nothing but the stamp would

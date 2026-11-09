@@ -21,11 +21,26 @@ review panel on 2026-11-07, both fixed by `ops/scripts/record_deployed_commit.sh
    `DEPLOYED_COMMIT` line written into `.env` travels WITH the container and
    comes back out of `GET /api/v1/status` as the `commit` field.
 
+3. The stamped commit has to EXIST IN THE PUBLIC REPOSITORY. The offer points
+   a reader at
+   `https://github.com/DiverseInc/DepthSight/archive/<commit>.tar.gz`
+   and tells them it is public. A commit that was never pushed has no archive
+   there -- that URL is a 404, and the claim is false. The manual deploy path
+   is `git pull origin main` with no `git reset --hard`, so a local commit or a
+   non-fast-forward merge leaves HEAD unpushed. The script therefore refuses to
+   stamp a commit that no pushed ref contains.
+
 WHAT IS TESTED HERE
 -------------------
 The REAL script, run in a throwaway git repository, under a real bash. A copy
 of the logic in the test would prove nothing about the script (AGENTS.md:
 "Verify against the real function, not a reimplementation").
+
+The throwaway repository has a REAL bare repository as `origin` and the
+commit under test is really PUSHED to it, because the script now refuses to
+stamp a commit that is not published: a repository with no remote would be
+refused for the wrong reason and every "it stamps correctly" test would be
+testing the refusal instead of the stamp.
 
 Every behavioural assertion below was MEASURED against the real script on
 LINUX, which is the platform it runs on (Elestio, CI). That matters: Git
@@ -56,7 +71,13 @@ REFUSAL = "REFUSING to stamp a checkout that is not the committed tree"
 # the repository; it never writes to it. Anything else -- `clean`, `checkout`,
 # `reset`, `stash`, `rm`, `push` -- destroys work, and this script's whole
 # job is to refuse rather than to "help".
-ALLOWED_GIT_SUBCOMMANDS = frozenset({"rev-parse", "status"})
+#
+# `branch` is here because the script has to know whether the commit is
+# PUBLISHED, and `git branch -r --contains HEAD` is how it asks: it LISTS
+# remote-tracking branches that contain the commit and changes nothing.
+# (`git branch -r` with no other verb is a listing; the script never creates,
+# renames or deletes a branch.)
+ALLOWED_GIT_SUBCOMMANDS = frozenset({"rev-parse", "status", "branch"})
 
 
 # --------------------------------------------------------------------------
@@ -119,7 +140,12 @@ def _script_bytes() -> bytes:
     return SCRIPT.read_bytes()
 
 
-def _drive(setup: str = "", runs: int = 1, make_repo: bool = True) -> dict:
+def _drive(
+    setup: str = "",
+    runs: int = 1,
+    make_repo: bool = True,
+    publish: str = "published",
+) -> dict:
     """Run the REAL script in a throwaway git repository and report what happened.
 
     The script is fed to bash over STDIN as BYTES:
@@ -132,11 +158,23 @@ def _drive(setup: str = "", runs: int = 1, make_repo: bool = True) -> dict:
     nothing depends on how the host translates paths. The script runs in a
     SUBSHELL: it calls `exit 1` when it refuses, and that must be the script's
     exit code, not the shell's.
+
+    `publish` says how the commit under test relates to the remote:
+      * "published"  -- a bare repository is created as `origin` and the commit
+        is really PUSHED to it, so the commit IS published;
+      * "unpushed"   -- the same remote exists, but a LATER commit (the one
+        HEAD points at) was never pushed, so the commit is not published;
+      * "no-remote"  -- there is no remote at all.
+
+    The default is "published" because the script refuses to stamp a commit
+    that no pushed ref contains: without a real remote, every "it stamps
+    correctly" test below would be testing the REFUSAL instead of the stamp.
     """
     body = (
         "set -u\n"
         'WORK=$(mktemp -d) || exit 1\n'
-        "trap 'rm -rf \"$WORK\"' EXIT\n"
+        'ORIGIN_BASE=$(mktemp -d) || exit 1\n'
+        "trap 'rm -rf \"$WORK\" \"$ORIGIN_BASE\"' EXIT\n"
         'cd "$WORK" || exit 1\n'
     )
     if make_repo:
@@ -152,10 +190,30 @@ def _drive(setup: str = "", runs: int = 1, make_repo: bool = True) -> dict:
             "printf '.env\\n' > .gitignore\n"
             "git add -A >/dev/null 2>&1\n"
             "git commit -qm first >/dev/null 2>&1\n"
+        )
+        if publish != "no-remote":
+            # A REAL bare repository, pushed to for real: the script asks
+            # `git branch -r --contains HEAD`, and that only means something
+            # when a remote-tracking ref really exists.
+            body += (
+                'git init -q --bare "$ORIGIN_BASE/origin.git" >/dev/null 2>&1\n'
+                'git remote add origin "$ORIGIN_BASE/origin.git"\n'
+                "git push -q origin HEAD:refs/heads/main >/dev/null 2>&1\n"
+                "git fetch -q origin >/dev/null 2>&1\n"
+            )
+        if publish == "unpushed":
+            # A second commit that is NEVER pushed: HEAD points at it, so the
+            # published refs do not contain it.
+            body += (
+                "printf 'print(2)\\n' > app.py\n"
+                "git commit -qam second >/dev/null 2>&1\n"
+            )
+        body += (
             "SHA=$(git rev-parse HEAD)\n"
+            "PUBLISHED=$(git rev-parse origin/main 2>/dev/null || true)\n"
         )
     else:
-        body += "SHA=none\n"
+        body += "SHA=none\nPUBLISHED=none\n"
     body += setup
     # The script, in a subshell, `runs` times.
     for _ in range(runs):
@@ -171,6 +229,7 @@ def _drive(setup: str = "", runs: int = 1, make_repo: bool = True) -> dict:
         "printf 'FILES=%s\\n' \"$(ls -1A \"$WORK\" | tr '\\n' ',')\"\n"
         "printf 'SUBFILES=%s\\n' \"$(ls -1A \"$WORK/sub\" 2>/dev/null | tr '\\n' ',')\"\n"
         "printf 'SHA=%s\\n' \"$SHA\"\n"
+        "printf 'PUBLISHED=%s\\n' \"$PUBLISHED\"\n"
     )
 
     proc = subprocess.run(
@@ -184,7 +243,7 @@ def _drive(setup: str = "", runs: int = 1, make_repo: bool = True) -> dict:
     fields = {}
     for line in out.splitlines():
         key, _sep, value = line.partition("=")
-        if key in ("RC", "ENV", "FILES", "SUBFILES", "SHA"):
+        if key in ("RC", "ENV", "FILES", "SUBFILES", "SHA", "PUBLISHED"):
             fields[key] = value
     env_b64 = fields.get("ENV", "MISSING")
     return {
@@ -196,6 +255,7 @@ def _drive(setup: str = "", runs: int = 1, make_repo: bool = True) -> dict:
         "files": fields.get("FILES", ""),
         "subfiles": fields.get("SUBFILES", ""),
         "sha": fields.get("SHA", ""),
+        "published": fields.get("PUBLISHED", ""),
     }
 
 
@@ -325,6 +385,120 @@ class TestADirtyCheckoutIsRefused:
             f"the stamp script runs git subcommand(s) it must never run: "
             f"{sorted(subcommands - ALLOWED_GIT_SUBCOMMANDS)}"
         )
+
+
+# --------------------------------------------------------------------------
+# The stamped commit must EXIST IN THE PUBLIC REPOSITORY
+# --------------------------------------------------------------------------
+class TestTheStampedCommitMustBePublished:
+    """The offer points a reader at the ARCHIVE of the stamped commit.
+
+    `https://github.com/DiverseInc/DepthSight/archive/<commit>.tar.gz` is a 404
+    for a commit that was never pushed, and the page says the commit is
+    public. The manual deploy path is `git pull origin main` with no
+    `git reset --hard`, so a local commit or a non-fast-forward merge leaves
+    HEAD unpushed -- the failure is ordinary, not exotic.
+    """
+
+    def test_a_pushed_commit_is_stamped(self):
+        """The happy path still works: a commit that IS published is stamped."""
+        result = _drive("printf 'POSTGRES_PASSWORD=secret\\n' > .env\n")
+        assert result["rc"] == 0, result["stderr"]
+        assert result["published"], "the throwaway repository has no published ref"
+        assert result["published"] == result["sha"], (
+            "the pushed commit and HEAD differ, so this test would not be "
+            "testing what it claims to test"
+        )
+        assert f"DEPLOYED_COMMIT={result['published']}\n".encode() in result["env"]
+
+    def test_a_commit_that_was_never_pushed_is_refused(self):
+        """HEAD points at a commit that no pushed ref contains."""
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n", publish="unpushed"
+        )
+        assert result["rc"] == 1, (result["stdout"], result["stderr"])
+        assert "not published" in result["stderr"].lower(), (
+            "the refusal must say the commit is not published; it said: "
+            f"{result['stderr']!r}"
+        )
+
+    def test_the_refusal_of_an_unpublished_commit_writes_nothing(self):
+        """A refusal that still stamped would publish a 404 as the source."""
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n", publish="unpushed"
+        )
+        assert result["rc"] == 1
+        assert result["env"] == b"POSTGRES_PASSWORD=secret\n", (
+            "the refusal rewrote the environment file"
+        )
+        assert b"DEPLOYED_COMMIT=" not in result["env"], (
+            "the refusal wrote a stamp anyway"
+        )
+
+    def test_a_repository_with_no_remote_at_all_is_refused(self):
+        """There is nothing to check against, so nothing may be promised.
+
+        Whether the script reports "cannot be checked" or "not published" is
+        its wording; what matters is the BEHAVIOUR: it refuses, it says why,
+        and it writes nothing.
+        """
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n", publish="no-remote"
+        )
+        assert result["rc"] == 1, (result["stdout"], result["stderr"])
+        assert result["stderr"].strip(), "the refusal printed nothing"
+        low = result["stderr"].lower()
+        assert "commit" in low, (
+            f"the refusal must name the commit it refused to stamp: "
+            f"{result['stderr']!r}"
+        )
+        assert "archive" in low or "publish" in low, (
+            f"the refusal must explain what is wrong with publishing this "
+            f"commit: {result['stderr']!r}"
+        )
+
+    def test_the_refusal_of_a_repository_with_no_remote_writes_nothing(self):
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n", publish="no-remote"
+        )
+        assert result["rc"] == 1
+        assert result["env"] == b"POSTGRES_PASSWORD=secret\n", (
+            "the refusal rewrote the environment file"
+        )
+        assert b"DEPLOYED_COMMIT=" not in result["env"]
+
+    def test_the_published_refusal_comes_before_the_write(self):
+        """The order matters: a commit that is not published must be refused
+        BEFORE anything is stamped."""
+        source = SCRIPT.read_text(encoding="utf-8")
+        refuse_at = source.index("REFUSING to stamp a commit that is not published")
+        write_at = source.index('DEPLOYED_COMMIT=" sha cr')
+        assert refuse_at < write_at, (
+            "the script writes the commit before it refuses an unpublished one"
+        )
+
+    def test_the_published_check_asks_which_refs_contain_the_commit(self):
+        """The check must be about THIS commit, not about the branch name."""
+        source = SCRIPT.read_text(encoding="utf-8")
+        assert "git branch -r --contains HEAD" in source, (
+            "the script must ask which published refs contain the commit it "
+            "is about to stamp"
+        )
+
+    def test_every_branch_call_is_a_read_only_listing(self):
+        """`git branch` can also DELETE a branch (`git branch -D`).
+
+        The allowlist above permits the subcommand because the script has to
+        list the published refs; this pins that it never does anything else
+        with it.
+        """
+        code = _code_only(SCRIPT.read_text(encoding="utf-8"))
+        calls = re.findall(r"git\s+branch[^\n]*", code)
+        assert calls, "the script does not call git branch at all"
+        for call in calls:
+            assert call.startswith("git branch -r"), (
+                f"the script must only LIST remote branches, but it runs {call!r}"
+            )
 
 
 # --------------------------------------------------------------------------

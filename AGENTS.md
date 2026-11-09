@@ -88,6 +88,8 @@ git log -1 --oneline          # MUST show the expected commit, else the pull no-
 bash ops/scripts/record_deployed_commit.sh   # stamps the commit; REFUSES a dirty checkout
 docker compose build --no-cache <changed services>
 docker compose up -d --no-deps <changed services>
+docker compose up -d --no-deps --force-recreate api   # the stamp lives in the api's environment
+docker compose restart caddy                           # caddy.config is bind-mounted; caddy reads it only at startup
 ```
 
 - **`bash ops/scripts/record_deployed_commit.sh` is not optional.** It writes
@@ -98,6 +100,21 @@ docker compose up -d --no-deps <changed services>
   AFTER the pull and BEFORE the build**: the value travels with the container,
   so a failed build leaves the old container reporting the old commit, which
   is the truth.
+- **The `api` service is ALWAYS recreated, even when nothing in it changed.**
+  `env_file` is read when the container is CREATED, so a container that is left
+  running keeps the environment it was created with. On a bot-only deploy the
+  `api` would otherwise keep publishing the PREVIOUS commit while the `bot`
+  already runs the new code -- and the archive the offer points at would not
+  contain the running bot. `--force-recreate` rebuilds nothing; it re-creates
+  the container so it picks up the stamp that was just written.
+- **`caddy` is ALWAYS restarted.** `caddy.config` is bind-mounted
+  (`docker-compose.yml:283`), and caddy reads its Caddyfile only at startup,
+  so `docker compose up -d` does not activate a changed route. `frontend/` is
+  bind-mounted too (`docker-compose.yml:289`), so `welcome.html` goes live the
+  moment the pull lands. Without the restart the site advertises the source
+  offer while `/source` still falls through to the app shell. It is restarted
+  LAST on purpose: the route appears at the same moment the published commit
+  becomes correct, never before.
 - It also **refuses to continue when the checkout is not the committed tree**
   (a modified or untracked file). The image is built from the Docker build
   context while the published source is the committed tree, so a dirty

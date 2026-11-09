@@ -98,8 +98,22 @@ fi
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://depthsight.diverseinc.net}"
 
 source_offer_is_live() {
-    curl -sk --max-time 15 "$PUBLIC_BASE_URL/source" 2>/dev/null | grep -q "DiverseInc/DepthSight"
+    curl -s --max-time 15 "$PUBLIC_BASE_URL/source" 2>/dev/null | grep -q "DiverseInc/DepthSight"
 }
+
+# The offer is a PUBLIC document, so it has to be served over a certificate
+# that verifies. `curl -k` (used for the site-root liveness check below)
+# skips verification, so it cannot tell the real offer from one served
+# through an impersonated certificate. This check verifies, and it reports
+# its OWN failure, so a broken certificate is never reported to the operator
+# as "the offer is missing" -- which would send them looking in the wrong
+# place, or make them restart caddy for no reason.
+if ! curl -s --max-time 15 -o /dev/null "$PUBLIC_BASE_URL/source" 2>/dev/null; then
+    echo -e "${RED}[!] The TLS certificate at $PUBLIC_BASE_URL did not verify${NC}"
+    echo -e "${RED}[!] The source offer cannot be served publicly over an unverified certificate${NC}"
+    echo -e "${RED}[!] Check the certificate, and check that this host has a CA bundle (ca-certificates)${NC}"
+    exit 1
+fi
 
 # The rest of the site has to answer too. A caddy restart that leaves the
 # whole site down must not be reported as a successful deploy, so the root

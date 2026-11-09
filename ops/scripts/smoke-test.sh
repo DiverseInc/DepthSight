@@ -77,22 +77,36 @@ FAIL=0
         fi
     fi
 
-    # 5. The AGPL-3.0 section 13 source offer must be reachable.
+    # 5. The AGPL-3.0 section 13 source offer must be reachable AND served
+    #    over a certificate that verifies.
     #
-    # A 200 on /source is NOT enough: when the Caddy route is missing the
-    # path falls through to the React SPA catch-all, which also answers
-    # 200 with the app shell. The BODY is therefore checked for the
-    # repository address the offer has to carry, so a broken route is
-    # reported instead of looking healthy.
-    SOURCE_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 10 "$DOMAIN/source" 2>/dev/null || echo "000")
-    if [ "$SOURCE_CODE" != "200" ]; then
-        echo "  [FAIL] GET $DOMAIN/source -> $SOURCE_CODE (source offer unreachable)"
+    #    A 200 on /source is NOT enough: when the Caddy route is missing the
+    #    path falls through to the React SPA catch-all, which also answers
+    #    200 with the app shell. The BODY is therefore checked for the
+    #    repository address the offer has to carry, so a broken route is
+    #    reported instead of looking healthy.
+    #
+    #    The liveness checks above use `curl -k` ON PURPOSE: they ask "is the
+    #    server answering", and a certificate problem must not make a healthy
+    #    site look dead. This check asks a different question -- "is the PUBLIC
+    #    offer being served properly" -- and a check that skips certificate
+    #    verification cannot tell the real offer from one served through an
+    #    impersonated certificate. So this one verifies, and a certificate
+    #    failure is reported as itself rather than as "unreachable".
+    if ! curl -s -o /dev/null --max-time 10 "$DOMAIN/source" 2>/dev/null; then
+        echo "  [FAIL] GET $DOMAIN/source -> the TLS certificate did not verify"
         FAIL=1
-    elif curl -sk --max-time 10 "$DOMAIN/source" 2>/dev/null | grep -q "DiverseInc/DepthSight"; then
-        echo "  [ok] GET $DOMAIN/source -> 200 (source offer served)"
     else
-        echo "  [FAIL] GET $DOMAIN/source -> 200 but the source offer was not served"
-        FAIL=1
+        SOURCE_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$DOMAIN/source" 2>/dev/null || echo "000")
+        if [ "$SOURCE_CODE" != "200" ]; then
+            echo "  [FAIL] GET $DOMAIN/source -> $SOURCE_CODE (source offer unreachable)"
+            FAIL=1
+        elif curl -s --max-time 10 "$DOMAIN/source" 2>/dev/null | grep -q "DiverseInc/DepthSight"; then
+            echo "  [ok] GET $DOMAIN/source -> 200 (source offer served over a verified certificate)"
+        else
+            echo "  [FAIL] GET $DOMAIN/source -> 200 but the source offer was not served"
+            FAIL=1
+        fi
     fi
 
     # This whole block is piped into tee, so it runs in a SUBSHELL and a

@@ -69,6 +69,14 @@ STAMP_SCRIPT = "ops/scripts/record_deployed_commit.sh"
 # manual path silently leaves the commit unstamped.
 STAMP_INVOCATION = f"bash {STAMP_SCRIPT}"
 
+# The MANUAL deploy sequence in AGENTS.md has to RE-CREATE the api service and
+# RESTART caddy, and it has to do so in that order. Both commands are pinned
+# as whole lines, because a weakened variant (`up -d` without
+# `--force-recreate`, `restart` of some other service) would read the same in
+# a loose substring search.
+RECREATE_API = "docker compose up -d --no-deps --force-recreate api"
+RESTART_CADDY = "docker compose restart caddy"
+
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -116,6 +124,19 @@ def _run_bash(body: str) -> str:
         f"stdout:\n{stdout}\nstderr:\n{stderr}"
     )
     return stdout
+
+
+def _manual_deploy_block(agents: str) -> str:
+    """The MANUAL deploy sequence in AGENTS.md, as the shell block it is.
+
+    Scoped to that one fenced block on purpose: the prose around it explains
+    the commands and may legitimately name them, and a search over the whole
+    document would pin the WRONG thing.
+    """
+    start = agents.index("## Deploying to Elestio")
+    fence = agents.index("```bash", start)
+    end = agents.index("```", fence + len("```bash"))
+    return agents[fence:end]
 
 
 # --------------------------------------------------------------------------
@@ -323,4 +344,90 @@ class TestTheDeployChecksTheWholeSiteAfterTheRestart:
         restarts = set(re.findall(r"docker compose restart\s+(\S+)", script))
         assert restarts == {"caddy"}, (
             f"update.sh restarts {sorted(restarts)}; it must restart caddy only"
+        )
+
+
+# --------------------------------------------------------------------------
+# The MANUAL deploy in AGENTS.md must ACTIVATE what it just published
+# --------------------------------------------------------------------------
+class TestTheManualDeployActivatesTheStampAndTheRoute:
+    """Two MEASURED gaps in the manual deploy sequence (review panel,
+    2026-11-09), both of which made the AGPL offer point at the wrong thing.
+
+    F1 -- the published commit could be STALE.
+      `docker-compose.yml` gives the `api` service `env_file: .env`, and a
+      container's environment is fixed when the container is CREATED. The
+      manual deploy rebuilt and recreated only the services whose files
+      changed, so on a BOT-ONLY deploy the `api` container kept publishing
+      the PREVIOUS `DEPLOYED_COMMIT` while the `bot` already ran the new
+      code -- and the archive the offer points at did not contain the running
+      bot. The api service is therefore always RE-CREATED, so it picks up the
+      stamp that was just written.
+
+    F2 -- the new `/source` route never activated.
+      `caddy.config` is bind-mounted into the caddy container
+      (`docker-compose.yml:283`) and caddy reads its Caddyfile only at
+      startup, so `docker compose up -d` does not activate a changed route.
+      `frontend/` is bind-mounted too (`docker-compose.yml:289`), so
+      `welcome.html` goes live the moment the pull lands and starts
+      advertising the offer. Without a restart the site advertised `/source`
+      while `/source` still fell through to the React SPA catch-all. Caddy is
+      therefore always RESTARTED -- LAST, on purpose, so the route appears at
+      the same moment the published commit becomes correct and never before.
+    """
+
+    @pytest.fixture(scope="class")
+    def block(self) -> str:
+        agents = AGENTS_MD.read_text(encoding="utf-8")
+        return _manual_deploy_block(agents)
+
+    def test_the_manual_deploy_recreates_the_api_service(self, block: str):
+        """The stamp lives in the api's ENVIRONMENT, so the api container has
+        to be re-created for the new value to exist inside it."""
+        assert RECREATE_API in block, (
+            "the manual deploy must re-create the api service ("
+            + RECREATE_API
+            + "); a container keeps the environment it was created with"
+        )
+
+    def test_the_manual_deploy_restarts_caddy(self, block: str):
+        """caddy reads its bind-mounted Caddyfile only at startup."""
+        assert RESTART_CADDY in block, (
+            "the manual deploy must restart caddy (" + RESTART_CADDY + "); "
+            "otherwise the new /source route never activates"
+        )
+
+    def test_the_api_recreate_comes_after_the_stamp(self, block: str):
+        """The container must be re-created AFTER the value is written.
+
+        The other way round the container would pick up the PREVIOUS value,
+        and the offer would point at the commit before this deploy.
+        """
+        call = block.index(STAMP_INVOCATION)
+        recreate = block.index(RECREATE_API)
+        assert call < recreate, (
+            f"the api must be re-created AFTER the stamp (at {call}); the "
+            f"re-create is at {recreate}"
+        )
+
+    def test_the_caddy_restart_comes_after_the_api_recreate(self, block: str):
+        """The route appears at the same moment the published commit becomes
+        correct -- never before. That ordering is deliberate."""
+        recreate = block.index(RECREATE_API)
+        restart = block.index(RESTART_CADDY)
+        assert recreate < restart, (
+            f"caddy must be restarted AFTER the api is re-created (at "
+            f"{recreate}); the restart is at {restart}"
+        )
+
+    def test_the_manual_deploy_never_discards_the_operator_s_work(self, block: str):
+        """The deploy must not silently throw work away.
+
+        The stamp REFUSES a dirty checkout instead, which is the safe
+        behaviour: it stops and says what is wrong, and the operator decides.
+        `git reset --hard` in the deploy would destroy that decision.
+        """
+        assert "git reset --hard" not in block, (
+            "the manual deploy must not run `git reset --hard`; the stamp "
+            "refuses a dirty checkout instead of discarding it"
         )

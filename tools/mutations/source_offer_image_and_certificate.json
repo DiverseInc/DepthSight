@@ -1,0 +1,74 @@
+{
+  "_comment": [
+    "Mutations that put the review-panel findings BACK into the branch.",
+    "",
+    "The review panel on 891aeb5 returned HOLD: 4 of the 4 engines that",
+    "answered said YES. Every finding below was MEASURED in the code by the",
+    "parent before it was treated as real.",
+    "",
+    "FINDING 1 (opencode, claude): the image is built from the Docker build",
+    "CONTEXT (`COPY . .`) while the AGPL-3.0 section 13 offer publishes the",
+    "COMMITTED tree. `git status --porcelain` -- what the deploy stamp uses to",
+    "refuse a dirty checkout -- does NOT list ignored files, so a file git",
+    "ignores was invisible to the stamp and still copied into the image.",
+    "Measured before the fix: 30 of the 46 positive .gitignore patterns had no",
+    "covering .dockerignore pattern, and 48 of the 451 git-ignored files",
+    "present in the tree would have been copied in -- including the review",
+    "panel's own transcripts and the full review.diff. The credential-copy",
+    "class was the sharp end of it: .gitignore closes .env, .env.*, .env_*",
+    "and .env-* (dot, underscore AND hyphen), while .dockerignore had only",
+    "the first two, so a .env_backup would have been baked into an image",
+    "layer.",
+    "",
+    "FINDING 2 (dsh): the deploy gate and the smoke test both decided 'is the",
+    "source offer live?' with `curl -sk`. Skipping certificate verification",
+    "means neither check can tell the real offer from one served through an",
+    "impersonated certificate. The live certificate was measured directly: a",
+    "valid Let's Encrypt certificate for depthsight.diverseinc.net, notAfter",
+    "2027-01-12, TLS 1.3, verification SUCCEEDS -- so the -k was never",
+    "needed. The ops sidecar needed a CA bundle to verify at all, so",
+    "ca-certificates is now installed explicitly in ops/Dockerfile.",
+    "",
+    "Every needle below occurs EXACTLY ONCE in its target file (asserted",
+    "before use by tests/test_deployed_commit_mutation_needles.py, which",
+    "covers both deployed-commit specs and every mutation in them).",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/source_offer_image_and_certificate.json",
+    "NEVER run concurrently with a test run or a reviewer -- both will read a",
+    "file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_dockerignore_covers_gitignore.py tests/test_the_offer_is_served_over_a_verified_certificate.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: the credential-copy class loses its underscore separator, so a .env_backup enters the image",
+      "file": ".dockerignore",
+      "needle": ".env_*\n.env-*",
+      "replace": ".env-*"
+    },
+    {
+      "label": "M2: the review panel's transcripts and review.diff are no longer excluded from the image",
+      "file": ".dockerignore",
+      "needle": ".review/",
+      "replace": "# .review/"
+    },
+    {
+      "label": "M3: the smoke test skips certificate verification again, so it cannot tell the real offer from an impersonated one",
+      "file": "ops/scripts/smoke-test.sh",
+      "needle": "curl -s -o /dev/null --max-time 10 \"$DOMAIN/source\" 2>/dev/null",
+      "replace": "curl -sk -o /dev/null --max-time 10 \"$DOMAIN/source\" 2>/dev/null"
+    },
+    {
+      "label": "M4: the deploy gate's certificate check never fires, so a broken certificate is reported as a missing offer",
+      "file": "update.sh",
+      "needle": "if ! curl -s --max-time 15 -o /dev/null \"$PUBLIC_BASE_URL/source\" 2>/dev/null; then",
+      "replace": "if false; then"
+    },
+    {
+      "label": "M5: the ops sidecar loses its CA bundle, so the smoke test cannot verify a certificate even if it tries to",
+      "file": "ops/Dockerfile",
+      "needle": "        ca-certificates \\\n",
+      "replace": "        # ca-certificates removed \\\n"
+    }
+  ]
+}

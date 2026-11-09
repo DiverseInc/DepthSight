@@ -99,3 +99,56 @@ data/
 *.sqlite3
 *.csv
 data_storage/
+
+# ---------------------------------------------------------------------------
+# THE RULE: nothing that .gitignore excludes may enter the image.
+#
+# The image is built from the Docker build CONTEXT (`COPY . .`), while the
+# AGPL-3.0 section 13 offer publishes the COMMITTED tree. Anything git
+# ignores is invisible to `git status --porcelain` -- so the deploy stamp's
+# dirty check passes -- but it is still copied into the image. That would
+# make the offer's promise ("the archive is the exact tree of the running
+# build") false, and it could bake a credential copy into an image layer.
+#
+# tests/test_dockerignore_covers_gitignore.py enforces the rule: every
+# pattern .gitignore excludes must also be excluded here.
+# ---------------------------------------------------------------------------
+# Credential copies: .gitignore closes .env, .env.*, .env_* and .env-* (all
+# three separators). .env.* alone was here, so a .env_backup or a
+# .env-backup was gitignored yet still visible to the build context.
+.env_*
+.env-*
+**/.env_*
+**/.env-*
+# Other credential-ish and data-ish artifacts.
+*.sqlite
+*.pkl
+*.parquet
+*.sql
+*.err
+*.log*
+*.bak-*
+credentials*.json
+**/credentials*.json
+# Local scratch and tool output.
+scratch/
+.scratch/
+md/
+extracted_strategies/
+found_strategies_mtf/
+.agent/
+.review/
+check.txt
+.prepush_pytest_output.txt
+docker-compose.legacy.yml
+data_storage_old/
+# Rust and ML working directories.
+depth_sight_hft/
+catboost_info/
+perfomance_test/
+performance_result/
+# Node dependencies: the root context must not carry another service's
+# node_modules. (The pwa image builds from ./pwa, so this does not affect
+# the pwa build itself.)
+pwa/node_modules/
+
