@@ -1,0 +1,162 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantees added by the $499 'Managed' tier",
+    "(owner decision 2026-11-04).",
+    "",
+    "A is the price the tier is sold at. B is the PRO-block gate in",
+    "api/plans.py. C is the alias resolution in PlansConfig.get_plan -- the",
+    "`premium` rows must keep working. D and H are the two halves of the",
+    "A3 suppression: D stops derive_entitlements from consulting the",
+    "deferred list, H empties the list itself. E is the tier ladder, where",
+    "`premium` must stay on the same rung as `managed`. F and G are the",
+    "marketing page: the price the Managed card shows, and the false",
+    "'Portfolio backtesting' claim coming back.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/managed_499_tier.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "I and J are the CURATED HEADLINE: a hand-written summary on the $499 card. Its numbers must be checked against the raw plan, so I (200 live strategies instead of 100) and J (the old wording) must both be killed.",
+    "K, L and M are the LIVE-TRADING DISCLOSURE the curated headline had dropped: Managed may trade live on all six venues (allow_real_trading, api/routes/strategies.py:538-554), Standard and Professional both say so on the page, and the $499 card must say it too.",
+    "K and M target the MANAGED card and carry its own preceding bullet, because the Standard and Professional cards carry a byte-identical venue line and the Standard card comes FIRST: an ambiguous needle silently mutated the wrong card. N removes the disclosure from the STANDARD card on purpose -- it is killed only by the pre-existing guard test_a_tier_that_may_trade_everywhere_says_so, which is why the harness target now includes tests/test_public_pricing_matches_catalog.py.",
+    "O and P are the BILLING-MODE GUARD: the $499 Managed tier is a monthly service and its one-off block is switched off, so the server must refuse a purchase in that mode (O) and the billing page must not offer the tier there (P).",
+    "Q and R are the CURATED HEADLINE against the DERIVED ENTITLEMENTS: the headline claims unlimited optimization runs and 100 live strategies, so taking either away must make the pricing guard fail.",
+    "S is the CATALOG AVAILABILITY GUARD: a tier the server refuses to sell in the active billing mode must not be in the catalog, so reverting the guard must put the $499 Managed tier back into the one-off catalog.",
+    "T, U and V are the CURATED HEADLINE CLASSIFICATION: every bullet is either entitlement-backed (proven from the plan) or service-copy (pinned word for word), so T (the platform stops routing to BingX), U (the service promise is reworded) and V (another tier outranks Managed in the queue) must each make the pricing guard fail."
+  ],
+  "pytest_target": "tests/test_managed_499_tier.py tests/test_public_pricing_matches_catalog.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the Managed tier is priced at $490 instead of $499",
+      "file": "api/plans_config.yml",
+      "needle": "  managed:\n    name: \"Managed\"\n    price_usd: 499\n",
+      "replace": "  managed:\n    name: \"Managed\"\n    price_usd: 490\n"
+    },
+    {
+      "label": "B: managed is no longer a PRO-block plan",
+      "file": "api/plans.py",
+      "needle": "_PRO_BLOCK_PLANS = (\"pro\", \"managed\", \"institutional\")",
+      "replace": "_PRO_BLOCK_PLANS = (\"pro\", \"institutional\")"
+    },
+    {
+      "label": "C: get_plan no longer resolves the premium alias",
+      "file": "api/plans.py",
+      "needle": "        self._reload_if_changed()\n        key = self.resolve_plan_key(plan_name)\n        return self._plans.get(key, {\"permissions\": [], \"quotas\": {}})\n",
+      "replace": "        self._reload_if_changed()\n        key = plan_name\n        return self._plans.get(key, {\"permissions\": [], \"quotas\": {}})\n"
+    },
+    {
+      "label": "D: derive_entitlements ignores the deferred-permission list",
+      "file": "api/plans.py",
+      "needle": "        if permission in deferred_permissions:\n",
+      "replace": "        if False and permission in deferred_permissions:\n"
+    },
+    {
+      "label": "E: the premium rung is lowered below managed",
+      "file": "frontend/src/pages/CommunityHub.tsx",
+      "needle": "\t\tmanaged: 3,\n\t\tpremium: 3,\n",
+      "replace": "\t\tmanaged: 3,\n\t\tpremium: 2,\n"
+    },
+    {
+      "label": "F: the marketing page prices the Managed card at $490",
+      "file": "frontend/welcome.html",
+      "needle": "<div class=\"amt\">$499<small> /month</small></div>",
+      "replace": "<div class=\"amt\">$490<small> /month</small></div>"
+    },
+    {
+      "label": "G: the marketing page advertises Portfolio backtesting on Standard again",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>Strategy backtesting</li>\n          <li>Saved strategies</li>\n",
+      "replace": "          <li>Strategy backtesting</li>\n          <li>Portfolio backtesting</li>\n          <li>Saved strategies</li>\n"
+    },
+    {
+      "label": "H: the config's deferred-permission list is emptied",
+      "file": "api/plans_config.yml",
+      "needle": "deferred_permissions:\n  - run_portfolio_backtest\n",
+      "replace": "deferred_permissions: []\n"
+    },
+    {
+      "label": "I: the Managed headline claims 200 live strategies instead of 100",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>100 live strategies (Professional has 30)</li>\n",
+      "replace": "          <li>200 live strategies (Professional has 30)</li>\n"
+    },
+    {
+      "label": "J: the Managed card reverts to the old 'Managed service.' wording",
+      "file": "frontend/welcome.html",
+      "needle": "<p class=\"desc\">We deploy, monitor and adjust your strategies inside the risk limits you set.</p>",
+      "replace": "<p class=\"desc\">Managed service. We deploy, monitor and adjust your strategies inside the risk limits you set.</p>"
+    },
+    {
+      "label": "K: the Managed card drops the all-venues live-trading disclosure",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>Highest queue priority, 20 concurrent tasks</li>\n          <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>\n",
+      "replace": "          <li>Highest queue priority, 20 concurrent tasks</li>\n"
+    },
+    {
+      "label": "L: the catalog's Managed headline drops the all-venues disclosure",
+      "file": "api/plans_config.yml",
+      "needle": "      - \"Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)\"\n",
+      "replace": ""
+    },
+    {
+      "label": "M: the Managed card names only three of the six venues",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>Highest queue priority, 20 concurrent tasks</li>\n          <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>\n",
+      "replace": "          <li>Highest queue priority, 20 concurrent tasks</li>\n          <li>Live trading on all three exchanges (OKX, Binance, Bybit)</li>\n"
+    },
+    {
+      "label": "N: the STANDARD card drops the all-venues live-trading disclosure",
+      "file": "frontend/welcome.html",
+      "needle": "          <li>Strategy backtesting</li>\n          <li>Saved strategies</li>\n          <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>\n",
+      "replace": "          <li>Strategy backtesting</li>\n          <li>Saved strategies</li>\n"
+    },
+    {
+      "label": "O: the server stops refusing a purchase in a billing mode the tier is not sold in",
+      "file": "api/routes/payments.py",
+      "needle": "    if not plans_config.is_billing_mode_available(plan_name, billing_mode):\n        raise HTTPException(\n            status_code=400,\n            detail=(\n                f\"The {plan_config.get('name', plan_name)} plan is not \"\n                f\"available for {billing_mode} billing.\"\n            ),\n        )\n",
+      "replace": "    if False:\n        raise HTTPException(\n            status_code=400,\n            detail=(\n                f\"The {plan_config.get('name', plan_name)} plan is not \"\n                f\"available for {billing_mode} billing.\"\n            ),\n        )\n"
+    },
+    {
+      "label": "P: the billing page offers a tier the server refuses to sell",
+      "file": "api/routes/payments.py",
+      "needle": "            if not plans_config.is_billing_mode_available(key, billing_mode):\n                continue\n",
+      "replace": "            if False:\n                continue\n"
+    },
+    {
+      "label": "Q: the Managed tier's unlimited optimization quota becomes 50",
+      "file": "api/plans_config.yml",
+      "needle": "      run_optimization_per_month: -1\n",
+      "replace": "      run_optimization_per_month: 50\n"
+    },
+    {
+      "label": "R: the Managed tier's live-strategy limit becomes 50",
+      "file": "api/plans_config.yml",
+      "needle": "      max_live_strategies: 100\n",
+      "replace": "      max_live_strategies: 50\n"
+    },
+    {
+      "label": "S: the catalog stops hiding a tier the server refuses to sell",
+      "file": "api/plans.py",
+      "needle": "        if not plans_config.is_billing_mode_available(key, billing_mode):\n            continue\n",
+      "replace": "        if False:\n            continue\n"
+    },
+    {
+      "label": "T: the platform stops routing to BingX while the card still names it",
+      "file": "bot_module/exchanges/common.py",
+      "needle": "    return (\"binance\", \"bybit\", \"gateio\", \"okx\", \"bitget\", \"kucoin\", \"bingx\")",
+      "replace": "    return (\"binance\", \"bybit\", \"gateio\", \"okx\", \"bitget\", \"kucoin\")"
+    },
+    {
+      "label": "U: the managed service promise is reworded",
+      "file": "api/plans_config.yml",
+      "needle": "      - \"We deploy, monitor and adjust your strategies within your risk limits\"\n",
+      "replace": "      - \"We deploy, monitor and adjust your strategies inside your risk limits\"\n"
+    },
+    {
+      "label": "V: the Free tier outranks Managed in the task queue",
+      "file": "api/plans_config.yml",
+      "needle": "      celery_task_priority: 9\n",
+      "replace": "      celery_task_priority: -1\n"
+    }
+  ]
+}

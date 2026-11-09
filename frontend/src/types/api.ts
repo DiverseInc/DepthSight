@@ -937,7 +937,7 @@ export interface User {
 	username: string;
 	email: string;
 	createdAt: string;
-	plan: "free" | "standard" | "pro";
+	plan: "free" | "standard" | "pro" | "managed" | "premium";
 	referralCode?: string;
 	role: "admin" | "user" | "affiliate";
 	xp: number;

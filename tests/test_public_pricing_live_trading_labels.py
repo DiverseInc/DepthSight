@@ -62,7 +62,7 @@ PLANS_CONFIG = REPO_ROOT / "api" / "plans_config.yml"
 
 # The tiers the catalog sells, by plan key.
 FREE_KEY = "free"
-PAID_KEYS = ("standard", "pro")
+PAID_KEYS = ("standard", "pro", "managed")
 
 
 # --------------------------------------------------------------------------

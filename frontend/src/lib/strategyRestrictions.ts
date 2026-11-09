@@ -1,5 +1,7 @@
 // src/lib/strategyRestrictions.ts
 
+import { hasProBlockAccess } from "./plans";
+
 export interface BlockRestrictionsConfig {
 	proOnly: string[];
 	klineOnly: string[];
@@ -59,5 +61,5 @@ export const normalizeBlockRestrictions = (
 };
 
 export const hasProPlanAccess = (plan?: string | null): boolean => {
-	return plan === "pro" || plan === "institutional";
+	return hasProBlockAccess(plan);
 };

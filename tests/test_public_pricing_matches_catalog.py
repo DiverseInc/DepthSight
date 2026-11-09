@@ -14,8 +14,8 @@ plans the backend does not sell:
   * a "$29 Pro" tier   -- the backend's top tier is $100 and is called
                           "Professional"; there is no $29 tier at all;
   * a "$99 Team" tier  -- the backend sells NO team tier, no seats and no
-                          RBAC; `api/plans_config.yml` has three plans:
-                          free, standard, pro;
+                          RBAC; `api/plans_config.yml` has four plans:
+                          free, standard, pro, managed;
   * per-tier quotas belonging to no tier -- "100 backtest runs / day" and
                           "500 AI Co-Pilot requests / day" on the $29 card,
                           "Unlimited backtest runs" on the $99 card.
@@ -59,7 +59,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from api.plans import build_plan_catalog
+from api.plans import _QUOTA_ENTITLEMENTS, build_plan_catalog, plans_config
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WELCOME_HTML = REPO_ROOT / "frontend" / "welcome.html"
@@ -73,6 +73,12 @@ FREE_PLAN_KEY = "free"
 # The two backtest engines the catalog sells, as quota keys.
 VECTOR_QUOTA_KEY = "run_vector_backtest_per_day"
 KLINE_QUOTA_KEY = "run_kline_backtest_per_day"
+
+# The entitlement CODE every quota gets in the derived entitlement list.
+# api/plans.py builds it as the quota key with "_per_" turned into "_".
+QUOTA_CODES = tuple(
+    quota_key.replace("_per_", "_") for quota_key, _subject, _period in _QUOTA_ENTITLEMENTS
+)
 
 
 # --------------------------------------------------------------------------
@@ -486,6 +492,476 @@ def _expected_included_labels(plan: dict, raw_plan: dict) -> set:
     return labels
 
 
+# The curated HEADLINE of a curated tier (the $499 Managed service) is PROSE,
+# so it cannot be compared with the derived labels one by one. This table
+# says, for each curated bullet, which DERIVED ENTITLEMENTS the bullet
+# claims. The guard below then proves the claim against the CATALOG: the
+# entitlement must exist, it must be granted, and it must carry the number
+# the bullet states.
+#
+# A curated bullet that is NOT in this table is copy that no entitlement
+# check can verify -- a service promise, or a comparison with another tier.
+# It is pinned by the owner's approved wording in
+# tests/test_managed_499_tier.py::TestTheManagedHeadline.
+CURATED_BULLET_ENTITLEMENTS = {
+    "Unlimited optimization runs, genetic searches and model trainings": (
+        ("run_optimization_month", "Unlimited"),
+        ("run_genetic_search_month", "Unlimited"),
+        ("train_model_month", "Unlimited"),
+    ),
+    "100 live strategies (Professional has 30)": (("live_strategies", "100"),),
+    "Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)": (
+        ("live_trading", "Live trading"),
+    ),
+}
+
+
+def _plan_numbers(raw_plan: dict) -> set:
+    """Every number the plan itself states: its quotas, limits and prices."""
+    numbers = set()
+    for group in ("quotas", "limits"):
+        for value in (raw_plan.get(group) or {}).values():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                numbers.add(int(value))
+    for block in (raw_plan.get("billing") or {}).values():
+        for value in (block or {}).values():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                numbers.add(int(value))
+    price = raw_plan.get("price_usd")
+    if isinstance(price, (int, float)) and not isinstance(price, bool):
+        numbers.add(int(price))
+    return numbers
+
+
+def _curated_claims_the_catalog_does_not_grant(
+    plan: dict, raw_plan: dict, headline: list, raw_plans: dict
+) -> list:
+    """The curated bullets that advertise something the tier does not grant.
+
+    Two checks, both against the CATALOG:
+
+      1. every entitlement a bullet claims must be a DERIVED ENTITLEMENT of
+         the tier, it must be granted, and it must carry the number the
+         bullet states;
+      2. every NUMBER a bullet states must be a number the tier's own plan
+         really holds -- or one held by a tier the bullet names ("Professional
+         has 30").
+
+    This is the strict derived-entitlements guard for a curated tier: the
+    headline is prose, but what it advertises is still checked against the
+    entitlements the catalog derives for the tier.
+    """
+    problems = []
+    entitlements = {entry["code"]: entry for entry in plan["entitlements"]}
+
+    for bullet in headline:
+        for code, stated in CURATED_BULLET_ENTITLEMENTS.get(bullet, ()):
+            entry = entitlements.get(code)
+            if entry is None:
+                problems.append(
+                    "%r claims %r, which the tier does not derive" % (bullet, code)
+                )
+            elif not entry["included"]:
+                problems.append(
+                    "%r claims %r, which the tier does not grant" % (bullet, code)
+                )
+            elif stated not in entry["label"]:
+                problems.append(
+                    "%r states %r but the catalog says %r"
+                    % (bullet, stated, entry["label"])
+                )
+
+        held = _plan_numbers(raw_plan)
+        for other in raw_plans.values():
+            name = other.get("name")
+            if name and name in bullet:
+                held |= _plan_numbers(other)
+        for number in re.findall(r"\d+", bullet):
+            if int(number) not in held:
+                problems.append(
+                    "%r states %s, which no quota, limit or price holds"
+                    % (bullet, number)
+                )
+
+    return problems
+
+
+# Every curated bullet is in EXACTLY ONE of the two sets below. There is no
+# third set and no "unchecked" bullet: the union is asserted against the
+# config's own headline, so a bullet added to api/plans_config.yml without a
+# class FAILS instead of slipping through the guard.
+#
+# ENTITLEMENT-BACKED: the bullet claims something the tier GRANTS, so it can
+# be proven from the plan's permissions, quotas and limits.
+CURATED_ENTITLEMENT_BACKED_BULLETS = frozenset(
+    {
+        "Everything in Professional",
+        "Unlimited optimization runs, genetic searches and model trainings",
+        "100 live strategies (Professional has 30)",
+        "Highest queue priority, 20 concurrent tasks",
+        "Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)",
+    }
+)
+
+# SERVICE-COPY: the bullet is a promise about the SERVICE WE OPERATE. No
+# permission, quota or limit encodes "we deploy, monitor and adjust your
+# strategies": it is what the owner sells, and it is what WE do. It cannot be
+# proven by code, so it is pinned WORD FOR WORD (the constant above IS the
+# approved wording) and it may only be claimed by the managed tier.
+CURATED_SERVICE_COPY_BULLETS = frozenset(
+    {
+        "We deploy, monitor and adjust your strategies within your risk limits",
+    }
+)
+
+# The tier that owns the curated headline. A service-copy bullet promises the
+# managed service, so no other tier may claim it.
+CURATED_TIER_KEY = "managed"
+
+# A limit of -1 means "no limit" everywhere in the config.
+_UNLIMITED = -1
+
+# Celery's task priority is a number where 0 runs BEFORE 9, so for this one
+# limit a LOWER value is a BETTER value. Every other limit is "higher is
+# better".
+_LOWER_IS_BETTER_LIMITS = {"celery_task_priority"}
+
+
+def _quota_value(value):
+    """A quota value, with -1 (unlimited) as the biggest possible number."""
+    if value is None:
+        return None
+    value = float(value)
+    return float("inf") if value == _UNLIMITED else value
+
+
+def _limit_value(key, value):
+    """A limit value; `celery_task_priority` is inverted (lower is better)."""
+    if value is None:
+        return None
+    value = float(value)
+    if key in _LOWER_IS_BETTER_LIMITS:
+        return -value
+    return float("inf") if value == _UNLIMITED else value
+
+
+def _bullet_number(bullet: str, pattern: str):
+    """The number a bullet states, read out of the bullet itself."""
+    match = re.search(pattern, bullet)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _named_plan(raw_plans: dict, name: str):
+    """The raw plan the catalog sells under `name`, or None."""
+    for raw in raw_plans.values():
+        if raw.get("name") == name:
+            return raw
+    return None
+
+
+# --------------------------------------------------------------------------
+# The venues the platform actually routes to
+# --------------------------------------------------------------------------
+# The bullet "Live trading on all six exchanges (OKX, Binance, Bybit, Bitget,
+# Gate.io, BingX)" is a claim about VENUES, so it can be checked against the
+# repo's own source instead of against a hand-written list:
+#
+#   * bot_module/exchanges/common.py::supported_exchange_ids() is the repo's
+#     supported-exchange list. It is CALLED here -- not re-implemented -- so
+#     the check follows the product.
+#   * frontend/src/components/settings/AddApiKeyModal.tsx is where a
+#     customer picks the venue of a live key: the exchange <Select> holds the
+#     venues the product OFFERS. A venue the platform could route to but does
+#     not offer (the exchange factory also accepts "kucoin") is not a venue a
+#     customer can trade on, so naming it in a pricing bullet would be a
+#     false promise.
+ADD_API_KEY_MODAL = (
+    REPO_ROOT / "frontend" / "src" / "components" / "settings" / "AddApiKeyModal.tsx"
+)
+
+_SELECT_ITEM_RE = re.compile(r'<SelectItem value="([^"]+)">([^<]+)</SelectItem>')
+
+_VENUE_COUNT_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+
+def _product_venue_options() -> dict:
+    """{display name: exchange id} for the venues a customer can trade on."""
+    source = ADD_API_KEY_MODAL.read_text(encoding="utf-8")
+    marker = "apiKeys.addModal.exchangeLabel"
+    assert marker in source, (
+        "the add-a-key modal no longer labels the exchange select, so the "
+        "venues a customer can trade on cannot be read"
+    )
+    block = source[source.index(marker):]
+    end = block.find("</SelectContent>")
+    if end != -1:
+        block = block[:end]
+    options = {
+        name.strip().lower(): value.strip()
+        for value, name in _SELECT_ITEM_RE.findall(block)
+    }
+    assert options, "the exchange select of the add-a-key modal is empty"
+    return options
+
+
+def _routed_exchange_ids() -> set:
+    """The exchange ids the platform routes to, from the repo's own source."""
+    from bot_module.exchanges.common import supported_exchange_ids
+
+    return {
+        str(exchange_id).strip().lower()
+        for exchange_id in supported_exchange_ids()
+    }
+
+
+def _venue_names(bullet: str) -> list:
+    """The venues a bullet names, in the order it names them."""
+    match = re.search(r"\(([^()]*)\)", bullet)
+    if not match:
+        return []
+    return [part.strip() for part in match.group(1).split(",") if part.strip()]
+
+
+def _stated_venue_count(bullet: str):
+    """The number of venues a bullet claims ('all six exchanges' -> 6)."""
+    match = re.search(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", bullet, re.I
+    )
+    if not match:
+        return None
+    token = match.group(1).lower()
+    return int(token) if token.isdigit() else _VENUE_COUNT_WORDS[token]
+
+
+def _venue_problems(bullet: str) -> list:
+    """Why a bullet's venue claim is not true of the platform."""
+    problems = []
+    options = _product_venue_options()
+    routed = _routed_exchange_ids()
+
+    names = _venue_names(bullet)
+    if not names:
+        return ["%r names no venue at all" % bullet]
+
+    for name in names:
+        exchange_id = options.get(name.strip().lower())
+        if exchange_id is None:
+            problems.append(
+                "%r names %r, which the product does not offer a live key for"
+                % (bullet, name)
+            )
+        elif exchange_id not in routed:
+            problems.append(
+                "%r names %r (%s), which the platform does not route to"
+                % (bullet, name, exchange_id)
+            )
+
+    stated = _stated_venue_count(bullet)
+    if stated is not None and stated != len(names):
+        problems.append(
+            "%r claims %d venue(s) but names %d" % (bullet, stated, len(names))
+        )
+
+    return problems
+
+
+def _everything_in_professional_problems(raw_plan: dict, raw_plans: dict, bullet: str) -> list:
+    """Why "Everything in <tier>" is not true of this plan."""
+    problems = []
+    match = re.match(r"Everything in (.+)$", bullet)
+    if not match:
+        return ["%r does not name the tier it compares itself with" % bullet]
+
+    name = match.group(1).strip()
+    other = _named_plan(raw_plans, name)
+    if other is None:
+        return [
+            "%r names the tier %r, which the catalog does not sell"
+            % (bullet, name)
+        ]
+
+    mine_permissions = set(raw_plan.get("permissions", []) or [])
+    for permission in other.get("permissions", []) or []:
+        if permission not in mine_permissions:
+            problems.append(
+                "%r claims everything in %s, but the %s permission is missing"
+                % (bullet, name, permission)
+            )
+
+    mine_quotas = raw_plan.get("quotas", {}) or {}
+    for key, value in (other.get("quotas", {}) or {}).items():
+        mine = mine_quotas.get(key)
+        if mine is None:
+            problems.append(
+                "%r claims everything in %s, but the %s quota is missing"
+                % (bullet, name, key)
+            )
+        elif _quota_value(mine) < _quota_value(value):
+            problems.append(
+                "%r claims everything in %s, but the %s quota is %r against %r"
+                % (bullet, name, key, mine, value)
+            )
+
+    mine_limits = raw_plan.get("limits", {}) or {}
+    for key, value in (other.get("limits", {}) or {}).items():
+        mine = mine_limits.get(key)
+        if mine is None:
+            problems.append(
+                "%r claims everything in %s, but the %s limit is missing"
+                % (bullet, name, key)
+            )
+        elif _limit_value(key, mine) < _limit_value(key, value):
+            problems.append(
+                "%r claims everything in %s, but the %s limit is %r against %r"
+                % (bullet, name, key, mine, value)
+            )
+
+    return problems
+
+
+def _curated_entitlement_backed_problems(
+    plan: dict, raw_plan: dict, headline: list, raw_plans: dict
+) -> list:
+    """The entitlement-backed curated bullets the plan does not support.
+
+    Every bullet in CURATED_ENTITLEMENT_BACKED_BULLETS is a claim about what
+    the tier GRANTS, so each one is checked against the plan's own
+    permissions, quotas and limits -- the raw numbers, not a label.
+    """
+    problems = []
+    limits = raw_plan.get("limits", {}) or {}
+    quotas = raw_plan.get("quotas", {}) or {}
+    permissions = raw_plan.get("permissions", []) or []
+
+    for bullet in headline:
+        if bullet not in CURATED_ENTITLEMENT_BACKED_BULLETS:
+            continue
+
+        if bullet == "Everything in Professional":
+            problems += _everything_in_professional_problems(
+                raw_plan, raw_plans, bullet
+            )
+
+        elif bullet == (
+            "Unlimited optimization runs, genetic searches and model trainings"
+        ):
+            for key in (
+                "run_optimization_per_month",
+                "run_genetic_search_per_month",
+                "train_model_per_month",
+            ):
+                if quotas.get(key) != _UNLIMITED:
+                    problems.append(
+                        "%r claims unlimited %s, but the quota is %r"
+                        % (bullet, key, quotas.get(key))
+                    )
+
+        elif bullet == "100 live strategies (Professional has 30)":
+            claimed = _bullet_number(bullet, r"(\d+)\s+live strategies")
+            actual = limits.get("max_live_strategies")
+            if claimed is not None and actual != claimed:
+                problems.append(
+                    "%r claims %d live strategies, but the limit is %r"
+                    % (bullet, claimed, actual)
+                )
+            comparison = re.search(r"\(([^()]+?)\s+has\s+(\d+)\)", bullet)
+            if comparison is None:
+                problems.append(
+                    "%r does not say which tier it compares itself with" % bullet
+                )
+            else:
+                other = _named_plan(raw_plans, comparison.group(1).strip())
+                if other is None:
+                    problems.append(
+                        "%r compares itself with the tier %r, which the "
+                        "catalog does not sell"
+                        % (bullet, comparison.group(1).strip())
+                    )
+                else:
+                    other_limit = (other.get("limits", {}) or {}).get(
+                        "max_live_strategies"
+                    )
+                    if other_limit != int(comparison.group(2)):
+                        problems.append(
+                            "%r says %s has %s live strategies, but the limit "
+                            "is %r"
+                            % (
+                                bullet,
+                                comparison.group(1).strip(),
+                                comparison.group(2),
+                                other_limit,
+                            )
+                        )
+
+        elif bullet == "Highest queue priority, 20 concurrent tasks":
+            claimed = _bullet_number(bullet, r"(\d+)\s+concurrent tasks")
+            actual = limits.get("max_concurrent_tasks")
+            if claimed is not None and actual != claimed:
+                problems.append(
+                    "%r claims %d concurrent tasks, but the limit is %r"
+                    % (bullet, claimed, actual)
+                )
+            # "Highest queue priority": Celery runs the LOWEST priority
+            # number first, so the claim is only true when this tier holds
+            # the best priority of every tier the catalog sells.
+            priorities = {
+                key: (raw.get("limits", {}) or {}).get("celery_task_priority")
+                for key, raw in raw_plans.items()
+            }
+            mine = priorities.get(plan["key"])
+            known = [
+                value
+                for value in priorities.values()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            ]
+            if not isinstance(mine, (int, float)) or isinstance(mine, bool):
+                problems.append(
+                    "%r claims the highest queue priority, but the tier has no "
+                    "celery_task_priority" % bullet
+                )
+            elif known and mine != min(known):
+                problems.append(
+                    "%r claims the highest queue priority, but %r is not the "
+                    "best priority of %r"
+                    % (bullet, mine, min(known))
+                )
+
+        elif bullet == (
+            "Live trading on all six exchanges "
+            "(OKX, Binance, Bybit, Bitget, Gate.io, BingX)"
+        ):
+            if "allow_real_trading" not in permissions:
+                problems.append(
+                    "%r claims live trading, but the tier has no "
+                    "allow_real_trading permission" % bullet
+                )
+            if not limits.get("allow_real_trading"):
+                problems.append(
+                    "%r claims live trading, but the tier's "
+                    "allow_real_trading limit is off" % bullet
+                )
+            problems += _venue_problems(bullet)
+
+    return problems
+
+
 def _expected_excluded_labels(plan: dict, raw_plan: dict) -> set:
     """The "not included" labels a card may list."""
     labels = {e["label"] for e in plan["entitlements"] if not e["included"]}
@@ -561,10 +1037,146 @@ class TestTheCatalogIsTheSourceOfTruth:
             )
             assert plan["price_usd"] == expected
 
-    def test_the_catalog_sells_three_tiers_and_no_team_tier(self, catalog):
-        assert {p["key"] for p in catalog["plans"]} == {"free", "standard", "pro"}
+    def test_the_catalog_sells_four_tiers_and_no_team_tier(self, catalog):
+        # The catalog gained a fourth tier by owner decision (2026-11-04):
+        # the $499/month "Managed" service. This is the only place in the
+        # test suite where the number of tiers is written down.
+        assert {p["key"] for p in catalog["plans"]} == {
+            "free",
+            "standard",
+            "pro",
+            "managed",
+        }
         assert "team" not in {p["key"] for p in catalog["plans"]}
         assert "Team" not in {p["name"] for p in catalog["plans"]}
+
+
+# --------------------------------------------------------------------------
+# The catalog must not advertise a tier the server refuses to sell
+# --------------------------------------------------------------------------
+def _catalog_in_billing_mode(monkeypatch, mode: str) -> dict:
+    """The catalog as it is published while the deployment bills `mode`.
+
+    The mode is flipped IN THE CONFIG OBJECT, IN MEMORY: `get_billing_mode`
+    is the single place that decides which mode the catalog is priced in,
+    and the purchase endpoint reads the same object. No file is written, so
+    the test cannot leave api/plans_config.yml changed.
+    """
+    monkeypatch.setattr(plans_config, "get_billing_mode", lambda: mode)
+    catalog = build_plan_catalog()
+    assert catalog["billing_mode"] == mode, (
+        "the billing mode was not flipped: the catalog still says %r"
+        % catalog["billing_mode"]
+    )
+    return catalog
+
+
+class TestTheCatalogOnlyOffersTiersThatCanBeBought:
+    """A tier the purchase endpoint REFUSES must not be in the catalog.
+
+    THE DEFECT THIS PINS
+    --------------------
+    `build_plan_catalog` filtered on a plan's `active` flag ONLY. It never
+    consulted `plans_config.is_billing_mode_available`, so in a ONE-OFF
+    (lifetime) deployment the public pricing API still listed the $499
+    Managed tier as an ACTIVE plan at $499 -- while
+    api/routes/payments.py:115-122 answers a purchase of it with HTTP 400
+    ("not available for lifetime billing"), because the tier's one-off block
+    is switched off (`billing.lifetime.enabled: false`).
+
+    The managed tier is the first tier whose lifetime mode is disabled, so
+    this branch is what exposed it. The deployed mode is monthly (pinned by
+    TestTheOneOffLifetimePrice), so the mispricing is latent rather than
+    live -- but the pricing page must never promise a purchase the server
+    refuses.
+    """
+
+    @pytest.fixture
+    def catalog_in_lifetime_mode(self, monkeypatch) -> dict:
+        return _catalog_in_billing_mode(monkeypatch, "lifetime")
+
+    def test_the_monthly_catalog_is_unchanged(self, monkeypatch, raw_plans):
+        """The fix must not move a single tier, price or entitlement.
+
+        The deployment bills monthly, so the monthly catalog IS what the
+        pricing page publishes today. It must be identical after the fix:
+        the same tiers, in the same order, at the same prices, with the
+        same entitlements.
+
+        The published catalog is built HERE, before the mode is flipped, so
+        the comparison does not depend on when a fixture happens to run.
+        """
+        deployed = build_plan_catalog()
+        monthly = _catalog_in_billing_mode(monkeypatch, "monthly")
+
+        assert deployed["billing_mode"] == "monthly", (
+            "this deployment bills monthly; if the mode changed, this "
+            "comparison has to be revisited"
+        )
+        assert monthly == deployed, (
+            "the monthly catalog changed: the deployed mode is monthly, so "
+            "the fix must not move a tier, a price or an entitlement"
+        )
+
+        published = monthly["plans"]
+        expected = {
+            key for key, raw in raw_plans.items() if raw.get("active", False)
+        }
+        assert {plan["key"] for plan in published} == expected
+        assert len(expected) == 4, "the catalog sells four tiers"
+        for plan in published:
+            raw = raw_plans[plan["key"]]
+            monthly = (raw.get("billing", {}) or {}).get("monthly", {}) or {}
+            assert plan["price_usd"] == monthly.get("price_usd", raw["price_usd"])
+        assert {plan["key"]: plan["price_usd"] for plan in published} == {
+            "free": 0,
+            "standard": 30,
+            "pro": 100,
+            "managed": 499,
+        }
+
+    def test_a_tier_the_server_will_not_sell_is_not_in_the_catalog(
+        self, catalog_in_lifetime_mode
+    ):
+        """The $499 Managed tier is a monthly service: no one-off sale."""
+        keys = [plan["key"] for plan in catalog_in_lifetime_mode["plans"]]
+
+        assert "managed" not in keys, (
+            "the catalog advertises the Managed tier in a one-off "
+            "deployment, where the purchase endpoint refuses to sell it"
+        )
+        assert keys == ["free", "standard", "pro"], (
+            "the one-off catalog must list exactly the tiers that are still "
+            "sold in that mode"
+        )
+
+    def test_the_tiers_that_sell_a_one_off_are_still_listed(
+        self, catalog_in_lifetime_mode
+    ):
+        """The guard must not over-block the tiers that DO sell one."""
+        prices = {
+            plan["key"]: plan["price_usd"]
+            for plan in catalog_in_lifetime_mode["plans"]
+        }
+        assert prices == {"free": 0, "standard": 99, "pro": 299}, (
+            "the tiers with a one-off price must still be published, at "
+            "their one-off price"
+        )
+
+    def test_the_catalog_lists_exactly_the_tiers_that_can_be_bought(
+        self, catalog_in_lifetime_mode
+    ):
+        """The rule is derived from the config, not written down here."""
+        every = set(plans_config.get_all_plans())
+        unavailable = {
+            key
+            for key in every
+            if not plans_config.is_billing_mode_available(key, "lifetime")
+        }
+        assert unavailable == {"managed"}
+        assert {
+            plan["key"] for plan in catalog_in_lifetime_mode["plans"]
+        } == every - unavailable
 
 
 # --------------------------------------------------------------------------
@@ -640,12 +1252,56 @@ class TestTheEntitlementsAreTheCatalogsOwn:
             plan = plans_by_name.get(card["name"])
             assert plan is not None
             granted = _expected_included_labels(plan, raw_plans[plan["key"]])
+            # A curated tier (the $499 managed service) shows a short,
+            # hand-written HEADLINE instead of the derived label list, because
+            # its derived list is twenty bullets long. The headline still lives
+            # in the CATALOG, so the card must list EXACTLY the catalog's bullets
+            # for that tier -- and the strict derived-entitlements guard still
+            # applies to it: every claim the headline makes is checked against
+            # the catalog's DERIVED ENTITLEMENTS (and the tier's own plan)
+            # below, so a headline that advertises something the tier does not
+            # grant FAILS.
+            headline = plan.get("headline_bullets") or []
+            expected = set(headline) if headline else granted
 
-            assert set(card["included"]) == granted, (
-                f"the {card['name']} card does not list exactly the entitlements "
-                f"the catalog grants. missing={sorted(granted - set(card['included']))} "
-                f"extra={sorted(set(card['included']) - granted)}"
+            assert set(card["included"]) == expected, (
+                f"the {card['name']} card does not list exactly the bullets "
+                f"the catalog holds for it. missing={sorted(expected - set(card['included']))} "
+                f"extra={sorted(set(card['included']) - expected)}"
             )
+
+            if headline:
+                problems = _curated_claims_the_catalog_does_not_grant(
+                    plan, raw_plans[plan["key"]], headline, raw_plans
+                )
+                assert not problems, (
+                    f"the {card['name']} card advertises what the catalog does "
+                    f"not grant: {problems}"
+                )
+
+    def test_a_curated_headline_claims_nothing_from_another_tier(
+        self, cards, plans_by_name, raw_plans
+    ):
+        """A curated headline is hand-written copy, so it needs the same
+        cross-tier guard the derived labels already have: it must not reuse
+        a label that belongs to another tier alone.
+        """
+        for card in cards:
+            plan = plans_by_name.get(card["name"])
+            assert plan is not None
+            if not (plan.get("headline_bullets") or []):
+                continue
+            mine = _expected_included_labels(plan, raw_plans[plan["key"]])
+
+            for other_name, other in plans_by_name.items():
+                if other_name == card["name"]:
+                    continue
+                theirs = _expected_included_labels(other, raw_plans[other["key"]])
+                for label in theirs - mine:
+                    assert label not in card["included"], (
+                        f"the {card['name']} headline claims {label!r}, which "
+                        f"belongs to the {other_name} tier"
+                    )
 
     def test_no_card_claims_a_quota_from_another_tier(
         self, cards, plans_by_name, raw_plans
@@ -680,6 +1336,168 @@ class TestTheEntitlementsAreTheCatalogsOwn:
                     f"the {card['name']} card lists {label!r} as not included, "
                     "but the catalog does not exclude it"
                 )
+
+
+# --------------------------------------------------------------------------
+# Every curated bullet is classified, and every class is checked
+# --------------------------------------------------------------------------
+class TestEveryCuratedBulletIsClassifiedAndChecked:
+    """A curated bullet may not slip through the guard unchecked.
+
+    THE DEFECT THIS PINS
+    --------------------
+    The $499 Managed card shows a CURATED headline instead of the derived
+    entitlement list, so the strict derived-entitlements guard cannot be
+    applied to it bullet by bullet. The old guard checked the entitlement
+    backing of 3 of the 6 bullets, and the only check that applied to
+    EVERY bullet was a numeric one: every digit had to appear somewhere in
+    the plan's numbers. A bullet with no digits -- the service promise --
+    was therefore UNCHECKED, and so was a bullet that named a venue the
+    platform does not route to.
+
+    Every bullet is now in EXACTLY ONE of two sets: the entitlement-backed
+    ones, which are proven from the plan's permissions, quotas and limits,
+    and the service-copy ones, which are pinned word for word and may only
+    be claimed by the managed tier.
+    """
+
+    def test_every_curated_bullet_is_in_exactly_one_class(self, catalog):
+        assert not (
+            CURATED_ENTITLEMENT_BACKED_BULLETS & CURATED_SERVICE_COPY_BULLETS
+        ), "a bullet is in both classes"
+
+        every = [
+            bullet
+            for plan in catalog["plans"]
+            for bullet in (plan.get("headline_bullets") or [])
+        ]
+        assert every, "no curated headline to check"
+
+        classified = (
+            CURATED_ENTITLEMENT_BACKED_BULLETS | CURATED_SERVICE_COPY_BULLETS
+        )
+        assert classified == set(every), (
+            "these curated bullets are not classified: %r. Every bullet must "
+            "be in CURATED_ENTITLEMENT_BACKED_BULLETS or "
+            "CURATED_SERVICE_COPY_BULLETS, so it cannot escape the guard."
+            % sorted(set(every) - classified)
+        )
+
+    def test_the_service_copy_bullet_is_pinned_verbatim(self, catalog):
+        """The wording is the owner's approved copy: it cannot change quietly.
+
+        The constant above IS the approved wording, and the check is an
+        exact string comparison -- so a reworded bullet is not the same
+        bullet and the test says so.
+        """
+        managed = {
+            plan["key"]: plan for plan in catalog["plans"]
+        }[CURATED_TIER_KEY]
+
+        for bullet in CURATED_SERVICE_COPY_BULLETS:
+            assert bullet in (managed.get("headline_bullets") or []), (
+                "the managed tier no longer says %r word for word" % bullet
+            )
+
+    def test_a_service_copy_bullet_is_claimed_by_the_managed_tier_only(
+        self, catalog
+    ):
+        """The service promise belongs to the managed service and to nobody
+        else: another tier claiming it would be advertising a service it
+        does not run.
+        """
+        for bullet in CURATED_SERVICE_COPY_BULLETS:
+            claiming = [
+                plan["key"]
+                for plan in catalog["plans"]
+                if bullet in (plan.get("headline_bullets") or [])
+            ]
+            assert claiming == [CURATED_TIER_KEY], (
+                "the service promise %r is claimed by %r" % (bullet, claiming)
+            )
+
+    def test_every_entitlement_backed_bullet_is_true_of_the_plan(
+        self, catalog, raw_plans
+    ):
+        """Each entitlement-backed bullet is proven from the raw plan."""
+        problems = []
+        for plan in catalog["plans"]:
+            headline = plan.get("headline_bullets") or []
+            if not headline:
+                continue
+            problems += _curated_entitlement_backed_problems(
+                plan, raw_plans[plan["key"]], headline, raw_plans
+            )
+
+        assert not problems, (
+            "the curated headline advertises what the plan does not grant: %r"
+            % problems
+        )
+
+
+# --------------------------------------------------------------------------
+# The advertised QUOTA labels are published copy: they must not drift.
+# --------------------------------------------------------------------------
+class TestTheAdvertisedQuotaLabelsArePinned:
+    """The words the catalog derives for a quota are the words on the page.
+
+    "20 backtests per day", "Unlimited backtests", "Unlimited AI Assistant
+    queries" -- these are PUBLISHED COPY, so they are pinned here.
+
+    Free, Standard and Professional are pinned to the words origin/main
+    published, so the pluralisation rule in `api/plans.py::_quota_sentence`
+    can never change what an existing tier advertises. Managed is new on
+    this branch, so its labels are pinned to the CORRECT plural --
+    "Unlimited AI Assistant queries", never "Unlimited AI Assistant querys".
+    """
+
+    EXPECTED = {
+        "free": {
+            "run_vector_backtest_day": "20 backtests per day",
+            "use_ai_assistant_day": "10 AI Assistant queries per day",
+        },
+        "standard": {
+            "run_vector_backtest_day": "50 backtests per day",
+            "use_ai_assistant_day": "20 AI Assistant queries per day",
+        },
+        "pro": {
+            "run_vector_backtest_day": "Unlimited backtests",
+            "run_kline_backtest_day": "Unlimited kline backtests",
+            "use_ai_assistant_day": "50 AI Assistant queries per day",
+            "run_optimization_month": "50 optimization runs per month",
+            "run_genetic_search_month": "10 genetic searches per month",
+            "generate_dataset_month": "30 dataset generations per month",
+            "train_model_month": "15 model trainings per month",
+        },
+        "managed": {
+            "run_vector_backtest_day": "Unlimited backtests",
+            "run_kline_backtest_day": "Unlimited kline backtests",
+            "use_ai_assistant_day": "Unlimited AI Assistant queries",
+            "run_optimization_month": "Unlimited optimization runs",
+            "run_genetic_search_month": "Unlimited genetic searches",
+            "generate_dataset_month": "Unlimited dataset generations",
+            "train_model_month": "Unlimited model trainings",
+        },
+    }
+
+    def test_every_tier_advertises_exactly_these_quota_labels(self, catalog):
+        for plan in catalog["plans"]:
+            key = plan["key"]
+            expected = self.EXPECTED.get(key)
+            assert expected is not None, (
+                "the %s tier is not pinned: add its advertised quota labels to "
+                "TestTheAdvertisedQuotaLabelsArePinned" % key
+            )
+            labels = {
+                entry["code"]: entry["label"]
+                for entry in plan["entitlements"]
+                if entry["code"] in QUOTA_CODES and entry["included"]
+            }
+            assert labels == expected, (
+                "the %s tier advertises different quota labels than the pinned "
+                "copy: changed=%s"
+                % (key, sorted(set(labels.items()) ^ set(expected.items())))
+            )
 
 
 # --------------------------------------------------------------------------
@@ -1383,53 +2201,64 @@ class TestThePagePromisesOnlyWhatTheProductDoes:
             "creates them"
         )
 
-    def test_portfolio_backtesting_follows_the_permission_not_the_quota(
-        self, cards, plans_by_name, raw_plans
-    ):
-        """Portfolio backtesting is gated by a PERMISSION.
+    def test_no_tier_advertises_portfolio_backtesting(self, cards):
+        """Portfolio backtesting is HELD but never ADVERTISED.
 
-        `run_portfolio_backtest_per_day` is 0 for every tier, but that quota
-        is enforced NOWHERE. There are exactly two quota mechanisms in the
-        backend and neither touches the portfolio route:
+        The permission is a real entitlement and it is UNCHANGED: the route
+        (api/routes/portfolio.py:917-925) checks the `run_portfolio_backtest`
+        PERMISSION, and `tests/test_plans.py` pins free -> 403 and
+        standard -> 202 for POST /api/v1/portfolio-backtests.
 
-          * `check_usage_quota` (api/dependencies.py:90) is wired up only on
-            the two backtest engines (api/routes/backtests.py:232) and on
-            genetic search (api/routes/discovery.py:112);
-          * `QuotaManager.check_and_consume` (api/quota_manager.py:22, whose
-            limit 0 means "forbidden", api/quota_manager.py:71-72) is called
-            from exactly one place: api/ai_assistant.py:1474, with the
-            feature "use_ai_assistant".
+        What changed is the ADVERTISEMENT. The feature is an unfinished
+        scaffold: `portfolio_kpis` appears nowhere in `bot_module/`, so
+        `tasks.py:1666` always raises and `tasks.py:1673` marks the run
+        FAILED, and the viewer's GET /portfolio-backtests/{runId} does not
+        exist, so the frontend fetch 404s. A paying customer could launch a
+        run that always fails and then click a run that 404s.
 
-        The portfolio endpoint (api/routes/portfolio.py:917-925) checks the
-        `run_portfolio_backtest` PERMISSION and the concurrent-task limit,
-        and the Celery task (tasks.py:1869-1902) checks no daily quota at
-        all. The live catalog agrees: GET /api/v1/public/plans returns
-        "Portfolio backtesting" as INCLUDED for Standard and Professional,
-        and the live OpenAPI publishes /api/v1/portfolio-backtests.
-
-        So the capability follows the permission -- Standard and Pro hold
-        it, Free does not -- and the page must follow the permission too.
+        So no tier may promise it -- not as included, and not under "Not
+        included" either, because that still advertises it. The suppression
+        is config-driven (`deferred_permissions` in api/plans_config.yml),
+        so it cannot drift back into the page by hand.
         """
         for card in cards:
-            plan = plans_by_name.get(card["name"])
-            assert plan is not None
-            permissions = raw_plans[plan["key"]].get("permissions", []) or []
-            holds = "run_portfolio_backtest" in permissions
-
-            claims = "Portfolio backtesting" in card["included"]
-            assert claims == holds, (
-                f"the {card['name']} card {'claims' if claims else 'does not claim'} "
-                "portfolio backtesting, but that tier "
-                f"{'holds' if holds else 'does not hold'} the "
-                "run_portfolio_backtest permission"
+            assert "Portfolio backtesting" not in card["included"], (
+                f"the {card['name']} card advertises a feature that always "
+                "fails"
             )
+            assert "Portfolio backtesting" not in card["not_included"], (
+                f"the {card['name']} card lists portfolio backtesting as "
+                "something the customer does not get, which still "
+                "advertises it"
+            )
+
+    def test_the_portfolio_backtest_entitlement_is_unchanged(self, raw_plans):
+        """A3 stops ADVERTISING the capability; it does not take it away.
+
+        Standard and Professional still hold the permission, so
+        `tests/test_plans.py` keeps pinning standard -> 202 and free -> 403.
+        """
+        for tier in ("standard", "pro"):
+            permissions = raw_plans[tier].get("permissions", []) or []
+            assert "run_portfolio_backtest" in permissions, (
+                f"the {tier} tier lost the run_portfolio_backtest permission: "
+                "the entitlement is not what A3 was allowed to change"
+            )
+        free_permissions = raw_plans["free"].get("permissions", []) or []
+        assert "run_portfolio_backtest" not in free_permissions
+        assert raw_plans["free"]["quotas"]["run_portfolio_backtest_per_day"] == 0
 
     def test_a_tier_without_a_capability_says_so(self, cards, plans_by_name):
         """The page states the boundary in BOTH directions.
 
-        A card that says "Portfolio backtesting" on Standard and says
-        nothing about it on Free leaves the reader guessing. The catalog
-        excludes the capability from Free, so the Free card must say it.
+        A card that says a capability on Standard and says nothing about it
+        on Free leaves the reader guessing, so a capability the catalog
+        excludes from a tier must be listed on that tier's card.
+
+        Since the $499 Managed tier (2026-11-04) the catalog excludes
+        "Portfolio backtesting" from EVERY tier -- the feature is an
+        unfinished scaffold -- so that label is not in `excluded` any more
+        and the loop below has nothing to say about it.
         """
         for card in cards:
             plan = plans_by_name.get(card["name"])
