@@ -85,9 +85,25 @@ git config --global url."https://github.com/".insteadOf "git@github.com:"
 git remote set-url origin https://github.com/DiverseInc/DepthSight.git
 git pull origin main
 git log -1 --oneline          # MUST show the expected commit, else the pull no-opped
+bash ops/scripts/record_deployed_commit.sh   # stamps the commit; REFUSES a dirty checkout
 docker compose build --no-cache <changed services>
 docker compose up -d --no-deps <changed services>
 ```
+
+- **`bash ops/scripts/record_deployed_commit.sh` is not optional.** It writes
+  `DEPLOYED_COMMIT=<sha>` into `.env`, which `docker-compose.yml` hands to the
+  `api` service as `env_file`; the running service publishes it as the
+  `commit` field of `GET /api/v1/status`, and the AGPL-3.0 section 13 offer at
+  `/source` points a reader at the archive of exactly that commit. **Run it
+  AFTER the pull and BEFORE the build**: the value travels with the container,
+  so a failed build leaves the old container reporting the old commit, which
+  is the truth.
+- It also **refuses to continue when the checkout is not the committed tree**
+  (a modified or untracked file). The image is built from the Docker build
+  context while the published source is the committed tree, so a dirty
+  checkout would put code in the running containers that is not in the
+  published source. It deletes nothing — it prints the offending paths and
+  stops. Park them with `git stash -u` and deploy again.
 
 - Services: `api bot market_data celery_worker websocket frontend pwa ops`;
   infra is `postgres redis redis-market caddy`. **Rebuild only the services whose

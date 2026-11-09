@@ -1,11 +1,11 @@
 # tests/test_update_sh_records_the_deployed_commit.py
-"""The deploy script must publish the commit it built, and must not call a
+"""The deploy path must publish the commit it built, and must not call a
 broken deploy a success.
 
-THE DEFECT THIS PINS
---------------------
-Two MEASURED gaps in `update.sh`, both found by the review panel on
-2026-11-07 and both fixed here.
+THE DEFECTS THIS PINS
+---------------------
+Two MEASURED gaps, both found by the review panel on 2026-11-07 and both
+fixed here.
 
 1. (Copilot, panel #3, condition (a)) The AGPL-3.0 section 13 offer pointed
    the reader at the tip of `main` and told them to ASK BY EMAIL for the
@@ -14,17 +14,11 @@ Two MEASURED gaps in `update.sh`, both found by the review panel on
    load-bearing for the one thing section 13 asks for: the source of the
    version the reader is actually talking to.
 
-   The fix runs through the deploy script: `update.sh` records the commit it
-   is about to build into `.env` (which `docker-compose.yml` passes to the
-   `api` service as `env_file`), the API publishes it as the `commit` field of
-   the unauthenticated `GET /api/v1/status`, and the offer page turns that
-   value into a download URL. No human in the loop.
-
-   The recording has to be correct, not merely present: it must REPLACE an
-   existing value rather than append a second one, it must survive a `.env`
-   with CRLF endings, and it must survive a `.env` with no trailing newline.
-   A `.env` carrying two `DEPLOYED_COMMIT` lines would make the value
-   ambiguous, and the whole point of the value is that it is unambiguous.
+   The fix runs through the deploy path: the commit is recorded into `.env`
+   (which `docker-compose.yml` passes to the `api` service as `env_file`), the
+   API publishes it as the `commit` field of the unauthenticated
+   `GET /api/v1/status`, and the offer page turns that value into a download
+   URL. No human in the loop.
 
 2. (Ollama, panel #4) When the source offer is not being served, the script
    restarts caddy -- and then checked ONLY the offer. Nothing verified that
@@ -33,13 +27,28 @@ Two MEASURED gaps in `update.sh`, both found by the review panel on
    with a BOUNDED retry (a fixed number of attempts) and a LOUD failure: a
    red error and `exit 1`. Never a silent success, never an unbounded loop.
 
-The behavioural tests below run the REAL `record_deployed_commit` function out
-of `update.sh` under bash, against real `.env` files. A copy of the logic
-would prove nothing about the script (AGENTS.md: "Verify against the real
-function, not a reimplementation").
+WHERE THE RECORDING LIVES NOW
+-----------------------------
+The recording used to be a shell FUNCTION inside `update.sh`, and the tests
+below used to lift that function out of the file with a regex and run it.
+That is no longer where it lives: the recording is now ONE script,
+`ops/scripts/record_deployed_commit.sh`, shared by the automatic deploy
+(`update.sh`) and the MANUAL deploy in AGENTS.md -- because the manual deploy
+is the path the owner actually uses, and a fix that only fires on the path
+nobody uses is decorative.
+
+So the behaviour of the recording is tested in
+`tests/test_record_deployed_commit_script.py`, against the real script. The
+tests HERE pin the ARRANGEMENT: that there is exactly ONE implementation,
+that both deploy paths call it, that it runs at the right moment, and that its
+failure cannot be swallowed.
+
+The behavioural tests that ran the real caddy/site-root functions out of
+`update.sh` still do exactly that: a copy of the logic would prove nothing
+about the script (AGENTS.md: "Verify against the real function, not a
+reimplementation").
 """
 
-import base64
 import re
 import shutil
 import subprocess
@@ -50,16 +59,20 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 UPDATE_SH = REPO_ROOT / "update.sh"
 COMPOSE_YML = REPO_ROOT / "docker-compose.yml"
+AGENTS_MD = REPO_ROOT / "AGENTS.md"
+STAMP_SCRIPT = "ops/scripts/record_deployed_commit.sh"
 
-# The commit the deploy script is expected to record. Any 40-hex sha will do:
-# the value is whatever `git rev-parse HEAD` returns on the deploy host.
-SHA = "0123456789abcdef0123456789abcdef01234567"
+# The ONE way the stamp is invoked. `bash <script>`, never `./<script>`:
+# every tracked shell script in this repository is mode 100644 (there is not
+# one 100755 file in it), so a bare `./...` fails with "Permission denied" on
+# the deploy host -- which, under `set -e`, aborts the deploy, and in the
+# manual path silently leaves the commit unstamped.
+STAMP_INVOCATION = f"bash {STAMP_SCRIPT}"
 
 
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
-
 @pytest.fixture(scope="module")
 def script() -> str:
     assert UPDATE_SH.is_file(), "update.sh must exist"
@@ -105,48 +118,82 @@ def _run_bash(body: str) -> str:
     return stdout
 
 
-def _record(env_bytes, sha: str = SHA, runs: int = 1) -> bytes:
-    """Run the REAL record_deployed_commit() from update.sh; return the .env bytes.
-
-    `git` is stubbed with a shell function, so the script's own
-    `git rev-parse HEAD` call is what decides the recorded value.
-    """
-    function = _extract_function(
-        UPDATE_SH.read_text(encoding="utf-8"), "record_deployed_commit"
-    )
-    seed = ""
-    if env_bytes is not None:
-        encoded = base64.b64encode(env_bytes).decode("ascii")
-        # An ABSOLUTE path: the .env under test is written inside the temp
-        # dir, never relative to whatever directory the shell happens to
-        # start in (which, under the mutation harness, is the repo).
-        seed = f"printf '%s' '{encoded}' | base64 -d > \"$WORK/.env\"\n"
-    body = (
-        "set -e\n"
-        'WORK=$(mktemp -d) || exit 1\n'
-        "trap 'rm -rf \"$WORK\"' EXIT\n"
-        'cd "$WORK" || exit 1\n'
-        f"{seed}"
-        f"{function}\n"
-        f"git() {{ echo '{sha}'; }}\n"
-        + "record_deployed_commit\n" * runs
-        + "base64 \"$WORK/.env\" | tr -d '\\n'\n"
-    )
-    return base64.b64decode(_run_bash(body).strip())
-
-
 # --------------------------------------------------------------------------
-# The deploy script records the commit it is about to build
+# There is ONE implementation of the stamp, and both deploy paths call it
 # --------------------------------------------------------------------------
-
-class TestTheDeployScriptRecordsTheCommitItBuilds:
-    def test_the_script_records_the_commit_from_git_rev_parse_head(self, script: str):
-        assert "DEPLOYED_COMMIT=$(git rev-parse HEAD)" in script, (
-            "the deploy script must take the commit it is about to build from "
-            "`git rev-parse HEAD`, not from anything it invents"
+class TestThereIsOneImplementationAndBothPathsCallIt:
+    def test_the_stamp_script_exists(self):
+        assert (REPO_ROOT / STAMP_SCRIPT).is_file(), (
+            f"{STAMP_SCRIPT} must exist: it is the one implementation of the "
+            "commit stamp"
         )
 
-    def test_the_recording_happens_after_the_reset_and_before_the_build(
+    def test_update_sh_calls_the_shared_script_exactly_once(self, script: str):
+        calls = [
+            line
+            for line in script.splitlines()
+            if STAMP_SCRIPT in line and not line.strip().startswith("#")
+        ]
+        assert len(calls) == 1, (
+            f"update.sh calls the stamp script {len(calls)} times: {calls}"
+        )
+
+    def test_update_sh_has_no_second_implementation_of_the_stamping(
+        self, script: str
+    ):
+        """The stamping logic must exist in exactly ONE place.
+
+        A second copy in `update.sh` would drift from the shared script, and
+        the offer's claim would then be true of whichever copy ran.
+        """
+        assert "DEPLOYED_COMMIT=" not in script, (
+            "update.sh still writes DEPLOYED_COMMIT itself; the stamping logic "
+            "must live only in " + STAMP_SCRIPT
+        )
+        assert "git rev-parse HEAD" not in script, (
+            "update.sh still takes the commit itself; the stamping logic must "
+            "live only in " + STAMP_SCRIPT
+        )
+
+    def test_the_call_goes_through_bash_and_not_a_bare_path(self, script: str):
+        """A bare `./` invocation cannot work: nothing in this repository is
+        mode 100755, so on the deploy host it fails with "Permission denied"."""
+        call = next(
+            line
+            for line in script.splitlines()
+            if STAMP_SCRIPT in line and not line.strip().startswith("#")
+        )
+        assert call.strip() == STAMP_INVOCATION, (
+            f"the stamp must be invoked as {STAMP_INVOCATION!r}; it is "
+            f"{call.strip()!r}"
+        )
+
+    def test_the_agents_md_manual_deploy_calls_the_shared_script(self):
+        """The manual deploy in AGENTS.md is the path the owner actually uses.
+
+        The first version of this fix only ran inside `update.sh`, so on a
+        manual deployment the commit field stayed EMPTY -- and the AGPL offer
+        would have pointed at a commit the site was not running.
+        """
+        agents = AGENTS_MD.read_text(encoding="utf-8")
+        assert STAMP_INVOCATION in agents, (
+            "AGENTS.md's manual deploy sequence must call " + STAMP_INVOCATION
+        )
+
+    def test_the_manual_deploy_runs_the_stamp_after_the_pull_and_before_the_build(
+        self,
+    ):
+        """The value must describe the tree that is about to be BUILT."""
+        agents = AGENTS_MD.read_text(encoding="utf-8")
+        call = agents.index(STAMP_INVOCATION)
+        pull = agents.index("git pull origin main")
+        build = agents.index("docker compose build")
+        assert pull < call < build, (
+            f"the stamp must run after the pull ({pull}) and before the build "
+            f"({build}); it is at {call}"
+        )
+
+    def test_the_stamp_runs_after_the_reset_and_before_the_build(
         self, script: str
     ):
         """The recorded commit must be the tree that is ABOUT TO be built.
@@ -156,16 +203,35 @@ class TestTheDeployScriptRecordsTheCommitItBuilds:
         container will be built from.
         """
         reset = script.index("git reset --hard origin/main")
-        call = re.search(r"(?m)^record_deployed_commit$", script)
-        assert call, "update.sh never calls record_deployed_commit"
+        call = script.index(STAMP_INVOCATION)
         build = script.index("docker compose up -d --build")
-        assert reset < call.start() < build, (
-            "record_deployed_commit must run after the reset to origin/main "
-            f"(at {reset}) and before the rebuild (at {build}); it runs at "
-            f"{call.start()}"
+        assert reset < call < build, (
+            f"the stamp must run after the reset to origin/main (at {reset}) "
+            f"and before the rebuild (at {build}); it runs at {call}"
         )
 
-    def test_the_recording_writes_to_the_env_file_the_api_service_reads(
+    def test_a_failed_stamp_cannot_be_swallowed(self, script: str):
+        """A refusal must STOP the deploy, not be ignored.
+
+        The stamp refuses a checkout that is not the committed tree, so that
+        the offer's claim is true by construction. If the refusal were
+        ignored, the deploy would build from a dirty tree and publish a claim
+        that is false.
+        """
+        assert re.search(r"(?m)^set -e\b", script), (
+            "update.sh must run with `set -e`, so a failed stamp stops the deploy"
+        )
+        call_line = next(
+            line
+            for line in script.splitlines()
+            if STAMP_SCRIPT in line and not line.strip().startswith("#")
+        )
+        for swallow in ("|| true", "|| :", "2>/dev/null", "&"):
+            assert swallow not in call_line, (
+                f"the stamp call swallows its failure with {swallow!r}"
+            )
+
+    def test_the_value_reaches_the_container_through_the_env_file(
         self, script: str
     ):
         """The value only reaches the container if it goes into .env.
@@ -175,10 +241,6 @@ class TestTheDeployScriptRecordsTheCommitItBuilds:
         written before the build, a failed build leaves the old container
         reporting the old commit, which is the truth.
         """
-        assert ".env" in _extract_function(script, "record_deployed_commit"), (
-            "record_deployed_commit must write the commit into .env"
-        )
-
         compose = COMPOSE_YML.read_text(encoding="utf-8")
         api_block = re.search(r"(?ms)^  api:\n(.*?)(?=^  \w)", compose)
         assert api_block, "docker-compose.yml has no api service block"
@@ -189,70 +251,8 @@ class TestTheDeployScriptRecordsTheCommitItBuilds:
 
 
 # --------------------------------------------------------------------------
-# The recording is correct
-# --------------------------------------------------------------------------
-
-class TestTheRecordedValueIsCorrect:
-    def test_a_missing_env_file_is_created_with_the_commit(self):
-        assert _record(None) == f"DEPLOYED_COMMIT={SHA}\n".encode()
-
-    def test_the_commit_is_appended_when_the_key_is_absent(self):
-        result = _record(b"PUBLIC_BASE_URL=https://example.test\n")
-        assert result == (
-            b"PUBLIC_BASE_URL=https://example.test\n"
-            + f"DEPLOYED_COMMIT={SHA}\n".encode()
-        )
-
-    def test_an_existing_value_is_replaced_not_appended(self):
-        """Two DEPLOYED_COMMIT lines would make the published commit ambiguous."""
-        result = _record(
-            b"DEPLOYED_COMMIT=0000000000000000000000000000000000000000\n"
-            b"PUBLIC_BASE_URL=https://example.test\n",
-        )
-        assert result == (
-            f"DEPLOYED_COMMIT={SHA}\n".encode()
-            + b"PUBLIC_BASE_URL=https://example.test\n"
-        )
-        assert result.count(b"DEPLOYED_COMMIT=") == 1, (
-            "the commit must be recorded exactly once; it was recorded "
-            f"{result.count(b'DEPLOYED_COMMIT=')} times"
-        )
-
-    def test_recording_twice_leaves_exactly_one_commit_line(self):
-        """The deploy script runs again on every deploy; it must be idempotent."""
-        result = _record(b"PUBLIC_BASE_URL=https://example.test\n", runs=2)
-        assert result.count(b"DEPLOYED_COMMIT=") == 1, (
-            "recording the commit twice must leave ONE line; it left "
-            f"{result.count(b'DEPLOYED_COMMIT=')}"
-        )
-        assert f"DEPLOYED_COMMIT={SHA}\n".encode() in result
-
-    def test_a_crlf_env_file_keeps_its_carriage_returns(self):
-        """A Windows-edited .env must not have its endings rewritten."""
-        result = _record(
-            b"PUBLIC_BASE_URL=https://example.test\r\n"
-            b"DEPLOYED_COMMIT=0000000000000000000000000000000000000000\r\n",
-        )
-        assert result == (
-            b"PUBLIC_BASE_URL=https://example.test\r\n"
-            + f"DEPLOYED_COMMIT={SHA}\r\n".encode()
-        ), (
-            "the CRLF line endings of .env must be preserved; the recorded "
-            f"file was {result!r}"
-        )
-
-    def test_an_env_file_without_a_trailing_newline_still_gets_the_commit(self):
-        result = _record(b"PUBLIC_BASE_URL=https://example.test")
-        assert result == (
-            b"PUBLIC_BASE_URL=https://example.test\n"
-            + f"DEPLOYED_COMMIT={SHA}\n".encode()
-        )
-
-
-# --------------------------------------------------------------------------
 # A failed caddy restart must not look like a successful deploy
 # --------------------------------------------------------------------------
-
 class TestTheDeployChecksTheWholeSiteAfterTheRestart:
     def test_the_script_checks_the_site_root(self, script: str):
         assert "site_root_is_live" in script, (

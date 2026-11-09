@@ -1,0 +1,114 @@
+{
+  "_comment": [
+    "Mutations that put the AGPL-3.0 section 13 'the published source is the",
+    "running code' defect BACK into the branch, by breaking the ONE script",
+    "that makes the claim true.",
+    "",
+    "THE DEFECT (measured 2026-11-07, review panel #5 on PR #64, and confirmed",
+    "by BOTH reviewers who answered): the container image is built from the",
+    "Docker build CONTEXT (the Dockerfile ends with `COPY . .`), while the",
+    "archive the offer publishes is the COMMITTED tree, and `git pull` never",
+    "removes untracked files. So a checkout with local changes produced a",
+    "running image containing files the published source did not contain -- and",
+    "the offer claimed they were the same code.",
+    "",
+    "THE FIX is ops/scripts/record_deployed_commit.sh: it records the commit it",
+    "is about to build into .env, and it REFUSES to stamp a checkout that is",
+    "not the committed tree. One implementation, shared by update.sh and the",
+    "MANUAL deploy sequence in AGENTS.md -- the manual path is the one the",
+    "operator actually uses, and a fix that only fires on the path nobody uses",
+    "is decorative (that was the SECOND half of the panel's finding).",
+    "",
+    "EVERY NEEDLE BELOW IS ASSERTED UNIQUE BEFORE USE: each occurs EXACTLY ONCE",
+    "in its file, measured against the file's bytes. A needle that matched two",
+    "sites would make the mutation meaningless, because the harness replaces",
+    "only the first hit; a needle that matched nothing would make the mutant",
+    "SKIP, and a SKIP is not a pass.",
+    "",
+    "MUTANTS",
+    "  A  the dirty-check refusal is removed, so a checkout with local changes",
+    "     is stamped and the offer's claim becomes false. Killed by",
+    "     test_an_untracked_file_is_refused and",
+    "     test_a_modified_tracked_file_is_refused.",
+    "  B  the missing-environment-file refusal is removed, so the script creates",
+    "     a stub .env. That would start the application with NO configuration",
+    "     at all -- a silent outage. Killed by",
+    "     test_a_missing_environment_file_is_refused and",
+    "     test_a_missing_environment_file_is_not_created.",
+    "  C  the value is APPENDED instead of replaced, so .env ends up carrying",
+    "     two DEPLOYED_COMMIT lines and the published commit is ambiguous.",
+    "     Killed by test_an_existing_value_is_replaced_not_appended and",
+    "     test_recording_twice_leaves_exactly_one_commit_line.",
+    "  D  the carriage-return handling is dropped, so a Windows-edited .env has",
+    "     its line endings rewritten. Killed by",
+    "     test_a_crlf_environment_file_keeps_its_carriage_returns.",
+    "  E  the project-root lookup is broken, so the script stamps the directory",
+    "     it was started in instead of the project root. Killed by",
+    "     test_run_from_a_subdirectory_it_still_stamps_the_root.",
+    "  F  the refusal reports SUCCESS, so a dirty checkout is stamped anyway",
+    "     and the deploy carries on. Killed by",
+    "     test_an_untracked_file_is_refused.",
+    "  G  the not-a-git-repository check is removed, so the script runs outside",
+    "     a checkout and fails in a way that is not a clean refusal. Killed by",
+    "     test_outside_a_git_repository_the_script_refuses.",
+    "  H  the stamp is written to the wrong file, so the value never reaches the",
+    "     .env the api service reads. Killed by",
+    "     test_a_clean_checkout_records_the_commit.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/deployed_commit_script.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_record_deployed_commit_script.py tests/test_update_sh_records_the_deployed_commit.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "A: the dirty-check refusal is removed, so a checkout with local changes is stamped",
+      "file": "ops/scripts/record_deployed_commit.sh",
+      "needle": "if [ -n \"$DIRTY\" ]; then",
+      "replace": "if false; then"
+    },
+    {
+      "label": "B: the missing-environment-file refusal is removed, so the script creates a stub .env",
+      "file": "ops/scripts/record_deployed_commit.sh",
+      "needle": "if [ ! -f \"$ENV_FILE\" ]; then",
+      "replace": "if false; then"
+    },
+    {
+      "label": "C: the commit is appended instead of replaced, so .env carries two DEPLOYED_COMMIT lines",
+      "file": "ops/scripts/record_deployed_commit.sh",
+      "needle": "if grep -q '^DEPLOYED_COMMIT=' \"$ENV_FILE\"; then",
+      "replace": "if false; then"
+    },
+    {
+      "label": "D: the carriage-return handling is dropped, so a Windows-edited .env loses its endings",
+      "file": "ops/scripts/record_deployed_commit.sh",
+      "needle": "if (sub(/\\r$/, \"\", line)) { cr = \"\\r\" }",
+      "replace": "if (false) { cr = \"\\r\" }"
+    },
+    {
+      "label": "E: the project-root lookup is broken, so the script stamps the directory it was started in",
+      "file": "ops/scripts/record_deployed_commit.sh",
+      "needle": "PROJECT_ROOT=$(git rev-parse --show-toplevel)",
+      "replace": "PROJECT_ROOT=$(pwd)"
+    },
+    {
+      "label": "F: the refusal reports success, so a dirty checkout is stamped anyway",
+      "file": "ops/scripts/record_deployed_commit.sh",
+      "needle": "    echo \"  git checkout -- <path>   # discard ONE path's changes, deliberately\" >&2\n    exit 1\n",
+      "replace": "    echo \"  git checkout -- <path>   # discard ONE path's changes, deliberately\" >&2\n    exit 0\n"
+    },
+    {
+      "label": "G: the not-a-git-repository check is removed, so the script runs outside a checkout",
+      "file": "ops/scripts/record_deployed_commit.sh",
+      "needle": "if ! git rev-parse --git-dir >/dev/null 2>&1; then",
+      "replace": "if false; then"
+    },
+    {
+      "label": "H: the stamp is written to the wrong file, so the value never reaches the api service",
+      "file": "ops/scripts/record_deployed_commit.sh",
+      "needle": "ENV_FILE=\"$PROJECT_ROOT/.env\"",
+      "replace": "ENV_FILE=\"$PROJECT_ROOT/.env.stamped\""
+    }
+  ]
+}

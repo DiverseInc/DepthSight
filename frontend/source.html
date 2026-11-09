@@ -133,11 +133,19 @@
       </p>
       <p class="url">https://github.com/DiverseInc/DepthSight/archive/&lt;commit&gt;.tar.gz</p>
       <p class="note">
-        The archive that URL gives you back is the exact tree of the running build. The archive
-        link further up this page is the tip of the <code>main</code> branch, so it can be a
-        little ahead of the build you are talking to; the <code>commit</code> field of the
-        status page is how you get the build you are talking to. If you would rather have it
-        sent to you, the email request below works too.
+        The archive that URL gives you back is the exact tree of the running build. The
+        containers are built from that commit's checkout, and our deploy step refuses to
+        build from a checkout that has local changes — so what is running here and what the
+        archive contains are the same code. The archive link further up this page is the
+        tip of the <code>main</code> branch, so it can be a little ahead of the build you
+        are talking to; the <code>commit</code> field of the status page is how you get
+        the build you are talking to. If you would rather have it sent to you, the email
+        request below works too.
+      </p>
+      <p class="note">
+        If the <code>commit</code> field is empty, this deployment was started before the
+        stamp was added, and we cannot name its commit from here. Use the email request
+        below and we will send you the complete source of the build you are using.
       </p>
     </div>
 

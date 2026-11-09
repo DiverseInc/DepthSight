@@ -32,7 +32,7 @@ fi
 if [ -f "docker-compose.yml" ] && [ -d ".git" ]; then
     PROJECT_DIR=$(pwd)
 else
-    PROJECT_DIR="/opt/depthsight"
+    PROJECT_DIR="/opt/app/depthsight"
 fi
 
 if [ ! -d "$PROJECT_DIR" ]; then
@@ -57,47 +57,20 @@ find . -type f -name "Caddyfile" -exec sed -i 's/\r$//' {} +
 # The AGPL-3.0 section 13 offer has to point at the source of the RUNNING
 # version, and that version's commit has to be locatable from a public URL
 # with no human in the loop. .env is what docker-compose.yml hands to the
-# api service as env_file, so the value written here travels WITH the
+# api service as env_file, so the value written there travels WITH the
 # container and comes back out of GET /api/v1/status as the `commit` field.
 #
 # It is written BEFORE the build on purpose: if the build fails, no new
 # container is created, the old container keeps running and keeps reporting
 # the OLD commit -- which is the truth. Writing it after the build would
 # leave .env claiming a commit that is not what is serving.
-record_deployed_commit() {
-    DEPLOYED_COMMIT=$(git rev-parse HEAD)
-    if [ ! -f .env ]; then
-        printf 'DEPLOYED_COMMIT=%s\n' "$DEPLOYED_COMMIT" > .env
-        return 0
-    fi
-    ENV_TMP=$(mktemp)
-    if grep -q '^DEPLOYED_COMMIT=' .env; then
-        # Replace the value in place, keeping that line's own line ending: a
-        # CRLF .env must not lose its carriage returns, and an LF one must
-        # not gain any.
-        awk -v sha="$DEPLOYED_COMMIT" '
-            /^DEPLOYED_COMMIT=/ {
-                line = $0
-                cr = ""
-                if (sub(/\r$/, "", line)) { cr = "\r" }
-                print "DEPLOYED_COMMIT=" sha cr
-                next
-            }
-            { print }
-        ' .env > "$ENV_TMP"
-    else
-        # Append, keeping the endings the file already has and making sure
-        # the last line is terminated before the new one goes on.
-        awk -v sha="$DEPLOYED_COMMIT" '
-            { print }
-            END { print "DEPLOYED_COMMIT=" sha }
-        ' .env > "$ENV_TMP"
-    fi
-    cat "$ENV_TMP" > .env
-    rm -f "$ENV_TMP"
-}
-
-record_deployed_commit
+#
+# The logic lives in ONE place -- ops/scripts/record_deployed_commit.sh --
+# because the manual deploy in AGENTS.md must do exactly the same thing. It
+# also refuses a checkout that is not the committed tree: the image is built
+# from the Docker build context, so a checkout with local changes would put
+# code in the running containers that is not in the published source.
+bash ops/scripts/record_deployed_commit.sh
 
 # 4. Rebuild and Restart
 echo -e "${BLUE}[*] Rebuilding and restarting containers (this may take a few minutes)...${NC}"
