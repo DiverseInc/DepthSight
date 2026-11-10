@@ -131,7 +131,13 @@ docker compose up -d --no-deps --force-recreate api
 echo -e "${BLUE}[*] Verifying the AGPL source offer is reachable...${NC}"
 PUBLIC_BASE_URL=""
 if [ -f .env ]; then
-    PUBLIC_BASE_URL=$(grep -E '^PUBLIC_BASE_URL=' .env 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    # `tr -d '\r'` is not optional here, and it matches the two sibling .env
+    # reads in this same script (the DEPLOYED_COMMIT read below) and the one in
+    # ops/scripts/smoke-test.sh: a .env may carry CRLF line endings, the stamp
+    # script preserves whatever endings a .env already has, and a trailing \r
+    # inside a URL breaks the request -- the offer would then be reported as
+    # a certificate failure when the certificate is fine.
+    PUBLIC_BASE_URL=$(grep -E '^PUBLIC_BASE_URL=' .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' || true)
 fi
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://depthsight.diverseinc.net}"
 
