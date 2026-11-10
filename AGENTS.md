@@ -86,8 +86,8 @@ git remote set-url origin https://github.com/DiverseInc/DepthSight.git
 git pull origin main
 git log -1 --oneline          # MUST show the expected commit, else the pull no-opped
 bash ops/scripts/record_deployed_commit.sh   # stamps the commit; REFUSES a dirty checkout
-docker compose build --no-cache <changed services>
-docker compose up -d --no-deps <changed services>
+docker compose build --no-cache mcp-memory api websocket bot market_data celery_worker frontend pwa ops
+docker compose up -d --no-deps mcp-memory api websocket bot market_data celery_worker frontend pwa ops
 docker compose up -d --no-deps --force-recreate api   # the stamp lives in the api's environment
 docker compose restart caddy                           # caddy.config is bind-mounted; caddy reads it only at startup
 ```
@@ -107,6 +107,21 @@ docker compose restart caddy                           # caddy.config is bind-mo
   already runs the new code -- and the archive the offer points at would not
   contain the running bot. `--force-recreate` rebuilds nothing; it re-creates
   the container so it picks up the stamp that was just written.
+- **The deployment has to be ONE COMMIT, so the service list is explicit.**
+  The AGPL-3.0 section 13 offer names ONE commit — the `commit` field of
+  `GET /api/v1/status` — and promises that its archive is the exact tree of
+  the running build. That promise is only true when the WHOLE deployment is
+  that one commit, so a placeholder for "the services that changed" is not
+  allowed here. Six services build from the ROOT context (`docker-compose.yml`:
+  `mcp-memory`, `api`, `websocket`, `bot`, `market_data`, `celery_worker`)
+  and the `api` IMPORTS `bot_module` (`api/depthsight_api.py`), so on a
+  `bot_module/` change a deploy that rebuilds only `bot` leaves the api,
+  the market-data service, the celery worker and the mcp-memory server
+  running the OLD code while the api publishes the NEW commit — and the
+  archive the offer names does not contain the code those services are
+  running. `frontend`, `pwa` and `ops` build from their own contexts and
+  are rebuilt from that same commit. Rebuilding everything is slower; a
+  deployment on two commits is a broken promise.
 - **`caddy` is ALWAYS restarted.** `caddy.config` is bind-mounted
   (`docker-compose.yml:283`), and caddy reads its Caddyfile only at startup,
   so `docker compose up -d` does not activate a changed route. `frontend/` is
@@ -122,9 +137,14 @@ docker compose restart caddy                           # caddy.config is bind-mo
   published source. It deletes nothing — it prints the offending paths and
   stops. Park them with `git stash -u` and deploy again.
 
-- Services: `api bot market_data celery_worker websocket frontend pwa ops`;
-  infra is `postgres redis redis-market caddy`. **Rebuild only the services whose
-  files changed** — a `bot_module/` change means `bot`, not all five.
+- Services built from THIS repository: `mcp-memory api websocket bot
+  market_data celery_worker frontend pwa ops`; infra is `postgres redis
+  redis-market caddy`. **The deploy rebuilds and re-creates every service
+  in that first list, and the list is written out on purpose.**
+- `update.sh` (the auto-updater the cron runs) accepts BOTH install
+  locations: `/opt/app/depthsight` and `/opt/depthsight`, the latter being
+  where the one-click `deploy.sh` installer clones the project. If neither
+  exists it stops and names both paths it looked at.
 - The SSH remote resets between sessions; the `insteadOf` rewrite in step 2 is the
   permanent fix. Run it first, every time.
 - `docker compose up -d` will NOT recreate a container for a bind-mounted file's

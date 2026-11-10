@@ -29,10 +29,34 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # 2. Determine Project Directory
+#
+# The one-click installer (deploy.sh) clones the project into /opt/depthsight
+# and its cron runs THIS script with a working directory that is NOT a git
+# checkout -- so the fallback below is the path the auto-update actually
+# takes, and it has to work on BOTH kinds of host.
+#
+# /opt/app/depthsight is where the maintainer's host keeps the project;
+# /opt/depthsight is where the one-click installer puts it. Accepting only
+# one of them means the auto-update is DEAD on the other one: the cron runs
+# the script, the script cannot find the project, and nothing updates any
+# more. So both are accepted, in that order, and if neither exists the
+# script stops and says BOTH paths it looked at.
+resolve_project_dir() {
+    local candidate
+    for candidate in "$@"; do
+        if [ -d "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    echo "[!] Project directory not found. Looked for: $*" >&2
+    return 1
+}
+
 if [ -f "docker-compose.yml" ] && [ -d ".git" ]; then
     PROJECT_DIR=$(pwd)
 else
-    PROJECT_DIR="/opt/app/depthsight"
+    PROJECT_DIR=$(resolve_project_dir /opt/app/depthsight /opt/depthsight) || exit 1
 fi
 
 if [ ! -d "$PROJECT_DIR" ]; then
@@ -80,6 +104,20 @@ if [ -f "docker-compose.bitcart.yml" ] && docker compose ps | grep -q bitcart; t
 else
     docker compose up -d --build
 fi
+
+# 4a. The api container is RE-CREATED, not merely left running.
+#
+# docker-compose.yml gives the api service `env_file: .env`, and a
+# container's environment is fixed when the container is CREATED --
+# `docker compose up -d --build` does not re-create a container whose image
+# id did not change (a bot-only change, or a build the cache reused). The
+# api would then keep publishing the PREVIOUS DEPLOYED_COMMIT while the
+# rest of the deployment already runs the new code, and the archive the
+# AGPL offer names would not contain the running code.
+#
+# --force-recreate builds nothing: it re-creates the container so that it
+# picks up the stamp that was just written into .env.
+docker compose up -d --no-deps --force-recreate api
 
 # 4b. The AGPL-3.0 section 13 source offer must be reachable after a deploy.
 #
@@ -159,6 +197,59 @@ if [ "$OFFER_LIVE" -eq 0 ]; then
     fi
 fi
 echo -e "${GREEN}[+] Source offer is live at $PUBLIC_BASE_URL/source${NC}"
+
+# 4c. The offer PROMISES a downloadable archive of the exact tree of the
+# running build -- and nothing has ever FETCHED that archive. Every gate
+# above only proved that the PAGE is served: a 404 archive, an empty
+# archive, or an archive of a commit that does not exist all passed.
+#
+# The commit is the STAMPED one -- the same DEPLOYED_COMMIT the api
+# publishes as the `commit` field of GET /api/v1/status, and the same one
+# the offer turns into the archive URL. A deployment from before the stamp
+# existed has no commit to check, so the check is SKIPPED with a clear
+# message (there is nothing to check, not a failure). A stamped commit
+# whose archive does not resolve is a LOUD failure: the offer is promising
+# a file that is not there.
+source_archive_is_available() {
+    local commit url code tmp stamp_key
+    commit=""
+    # The .env key the stamp script writes. update.sh READS the stamp here
+    # (to fetch the archive the offer names) and never WRITES it: the
+    # stamping lives in ops/scripts/record_deployed_commit.sh, and nowhere
+    # else.
+    stamp_key="DEPLOYED_COMMIT"
+    if [ -f .env ]; then
+        commit=$(grep -E "^${stamp_key}=" .env 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' | tr -d '"' | tr -d "'" || true)
+    fi
+    if [ -z "$commit" ]; then
+        echo "SKIP: no DEPLOYED_COMMIT in .env, so there is no source archive to fetch"
+        return 0
+    fi
+    url="https://github.com/DiverseInc/DepthSight/archive/${commit}.tar.gz"
+    tmp=$(mktemp)
+    code=$(curl -sL --max-time 60 -o "$tmp" -w "%{http_code}" "$url" 2>/dev/null || echo "000")
+    if [ "$code" != "200" ]; then
+        rm -f "$tmp"
+        echo "FAIL: the source archive the offer names is not available: GET $url returned HTTP $code"
+        return 1
+    fi
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        echo "FAIL: the source archive the offer names is empty: GET $url returned HTTP 200 and no bytes"
+        return 1
+    fi
+    rm -f "$tmp"
+    echo "OK: the source archive the offer names is reachable and not empty: $url"
+    return 0
+}
+
+echo -e "${BLUE}[*] Verifying the source archive the offer names really exists...${NC}"
+if ! source_archive_is_available; then
+    echo -e "${RED}[!] The AGPL source offer names an archive that does not resolve${NC}"
+    echo -e "${RED}[!] The offer promises https://github.com/DiverseInc/DepthSight/archive/<commit>.tar.gz for the stamped commit${NC}"
+    echo -e "${RED}[!] Either that commit is not published, or the offer names a commit the running build is not${NC}"
+    exit 1
+fi
 
 # 5. Cleanup
 echo -e "${BLUE}[*] Cleaning up old unused Docker images to free up space...${NC}"

@@ -1,0 +1,158 @@
+{
+  "_comment": [
+    "Mutations for the REVERSE direction of the .dockerignore contract: a",
+    "pattern may not sweep a TRACKED file out of the ROOT build context.",
+    "",
+    "THE GAP THESE MUTANTS CLOSE",
+    "tests/test_dockerignore_covers_gitignore.py only checks the FORWARD",
+    "direction ('every .gitignore pattern has a covering .dockerignore",
+    "pattern'). The reverse direction -- 'does a .dockerignore pattern",
+    "exclude a file git TRACKS' -- was measured (zero regression today: the",
+    "273 excluded tracked files are all pre-existing) but NOTHING PINNED it,",
+    "so a future pattern could silently drop a tracked file out of the",
+    "image and make the running service differ from the published source",
+    "archive. tests/test_dockerignore_tracked_files.py pins it: the excluded",
+    "set must be EXACTLY the documented allowlist -- neither more nor fewer.",
+    "",
+    "M1 (product) a new pattern sweeps a tracked file out of the root",
+    "    context. AGENTS.md is tracked and is currently IN the image; the",
+    "    mutant excludes it. A subset-only comparison would MISS this, the",
+    "    exact-set comparison kills it.",
+    "M2 (product) the '!.env.example' negation is gone, so the tracked",
+    "    .env.example falls back to the '.env.*' rule and leaves the",
+    "    image. This is the last-rule-wins / negation semantics at work.",
+    "M3 (product) the 'tests/' rule is gone: the allowlist entry goes stale",
+    "    and the excluded set shrinks, which is the 'silently shrunken",
+    "    allowlist' half of the rule.",
+    "M4 (test) the matcher loses directory-prefix semantics: 'a/b' stops",
+    "    covering 'a/b/c.txt'. The controls AND the rule test catch it.",
+    "M5 (test) the matcher stops honouring the '!' negation.",
+    "M6 (test) the allowlist is loosened to 'any tracked file under a",
+    "    prefix' -- a broad 'frontend/' entry -- without an exact-set",
+    "    check. The exact-set test kills it.",
+    "M7 (test) the allowlist silently SHRINKS: the 'docs/' entry is gone.",
+    "    The exact-set test kills it.",
+    "M8 (test) the EXACTNESS COMPARISON is weakened to a subset check,",
+    "    'excluded <= allowlist': a new exclusion would pass unnoticed.",
+    "M9 (test) the matcher applies the FIRST matching rule instead of the",
+    "    LAST one, so a later negation can no longer re-include a file.",
+    "M10 (test) the exactness comparison is weakened to the OTHER subset",
+    "    check, 'allowlist <= excluded': a shrunken allowlist would pass.",
+    "M11 (test) the WSL path translation is gone, so the worktree's git dir",
+    "    cannot be resolved under WSL and the tracked-file list comes back",
+    "    empty. The rule tests must then FAIL (never skip) -- the tracked list",
+    "    is resolved through the worktree's git dir, so the rule tests cannot",
+    "    skip in the harness.",
+    "M12 (test) the loud failure is silent again: the tracked list becomes",
+    "    None instead of raising. The new 'obtainable' test must FAIL.",
+    "",
+    "M8 AND M10 ARE KILLED, NOT EXPECTED SURVIVORS. A verdict computed",
+    "inline in a test cannot be weakened-detected: while the product is",
+    "correct a subset check and an exact check agree, so no test could tell",
+    "them apart. The comparison therefore lives in a named CALLABLE,",
+    "allowlist_matches_exactly(), and is called DIRECTLY with deliberately",
+    "inconsistent SYNTHETIC pairs (equal, strict subset, superset, disjoint,",
+    "empty/non-empty). The direct test depends on no repository data, so the",
+    "product state cannot satisfy it -- only a genuinely exact comparison",
+    "can. M8 and M10 therefore go red in the same way as every other mutant.",
+    "",
+    "THE TRACKED LIST IS RESOLVED THROUGH THE WORKTREE'S GIT DIR",
+    "This checkout is a LINKED worktree: its .git is a FILE holding a Windows",
+    "drive path ('gitdir: C:/dev/DepthSight/.git/worktrees/...'). Under WSL --",
+    "where the mutation harness runs pytest -- git resolves that path RELATIVE",
+    "to the current directory and fails with rc=128, so the tracked-file list",
+    "used to come back None, the four rule tests SKIPPED, pytest exited 0 and",
+    "M1, M2, M3, M6 and M7 were recorded as SURVIVORS. The product WAS defended",
+    "and the GUARD was SILENT. tracked_files() therefore asks git for the",
+    "worktree's git dir EXPLICITLY (translating a Windows drive path to the",
+    "WSL mount point as well), and require_tracked_files() FAILS LOUDLY when",
+    "the list cannot be resolved in a checkout -- never a skip. M11 and M12 pin",
+    "those two halves.",
+    "",
+    "Every needle is a SINGLE contiguous string and each occurs EXACTLY ONCE",
+    "in its target file (counted against the file's bytes before use). The",
+    "harness tries the CRLF form first and the LF form second, because this",
+    "worktree is mixed: .dockerignore is CRLF here, and the new test file is",
+    "LF (like its sibling tests/test_dockerignore_covers_gitignore.py).",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/dockerignore_tracked_files.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_dockerignore_tracked_files.py",
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "M1: a new .dockerignore pattern sweeps the tracked AGENTS.md out of the root build context",
+      "file": ".dockerignore",
+      "needle": "check.txt\n.prepush_pytest_output.txt\n",
+      "replace": "check.txt\n.prepush_pytest_output.txt\nAGENTS.md\n"
+    },
+    {
+      "label": "M2: the '!.env.example' negation is gone, so the tracked .env.example leaves the image",
+      "file": ".dockerignore",
+      "needle": "!.env.example\n",
+      "replace": ""
+    },
+    {
+      "label": "M3: the 'tests/' rule is gone, so the allowlist entry goes stale and the excluded set shrinks",
+      "file": ".dockerignore",
+      "needle": "tests/\ndocs/\n",
+      "replace": "docs/\n"
+    },
+    {
+      "label": "M4: the matcher loses directory-prefix semantics, so 'a/b' stops covering 'a/b/c.txt'",
+      "file": "tests/test_dockerignore_tracked_files.py",
+      "needle": "        for k in range(1, len(segments) + 1):\n",
+      "replace": "        for k in range(len(segments), len(segments) + 1):\n"
+    },
+    {
+      "label": "M5: the matcher stops honouring the '!' negation",
+      "file": "tests/test_dockerignore_tracked_files.py",
+      "needle": "    negated = p.startswith(\"!\")\n    if negated:\n        p = p[1:]\n",
+      "replace": "    negated = False\n    if negated:\n        p = p[1:]\n"
+    },
+    {
+      "label": "M6: the allowlist is loosened to 'any tracked file under a prefix' with no exact-set check",
+      "file": "tests/test_dockerignore_tracked_files.py",
+      "needle": "    (\"dir\", \"tests/\",\n     \"the runtime services never import the test suite (alembic needs \"\n     \"alembic/ + alembic.ini); the AGPL offer publishes it in the archive\"),\n",
+      "replace": "    (\"dir\", \"tests/\",\n     \"the runtime services never import the test suite (alembic needs \"\n     \"alembic/ + alembic.ini); the AGPL offer publishes it in the archive\"),\n    (\"dir\", \"frontend/\",\n     \"MUTANT: any tracked file under a prefix\"),\n"
+    },
+    {
+      "label": "M7: the allowlist silently shrinks -- the 'docs/' entry is gone",
+      "file": "tests/test_dockerignore_tracked_files.py",
+      "needle": "    (\"dir\", \"docs/\",\n     \"documentation is not needed at runtime; the AGPL offer publishes it in \"\n     \"the source archive\"),\n",
+      "replace": ""
+    },
+    {
+      "label": "M8: the exactness comparison is weakened to a subset check ('excluded <= allowlist'), so a new exclusion would pass unnoticed",
+      "file": "tests/test_dockerignore_tracked_files.py",
+      "needle": "    return set(allowlist) == set(excluded)\n",
+      "replace": "    return set(allowlist) <= set(excluded)\n"
+    },
+    {
+      "label": "M9: the matcher applies the FIRST matching rule instead of the LAST, so a later negation cannot re-include a file",
+      "file": "tests/test_dockerignore_tracked_files.py",
+      "needle": "            excluded = not rule.negated\n",
+      "replace": "            excluded = not rule.negated\n            break\n"
+    },
+    {
+      "label": "M10: the exactness comparison is weakened to the OTHER subset check ('allowlist <= excluded'), so a shrunken allowlist would pass unnoticed",
+      "file": "tests/test_dockerignore_tracked_files.py",
+      "needle": "    return set(allowlist) == set(excluded)\n",
+      "replace": "    return set(allowlist) >= set(excluded)\n"
+    },
+    {
+      "label": "M11: the WSL path translation is gone, so the worktree's git dir cannot be resolved under WSL and the tracked-file list is empty",
+      "file": "tests/test_dockerignore_tracked_files.py",
+      "needle": "    if len(path) >= 3 and path[1] == \":\" and path[0].isalpha():\n        return \"/mnt/\" + path[0].lower() + path[2:].replace(\"\\\\\", \"/\")\n    return path\n",
+      "replace": "    return path\n"
+    },
+    {
+      "label": "M12: the loud failure is silent again -- the tracked list becomes None instead of raising, so a broken resolution would not fail",
+      "file": "tests/test_dockerignore_tracked_files.py",
+      "needle": "        raise AssertionError(\n            \"git ls-files failed in this checkout: the tracked-file list is \"\n            \"unavailable, so the .dockerignore tracked-file rules would be \"\n            \"vacuous. See tests/test_gitignore_ignores_env_copies.py for the \"\n            \"same guard.\"\n        )\n",
+      "replace": "        return None\n"
+    }
+  ]
+}

@@ -65,6 +65,7 @@ SPEC_NAMES = (
     "source_offer_deployed_commit.json",
     "deployed_commit_script.json",
     "source_offer_image_and_certificate.json",
+    "dockerignore_tracked_files.json",
 )
 
 

@@ -33,6 +33,16 @@ Every pattern `.gitignore` excludes must also be excluded by
 `.dockerignore`. That is the invariant that makes the offer's promise true
 by construction rather than by luck.
 
+THE OTHER DIRECTION
+-------------------
+That rule is ONE direction. The reverse -- "does a `.dockerignore` pattern
+exclude a file that git TRACKS?" -- is a different question, and it was not
+checked here: a tracked file excluded from the build context does not make
+the checkout dirty, so the deploy stamp still calls it the committed tree
+while the image is built without it. That reverse direction, and the
+explicit allowlist of the tracked files that may be excluded, are pinned in
+`tests/test_dockerignore_tracked_files.py`.
+
 THE MATCHER
 -----------
 Docker's own pattern matcher is not callable from a test without a docker

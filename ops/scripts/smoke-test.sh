@@ -18,6 +18,11 @@ LOG_FILE="$STATE_DIR/smoke.log"
 mkdir -p "$STATE_DIR"
 
 DOMAIN="${PUBLIC_BASE_URL:-https://depthsight.diverseinc.net}"
+# The live environment file. The ops container mounts it read-only at this
+# path, so it always holds the CURRENT stamp -- unlike the container's own
+# environment, which is fixed when the container is created. It is
+# overridable so the smoke test can be exercised against a fixture.
+ENV_FILE="${DEPLOY_ENV_FILE:-/opt/depthsight/.env}"
 PG_HOST="${POSTGRES_HOST:-postgres}"
 PG_DB="${POSTGRES_DB:-depthsight_db}"
 PG_USER="${POSTGRES_USER:-depthsight_user}"
@@ -68,8 +73,8 @@ FAIL=0
     esac
 
     # 4. .env sanity (if mounted)
-    if [ -f /opt/depthsight/.env ]; then
-        if grep -q '[{}]' /opt/depthsight/.env; then
+    if [ -f "$ENV_FILE" ]; then
+        if grep -q '[{}]' "$ENV_FILE"; then
             echo "  [FAIL] .env contains { or } characters - elestio .env bug regressed!"
             FAIL=1
         else
@@ -107,6 +112,44 @@ FAIL=0
             echo "  [FAIL] GET $DOMAIN/source -> 200 but the source offer was not served"
             FAIL=1
         fi
+    fi
+
+    # 6. The AGPL offer PROMISES a downloadable archive of the exact tree of
+    #    the running build, and until now nothing ever FETCHED it: a 404
+    #    archive or an empty archive passed every check, because only the
+    #    PAGE was checked.
+    #
+    #    The commit is the STAMPED one -- the same DEPLOYED_COMMIT the api
+    #    publishes as the `commit` field of GET /api/v1/status. It is read
+    #    from the mounted .env (live, never stale) and from the environment
+    #    as a fallback. A deployment from before the stamp existed has no
+    #    commit: the check is SKIPPED, because there is nothing to check.
+    #    A stamped commit whose archive does not resolve FAILS: the offer
+    #    is naming a file that is not there.
+    STAMPED_COMMIT=""
+    STAMP_KEY="DEPLOYED_COMMIT"
+    if [ -f "$ENV_FILE" ]; then
+        STAMPED_COMMIT=$(grep -E "^${STAMP_KEY}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r' | tr -d '"' || true)
+    fi
+    if [ -z "$STAMPED_COMMIT" ]; then
+        STAMPED_COMMIT="${DEPLOYED_COMMIT:-}"
+    fi
+    if [ -z "$STAMPED_COMMIT" ]; then
+        echo "  [ok] SKIP the source archive check: no DEPLOYED_COMMIT is stamped"
+    else
+        ARCHIVE_URL="https://github.com/DiverseInc/DepthSight/archive/${STAMPED_COMMIT}.tar.gz"
+        ARCHIVE_BODY=$(mktemp)
+        ARCHIVE_CODE=$(curl -sL -o "$ARCHIVE_BODY" -w "%{http_code}" --max-time 30 "$ARCHIVE_URL" 2>/dev/null || echo "000")
+        if [ "$ARCHIVE_CODE" != "200" ]; then
+            echo "  [FAIL] GET $ARCHIVE_URL -> $ARCHIVE_CODE (the source archive the offer names is not available)"
+            FAIL=1
+        elif [ ! -s "$ARCHIVE_BODY" ]; then
+            echo "  [FAIL] GET $ARCHIVE_URL -> 200 but the source archive is empty"
+            FAIL=1
+        else
+            echo "  [ok] GET $ARCHIVE_URL -> 200 (the source archive the offer names is available)"
+        fi
+        rm -f "$ARCHIVE_BODY"
     fi
 
     # This whole block is piped into tee, so it runs in a SUBSHELL and a

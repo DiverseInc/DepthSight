@@ -21,14 +21,17 @@ review panel on 2026-11-07, both fixed by `ops/scripts/record_deployed_commit.sh
    `DEPLOYED_COMMIT` line written into `.env` travels WITH the container and
    comes back out of `GET /api/v1/status` as the `commit` field.
 
-3. The stamped commit has to EXIST IN THE PUBLIC REPOSITORY. The offer points
-   a reader at
+3. The stamped commit has to EXIST IN THE PUBLIC REPOSITORY, ON ITS `main`
+   BRANCH, AND THE LIVE REMOTE HAS TO CONFIRM IT. The offer points a reader
+   at
    `https://github.com/DiverseInc/DepthSight/archive/<commit>.tar.gz`
-   and tells them it is public. A commit that was never pushed has no archive
-   there -- that URL is a 404, and the claim is false. The manual deploy path
-   is `git pull origin main` with no `git reset --hard`, so a local commit or a
-   non-fast-forward merge leaves HEAD unpushed. The script therefore refuses to
-   stamp a commit that no pushed ref contains.
+   and tells them it is public, and the source page says the running service
+   is deployed from the `main` branch of THAT repository. A commit that was
+   never pushed has no archive there -- that URL is a 404, and the claim is
+   false. The manual deploy path is `git pull origin main` with no
+   `git reset --hard`, so a local commit or a non-fast-forward merge leaves
+   HEAD unpushed. A commit that is published on some OTHER branch, or on a
+   fork, or that the live remote no longer has, is just as false.
 
 WHAT IS TESTED HERE
 -------------------
@@ -77,7 +80,31 @@ REFUSAL = "REFUSING to stamp a checkout that is not the committed tree"
 # remote-tracking branches that contain the commit and changes nothing.
 # (`git branch -r` with no other verb is a listing; the script never creates,
 # renames or deletes a branch.)
-ALLOWED_GIT_SUBCOMMANDS = frozenset({"rev-parse", "status", "branch"})
+#
+# `config`, `merge-base` and `ls-remote` were added on 2026-11-09, when the
+# published check was narrowed to the MAIN branch of the PUBLIC repository:
+#   * `config --get-all remote.origin.url` reads the url the operator
+#     DECLARED for origin. It is a read, never a write.
+#   * `merge-base --is-ancestor` asks whether one commit is in the history of
+#     another. It is a question, never a merge.
+#   * `ls-remote` asks the LIVE remote what its refs are right now. It is a
+#     listing, never a push.
+# Allowing a subcommand is not the same as allowing a use of it, so each of
+# the three is pinned to its read-only form by a test in
+# TestTheNewGitCallsAreReadOnly below.
+ALLOWED_GIT_SUBCOMMANDS = frozenset(
+    {"rev-parse", "status", "branch", "config", "merge-base", "ls-remote"}
+)
+
+# The ONE public repository the AGPL-3.0 section 13 offer names. The deploy
+# stamp refuses to write DEPLOYED_COMMIT unless `origin` IS this repository,
+# so the fixture below DECLARES this url for origin. The transport still goes
+# to a local bare repository, because an `insteadOf` rewrite maps the public
+# url onto it -- so the tests exercise the real check without touching the
+# network. (`git config --get remote.origin.url` returns the DECLARED url;
+# `git remote get-url origin` returns the REWRITTEN one, and it is the
+# declared url the offer is about.)
+PUBLIC_URL = "https://github.com/DiverseInc/DepthSight.git"
 
 
 # --------------------------------------------------------------------------
@@ -195,9 +222,17 @@ def _drive(
             # A REAL bare repository, pushed to for real: the script asks
             # `git branch -r --contains HEAD`, and that only means something
             # when a remote-tracking ref really exists.
+            #
+            # The DECLARED url of origin is the PUBLIC repository the offer
+            # names -- that is what the script now checks -- and the
+            # insteadOf rewrite maps that url onto the local bare repository,
+            # so the transport stays local and the test never touches the
+            # network.
             body += (
                 'git init -q --bare "$ORIGIN_BASE/origin.git" >/dev/null 2>&1\n'
-                'git remote add origin "$ORIGIN_BASE/origin.git"\n'
+                f'git remote add origin "{PUBLIC_URL}"\n'
+                'git config "url.$ORIGIN_BASE/origin.git.insteadOf" '
+                f'"{PUBLIC_URL}"\n'
                 "git push -q origin HEAD:refs/heads/main >/dev/null 2>&1\n"
                 "git fetch -q origin >/dev/null 2>&1\n"
             )
@@ -544,6 +579,54 @@ class TestTheStaticScannerItself:
         subcommands = _git_subcommands(SCRIPT.read_text(encoding="utf-8"))
         assert subcommands <= ALLOWED_GIT_SUBCOMMANDS
         assert subcommands, "the scanner found no git call at all -- it is not working"
+
+
+# --------------------------------------------------------------------------
+# The three git verbs the public-repository check needed, pinned to their
+# READ-ONLY forms
+# --------------------------------------------------------------------------
+class TestTheNewGitCallsAreReadOnly:
+    """Allowing a git SUBCOMMAND is not the same as allowing a USE of it.
+
+    The allowlist above had to grow three verbs when the published check was
+    narrowed to the public repository's main branch. A subcommand allowlist
+    is coarse -- `git config` can rewrite a global config, `git merge-base`
+    can merge, `git ls-remote` sits next to `git push` -- so each of the three
+    is pinned here to the one read-only form the script is allowed to use.
+
+    This is a guard on the FORM of the calls, not a proof of the behaviour:
+    the behaviour is proved in tests/test_deployed_commit_public_ref.py, by
+    running the real script and looking at its exit code, its refusal and
+    the bytes it leaves in .env.
+    """
+
+    def test_git_config_is_only_ever_read(self):
+        code = _code_only(SCRIPT.read_text(encoding="utf-8"))
+        calls = re.findall(r"git\s+config[^\n]*", code)
+        assert calls, "the script does not call git config at all"
+        for call in calls:
+            assert call.startswith("git config --get"), (
+                f"the script must only READ configuration, but it runs {call!r}"
+            )
+
+    def test_git_merge_base_is_only_ever_asked_about_ancestry(self):
+        code = _code_only(SCRIPT.read_text(encoding="utf-8"))
+        calls = re.findall(r"git\s+merge-base[^\n]*", code)
+        assert calls, "the script does not call git merge-base at all"
+        for call in calls:
+            assert call.startswith("git merge-base --is-ancestor"), (
+                f"the script must only ASK about ancestry, but it runs {call!r}"
+            )
+
+    def test_git_ls_remote_is_only_ever_a_listing(self):
+        code = _code_only(SCRIPT.read_text(encoding="utf-8"))
+        calls = re.findall(r"git\s+ls-remote[^\n]*", code)
+        assert calls, "the script does not call git ls-remote at all"
+        for call in calls:
+            assert call.startswith("git ls-remote origin main"), (
+                f"the script must only LIST the remote's main branch, but it "
+                f"runs {call!r}"
+            )
 
 
 # --------------------------------------------------------------------------
