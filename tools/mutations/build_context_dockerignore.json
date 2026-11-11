@@ -17,6 +17,19 @@
     "does not exist on the host and pwa/ currently holds no gitignored file,",
     "so the hole was LATENT, not live. The fix closes it.",
     "",
+    "SECOND HOLE, THE SAME CLASS (2026-11-11, claude's residual on panel",
+    "run #7, confirmed in code): git consults the NEAREST .gitignore, so a",
+    "file ignored by the CONTEXT'S OWN .gitignore is invisible to",
+    "`git status --porcelain` as well -- and the rule set of a context did",
+    "not cover the context's own .gitignore at all. `frontend/.gitignore`",
+    "ignores `*.local`, `dist-ssr`, `.DS_Store`, `*.suo`, `*.ntvs*`,",
+    "`*.njsproj`, `*.sln`, `*.sw?` and `alembic/versions/*`, and NONE of",
+    "those were covered: such a file was copied into the image while the",
+    "deploy stamp could not see it. Both contexts now carry those rules,",
+    "and the guard asks the forward rule against BOTH .gitignore files.",
+    "MEASURED: adding them excludes ZERO tracked files (the reverse rule",
+    "stays exact), so the fix cannot sweep committed code out of an image.",
+    "",
     "These mutants remove ONE rule from ONE context's rule set, and the",
     "guard must catch every one of them:",
     "  * removing a DEPTH form leaves the nested copy uncovered (the rule is",
@@ -43,7 +56,7 @@
     {
       "label": "M2: the DEPTH form of node_modules is gone from the pwa context, so a NESTED node_modules enters the pwa image and overwrites the one the image installed",
       "file": "pwa/.dockerignore",
-      "needle": "**/node_modules/\n",
+      "needle": "**/node_modules\n",
       "replace": ""
     },
     {
@@ -55,7 +68,25 @@
     {
       "label": "M4: the DEPTH form of node_modules is gone from the frontend context, so a NESTED node_modules enters the frontend image and overwrites the one the image installed",
       "file": "frontend/.dockerignore",
-      "needle": "**/node_modules/\n",
+      "needle": "**/node_modules\n",
+      "replace": ""
+    },
+    {
+      "label": "M5: the DEPTH form of the '*.local' class is gone from the frontend context, so a NESTED x.local enters the frontend image -- and it is ignored by frontend/.gitignore, so `git status --porcelain` cannot report it",
+      "file": "frontend/.dockerignore",
+      "needle": "**/*.local\n",
+      "replace": ""
+    },
+    {
+      "label": "M6: the DEPTH form of the 'dist-ssr' class is gone from the pwa context, so a NESTED dist-ssr enters the pwa image -- and it is ignored by pwa/.gitignore, so `git status --porcelain` cannot report it",
+      "file": "pwa/.dockerignore",
+      "needle": "**/dist-ssr\n",
+      "replace": ""
+    },
+    {
+      "label": "M7: the rule that covers frontend/.gitignore inside the ROOT context is gone, so a NESTED frontend/sub/x.local enters the SIX images that build from the root context (api, bot, celery_worker, market_data, mcp-memory, websocket) while `git status --porcelain` cannot report it",
+      "file": ".dockerignore",
+      "needle": "**/frontend/**/*.local\n",
       "replace": ""
     }
   ]

@@ -221,4 +221,41 @@ performance_result/
 # the pwa build itself.)
 pwa/node_modules/
 **/pwa/node_modules/
-
+# ---------------------------------------------------------------------------
+# THE SUB-DIRECTORIES' OWN .gitignore RULES (added 2026-11-11).
+#
+# The root build context CONTAINS frontend/ and pwa/, and git consults the
+# NEAREST .gitignore -- so those directories' own rules apply inside the root
+# context too. The root Dockerfile does `COPY . .` for SIX services (api,
+# bot, celery_worker, market_data, mcp-memory, websocket), so a file such as
+# frontend/x.local was copied into all six images while being invisible to
+# `git status --porcelain` (git consults the nearest .gitignore, so the file
+# was ignored and therefore unreported) -- which breaks the offer's promise
+# that the archive of the stamped commit IS the exact tree of the running
+# build.
+#
+# Each rule is scoped to its sub-directory, so it cannot touch the repository
+# root's own alembic/versions/ -- whose migration files are TRACKED and are
+# needed by the api image. Measured: these rules exclude ZERO tracked files.
+#
+# The rule is pinned by tests/test_dockerignore_build_contexts.py.
+# ---------------------------------------------------------------------------
+**/frontend/**/node_modules
+**/frontend/**/dist-ssr
+**/frontend/**/*.local
+**/frontend/**/.DS_Store
+**/frontend/**/*.suo
+**/frontend/**/*.ntvs*
+**/frontend/**/*.njsproj
+**/frontend/**/*.sln
+**/frontend/**/*.sw?
+**/frontend/**/alembic/versions/*
+**/pwa/**/node_modules
+**/pwa/**/dist-ssr
+**/pwa/**/*.local
+**/pwa/**/.DS_Store
+**/pwa/**/*.suo
+**/pwa/**/*.ntvs*
+**/pwa/**/*.njsproj
+**/pwa/**/*.sln
+**/pwa/**/*.sw?

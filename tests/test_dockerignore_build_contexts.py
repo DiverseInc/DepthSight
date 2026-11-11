@@ -116,7 +116,29 @@ FRONTEND_DOCKERFILE = REPO_ROOT / "frontend" / "Dockerfile.prod"
 OPS_DOCKERFILE = REPO_ROOT / "ops" / "Dockerfile"
 PWA_DOCKERFILE = REPO_ROOT / "pwa" / "Dockerfile.prod"
 
+# The ROOT context. It CONTAINS frontend/ and pwa/ as subdirectories, and the
+# root Dockerfile does `COPY . .` for SIX services (api, bot, celery_worker,
+# market_data, mcp-memory, websocket) -- so the root context is a build
+# context like any other, and it needs a rule set that covers the rules of
+# the .gitignore files it CONTAINS.
+ROOT_CONTEXT = "."
+ROOT_DOCKERIGNORE = REPO_ROOT / ".dockerignore"
+
 ALL_CONTEXTS = (FRONTEND_CONTEXT, OPS_CONTEXT, PWA_CONTEXT)
+
+# Each context's OWN .gitignore. Git consults the NEAREST .gitignore, so a
+# file these rules ignore is invisible to `git status --porcelain` even
+# though it sits inside the build context -- which is why the forward rule
+# has to be asked against them too.
+CONTEXT_GITIGNORES = {
+    FRONTEND_CONTEXT: REPO_ROOT / "frontend" / ".gitignore",
+    PWA_CONTEXT: REPO_ROOT / "pwa" / ".gitignore",
+}
+
+
+def context_gitignore(context: str) -> Path:
+    """The context's own .gitignore, or a path that does not exist."""
+    return CONTEXT_GITIGNORES.get(context, REPO_ROOT / "no-such-context" / ".gitignore")
 
 
 # --------------------------------------------------------------------------
@@ -194,17 +216,49 @@ def context_relative(context: str, sample: str) -> str:
     return sample
 
 
-def uncovered_in_context(context: str, git_patterns, docker_patterns):
-    """(pattern, depth, sample) triples with no covering rule in the context."""
+def uncovered_in_context(context: str, git_patterns, docker_patterns,
+                         own_git_patterns=()):
+    """(pattern, depth, sample) triples with no covering rule in the context.
+
+    TWO .gitignore FILES APPLY INSIDE A CONTEXT, not one:
+
+      * the ROOT's -- git consults every .gitignore up the tree, so the root's
+        rules apply here as well, and a slashed root pattern reaches into a
+        context only when it NAMES that context;
+      * the CONTEXT'S OWN -- anchored at the context root, so EVERY one of its
+        patterns applies inside the context.
+
+    MEASURED 2026-11-11 (claude's residual on panel run #7, confirmed in
+    code): this file checked ONLY the root's .gitignore. `frontend/.gitignore`
+    ignores `*.local`, `dist-ssr`, `.DS_Store`, `*.suo`, `*.ntvs*`,
+    `*.njsproj`, `*.sln`, `*.sw?` and `alembic/versions/*`, and NONE of those
+    were covered by the context's rule set -- so such a file was copied into
+    the image while `git status --porcelain` could not report it (git
+    consults the NEAREST .gitignore, so the file was ignored and therefore
+    unreported). A guard that is green on the case it was written for is
+    worse than no guard: the case WAS in the repository the whole time.
+    """
     uncovered = []
     for pattern in git_patterns:
+        if pattern.startswith("!"):
+            continue
         if not reachable_in(context, pattern):
             continue
-        for depth, sample in sample_paths_at_depths(pattern):
-            rel = context_relative(context, sample)
-            if not excluded_by(docker_patterns, rel):
-                uncovered.append((pattern, depth, rel))
+        uncovered += _uncovered_for(pattern, docker_patterns, context)
+    for pattern in (own_git_patterns or ()):
+        if pattern.startswith("!"):
+            continue
+        uncovered += _uncovered_for(pattern, docker_patterns, context)
     return uncovered
+
+
+def _uncovered_for(pattern: str, docker_patterns, context: str):
+    out = []
+    for depth, sample in sample_paths_at_depths(pattern):
+        rel = context_relative(context, sample)
+        if not excluded_by(docker_patterns, rel):
+            out.append((pattern, depth, rel))
+    return out
 
 
 def allowed_exclusions(context: str, tracked) -> set:
@@ -268,14 +322,22 @@ def test_a_context_that_copies_everything_has_its_own_dockerignore():
 
 
 def test_nothing_gitignored_in_the_context_enters_that_image():
-    """The forward rule, per context, at depth 0, 1 and 2."""
+    """The forward rule, per context, at depth 0, 1 and 2.
+
+    It is asked against BOTH .gitignore files that apply inside the context:
+    the root's (git consults every .gitignore up the tree) and the context's
+    OWN (anchored at the context root). Checking only the root's is what
+    let `*.local`, `dist-ssr` and the IDE files through -- see
+    `uncovered_in_context`.
+    """
     for context, dockerignore, docker_patterns in (
         (FRONTEND_CONTEXT, FRONTEND_DOCKERIGNORE, read_patterns(FRONTEND_DOCKERIGNORE)),
         (PWA_CONTEXT, PWA_DOCKERIGNORE, read_patterns(PWA_DOCKERIGNORE)),
     ):
         assert docker_patterns, "%s has no patterns" % dockerignore.name
         uncovered = uncovered_in_context(
-            context, read_patterns(GITIGNORE_FILE), docker_patterns)
+            context, read_patterns(GITIGNORE_FILE), docker_patterns,
+            own_git_patterns=read_patterns(context_gitignore(context)))
         assert not uncovered, (
             "these .gitignore patterns have no covering rule in %s, so a file "
             "they match is invisible to the deploy stamp (git status does not "
@@ -330,8 +392,102 @@ def test_the_forward_check_can_fail():
     )
 
 
+def test_the_contexts_own_gitignore_is_asked_about():
+    """The check must be able to say NO about the CONTEXT's own .gitignore.
+
+    The negative control is the REAL class: `frontend/.gitignore` ignores
+    `*.local`, and until 2026-11-11 nothing asked about it -- so a
+    `frontend/x.local` was copied into the frontend image while
+    `git status --porcelain` could not report it.
+    """
+    uncovered = uncovered_in_context("pwa", [], ["*.pkl"],
+                                     own_git_patterns=["*.local"])
+    assert uncovered, (
+        "a pattern that only the CONTEXT'S OWN .gitignore carries must be "
+        "asked about -- that is exactly the class this check used to skip"
+    )
+    assert {depth for _p, depth, _s in uncovered} == {0, 1, 2}, (
+        "the uncovered depths must be exactly 0, 1 and 2"
+    )
+    assert uncovered_in_context("pwa", [], ["*.local", "**/*.local"],
+                                own_git_patterns=["*.local"]) == [], (
+        "adding the rule must close the gap"
+    )
+
+
+def repository_gitignores():
+    """Every .gitignore in the repository, with the directory it governs.
+
+    Git consults the NEAREST .gitignore, so the rules of `frontend/.gitignore`
+    govern `frontend/*` even inside the ROOT build context. The directory
+    each file governs is the prefix its patterns are relative to.
+    """
+    skip = ("node_modules", ".git", "site-packages", ".venv", "venv",
+            "_parked", "__pycache__")
+    out = []
+    for g in sorted(REPO_ROOT.rglob(".gitignore")):
+        rel = g.relative_to(REPO_ROOT).as_posix()
+        parts = rel.split("/")
+        if any(p in skip for p in parts):
+            continue
+        prefix = rel[: -len("/.gitignore")] if "/" in rel else ""
+        out.append((prefix, read_patterns(g)))
+    return out
+
+
+def test_the_root_context_excludes_everything_the_repository_gitignores():
+    """The root context CONTAINS frontend/ and pwa/, and git consults the
+    NEAREST .gitignore -- so those directories' own rules apply inside the
+    root context too.
+
+    MEASURED 2026-11-11 (the same class as the pwa hole, found in the root):
+    the root Dockerfile does `COPY . .` for SIX services, so `frontend/x.local`
+    was copied into all six of those images while `git status --porcelain`
+    could not report it (git consults the nearest .gitignore, so the file was
+    ignored and therefore unreported).
+    """
+    docker_patterns = read_patterns(ROOT_DOCKERIGNORE)
+    uncovered = []
+    for prefix, git_patterns in repository_gitignores():
+        for pattern in git_patterns:
+            if pattern.startswith("!"):
+                continue
+            for depth, sample in sample_paths_at_depths(pattern):
+                path = (prefix + "/" + sample) if prefix else sample
+                if not excluded_by(docker_patterns, path):
+                    uncovered.append((prefix or "<root>", pattern, depth, path))
+    assert not uncovered, (
+        "these .gitignore rules have no covering rule in the ROOT "
+        ".dockerignore, so a file they match would be copied into the SIX "
+        "images that build from the root context while being invisible to the "
+        "deploy stamp: %s"
+        % "; ".join("%s/%s at depth %d (e.g. %s)" % t for t in uncovered[:12])
+    )
+
+
+def test_the_root_context_check_can_fail():
+    """The root check has to be able to say NO.
+
+    It is exercised on a SYNTHETIC pair, so the repository's own (currently
+    correct) data cannot satisfy it.
+    """
+    patterns = ["*.local"]
+    samples = [(d, s) for d, s in sample_paths_at_depths("*.local")]
+    path = "frontend/sub/deep/sample.local"
+    assert not excluded_by(patterns, path), (
+        "a bare rule covers the ROOT only, so a nested file is NOT excluded"
+    )
+    assert excluded_by(["**/frontend/**/*.local"], path), (
+        "the scoped depth rule must cover the nested file inside the "
+        "sub-directory"
+    )
+    assert excluded_by(["**/frontend/**/*.local"], "frontend/sample.local"), (
+        "and the file directly inside the sub-directory"
+    )
+    assert samples, "the sampling must produce depths"
+
+
 def test_the_allowlist_is_only_the_builders_own_inputs():
-    """The allowlist is a RULE, not a list that can go stale."""
     tracked = [
         "pwa/.gitignore",
         "pwa/Dockerfile.prod",
