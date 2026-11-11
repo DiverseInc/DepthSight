@@ -26,6 +26,11 @@
     "    allowlist' half of the rule.",
     "M4 (test) the matcher loses directory-prefix semantics: 'a/b' stops",
     "    covering 'a/b/c.txt'. The controls AND the rule test catch it.",
+    "    (2026-11-10: the needle MOVED with the matcher rewrite. The matcher",
+    "    now implements DOCKER's semantics -- measured with the real docker",
+    "    CLI -- in which a bare pattern covers the ROOT only and a rule that",
+    "    matches a DIRECTORY covers everything under it, so the loop that walks",
+    "    the path's ANCESTORS is the half M4 breaks.)",
     "M5 (test) the matcher stops honouring the '!' negation.",
     "M6 (test) the allowlist is loosened to 'any tracked file under a",
     "    prefix' -- a broad 'frontend/' entry -- without an exact-set",
@@ -89,9 +94,9 @@
       "replace": "check.txt\n.prepush_pytest_output.txt\nAGENTS.md\n"
     },
     {
-      "label": "M2: the '!.env.example' negation is gone, so the tracked .env.example leaves the image",
+      "label": "M2: the '!.env.example' negation is gone (both the root form and its depth form), so the tracked .env.example leaves the image",
       "file": ".dockerignore",
-      "needle": "!.env.example\n",
+      "needle": "!.env.example\n!**/.env.example\n",
       "replace": ""
     },
     {
@@ -103,8 +108,8 @@
     {
       "label": "M4: the matcher loses directory-prefix semantics, so 'a/b' stops covering 'a/b/c.txt'",
       "file": "tests/test_dockerignore_tracked_files.py",
-      "needle": "        for k in range(1, len(segments) + 1):\n",
-      "replace": "        for k in range(len(segments), len(segments) + 1):\n"
+      "needle": "    for k in range(1, len(segments)):\n",
+      "replace": "    for k in range(len(segments), len(segments)):\n"
     },
     {
       "label": "M5: the matcher stops honouring the '!' negation",

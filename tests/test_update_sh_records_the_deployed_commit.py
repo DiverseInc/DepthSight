@@ -27,6 +27,17 @@ fixed here.
    with a BOUNDED retry (a fixed number of attempts) and a LOUD failure: a
    red error and `exit 1`. Never a silent success, never an unbounded loop.
 
+3. (Claude, review panel 2026-11-10) The restart itself was CONDITIONAL --
+   it only ran when the offer was missing. Caddy reads its Caddyfile only at
+   startup, and `docker compose up -d` does not recreate a container whose
+   bind-mounted file changed, so once the offer was live the check passed on
+   every later deploy and caddy was never restarted: a later change to
+   caddy.config was silently not applied, and the running proxy executed an
+   OLDER commit's configuration than the commit the api published and
+   /source named. That is the two-commit promise the offer must not break.
+   The restart is now unconditional, and so is the site-root check that
+   guards it -- which is what the tests below pin.
+
 WHERE THE RECORDING LIVES NOW
 -----------------------------
 The recording used to be a shell FUNCTION inside `update.sh`, and the tests
@@ -354,15 +365,54 @@ class TestTheDeployChecksTheWholeSiteAfterTheRestart:
             f"{restart}); it is checked at {call.start()}"
         )
 
-    def test_the_root_check_runs_inside_the_restart_branch(self, script: str):
-        """It is the RESTART that can take the site down, so that is where
-        the rest of the site has to be checked."""
+    def test_the_restart_is_not_conditional(self, script: str):
+        """The caddy restart must NOT be inside the OFFER_LIVE branch.
+
+        MEASURED DEFECT (review panel, 2026-11-10, Claude): the restart was
+        `if [ "$OFFER_LIVE" -eq 0 ]; then ... docker compose restart caddy`.
+        Caddy reads its Caddyfile only at startup and `docker compose up -d`
+        does not recreate a container whose bind-mounted file changed, so
+        once the offer was live the check passed on every LATER deploy and
+        caddy was NEVER restarted. A later change to caddy.config was then
+        silently not applied: the running proxy executed an OLDER commit's
+        configuration than the commit the api published and /source named --
+        exactly the two-commit promise the AGPL offer must not break.
+
+        So the restart is unconditional, and the site-root check that guards
+        the restart is unconditional too.
+        """
         branch = re.search(
             r"(?ms)^if \[ \"\$OFFER_LIVE\" -eq 0 \]; then\n(.*?)^fi$", script
         )
         assert branch, "update.sh has no OFFER_LIVE branch"
-        assert "site_root_is_live" in branch.group(1), (
-            "the site root must be checked in the branch that restarts caddy"
+        assert "docker compose restart caddy" not in branch.group(1), (
+            "the caddy restart is inside the OFFER_LIVE branch, so a deploy "
+            "that leaves the offer in place never restarts caddy and a later "
+            "change to caddy.config is silently not applied"
+        )
+
+    def test_the_restart_happens_before_the_offer_is_checked(self, script: str):
+        """The restart is what loads the new Caddyfile, so it comes first."""
+        restart = script.index("docker compose restart caddy")
+        check = re.search(r"(?m)^\s*if source_offer_is_live; then$", script)
+        assert check, "update.sh never calls source_offer_is_live"
+        assert restart < check.start(), (
+            "caddy must be restarted BEFORE the offer is checked (the restart "
+            f"is at {restart}, the check at {check.start()}): until the "
+            "restart the running proxy still serves the previous Caddyfile"
+        )
+
+    def test_the_root_check_is_not_conditional_either(self, script: str):
+        """The restart now happens on EVERY deploy, so the site can go down
+        on every deploy, so the site root is checked on every deploy."""
+        branch = re.search(
+            r"(?ms)^if \[ \"\$OFFER_LIVE\" -eq 0 \]; then\n(.*?)^fi$", script
+        )
+        assert branch, "update.sh has no OFFER_LIVE branch"
+        assert "site_root_is_live" not in branch.group(1), (
+            "the site root is only checked when the offer is missing, but the "
+            "caddy restart now happens on EVERY deploy -- so the site can go "
+            "down on every deploy and the root must be checked every time"
         )
 
     def test_the_retry_is_bounded(self, script: str):

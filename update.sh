@@ -119,15 +119,25 @@ fi
 # picks up the stamp that was just written into .env.
 docker compose up -d --no-deps --force-recreate api
 
-# 4b. The AGPL-3.0 section 13 source offer must be reachable after a deploy.
+# 4b. caddy is RESTARTED, unconditionally, and only then is the offer checked.
 #
 # Caddy reads its Caddyfile only at startup, and `docker compose up -d` does
 # NOT recreate a container whose bind-mounted file changed (AGENTS.md:97-98).
-# A deploy that adds a route therefore leaves the path on the React SPA
-# catch-all, which answers 200 with the app shell instead of the offer, so
-# the BODY is checked and not just the status. If the offer is missing,
-# caddy is restarted -- that is what loads the new Caddyfile -- and the
-# check is repeated.
+# So a deploy that changes caddy.config leaves the RUNNING proxy on the
+# PREVIOUS configuration -- while the api publishes the new commit and
+# /source names the new commit's archive. Caddy's configuration is part of
+# the running build, so that is exactly the two-commit promise the AGPL
+# offer must not break: the offer says the archive of <commit> IS the
+# running build.
+#
+# So the restart is NOT conditional on the offer being missing. It WAS, and
+# that was wrong: once the offer is live the check passed on every later
+# deploy and caddy was never restarted, so a later change to caddy.config
+# was silently never applied.
+echo -e "${BLUE}[*] Restarting caddy so it loads the deployed Caddyfile...${NC}"
+docker compose restart caddy
+sleep 3
+
 echo -e "${BLUE}[*] Verifying the AGPL source offer is reachable...${NC}"
 PUBLIC_BASE_URL=""
 if [ -f .env ]; then
@@ -177,30 +187,27 @@ for _ in 1 2 3; do
 done
 
 if [ "$OFFER_LIVE" -eq 0 ]; then
-    echo -e "${BLUE}[*] The source offer is not being served; restarting caddy...${NC}"
-    docker compose restart caddy
-    sleep 3
-    if ! source_offer_is_live; then
-        echo -e "${RED}[!] The AGPL source offer is NOT reachable at $PUBLIC_BASE_URL/source${NC}"
-        echo -e "${RED}[!] Check 'docker compose logs caddy | tail -50'${NC}"
-        exit 1
+    echo -e "${RED}[!] The AGPL source offer is NOT reachable at $PUBLIC_BASE_URL/source${NC}"
+    echo -e "${RED}[!] caddy was just restarted, so it is running the deployed Caddyfile${NC}"
+    echo -e "${RED}[!] Check 'docker compose logs caddy | tail -50'${NC}"
+    exit 1
+fi
+
+# The restart bounced the proxy in front of the WHOLE site, so the rest of the
+# service has to answer too. Bounded: three attempts, then a loud failure. A
+# failed check never carries on as a success.
+SITE_ROOT_LIVE=0
+for _ in 1 2 3; do
+    if site_root_is_live; then
+        SITE_ROOT_LIVE=1
+        break
     fi
-    # The restart just bounced the proxy in front of the WHOLE site, so the
-    # rest of the service has to answer too. Bounded: three attempts, then a
-    # loud failure. A failed check never carries on as a success.
-    SITE_ROOT_LIVE=0
-    for _ in 1 2 3; do
-        if site_root_is_live; then
-            SITE_ROOT_LIVE=1
-            break
-        fi
-        sleep 5
-    done
-    if [ "$SITE_ROOT_LIVE" -eq 0 ]; then
-        echo -e "${RED}[!] The site root is NOT answering at $PUBLIC_BASE_URL/ after the caddy restart${NC}"
-        echo -e "${RED}[!] Check 'docker compose logs caddy | tail -50' and 'docker compose ps'${NC}"
-        exit 1
-    fi
+    sleep 5
+done
+if [ "$SITE_ROOT_LIVE" -eq 0 ]; then
+    echo -e "${RED}[!] The site root is NOT answering at $PUBLIC_BASE_URL/ after the caddy restart${NC}"
+    echo -e "${RED}[!] Check 'docker compose logs caddy | tail -50' and 'docker compose ps'${NC}"
+    exit 1
 fi
 echo -e "${GREEN}[+] Source offer is live at $PUBLIC_BASE_URL/source${NC}"
 

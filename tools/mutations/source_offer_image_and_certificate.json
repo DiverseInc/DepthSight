@@ -41,16 +41,16 @@
   "timeout_s": 1800,
   "mutations": [
     {
-      "label": "M1: the credential-copy class loses its underscore separator, so a .env_backup enters the image",
+      "label": "M1: the DEPTH form of the credential-copy class is gone, so a NESTED .env_backup enters the image",
       "file": ".dockerignore",
-      "needle": ".env_*\n.env-*",
-      "replace": ".env-*"
+      "needle": "**/.env_*\n",
+      "replace": ""
     },
     {
-      "label": "M2: the review panel's transcripts and review.diff are no longer excluded from the image",
+      "label": "M2: the DEPTH form of the .review exclusion is gone, so a NESTED .review/ (the review panel's transcripts) enters the image",
       "file": ".dockerignore",
-      "needle": ".review/",
-      "replace": "# .review/"
+      "needle": "**/.review\n",
+      "replace": ""
     },
     {
       "label": "M3: the smoke test skips certificate verification again, so it cannot tell the real offer from an impersonated one",

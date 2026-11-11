@@ -18,10 +18,10 @@ archive is the exact tree of the running build").
 
 MEASURED, NOT ASSUMED
 ---------------------
-At this commit the repository tracks 1046 files. The .dockerignore rules
-exclude exactly 273 of them from the ROOT build context:
+At this commit the repository tracks 1053 files. The .dockerignore rules
+exclude exactly 279 of them from the ROOT build context:
 
-    tests/                                                        254
+    tests/                                                        260
     docs/                                                           5
     frontend/  (.gitignore, Dockerfile.dev, Dockerfile.prod,
                 .env.production)                                     4
@@ -33,6 +33,29 @@ and the DELTA introduced by this PR's .dockerignore change is ZERO tracked
 files: none of the newly added patterns (*.sqlite, *.pkl, *.parquet,
 *.sql, *.err, *.log, *.bak-*, credentials*.json, docker-compose.legacy.yml,
 check.txt) matches a tracked file.
+
+THE DEPTH HOLE, AND WHY THE EXCLUDED SET DID NOT MOVE
+-----------------------------------------------------
+This file's matcher used to implement GIT's semantics for a bare pattern --
+"a pattern with no slash matches at any level" -- which is how the nested
+depth hole survived a review: the matcher said a bare '*.pkl' excluded
+'sub/model.pkl', and it did not.
+
+Docker's real rule (MEASURED with the real docker CLI, 29.9.3) is the
+opposite: '*' compiles to '[^/]*' and the pattern is matched against the
+WHOLE relative path, so a bare pattern covers the ROOT ONLY, '**/name'
+reaches every depth, and a rule that matches a DIRECTORY covers everything
+under it. The matcher below implements THAT.
+
+Correcting it does NOT move the excluded set, and that is the point of the
+allowlist being an EXACT set: the seven tracked files that the old matcher
+claimed to exclude ('frontend/.gitignore', 'frontend/Dockerfile.dev',
+'frontend/Dockerfile.prod', 'ops/Dockerfile', 'pwa/.gitignore',
+'pwa/Dockerfile.dev', 'pwa/Dockerfile.prod') are now excluded by the
+'**/' depth forms their allowlist entries document, and the two files the
+old matcher let back in ('frontend/.env.example', 'pwa/.env.example') are
+re-included by the '**/.env.example' negation. The set is the same set --
+but now it is the set DOCKER actually computes.
 
 THE RULE
 --------
@@ -62,12 +85,27 @@ THE MATCHER
 -----------
 Docker's own matcher is not callable from a test without a docker daemon, so
 this file implements the subset of the syntax this repository uses: plain
-paths, a leading "/" (anchored to the context root), a trailing "/" (a
-directory), "*", "?", "**" and "!" (negation), with the LAST matching rule
-winning, as Docker does. A reimplementation is only acceptable if it can
-FAIL, so the matcher has its own controls: each one asserts that a pattern
-does NOT match a path it must not match, and the rule test below asserts on
-the COMPUTED excluded set -- not on a scan of the .dockerignore text.
+paths, "*", "?", "**" and "!" (negation), with the LAST matching rule
+winning, as Docker does.
+
+The rules below are DOCKER's rules, MEASURED with the real docker CLI
+(29.9.3), not git's:
+
+  * '*' compiles to '[^/]*' and the pattern is matched against the WHOLE
+    relative path, so a BARE pattern covers the ROOT ONLY -- '*.pkl' does
+    NOT match 'sub/model.pkl', while '**/*.pkl' does;
+  * a rule that matches a DIRECTORY covers everything under it: 'logs'
+    excludes 'logs/app.log', and 'test*' excludes 'tests/unit/test_x.py';
+  * a leading and a trailing slash are IGNORED: 'data/' behaves exactly
+    like 'data', and 'data/' even matches a FILE named 'data'. There is no
+    "directory only" rule in Docker's .dockerignore, so none is implemented
+    here;
+  * the last matching rule wins, and '!' re-includes.
+
+A reimplementation is only acceptable if it can FAIL, so the matcher has
+its own controls: each one asserts that a pattern does NOT match a path it
+must not match, and the rule test below asserts on the COMPUTED excluded
+set -- not on a scan of the .dockerignore text.
 
 THE COMPARISON IS A CALLABLE
 -----------------------------
@@ -97,38 +135,26 @@ DOCKERIGNORE = REPO_ROOT / ".dockerignore"
 # --------------------------------------------------------------------------
 class _Rule(NamedTuple):
     regex: str
-    anchored: bool
-    dir_only: bool
     negated: bool
 
 
 def _glob_to_regex(glob: str) -> str:
-    """The subset of Docker's glob syntax this repository uses.
+    """Docker's glob syntax, compiled against the WHOLE relative path.
 
     "*" matches within one path segment, "?" matches exactly one character
-    and "**" crosses separators.
+    and "**" crosses separators. "**/" matches any number of leading
+    directories, including none -- which is what makes "**/logs" reach both
+    "logs/app.log" and "sub/logs/app.log".
     """
     out = []
     i = 0
     n = len(glob)
     while i < n:
+        if glob.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+            continue
         if glob.startswith("**", i):
-            starts_component = (i == 0) or glob[i - 1] == "/"
-            j = i + 2
-            ends_component = (j == n) or glob[j] == "/"
-            if starts_component and ends_component:
-                if j < n:
-                    j += 1  # consume the '/' that follows '**'
-                if i == 0 and j >= n:
-                    out.append(".*")  # '**' alone matches everything
-                elif i == 0:
-                    out.append("(?:.*/)?")  # leading '**/' -> any depth
-                elif j >= n:
-                    out.append("(?:/.*)?")  # trailing '/**' -> everything below
-                else:
-                    out.append("(?:/.*/)?")  # 'a/**/b'
-                i = j
-                continue
             out.append(".*")
             i += 2
             continue
@@ -151,33 +177,28 @@ def _compile_pattern(pattern: str) -> Optional[_Rule]:
     negated = p.startswith("!")
     if negated:
         p = p[1:]
-    dir_only = p.endswith("/")
-    if dir_only:
-        p = p[:-1]
-    anchored = p.startswith("/")
-    if anchored:
-        p = p[1:]
-    elif "/" in p:
-        anchored = True
+    # Docker IGNORES a leading and a trailing slash: 'data/' is 'data', and
+    # 'data/' even matches a FILE named 'data' (MEASURED with the real
+    # docker CLI). There is no "directory only" rule to implement here.
+    p = p.strip("/")
     if not p:
         return None
-    return _Rule(_glob_to_regex(p), anchored, dir_only, negated)
+    return _Rule(_glob_to_regex(p), negated)
 
 
 def _pattern_matches(rule: _Rule, path: str) -> bool:
-    """Does this single rule match this path?"""
+    """Does this single rule match this path? (Docker semantics.)
+
+    The rule is matched against the WHOLE relative path -- docker compiles
+    '*' to '[^/]*', so a bare pattern covers the ROOT only -- and a rule that
+    matches a DIRECTORY covers everything under it.
+    """
+    if re.fullmatch(rule.regex, path):
+        return True
     segments = path.split("/")
-    if rule.anchored:
-        for k in range(1, len(segments) + 1):
-            candidate = "/".join(segments[:k])
-            if re.fullmatch(rule.regex, candidate):
-                # A rule that matches a DIRECTORY covers everything under it.
-                return k < len(segments) or not rule.dir_only
-        return False
-    for segment in segments:
-        if re.fullmatch(rule.regex, segment):
-            if rule.dir_only and segment == segments[-1]:
-                continue  # 'data/' names a directory, not a file called data
+    for k in range(1, len(segments)):
+        ancestor = "/".join(segments[:k])
+        if re.fullmatch(rule.regex, ancestor):
             return True
     return False
 
@@ -219,24 +240,28 @@ def read_patterns(path: Path):
 # The matcher's own controls: a matcher that cannot say NO proves nothing
 # --------------------------------------------------------------------------
 CONTROLS = [
-    # a plain name matches at any level, and covers what is under it
+    # a bare pattern covers the ROOT ONLY: docker compiles '*' to '[^/]*' and
+    # matches the pattern against the WHOLE relative path
     ("logs", "logs/app.log", True),
-    ("logs", "a/logs/b.log", True),
-    ("logs", "a/b/logs/c.log", True),
+    ("logs", "a/logs/b.log", False),
     ("logs", "log.txt", False),
-    # a glob does not cross a separator, but matches at any depth
     ("*.py", "app.py", True),
-    ("*.py", "a/b/app.py", True),
+    ("*.py", "a/b/app.py", False),
     ("*.py", "a/b/app.pyc", False),
+    # '**/' crosses directories, and also matches at the root
+    ("**/logs", "logs/app.log", True),
+    ("**/logs", "a/logs/b.log", True),
+    ("**/*.py", "a/b/app.py", True),
+    ("**/*.py", "app.py", True),
     # a leading slash anchors to the context root
     ("/root.txt", "root.txt", True),
     ("/root.txt", "a/root.txt", False),
     # a directory rule covers its contents
     ("a/b", "a/b/c.txt", True),
     ("a/b", "a/b", True),
-    # a trailing slash means a directory
+    ("a/b", "x/a/b/c.txt", False),
+    # a trailing slash is IGNORED by docker: 'data/' is 'data'
     ("data/", "data/x", True),
-    ("data/", "a/data/x", True),
     ("data/", "database/x", False),
     # '**' crosses separators
     ("**/secrets/", "a/b/secrets/k", True),
@@ -247,9 +272,13 @@ CONTROLS = [
     # the shapes this repository actually uses
     (".env", ".env", True),
     (".env", ".envx", False),
-    (".env.*", "frontend/.env.production", True),
-    ("Dockerfile.*", "frontend/Dockerfile.dev", True),
+    (".env", "a/.env", False),
+    (".env.*", "frontend/.env.production", False),
+    ("**/.env.*", "frontend/.env.production", True),
+    ("Dockerfile.*", "frontend/Dockerfile.dev", False),
+    ("**/Dockerfile*", "frontend/Dockerfile.dev", True),
     ("tests/", "tests/unit/test_x.py", True),
+    ("tests/", "a/tests/unit/test_x.py", False),
     # the negative control: a file nothing matches SURVIVES
     ("*.txt", "app.py", False),
 ]
@@ -455,9 +484,13 @@ ALLOWLIST = (
      "a ROOT-context image layer"),
 )
 
-# Bump this when the allowlist changes: a change to it is a REVIEW, not a
-# side effect of editing a pattern.
-ALLOWLIST_LAST_REVIEWED = "2026-11-09"
+# The date the allowlist was last reviewed. Bump this when the allowlist
+# changes: a change to it is a REVIEW, not a side effect of editing a
+# pattern. It is also bumped when the allowlist is re-reviewed against
+# changed circumstances -- here, against the CORRECTED (docker) matcher,
+# which changed the excluded set of every rule and still left the allowlist
+# exactly right.
+ALLOWLIST_LAST_REVIEWED = "2026-11-10"
 
 
 def allowlist_expected(tracked):
