@@ -1,0 +1,62 @@
+{
+  "_comment": [
+    "Mutants that put the BUILD CONTEXT hole BACK into the branch.",
+    "",
+    "FINDING (review panel run #6, 2026-11-11, hermes, counted YES):",
+    "`pwa/` is its own docker build context (`context: ./pwa` in",
+    "docker-compose.yml) and `pwa/Dockerfile.prod` does `COPY . .`, but",
+    "`pwa/` had NO .dockerignore, while `frontend/` HAS one. A build context",
+    "uses the .dockerignore in ITS OWN ROOT, so the root .dockerignore does",
+    "not apply to the pwa image at all: a gitignored file inside pwa/ was",
+    "copied into that image, and `git status --porcelain` does not report",
+    "ignored files -- so the deploy stamp could not see it and the published",
+    "archive did not contain it. The offer promises the archive of the",
+    "stamped commit IS the exact tree of the running build.",
+    "",
+    "MEASURED on production before the fix (2026-11-11): pwa/.dockerignore",
+    "does not exist on the host and pwa/ currently holds no gitignored file,",
+    "so the hole was LATENT, not live. The fix closes it.",
+    "",
+    "These mutants remove ONE rule from ONE context's rule set, and the",
+    "guard must catch every one of them:",
+    "  * removing a DEPTH form leaves the nested copy uncovered (the rule is",
+    "    'excluded at the context root, at depth 1 and at depth 2');",
+    "  * removing the re-inclusion of the tracked .env.production sweeps a",
+    "    TRACKED file out of the context, which the reverse rule catches.",
+    "",
+    "Every needle below occurs EXACTLY ONCE in its target file (asserted by",
+    "tests/test_deployed_commit_mutation_needles.py and re-checked by the",
+    "harness).",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/build_context_dockerignore.json",
+    "NEVER run concurrently with a test run or a reviewer."
+  ],
+  "pytest_target": "tests/test_dockerignore_build_contexts.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "M1: the DEPTH form of the underscore-separated env-copy class is gone from the pwa context, so a NESTED .env_backup enters the pwa image",
+      "file": "pwa/.dockerignore",
+      "needle": "**/.env_*\n",
+      "replace": ""
+    },
+    {
+      "label": "M2: the DEPTH form of node_modules is gone from the pwa context, so a NESTED node_modules enters the pwa image and overwrites the one the image installed",
+      "file": "pwa/.dockerignore",
+      "needle": "**/node_modules/\n",
+      "replace": ""
+    },
+    {
+      "label": "M3: the pwa context no longer re-includes the tracked .env.production, so the image would be built without the env file the build reads and the published archive would not match the image",
+      "file": "pwa/.dockerignore",
+      "needle": "!.env.production\n",
+      "replace": ""
+    },
+    {
+      "label": "M4: the DEPTH form of node_modules is gone from the frontend context, so a NESTED node_modules enters the frontend image and overwrites the one the image installed",
+      "file": "frontend/.dockerignore",
+      "needle": "**/node_modules/\n",
+      "replace": ""
+    }
+  ]
+}

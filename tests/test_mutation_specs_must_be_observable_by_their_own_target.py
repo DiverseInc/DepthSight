@@ -255,11 +255,23 @@ ALLOWLIST = (
         "this spec guards the PINNED REWRITE. R1 (coverage) holds.",
         "2026-11-09",
     ),
+    (
+        "build_context_dockerignore.json",
+        "R2 cannot hold across SPECS: `frontend/.dockerignore` is also read "
+        "by `tests/test_production_bundle_excludes_demo_credentials.py`, "
+        "which guards the DEMO CREDENTIAL class in the web build contexts; "
+        "this spec guards the BUILD CONTEXT (a context that copies the whole "
+        "context needs its own rule set, and it must not sweep a tracked "
+        "file out of it). `pwa/.dockerignore` is observed by this spec's own "
+        "target alone. R1 (coverage) holds: this spec's own target reads both "
+        "dotfiles.",
+        "2026-11-11",
+    ),
 )
 
 # Bump this when the allowlist changes: a change to it is a REVIEW, not a
 # side effect of editing the rule.
-ALLOWLIST_LAST_REVIEWED = "2026-11-09"
+ALLOWLIST_LAST_REVIEWED = "2026-11-11"
 
 ALLOWLIST_NAMES = tuple(name for name, _reason, _date in ALLOWLIST)
 
