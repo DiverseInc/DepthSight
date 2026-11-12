@@ -86,6 +86,13 @@
     "    test_an_archive_that_is_not_there_fails_the_smoke_test.",
     "M15 -- the smoke test accepted an EMPTY archive. Killed by",
     "    test_an_empty_archive_fails_the_smoke_test.",
+    "M16 -- the MANUAL deploy sequence in AGENTS.md has no stop-on-error, so a",
+    "    FAILED BUILD is followed by `--force-recreate api`: the api is then",
+    "    re-created from the OLD image with the NEW stamp already in its",
+    "    environment, so the running service publishes a commit whose code it",
+    "    is NOT running, and the offer names an archive that is not the",
+    "    running build. Killed by",
+    "    test_the_manual_deploy_block_stops_at_the_first_failed_step.",
     "",
     "EVERY NEEDLE IS ASSERTED UNIQUE BEFORE USE: each needle below occurs",
     "EXACTLY ONCE in its file, measured before the mutation was written. A",
@@ -182,6 +189,12 @@
       "file": "ops/scripts/smoke-test.sh",
       "needle": "elif [ ! -s \"$ARCHIVE_BODY\" ]; then",
       "replace": "elif false; then"
+    },
+    {
+      "label": "M16: the MANUAL deploy sequence has no stop-on-error, so a FAILED BUILD is followed by a recreate of the api from the OLD image with the NEW stamp in its environment -- the running service would publish a commit whose code it is not running",
+      "file": "AGENTS.md",
+      "needle": "set -e\n",
+      "replace": ""
     }
   ]
 }

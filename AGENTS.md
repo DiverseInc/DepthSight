@@ -80,6 +80,7 @@ There is no Python linter configured. `pytest.ini` sets `pythonpath = .` and
 The maintainer has no SSH; they paste into the Elestio web terminal.
 
 ```bash
+set -e
 cd /opt/app/depthsight
 git config --global url."https://github.com/".insteadOf "git@github.com:"
 git remote set-url origin https://github.com/DiverseInc/DepthSight.git
@@ -90,7 +91,36 @@ docker compose build --no-cache mcp-memory api websocket bot market_data celery_
 docker compose up -d --no-deps mcp-memory api websocket bot market_data celery_worker frontend pwa ops
 docker compose up -d --no-deps --force-recreate api   # the stamp lives in the api's environment
 docker compose restart caddy                           # caddy.config is bind-mounted; caddy reads it only at startup
+docker compose exec -T api printenv DEPLOYED_COMMIT || echo "STAMP NOT READABLE -- CHECK IT"
 ```
+
+- **The sequence FAILS FAST (`set -e`), and that is not a style choice.** The
+  stamp is written BEFORE the build, so if the build fails and the sequence
+  carries on anyway, `--force-recreate api` re-creates the api from the OLD
+  image with the NEW stamp already in its environment: the running service
+  would then publish a commit whose code it is not running, and the offer at
+  `/source` would name an archive that is not the running build. With
+  `set -e` the FIRST failed step stops the sequence and nothing after it
+  runs. MEASURED 2026-11-11 on this box: `set -e` DOES exit an INTERACTIVE
+  shell (which is what the Elestio web terminal is), so the guard holds
+  whether the block is pasted whole or one line at a time.
+- **The last line reads the stamp back out of the RUNNING container.** It is
+  the value the service publishes as the `commit` field of
+  `GET /api/v1/status`, and it is what the offer points a reader at. Print it
+  and compare it with `git rev-parse HEAD`: they must be the same commit.
+- **`deploy.sh` is NOT this repository's deploy path.** It is the one-click
+  installer for UPSTREAM's code: it clones
+  `https://github.com/DepthSight-Pro/DepthSight.git` (`deploy.sh:97`) and its
+  cron runs THAT checkout's `update.sh` (`deploy.sh:232`). MEASURED 2026-11-11
+  against upstream's `main`: that `update.sh` has NO stamp step (no
+  `record_deployed_commit`, no `DEPLOYED_COMMIT` anywhere in it) and upstream
+  has no `ops/scripts/record_deployed_commit.sh` at all -- so that deployment
+  publishes no commit and has no archive to name. A host deployed from THIS
+  repository runs THIS repository's `update.sh`, whose stamp refuses unless
+  the DECLARED origin is this repository's public one
+  (`ops/scripts/record_deployed_commit.sh:117-160`). **The origin the stamp
+  checks and the origin `deploy.sh` clones are two different deployments, not
+  one.**
 
 - **`bash ops/scripts/record_deployed_commit.sh` is not optional.** It writes
   `DEPLOYED_COMMIT=<sha>` into `.env`, which `docker-compose.yml` hands to the

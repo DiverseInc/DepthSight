@@ -348,6 +348,65 @@ class TestThereIsOneImplementationAndBothPathsCallIt:
 
 
 # --------------------------------------------------------------------------
+# The MANUAL deploy sequence has to FAIL FAST
+# --------------------------------------------------------------------------
+class TestTheManualDeployFailsFast:
+    """A failed step must stop the manual deploy sequence.
+
+    MEASURED DEFECT (review panel, 2026-11-11, Claude's residual, confirmed
+    in the block): the sequence AGENTS.md hands the operator had no
+    stop-on-error. The stamp is written BEFORE the build, so a failed build
+    followed by a carried-on sequence would re-create the api from the OLD
+    image with the NEW stamp already in its environment: the running service
+    would publish a commit whose code it is not running, and the offer at
+    `/source` would name an archive that is not the running build.
+
+    MEASURED 2026-11-11 on this box: `set -e` DOES exit an INTERACTIVE shell
+    (which is what the Elestio web terminal is), so the block has to set it
+    -- and it protects the sequence whether the block is pasted whole or one
+    line at a time.
+    """
+
+    def test_the_manual_deploy_block_stops_at_the_first_failed_step(self):
+        agents = AGENTS_MD.read_text(encoding="utf-8")
+        block = _manual_deploy_block(agents).split("```bash", 1)[-1]
+        lines = [
+            l.strip()
+            for l in block.splitlines()
+            if l.strip() and not l.strip().startswith("#")
+        ]
+        assert lines, "the manual deploy block is empty"
+        assert lines[0].startswith("set -e"), (
+            "the manual deploy block must start with `set -e`, so a failed "
+            "step stops the sequence and NOTHING after it runs -- otherwise a "
+            "failed build is followed by a recreate of the api from the old "
+            "image with the new stamp already in its environment, and the "
+            f"offer names an archive that is not the running build; the first "
+            f"line is {lines[0]!r}"
+        )
+
+    def test_the_block_reads_the_stamp_back_out_of_the_running_container(self):
+        """The deploy is only DONE when the RUNNING container carries it.
+
+        The value in `.env` is only the INPUT; the value the service publishes
+        is the one in the container's environment, and it is that one the
+        offer points a reader at.
+        """
+        agents = AGENTS_MD.read_text(encoding="utf-8")
+        block = _manual_deploy_block(agents)
+        read_back = "docker compose exec -T api printenv DEPLOYED_COMMIT"
+        assert read_back in block, (
+            "the manual deploy must read DEPLOYED_COMMIT back out of the "
+            "running api container: it is the value the service publishes as "
+            "the `commit` field and the value the offer points at"
+        )
+        assert block.index(read_back) > block.index(RECREATE_API), (
+            "the stamp has to be read back AFTER the api is re-created, or it "
+            "reads the environment of the container that was just replaced"
+        )
+
+
+# --------------------------------------------------------------------------
 # A failed caddy restart must not look like a successful deploy
 # --------------------------------------------------------------------------
 class TestTheDeployChecksTheWholeSiteAfterTheRestart:
