@@ -29,6 +29,25 @@
     "needed. The ops sidecar needed a CA bundle to verify at all, so",
     "ca-certificates is now installed explicitly in ops/Dockerfile.",
     "",
+    "FINDING 3 (measured 2026-11-12): the deploy gate's certificate check",
+    "made ONE request with NO retry -- the only check in update.sh without",
+    "one, while its two siblings (source_offer_is_live, site_root_is_live)",
+    "both use a bounded three-attempt retry -- and reported EVERY failure as",
+    "'the TLS certificate did not verify'. curl's exit codes are DISTINCT:",
+    "60 is a certificate that does not verify, 7 is 'connection refused',",
+    "28 is 'timeout', and ONLY 60 is a certificate failure. So a caddy that",
+    "was still coming up right after 'docker compose restart caddy' turned a",
+    "GOOD deploy into a red certificate failure and sent the operator to fix",
+    "a certificate that was fine.",
+    "",
+    "The check is a FUNCTION in update.sh now (verify_offer_certificate),",
+    "because the tests exercise the REAL function. It reads curl's exit",
+    "status in the ELSE branch of 'if curl ...' -- inside 'if ! cmd' the $?",
+    "is the status of the NEGATION (0), not of the command -- retries a",
+    "bounded three times, and picks the message from the captured status.",
+    "M4 neuters the check so it never fires, M6 removes the retry bound and",
+    "M7 removes the 60-vs-other distinction; each has to be KILLED.",
+    "",
     "Every needle below occurs EXACTLY ONCE in its target file (asserted",
     "before use by tests/test_deployed_commit_mutation_needles.py, which",
     "covers both deployed-commit specs and every mutation in them).",
@@ -61,14 +80,26 @@
     {
       "label": "M4: the deploy gate's certificate check never fires, so a broken certificate is reported as a missing offer",
       "file": "update.sh",
-      "needle": "if ! curl -s --max-time 15 -o /dev/null \"$PUBLIC_BASE_URL/source\" 2>/dev/null; then",
-      "replace": "if false; then"
+      "needle": "        if curl -s --max-time 15 -o /dev/null \"$PUBLIC_BASE_URL/source\" 2>/dev/null; then",
+      "replace": "        if true; then"
     },
     {
       "label": "M5: the ops sidecar loses its CA bundle, so the smoke test cannot verify a certificate even if it tries to",
       "file": "ops/Dockerfile",
       "needle": "        ca-certificates \\\n",
       "replace": "        # ca-certificates removed \\\n"
+    },
+    {
+      "label": "M6: the deploy gate's certificate check makes only ONE attempt, so a caddy that is still coming up right after the restart is reported as a failure",
+      "file": "update.sh",
+      "needle": "    for attempt in 1 2 3; do",
+      "replace": "    for attempt in 1; do"
+    },
+    {
+      "label": "M7: the deploy gate's certificate check reports EVERY failure as a certificate failure, so a site that is not answering sends the operator to fix a certificate that is fine",
+      "file": "update.sh",
+      "needle": "    if [ \"$status\" -eq 60 ]; then",
+      "replace": "    if true; then"
     }
   ]
 }

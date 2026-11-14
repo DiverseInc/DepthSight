@@ -136,9 +136,29 @@ CONTEXT_GITIGNORES = {
 }
 
 
-def context_gitignore(context: str) -> Path:
-    """The context's own .gitignore, or a path that does not exist."""
-    return CONTEXT_GITIGNORES.get(context, REPO_ROOT / "no-such-context" / ".gitignore")
+def context_gitignore(context: str):
+    """The context's own .gitignore, or None when it has none.
+
+    `ops/` has NO .gitignore of its own: git consults the ROOT's for it. A
+    context without one is not an error -- it means the root's rules are the
+    only ones that reach into it -- so the caller must cope with None.
+    """
+    path = CONTEXT_GITIGNORES.get(context)
+    if path is None or not path.is_file():
+        return None
+    return path
+
+
+def read_patterns_or_empty(path):
+    """The rule set of a file that may not exist.
+
+    A context can have no .gitignore of its own (`ops/` has none), so the
+    question "what does THIS context's own .gitignore ignore" has the answer
+    "nothing" rather than "the file could not be read".
+    """
+    if path is None or not Path(path).is_file():
+        return []
+    return read_patterns(path)
 
 
 # --------------------------------------------------------------------------
@@ -163,21 +183,43 @@ def compose_build_contexts():
     return out
 
 
-def copies_the_whole_context(dockerfile: Path) -> bool:
-    """Does this Dockerfile copy the whole build context?
+def copies_a_whole_subtree(dockerfile: Path) -> bool:
+    """Does this Dockerfile copy a whole SUBTREE of the build context?
 
-    `COPY . .` (and `COPY . /somewhere`) bring every file the context
-    contains into the image. A Dockerfile that copies named paths only
-    (`COPY scripts/ /opt/ops/`) cannot pick up an unrelated file, so it does
-    not need the context's own .dockerignore.
+    `COPY . .` brings every file the context contains into the image. A
+    `COPY <dir>/ <dest>/` does the same for that DIRECTORY: docker copies the
+    directory's CONTENTS, so every file under it -- including files git
+    ignores -- enters the image.
+
+    MEASURED 2026-11-12 (review panel run #10, hermes, counted YES): the
+    version of this check that shipped recognised ONLY `COPY . .`, and its
+    docstring claimed that "a Dockerfile that copies named paths only
+    (`COPY scripts/ /opt/ops/`) cannot pick up an unrelated file". THAT WAS
+    FALSE: `scripts/` is a DIRECTORY. The ops context therefore had NO
+    .dockerignore and NO rule set at all while its Dockerfile copied a whole
+    subtree -- so a gitignored file under ops/scripts/ would have been copied
+    into the running ops image while being absent from the published archive,
+    which is exactly the lie the offer must not tell.
+
+    A NAMED FILE (`COPY loop.sh /opt/ops/loop.sh`) really does copy just that
+    file, and a context that copies only named files needs no rule set. So the
+    question is: does the COPY source name a DIRECTORY?
     """
     if not dockerfile.is_file():
         return False
+    context_dir = dockerfile.parent
     for line in dockerfile.read_text(encoding="utf-8", errors="replace").splitlines():
         m = re.match(r"^\s*COPY\s+(?:--from=\S+\s+)?(\S+)\s+(\S+)", line)
         if not m:
             continue
-        if m.group(1) in (".", "./"):
+        source = m.group(1)
+        if source in (".", "./"):
+            return True
+        candidate = context_dir / source
+        if source.endswith("/") or candidate.is_dir():
+            # a DIRECTORY source: docker copies the directory's CONTENTS, so
+            # every file under it -- including the ones git ignores -- enters
+            # the image. ONE decision point, so a mutant can kill it.
             return True
     return False
 
@@ -300,25 +342,79 @@ def test_every_build_context_is_declared_here():
     )
 
 
-def test_a_context_that_copies_everything_has_its_own_dockerignore():
-    """The hole itself, and it is derived from the Dockerfile."""
+def test_a_context_that_copies_a_whole_subtree_has_its_own_dockerignore():
+    """The hole itself, and it is derived from the Dockerfile.
+
+    A context that copies a whole subtree of itself into the image needs its
+    OWN rule set, because the root .dockerignore does not apply to a context.
+
+    MEASURED 2026-11-12 (review panel run #10, hermes, counted YES): `ops/`
+    was exempt from this rule because the check recognised only `COPY . .`.
+    `ops/Dockerfile` does `COPY scripts/ /opt/ops/` -- a DIRECTORY copy -- so
+    every file under ops/scripts/ entered the image, and the ops context had
+    NO .dockerignore at all. The exemption's premise was false.
+    """
     for context, dockerfile, dockerignore in (
         (FRONTEND_CONTEXT, FRONTEND_DOCKERFILE, FRONTEND_DOCKERIGNORE),
         (OPS_CONTEXT, OPS_DOCKERFILE, OPS_DOCKERIGNORE),
         (PWA_CONTEXT, PWA_DOCKERFILE, PWA_DOCKERIGNORE),
     ):
-        if not copies_the_whole_context(dockerfile):
+        if not copies_a_whole_subtree(dockerfile):
             # The exemption is re-derived from the Dockerfile every time, so
-            # a Dockerfile that starts copying everything is caught here
+            # a Dockerfile that starts copying a whole subtree is caught here
             # rather than being silently exempted by a list.
             continue
         assert dockerignore.is_file(), (
-            "%s is its own docker build context and %s copies the whole "
-            "context, but %s does not exist. The root .dockerignore does not "
+            "%s is its own docker build context and %s copies a whole subtree "
+            "of it, but %s does not exist. The root .dockerignore does not "
             "apply to this context, so a gitignored file inside it is copied "
             "into the image while being absent from the published archive."
             % (context, dockerfile.name, dockerignore.name)
         )
+
+
+def test_the_subtree_detection_can_say_no(tmp_path):
+    """The rule that decides whether a context needs its own rule set has to
+    be able to say NO -- and it has to say YES about a DIRECTORY copy, which
+    is the case the old check missed.
+
+    MEASURED 2026-11-12 (review panel run #10, hermes, counted YES): the
+    check recognised only `COPY . .` and its docstring claimed a directory
+    copy "cannot pick up an unrelated file". It can: `COPY scripts/ /opt/ops/`
+    copies every file under scripts/.
+
+    The pairs are SYNTHETIC (written into tmp_path), so the repository's own
+    -- currently correct -- data cannot satisfy this test: only a genuinely
+    correct check can.
+    """
+    context = tmp_path / "ctx"
+    (context / "scripts").mkdir(parents=True)
+    (context / "scripts" / "x.sh").write_text("x\n", encoding="utf-8")
+    (context / "loop.sh").write_text("x\n", encoding="utf-8")
+    dockerfile = context / "Dockerfile"
+
+    dockerfile.write_text("COPY scripts/ /opt/ops/\n", encoding="utf-8")
+    assert copies_a_whole_subtree(dockerfile), (
+        "COPY scripts/ copies every file under scripts/ -- a whole subtree "
+        "goes into the image, so the context needs its own .dockerignore"
+    )
+
+    dockerfile.write_text("COPY scripts /opt/ops/\n", encoding="utf-8")
+    assert copies_a_whole_subtree(dockerfile), (
+        "the same directory written without the trailing slash is still a "
+        "directory, and still copies a whole subtree"
+    )
+
+    dockerfile.write_text("COPY loop.sh /opt/ops/loop.sh\n", encoding="utf-8")
+    assert not copies_a_whole_subtree(dockerfile), (
+        "a NAMED FILE cannot pick up an unrelated file, so a context that "
+        "copies only named files does not need its own .dockerignore"
+    )
+
+    dockerfile.write_text("COPY . .\n", encoding="utf-8")
+    assert copies_a_whole_subtree(dockerfile), (
+        "the whole context is a whole subtree"
+    )
 
 
 def test_nothing_gitignored_in_the_context_enters_that_image():
@@ -332,12 +428,13 @@ def test_nothing_gitignored_in_the_context_enters_that_image():
     """
     for context, dockerignore, docker_patterns in (
         (FRONTEND_CONTEXT, FRONTEND_DOCKERIGNORE, read_patterns(FRONTEND_DOCKERIGNORE)),
+        (OPS_CONTEXT, OPS_DOCKERIGNORE, read_patterns(OPS_DOCKERIGNORE)),
         (PWA_CONTEXT, PWA_DOCKERIGNORE, read_patterns(PWA_DOCKERIGNORE)),
     ):
         assert docker_patterns, "%s has no patterns" % dockerignore.name
         uncovered = uncovered_in_context(
             context, read_patterns(GITIGNORE_FILE), docker_patterns,
-            own_git_patterns=read_patterns(context_gitignore(context)))
+            own_git_patterns=read_patterns_or_empty(context_gitignore(context)))
         assert not uncovered, (
             "these .gitignore patterns have no covering rule in %s, so a file "
             "they match is invisible to the deploy stamp (git status does not "
@@ -352,6 +449,7 @@ def test_no_tracked_file_is_swept_out_of_the_context():
     tracked = require_tracked_files()
     for context, dockerignore, docker_patterns in (
         (FRONTEND_CONTEXT, FRONTEND_DOCKERIGNORE, read_patterns(FRONTEND_DOCKERIGNORE)),
+        (OPS_CONTEXT, OPS_DOCKERIGNORE, read_patterns(OPS_DOCKERIGNORE)),
         (PWA_CONTEXT, PWA_DOCKERIGNORE, read_patterns(PWA_DOCKERIGNORE)),
     ):
         inside = [p for p in tracked if p.startswith(context + "/")]

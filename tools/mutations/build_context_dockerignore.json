@@ -30,6 +30,28 @@
     "MEASURED: adding them excludes ZERO tracked files (the reverse rule",
     "stays exact), so the fix cannot sweep committed code out of an image.",
     "",
+    "THIRD HOLE, THE SAME CLASS (2026-11-12, review panel run #10, hermes,",
+    "counted YES): `ops/` is its own build context and `ops/Dockerfile:16`",
+    "does `COPY scripts/ /opt/ops/` -- a whole-DIRECTORY copy, so every file",
+    "under ops/scripts/ enters the image -- but there was NO ops/.dockerignore",
+    "at all, so that context had NO rule set. The branch's own guard exempted",
+    "it on a FALSE premise: the check that decides whether a context needs a",
+    "rule set recognised ONLY `COPY . .`, and its docstring claimed that a",
+    "Dockerfile copying named paths only (`COPY scripts/ /opt/ops/`) 'cannot",
+    "pick up an unrelated file'. It can: `scripts/` is a DIRECTORY. MEASURED on",
+    "the production host (2026-11-12): the checkout's 13 git-ignored files",
+    "include NONE under ops/, so the hole was LATENT, not live. The fix adds",
+    "ops/.dockerignore (the root rule set translated into the context), makes",
+    "the check recognise a DIRECTORY copy, and extends the forward and reverse",
+    "rules to ops. MEASURED: the translated set excludes ZERO tracked files",
+    "(only ops/Dockerfile, the builder's own input, and it is allowlisted).",
+    "",
+    "M10 IS A MUTANT ON THE GUARD ITSELF: it disables the subtree check, so",
+    "the ops context is exempted again. The SYNTHETIC negative control in",
+    "tests/test_dockerignore_build_contexts.py (the check has to say YES about",
+    "a directory copy and NO about a named file) is what kills it -- the",
+    "repository's own correct data cannot satisfy that control.",
+    "",
     "These mutants remove ONE rule from ONE context's rule set, and the",
     "guard must catch every one of them:",
     "  * removing a DEPTH form leaves the nested copy uncovered (the rule is",
@@ -88,6 +110,24 @@
       "file": ".dockerignore",
       "needle": "**/frontend/**/*.local\n",
       "replace": ""
+    },
+    {
+      "label": "M8: the DEPTH form of the '*.env' class is gone from the ops context, so a NESTED ops/scripts/x.env enters the ops image -- and it is gitignored, so `git status --porcelain` cannot report it and the deploy stamp cannot see it",
+      "file": "ops/.dockerignore",
+      "needle": "**/*.env\n",
+      "replace": ""
+    },
+    {
+      "label": "M9: the DEPTH form of the '*.log*' class is gone from the ops context, so a NESTED ops/scripts/x.log enters the ops image -- and it is gitignored, so `git status --porcelain` cannot report it",
+      "file": "ops/.dockerignore",
+      "needle": "**/*.log*\n",
+      "replace": ""
+    },
+    {
+      "label": "M10: the check that decides whether a build context copies a whole SUBTREE is disabled, so the ops context is exempted again -- the exemption that hid hermes's finding on panel run #10 (2026-11-12): `ops/Dockerfile` does `COPY scripts/ /opt/ops/`, a DIRECTORY copy, and the old check recognised only `COPY . .`, so the ops context carried no rule set at all",
+      "file": "tests/test_dockerignore_build_contexts.py",
+      "needle": "if source.endswith(\"/\") or candidate.is_dir():\n",
+      "replace": "if False:\n"
     }
   ]
 }

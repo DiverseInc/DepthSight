@@ -162,10 +162,48 @@ source_offer_is_live() {
 # its OWN failure, so a broken certificate is never reported to the operator
 # as "the offer is missing" -- which would send them looking in the wrong
 # place, or make them restart caddy for no reason.
-if ! curl -s --max-time 15 -o /dev/null "$PUBLIC_BASE_URL/source" 2>/dev/null; then
-    echo -e "${RED}[!] The TLS certificate at $PUBLIC_BASE_URL did not verify${NC}"
-    echo -e "${RED}[!] The source offer cannot be served publicly over an unverified certificate${NC}"
-    echo -e "${RED}[!] Check the certificate, and check that this host has a CA bundle (ca-certificates)${NC}"
+#
+# curl's exit codes are DISTINCT: 60 is "the certificate does not verify",
+# 7 is "connection refused", 28 is "timeout". ONLY 60 is a certificate
+# failure. The old check reported EVERY failure as a certificate failure, so
+# a caddy that was still coming up after the restart three lines above
+# turned a GOOD deploy into a red CERTIFICATE failure and sent the
+# operator to fix a certificate that was perfectly fine.
+#
+# So the status is captured in the ELSE branch of a plain `if curl`: inside
+# `if ! cmd` the `$?` is the status of the NEGATION (0), not of the
+# command, so the negation form cannot be used here. The captured status
+# then DECIDES the message, and the request is retried a BOUNDED number of
+# times -- three attempts, with a pause between them, exactly like the two
+# sibling checks below -- so a caddy that has not finished coming up is not
+# a false failure either.
+verify_offer_certificate() {
+    local attempt status
+    status=0
+    for attempt in 1 2 3; do
+        if curl -s --max-time 15 -o /dev/null "$PUBLIC_BASE_URL/source" 2>/dev/null; then
+            return 0
+        else
+            status=$?
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            sleep 5
+        fi
+    done
+
+    if [ "$status" -eq 60 ]; then
+        echo -e "${RED}[!] The TLS certificate at $PUBLIC_BASE_URL did not verify${NC}"
+        echo -e "${RED}[!] The source offer cannot be served publicly over an unverified certificate${NC}"
+        echo -e "${RED}[!] Check the certificate, and check that this host has a CA bundle (ca-certificates)${NC}"
+    else
+        echo -e "${RED}[!] The site at $PUBLIC_BASE_URL/source did not answer${NC}"
+        echo -e "${RED}[!] curl exit status $status is not a certificate failure -- the site is not answering${NC}"
+        echo -e "${RED}[!] caddy was just restarted and may still be coming up; check 'docker compose logs caddy | tail -50'${NC}"
+    fi
+    return 1
+}
+
+if ! verify_offer_certificate; then
     exit 1
 fi
 
