@@ -1,0 +1,709 @@
+# tests/test_record_deployed_commit_script.py
+"""The deploy stamp: which commit are we running, and are we running the
+committed tree?
+
+WHY THIS FILE EXISTS
+-------------------
+Two MEASURED gaps in the AGPL-3.0 section 13 source offer, both found by the
+review panel on 2026-11-07, both fixed by `ops/scripts/record_deployed_commit.sh`.
+
+1. The offer tells a reader that the archive for the running build is "the
+   exact tree of the running build". The image is built from the Docker build
+   CONTEXT (the Dockerfile ends with `COPY . .`), while the advertised archive
+   is the COMMITTED tree, and `git pull` never removes untracked files. A
+   checkout with local changes therefore produces a running image that
+   contains files the published source does not. Refusing to stamp such a
+   checkout makes the claim true by construction instead of leaving it to
+   chance.
+
+2. The commit has to reach the running service with no human in the loop.
+   `docker-compose.yml` gives the `api` service `env_file: .env`, so a
+   `DEPLOYED_COMMIT` line written into `.env` travels WITH the container and
+   comes back out of `GET /api/v1/status` as the `commit` field.
+
+3. The stamped commit has to EXIST IN THE PUBLIC REPOSITORY, ON ITS `main`
+   BRANCH, AND THE LIVE REMOTE HAS TO CONFIRM IT. The offer points a reader
+   at
+   `https://github.com/DiverseInc/DepthSight/archive/<commit>.tar.gz`
+   and tells them it is public, and the source page says the running service
+   is deployed from the `main` branch of THAT repository. A commit that was
+   never pushed has no archive there -- that URL is a 404, and the claim is
+   false. The manual deploy path is `git pull origin main` with no
+   `git reset --hard`, so a local commit or a non-fast-forward merge leaves
+   HEAD unpushed. A commit that is published on some OTHER branch, or on a
+   fork, or that the live remote no longer has, is just as false.
+
+WHAT IS TESTED HERE
+-------------------
+The REAL script, run in a throwaway git repository, under a real bash. A copy
+of the logic in the test would prove nothing about the script (AGENTS.md:
+"Verify against the real function, not a reimplementation").
+
+The throwaway repository has a REAL bare repository as `origin` and the
+commit under test is really PUSHED to it, because the script now refuses to
+stamp a commit that is not published: a repository with no remote would be
+refused for the wrong reason and every "it stamps correctly" test would be
+testing the refusal instead of the stamp.
+
+Every behavioural assertion below was MEASURED against the real script on
+LINUX, which is the platform it runs on (Elestio, CI). That matters: Git
+Bash's `awk` is a MinGW build that strips a carriage return on read, so a
+CRLF-preservation assertion FAILS under Git Bash and PASSES under Linux.
+This file follows the repository's existing convention of driving shell code
+with `bash -s` (see `tests/test_update_sh_records_the_deployed_commit.py`),
+which on this machine resolves to WSL bash and in CI to the system bash.
+"""
+
+import base64
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = REPO_ROOT / "ops" / "scripts" / "record_deployed_commit.sh"
+
+# The refusal message the script prints when the checkout is not the committed
+# tree. It is quoted in the assertions because a refusal that does not say what
+# is wrong is not an actionable refusal.
+REFUSAL = "REFUSING to stamp a checkout that is not the committed tree"
+
+# The git subcommands the stamp script is allowed to RUN. The script reads
+# the repository; it never writes to it. Anything else -- `clean`, `checkout`,
+# `reset`, `stash`, `rm`, `push` -- destroys work, and this script's whole
+# job is to refuse rather than to "help".
+#
+# `branch` is here because the script has to know whether the commit is
+# PUBLISHED, and `git branch -r --contains HEAD` is how it asks: it LISTS
+# remote-tracking branches that contain the commit and changes nothing.
+# (`git branch -r` with no other verb is a listing; the script never creates,
+# renames or deletes a branch.)
+#
+# `config`, `merge-base` and `ls-remote` were added on 2026-11-09, when the
+# published check was narrowed to the MAIN branch of the PUBLIC repository:
+#   * `config --get-all remote.origin.url` reads the url the operator
+#     DECLARED for origin. It is a read, never a write.
+#   * `merge-base --is-ancestor` asks whether one commit is in the history of
+#     another. It is a question, never a merge.
+#   * `ls-remote` asks the LIVE remote what its refs are right now. It is a
+#     listing, never a push.
+# Allowing a subcommand is not the same as allowing a use of it, so each of
+# the three is pinned to its read-only form by a test in
+# TestTheNewGitCallsAreReadOnly below.
+ALLOWED_GIT_SUBCOMMANDS = frozenset(
+    {"rev-parse", "status", "branch", "config", "merge-base", "ls-remote"}
+)
+
+# The ONE public repository the AGPL-3.0 section 13 offer names. The deploy
+# stamp refuses to write DEPLOYED_COMMIT unless `origin` IS this repository,
+# so the fixture below DECLARES this url for origin. The transport still goes
+# to a local bare repository, because an `insteadOf` rewrite maps the public
+# url onto it -- so the tests exercise the real check without touching the
+# network. (`git config --get remote.origin.url` returns the DECLARED url;
+# `git remote get-url origin` returns the REWRITTEN one, and it is the
+# declared url the offer is about.)
+PUBLIC_URL = "https://github.com/DiverseInc/DepthSight.git"
+
+
+# --------------------------------------------------------------------------
+# Static analysis helpers
+# --------------------------------------------------------------------------
+def _code_only(source: str) -> str:
+    """The script with COMMENTS and QUOTED STRING CONTENTS removed.
+
+    A static scan is only meaningful if it looks at what the script RUNS, not
+    at what it SAYS. This script deliberately tells the operator which
+    commands THEY may want to run (`git stash -u`, `git checkout -- <path>`),
+    and its own header says it never runs `git clean`. A substring scan of the
+    whole file therefore flags the script for containing its own warning --
+    a false positive about the INSTRUMENT, not about the product. (Measured
+    2026-11-09: the first version of this check did exactly that, and made
+    the whole suite permanently red.)
+    """
+    out = []
+    for raw in source.splitlines():
+        kept = []
+        quote = None
+        i = 0
+        while i < len(raw):
+            ch = raw[i]
+            if quote is None:
+                if ch == "#":
+                    break  # a comment: the rest of the line is not code
+                if ch in ("'", '"'):
+                    quote = ch
+                    kept.append(ch)  # keep the markers, drop the content
+                else:
+                    kept.append(ch)
+            else:
+                if ch == quote:
+                    quote = None
+                    kept.append(ch)  # the closing marker
+                # else: inside a quoted string -> the content is dropped
+            i += 1
+        out.append("".join(kept))
+    return "\n".join(out)
+
+
+def _git_subcommands(source: str) -> set:
+    """Every `git <subcommand>` the script actually EXECUTES."""
+    return set(re.findall(r"\bgit\s+([a-z][a-z0-9-]*)", _code_only(source)))
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+def _bash() -> str:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash is not available on this machine")
+    return bash
+
+
+def _script_bytes() -> bytes:
+    assert SCRIPT.is_file(), f"the deploy stamp script is missing: {SCRIPT}"
+    return SCRIPT.read_bytes()
+
+
+def _drive(
+    setup: str = "",
+    runs: int = 1,
+    make_repo: bool = True,
+    publish: str = "published",
+) -> dict:
+    """Run the REAL script in a throwaway git repository and report what happened.
+
+    The script is fed to bash over STDIN as BYTES:
+      * as a command-line argument the Windows->WSL launcher re-quotes it and
+        the quoting does not survive;
+      * in text mode Windows rewrites every "\\n" to "\\r\\n" on the way into
+        the pipe, and bash then sees a carriage return on every line.
+
+    Everything the script touches lives in a temp dir INSIDE the shell, so
+    nothing depends on how the host translates paths. The script runs in a
+    SUBSHELL: it calls `exit 1` when it refuses, and that must be the script's
+    exit code, not the shell's.
+
+    `publish` says how the commit under test relates to the remote:
+      * "published"  -- a bare repository is created as `origin` and the commit
+        is really PUSHED to it, so the commit IS published;
+      * "unpushed"   -- the same remote exists, but a LATER commit (the one
+        HEAD points at) was never pushed, so the commit is not published;
+      * "no-remote"  -- there is no remote at all.
+
+    The default is "published" because the script refuses to stamp a commit
+    that no pushed ref contains: without a real remote, every "it stamps
+    correctly" test below would be testing the REFUSAL instead of the stamp.
+    """
+    body = (
+        "set -u\n"
+        'WORK=$(mktemp -d) || exit 1\n'
+        'ORIGIN_BASE=$(mktemp -d) || exit 1\n'
+        "trap 'rm -rf \"$WORK\" \"$ORIGIN_BASE\"' EXIT\n"
+        'cd "$WORK" || exit 1\n'
+    )
+    if make_repo:
+        body += (
+            "git init -q . >/dev/null 2>&1\n"
+            "git config user.email t@example.com\n"
+            "git config user.name t\n"
+            "printf 'print(1)\\n' > app.py\n"
+            "printf 'services: {}\\n' > docker-compose.yml\n"
+            # `.env` holds the live secrets and is gitignored in the real repo.
+            # Without this, the temp `.env` itself would look untracked and the
+            # script would refuse for the wrong reason.
+            "printf '.env\\n' > .gitignore\n"
+            "git add -A >/dev/null 2>&1\n"
+            "git commit -qm first >/dev/null 2>&1\n"
+        )
+        if publish != "no-remote":
+            # A REAL bare repository, pushed to for real: the script asks
+            # `git branch -r --contains HEAD`, and that only means something
+            # when a remote-tracking ref really exists.
+            #
+            # The DECLARED url of origin is the PUBLIC repository the offer
+            # names -- that is what the script now checks -- and the
+            # insteadOf rewrite maps that url onto the local bare repository,
+            # so the transport stays local and the test never touches the
+            # network.
+            body += (
+                'git init -q --bare "$ORIGIN_BASE/origin.git" >/dev/null 2>&1\n'
+                f'git remote add origin "{PUBLIC_URL}"\n'
+                'git config "url.$ORIGIN_BASE/origin.git.insteadOf" '
+                f'"{PUBLIC_URL}"\n'
+                "git push -q origin HEAD:refs/heads/main >/dev/null 2>&1\n"
+                "git fetch -q origin >/dev/null 2>&1\n"
+            )
+        if publish == "unpushed":
+            # A second commit that is NEVER pushed: HEAD points at it, so the
+            # published refs do not contain it.
+            body += (
+                "printf 'print(2)\\n' > app.py\n"
+                "git commit -qam second >/dev/null 2>&1\n"
+            )
+        body += (
+            "SHA=$(git rev-parse HEAD)\n"
+            "PUBLISHED=$(git rev-parse origin/main 2>/dev/null || true)\n"
+        )
+    else:
+        body += "SHA=none\nPUBLISHED=none\n"
+    body += setup
+    # The script, in a subshell, `runs` times.
+    for _ in range(runs):
+        body += "(\n" + _script_bytes().decode("utf-8") + "\n)\n"
+    body += (
+        "rc=$?\n"
+        "printf 'RC=%s\\n' \"$rc\"\n"
+        "if [ -f \"$WORK/.env\" ]; then\n"
+        "  printf 'ENV=%s\\n' \"$(base64 \"$WORK/.env\" | tr -d '\\n')\"\n"
+        "else\n"
+        "  printf 'ENV=MISSING\\n'\n"
+        "fi\n"
+        "printf 'FILES=%s\\n' \"$(ls -1A \"$WORK\" | tr '\\n' ',')\"\n"
+        "printf 'SUBFILES=%s\\n' \"$(ls -1A \"$WORK/sub\" 2>/dev/null | tr '\\n' ',')\"\n"
+        "printf 'SHA=%s\\n' \"$SHA\"\n"
+        "printf 'PUBLISHED=%s\\n' \"$PUBLISHED\"\n"
+    )
+
+    proc = subprocess.run(
+        [_bash(), "-s"],
+        input=body.encode("utf-8"),
+        capture_output=True,
+        timeout=300,
+    )
+    out = proc.stdout.decode("utf-8", errors="replace")
+    err = proc.stderr.decode("utf-8", errors="replace")
+    fields = {}
+    for line in out.splitlines():
+        key, _sep, value = line.partition("=")
+        if key in ("RC", "ENV", "FILES", "SUBFILES", "SHA", "PUBLISHED"):
+            fields[key] = value
+    env_b64 = fields.get("ENV", "MISSING")
+    return {
+        "rc": int(fields.get("RC", "255")),
+        "stdout": out,
+        "stderr": err,
+        "env": b"" if env_b64 == "MISSING" else base64.b64decode(env_b64),
+        "env_exists": env_b64 != "MISSING",
+        "files": fields.get("FILES", ""),
+        "subfiles": fields.get("SUBFILES", ""),
+        "sha": fields.get("SHA", ""),
+        "published": fields.get("PUBLISHED", ""),
+    }
+
+
+# --------------------------------------------------------------------------
+# The script records the commit it is about to build
+# --------------------------------------------------------------------------
+class TestTheStampRecordsTheCommit:
+    def test_a_clean_checkout_records_the_commit(self):
+        result = _drive("printf 'POSTGRES_PASSWORD=secret\\n' > .env\n")
+        assert result["rc"] == 0, result["stderr"]
+        assert f"DEPLOYED_COMMIT={result['sha']}\n".encode() in result["env"]
+
+    def test_the_value_is_the_head_commit_and_not_something_invented(self):
+        """The recorded value must be `git rev-parse HEAD`, verbatim."""
+        result = _drive("printf 'POSTGRES_PASSWORD=secret\\n' > .env\n")
+        assert result["sha"] in result["stdout"]
+        assert f"DEPLOYED_COMMIT={result['sha']}".encode() in result["env"]
+
+    def test_the_other_lines_of_the_environment_file_are_untouched(self):
+        """The operator's file holds the live secrets. It must survive intact."""
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\nREDIS_API_PASSWORD=other\\n' > .env\n"
+        )
+        assert result["rc"] == 0, result["stderr"]
+        assert b"POSTGRES_PASSWORD=secret\n" in result["env"]
+        assert b"REDIS_API_PASSWORD=other\n" in result["env"]
+
+    def test_recording_twice_leaves_exactly_one_commit_line(self):
+        """The script runs on every deploy; it must be idempotent."""
+        result = _drive("printf 'POSTGRES_PASSWORD=secret\\n' > .env\n", runs=2)
+        assert result["rc"] == 0, result["stderr"]
+        assert result["env"].count(b"DEPLOYED_COMMIT=") == 1
+
+    def test_an_existing_value_is_replaced_not_appended(self):
+        """Two DEPLOYED_COMMIT lines would make the published commit ambiguous."""
+        result = _drive(
+            "printf 'DEPLOYED_COMMIT=0000000000000000000000000000000000000000\\n' "
+            "> .env\n"
+        )
+        assert result["rc"] == 0, result["stderr"]
+        assert result["env"].count(b"DEPLOYED_COMMIT=") == 1
+        assert b"DEPLOYED_COMMIT=0000000000000000000000000000000000000000" not in (
+            result["env"]
+        )
+
+    def test_a_crlf_environment_file_keeps_its_carriage_returns(self):
+        """A Windows-edited .env must not have its endings rewritten."""
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\r\\nDEPLOYED_COMMIT=old\\r\\n' > .env\n"
+        )
+        assert result["rc"] == 0, result["stderr"]
+        assert b"POSTGRES_PASSWORD=secret\r\n" in result["env"]
+        assert f"DEPLOYED_COMMIT={result['sha']}\r\n".encode() in result["env"]
+        assert b"DEPLOYED_COMMIT=old" not in result["env"]
+
+    def test_an_lf_environment_file_does_not_gain_a_carriage_return(self):
+        result = _drive("printf 'POSTGRES_PASSWORD=secret\\n' > .env\n")
+        assert result["rc"] == 0, result["stderr"]
+        assert b"\r" not in result["env"]
+
+
+# --------------------------------------------------------------------------
+# A checkout that is not the committed tree is refused, and nothing is lost
+# --------------------------------------------------------------------------
+class TestADirtyCheckoutIsRefused:
+    def test_an_untracked_file_is_refused(self):
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n"
+            "printf 'SECRET = 1\\n' > sneaky.py\n"
+        )
+        assert result["rc"] == 1, (result["stdout"], result["stderr"])
+        assert REFUSAL in result["stderr"]
+        assert "sneaky.py" in result["stderr"]
+
+    def test_the_refusal_changes_nothing_in_the_environment_file(self):
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n"
+            "printf 'SECRET = 1\\n' > sneaky.py\n"
+        )
+        assert result["rc"] == 1
+        assert result["env"] == b"POSTGRES_PASSWORD=secret\n", (
+            "the refusal rewrote the environment file"
+        )
+
+    def test_the_refusal_deletes_nothing(self):
+        """A dirty deployment is a human problem. This script must not solve it
+        by throwing the work away."""
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n"
+            "printf 'SECRET = 1\\n' > sneaky.py\n"
+        )
+        assert result["rc"] == 1
+        assert "sneaky.py" in result["files"]
+
+    def test_a_modified_tracked_file_is_refused(self):
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n"
+            "printf 'print(2)\\n' > app.py\n"
+        )
+        assert result["rc"] == 1, (result["stdout"], result["stderr"])
+        assert REFUSAL in result["stderr"]
+        assert "app.py" in result["stderr"]
+
+    def test_the_refusal_does_not_discard_the_modification(self):
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n"
+            "printf 'print(2)\\n' > app.py\n"
+        )
+        assert result["rc"] == 1
+        assert "app.py" in result["files"]
+
+    def test_the_script_contains_no_command_that_could_destroy_work(self):
+        """The refusal says what is wrong and stops. It must never `clean`,
+        `checkout`, `reset` or `stash` the tree.
+
+        Checked as an ALLOWLIST of the git subcommands the script actually
+        RUNS, not as a blacklist of strings appearing somewhere in the file.
+        The refusal deliberately names `git stash -u` and `git checkout -- <path>`
+        as suggestions for the OPERATOR, and the header says the script never
+        runs `git clean` -- so a substring scan flags the script for containing
+        its own warning. The allowlist is STRICTER than the blacklist it
+        replaces: it also catches `git rm`, `git push` or any other
+        subcommand nobody thought to blacklist.
+        """
+        subcommands = _git_subcommands(SCRIPT.read_text(encoding="utf-8"))
+        assert subcommands <= ALLOWED_GIT_SUBCOMMANDS, (
+            f"the stamp script runs git subcommand(s) it must never run: "
+            f"{sorted(subcommands - ALLOWED_GIT_SUBCOMMANDS)}"
+        )
+
+
+# --------------------------------------------------------------------------
+# The stamped commit must EXIST IN THE PUBLIC REPOSITORY
+# --------------------------------------------------------------------------
+class TestTheStampedCommitMustBePublished:
+    """The offer points a reader at the ARCHIVE of the stamped commit.
+
+    `https://github.com/DiverseInc/DepthSight/archive/<commit>.tar.gz` is a 404
+    for a commit that was never pushed, and the page says the commit is
+    public. The manual deploy path is `git pull origin main` with no
+    `git reset --hard`, so a local commit or a non-fast-forward merge leaves
+    HEAD unpushed -- the failure is ordinary, not exotic.
+    """
+
+    def test_a_pushed_commit_is_stamped(self):
+        """The happy path still works: a commit that IS published is stamped."""
+        result = _drive("printf 'POSTGRES_PASSWORD=secret\\n' > .env\n")
+        assert result["rc"] == 0, result["stderr"]
+        assert result["published"], "the throwaway repository has no published ref"
+        assert result["published"] == result["sha"], (
+            "the pushed commit and HEAD differ, so this test would not be "
+            "testing what it claims to test"
+        )
+        assert f"DEPLOYED_COMMIT={result['published']}\n".encode() in result["env"]
+
+    def test_a_commit_that_was_never_pushed_is_refused(self):
+        """HEAD points at a commit that no pushed ref contains."""
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n", publish="unpushed"
+        )
+        assert result["rc"] == 1, (result["stdout"], result["stderr"])
+        assert "not published" in result["stderr"].lower(), (
+            "the refusal must say the commit is not published; it said: "
+            f"{result['stderr']!r}"
+        )
+
+    def test_the_refusal_of_an_unpublished_commit_writes_nothing(self):
+        """A refusal that still stamped would publish a 404 as the source."""
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n", publish="unpushed"
+        )
+        assert result["rc"] == 1
+        assert result["env"] == b"POSTGRES_PASSWORD=secret\n", (
+            "the refusal rewrote the environment file"
+        )
+        assert b"DEPLOYED_COMMIT=" not in result["env"], (
+            "the refusal wrote a stamp anyway"
+        )
+
+    def test_a_repository_with_no_remote_at_all_is_refused(self):
+        """There is nothing to check against, so nothing may be promised.
+
+        Whether the script reports "cannot be checked" or "not published" is
+        its wording; what matters is the BEHAVIOUR: it refuses, it says why,
+        and it writes nothing.
+        """
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n", publish="no-remote"
+        )
+        assert result["rc"] == 1, (result["stdout"], result["stderr"])
+        assert result["stderr"].strip(), "the refusal printed nothing"
+        low = result["stderr"].lower()
+        assert "commit" in low, (
+            f"the refusal must name the commit it refused to stamp: "
+            f"{result['stderr']!r}"
+        )
+        assert "archive" in low or "publish" in low, (
+            f"the refusal must explain what is wrong with publishing this "
+            f"commit: {result['stderr']!r}"
+        )
+
+    def test_the_refusal_of_a_repository_with_no_remote_writes_nothing(self):
+        result = _drive(
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n", publish="no-remote"
+        )
+        assert result["rc"] == 1
+        assert result["env"] == b"POSTGRES_PASSWORD=secret\n", (
+            "the refusal rewrote the environment file"
+        )
+        assert b"DEPLOYED_COMMIT=" not in result["env"]
+
+    def test_the_published_refusal_comes_before_the_write(self):
+        """The order matters: a commit that is not published must be refused
+        BEFORE anything is stamped."""
+        source = SCRIPT.read_text(encoding="utf-8")
+        refuse_at = source.index("REFUSING to stamp a commit that is not published")
+        write_at = source.index('DEPLOYED_COMMIT=" sha cr')
+        assert refuse_at < write_at, (
+            "the script writes the commit before it refuses an unpublished one"
+        )
+
+    def test_the_published_check_asks_which_refs_contain_the_commit(self):
+        """The check must be about THIS commit, not about the branch name."""
+        source = SCRIPT.read_text(encoding="utf-8")
+        assert "git branch -r --contains HEAD" in source, (
+            "the script must ask which published refs contain the commit it "
+            "is about to stamp"
+        )
+
+    def test_every_branch_call_is_a_read_only_listing(self):
+        """`git branch` can also DELETE a branch (`git branch -D`).
+
+        The allowlist above permits the subcommand because the script has to
+        list the published refs; this pins that it never does anything else
+        with it.
+        """
+        code = _code_only(SCRIPT.read_text(encoding="utf-8"))
+        calls = re.findall(r"git\s+branch[^\n]*", code)
+        assert calls, "the script does not call git branch at all"
+        for call in calls:
+            assert call.startswith("git branch -r"), (
+                f"the script must only LIST remote branches, but it runs {call!r}"
+            )
+
+
+# --------------------------------------------------------------------------
+# The scanner above is an INSTRUMENT. An instrument that cannot fail is not
+# an instrument, so the scanner has its own controls.
+# --------------------------------------------------------------------------
+class TestTheStaticScannerItself:
+    def test_it_flags_a_script_that_really_does_reset_the_tree(self):
+        assert "reset" in _git_subcommands(
+            "#!/bin/bash\nset -euo pipefail\ngit reset --hard HEAD\n"
+        )
+
+    def test_it_flags_a_script_that_really_does_clean_the_tree(self):
+        assert "clean" in _git_subcommands("#!/bin/bash\ngit clean -fdx\n")
+
+    def test_it_flags_a_script_that_really_does_stash_the_tree(self):
+        assert "stash" in _git_subcommands("#!/bin/bash\ngit stash -u\n")
+
+    def test_it_flags_a_script_that_really_does_check_out_the_tree(self):
+        assert "checkout" in _git_subcommands("#!/bin/bash\ngit checkout -- .\n")
+
+    def test_it_flags_a_destructive_command_hidden_in_a_substitution(self):
+        assert "reset" in _git_subcommands(
+            "#!/bin/bash\nX=$(git rev-parse HEAD)\ngit reset --hard\n"
+        )
+
+    def test_it_ignores_a_command_the_script_only_mentions_in_a_comment(self):
+        assert _git_subcommands(
+            "#!/bin/bash\n# this script never runs git reset --hard\ngit rev-parse HEAD\n"
+        ) == {"rev-parse"}
+
+    def test_it_ignores_a_command_the_script_only_says_out_loud(self):
+        assert _git_subcommands(
+            '#!/bin/bash\necho "  git stash -u   # park the changes" >&2\n'
+        ) == set()
+
+    def test_a_comment_cannot_smuggle_a_command_past_it(self):
+        assert "clean" not in _git_subcommands(
+            "#!/bin/bash\ngit status --porcelain # git clean -fdx\n"
+        )
+
+    def test_it_accepts_the_real_script(self):
+        subcommands = _git_subcommands(SCRIPT.read_text(encoding="utf-8"))
+        assert subcommands <= ALLOWED_GIT_SUBCOMMANDS
+        assert subcommands, "the scanner found no git call at all -- it is not working"
+
+
+# --------------------------------------------------------------------------
+# The three git verbs the public-repository check needed, pinned to their
+# READ-ONLY forms
+# --------------------------------------------------------------------------
+class TestTheNewGitCallsAreReadOnly:
+    """Allowing a git SUBCOMMAND is not the same as allowing a USE of it.
+
+    The allowlist above had to grow three verbs when the published check was
+    narrowed to the public repository's main branch. A subcommand allowlist
+    is coarse -- `git config` can rewrite a global config, `git merge-base`
+    can merge, `git ls-remote` sits next to `git push` -- so each of the three
+    is pinned here to the one read-only form the script is allowed to use.
+
+    This is a guard on the FORM of the calls, not a proof of the behaviour:
+    the behaviour is proved in tests/test_deployed_commit_public_ref.py, by
+    running the real script and looking at its exit code, its refusal and
+    the bytes it leaves in .env.
+    """
+
+    def test_git_config_is_only_ever_read(self):
+        code = _code_only(SCRIPT.read_text(encoding="utf-8"))
+        calls = re.findall(r"git\s+config[^\n]*", code)
+        assert calls, "the script does not call git config at all"
+        for call in calls:
+            assert call.startswith("git config --get"), (
+                f"the script must only READ configuration, but it runs {call!r}"
+            )
+
+    def test_git_merge_base_is_only_ever_asked_about_ancestry(self):
+        code = _code_only(SCRIPT.read_text(encoding="utf-8"))
+        calls = re.findall(r"git\s+merge-base[^\n]*", code)
+        assert calls, "the script does not call git merge-base at all"
+        for call in calls:
+            assert call.startswith("git merge-base --is-ancestor"), (
+                f"the script must only ASK about ancestry, but it runs {call!r}"
+            )
+
+    def test_git_ls_remote_is_only_ever_a_listing(self):
+        code = _code_only(SCRIPT.read_text(encoding="utf-8"))
+        calls = re.findall(r"git\s+ls-remote[^\n]*", code)
+        assert calls, "the script does not call git ls-remote at all"
+        for call in calls:
+            assert call.startswith("git ls-remote origin main"), (
+                f"the script must only LIST the remote's main branch, but it "
+                f"runs {call!r}"
+            )
+
+
+# --------------------------------------------------------------------------
+# The refusal is loud, and the file it needs must already exist
+# --------------------------------------------------------------------------
+class TestTheRefusalIsLoud:
+    def test_a_missing_environment_file_is_refused(self):
+        """The .env holds the live secrets and is gitignored, so it is the
+        operator's file. Creating a stub would start the application with no
+        configuration at all -- a silent outage -- so the script stops."""
+        result = _drive("")
+        assert result["rc"] == 1, (result["stdout"], result["stderr"])
+        assert ".env" in result["stderr"]
+
+    def test_a_missing_environment_file_is_not_created(self):
+        result = _drive("")
+        assert result["rc"] == 1
+        assert not result["env_exists"], (
+            "the script created a stub .env; that would start the app with no "
+            "configuration"
+        )
+
+    def test_outside_a_git_repository_the_script_refuses(self):
+        result = _drive("", make_repo=False)
+        assert result["rc"] == 1, (result["stdout"], result["stderr"])
+        assert "git" in result["stderr"].lower()
+
+    def test_the_refusal_explains_itself(self):
+        """A refusal that does not say what is wrong cannot be acted on."""
+        result = _drive("printf 'SECRET = 1\\n' > sneaky.py\n")
+        assert result["rc"] == 1
+        assert result["stderr"].strip(), "the refusal printed nothing"
+        assert "git status --porcelain" in result["stderr"], (
+            "the refusal must show the operator the same list it saw"
+        )
+
+
+# --------------------------------------------------------------------------
+# The script finds the project root, so it can be run from anywhere
+# --------------------------------------------------------------------------
+class TestTheScriptFindsTheProjectRoot:
+    def test_run_from_a_subdirectory_it_still_stamps_the_root(self):
+        """The deploy path in AGENTS.md runs from the project directory, but a
+        script that only works from one place is a trap for the next person."""
+        result = _drive(
+            "mkdir -p sub\n"
+            "printf 'POSTGRES_PASSWORD=secret\\n' > .env\n"
+            "cd sub\n"
+        )
+        assert result["rc"] == 0, result["stderr"]
+        assert f"DEPLOYED_COMMIT={result['sha']}\n".encode() in result["env"]
+        assert ".env" not in result["subfiles"], (
+            "the script wrote the environment file into the subdirectory"
+        )
+
+
+# --------------------------------------------------------------------------
+# The script is safe to RUN
+# --------------------------------------------------------------------------
+class TestTheScriptIsSafeToRun:
+    def test_the_script_exists_and_is_a_shell_script(self):
+        assert SCRIPT.is_file(), f"{SCRIPT} must exist"
+        assert SCRIPT.read_text(encoding="utf-8").startswith("#!/bin/bash")
+
+    def test_the_script_fails_closed(self):
+        """A stamp that failed quietly would leave a WRONG commit published."""
+        source = SCRIPT.read_text(encoding="utf-8")
+        assert "set -euo pipefail" in source, (
+            "the script must fail closed: `set -euo pipefail`"
+        )
+
+    def test_the_refusal_comes_before_the_write(self):
+        """The order matters: the refusal has to come BEFORE the write, or a
+        dirty checkout would already have been stamped."""
+        source = SCRIPT.read_text(encoding="utf-8")
+        refuse_at = source.index("REFUSING to stamp a checkout")
+        write_at = source.index('DEPLOYED_COMMIT=" sha cr')
+        assert refuse_at < write_at, (
+            "the script writes the commit before it refuses a dirty checkout"
+        )

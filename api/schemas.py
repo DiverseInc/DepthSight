@@ -2842,6 +2842,13 @@ class ComponentStatus(BaseModel):
 class SystemStatus(BaseModel):
     status: str = Field(..., json_schema_extra={"example": "ok"})
     version: str = Field(..., json_schema_extra={"example": "1.0.0"})
+    # The exact commit this deployment was built from, recorded by the deploy
+    # script. It makes the AGPL-3.0 section 13 Corresponding Source of the
+    # RUNNING version locatable from a public URL, with no human in the loop.
+    commit: Optional[str] = Field(
+        default=None,
+        json_schema_extra={"example": "a660767664d8950f4123d9ee53d2ddbbaafcbbc5"},
+    )
     timestamp_utc: datetime = Field(
         ..., json_schema_extra={"example": "2024-06-14T12:00:00Z"}
     )

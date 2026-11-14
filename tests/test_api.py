@@ -26,6 +26,74 @@ async def test_get_status(test_client: AsyncClient):
     assert data["data"]["status"] == "ok"
 
 
+# The AGPL-3.0 section 13 offer needs the source of the RUNNING build to be
+# locatable from a public URL, with no human in the loop: the status endpoint
+# publishes the commit the deployment was built from, and the /source offer
+# page turns that value into a download URL. update.sh records the commit in
+# .env, which docker-compose.yml hands to the api service as env_file.
+DEPLOYED_COMMIT_SHA = "a660767664d8950f4123d9ee53d2ddbbaafcbbc5"
+
+
+@pytest.mark.asyncio
+async def test_the_status_endpoint_reports_the_commit_the_deployment_was_built_from(
+    test_client: AsyncClient, monkeypatch
+):
+    """The running build names its own commit, publicly.
+
+    This is what turns the section 13 offer from an email request into a
+    download URL: the reader reads the commit off the status page and opens
+    the archive for exactly that commit.
+    """
+    from api.routes import diagnostics
+
+    monkeypatch.setattr(diagnostics, "APP_COMMIT", DEPLOYED_COMMIT_SHA)
+
+    response = await test_client.get("/api/v1/status")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["commit"] == DEPLOYED_COMMIT_SHA
+
+
+@pytest.mark.asyncio
+async def test_the_status_endpoint_answers_when_no_commit_was_recorded(
+    test_client: AsyncClient, monkeypatch
+):
+    """A deployment that never recorded a commit still answers.
+
+    The field is optional on purpose: a self-hosted operator who does not
+    run our deploy script must get a valid response, not a 500.
+    """
+    from api.routes import diagnostics
+
+    monkeypatch.setattr(diagnostics, "APP_COMMIT", None)
+
+    response = await test_client.get("/api/v1/status")
+
+    assert response.status_code == 200
+    assert response.json()["data"]["commit"] is None
+
+
+def test_the_deployed_commit_is_read_from_the_environment(monkeypatch):
+    """The value comes from the environment the container was started with.
+
+    The module is reloaded so the real module-level read is exercised, not a
+    copy of it (AGENTS.md: verify against the real function).
+    """
+    import importlib
+
+    from api.routes import diagnostics
+
+    monkeypatch.setenv("DEPLOYED_COMMIT", DEPLOYED_COMMIT_SHA)
+    try:
+        importlib.reload(diagnostics)
+        assert diagnostics.APP_COMMIT == DEPLOYED_COMMIT_SHA
+    finally:
+        monkeypatch.delenv("DEPLOYED_COMMIT", raising=False)
+        importlib.reload(diagnostics)
+
+    assert diagnostics.APP_COMMIT is None
+
+
 @pytest.mark.asyncio
 async def test_authentication_is_required(test_client: AsyncClient):
     """
