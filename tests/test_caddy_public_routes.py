@@ -33,6 +33,34 @@ CADDY_CONFIG = REPO_ROOT / "caddy.config"
 # this test take minutes and asserted nothing about OUR source.
 NOT_REPOSITORY_DIRS = frozenset({"node_modules", "dist", "__pycache__"})
 
+# The ONLY files Caddy may serve out of the bind-mounted frontend/ tree.
+# Each is reached through a handle that rewrites to exactly that path, so
+# no handler can walk the tree and publish the frontend source.
+PINNED_SERVED_FILES = ("/welcome.html", "/source.html")
+
+# A rewrite to one of the pinned files, anchored to the END of the line, so
+# that a target which merely STARTS with a pinned file is rejected.
+#
+# MEASURED 2026-11-07 (Copilot, panel #3, condition (f) -- "an existing test
+# was made permissive"): the previous pattern ended in a negative lookahead
+# `(?![A-Za-z0-9])`, which rejected only an ALPHANUMERIC suffix. It
+# therefore ACCEPTED "/source.html/../demo-build-flag.ts" -- and the
+# companion assertion `assert "rewrite * /source.html" in body` accepted it
+# too, because the traversal target CONTAINS that substring. A caddy.config
+# that rewrote to the file holding the demo credentials would have PASSED
+# this whole test file. The live config rewrites to exactly "/source.html",
+# so this was a regression-TEST gap, not a live exposure.
+PINNED_REWRITE_RE = re.compile(
+    r"(?m)^[^\S\n]*rewrite[^\S\n]+\*+[^\S\n]+/(?:welcome|source)\.html[^\S\n]*$"
+)
+
+# Every path a handler body rewrites to. A handler that rewrites to anything
+# other than the one pinned file -- or to a second target as well -- can
+# serve another file out of the mounted directory.
+_REWRITE_TARGET_RE = re.compile(
+    r"(?m)^[^\S\n]*rewrite[^\S\n]+\*+[^\S\n]+(?P<target>\S+)[^\S\n]*$"
+)
+
 
 @pytest.fixture(scope="module")
 def config() -> str:
@@ -47,6 +75,11 @@ def _handle_body(config: str, path_pattern: str) -> str:
     )
     assert match, f"caddy.config has no `handle {path_pattern} {{ ... }}` block"
     return match.group("body")
+
+
+def _rewrite_targets(body: str) -> set:
+    """The paths a handler body rewrites to."""
+    return {m.group("target") for m in _REWRITE_TARGET_RE.finditer(body)}
 
 
 def _static_og_image_paths(config: str) -> list:
@@ -138,9 +171,11 @@ class TestTheServedDirectoryHoldsNothingElse:
     could reach an arbitrary path under it would publish the source -- and
     anything else that ever lands in frontend/.
 
-    Two rules keep that impossible:
+    Three rules keep that impossible:
 
       * the @welcome handler rewrites every request to /welcome.html, so it
+        can only ever return that one file;
+      * the @source handler rewrites every request to /source.html, so it
         can only ever return that one file;
       * the @ogimage handler matches three exact filenames.
 
@@ -152,10 +187,23 @@ class TestTheServedDirectoryHoldsNothingElse:
 
     def test_the_welcome_handler_can_only_serve_welcome_html(self, config):
         body = _handle_body(config, "@welcome")
-        assert "rewrite * /welcome.html" in body, (
-            "the @welcome handler must rewrite every request to "
-            "/welcome.html, so it cannot serve another file from the "
-            "mounted frontend/ directory"
+        targets = _rewrite_targets(body)
+        assert targets == {"/welcome.html"}, (
+            "the @welcome handler must rewrite every request to exactly "
+            "/welcome.html and to nothing else, so it cannot serve another "
+            f"file from the mounted frontend/ directory (it rewrites to "
+            f"{sorted(targets)})"
+        )
+
+    def test_the_source_handler_can_only_serve_source_html(self, config):
+        """The AGPL section 13 offer is served the same pinned way."""
+        body = _handle_body(config, "@source")
+        targets = _rewrite_targets(body)
+        assert targets == {"/source.html"}, (
+            "the @source handler must rewrite every request to exactly "
+            "/source.html and to nothing else, so it cannot serve another "
+            f"file from the mounted frontend/ directory (it rewrites to "
+            f"{sorted(targets)})"
         )
 
     def test_no_handler_serves_the_mounted_directory_without_a_pinned_path(self, config):
@@ -164,9 +212,13 @@ class TestTheServedDirectoryHoldsNothingElse:
             body = match.group("body")
             if "file_server" not in body:
                 continue
-            assert "rewrite * /welcome.html" in body or "@ogimage" in match.group(1), (
+            assert (
+                PINNED_REWRITE_RE.search(body)
+                or "@ogimage" in match.group(1)
+            ), (
                 f"the handle {match.group(1)!r} serves files from the "
-                "mounted frontend/ directory without pinning the path"
+                "mounted frontend/ directory without pinning the path to "
+                f"one of {list(PINNED_SERVED_FILES)}"
             )
 
     def test_the_demo_credentials_are_not_in_the_served_directory(self):
@@ -181,8 +233,9 @@ class TestTheServedDirectoryHoldsNothingElse:
         that directory is not in the build and the image build fails on an
         import it cannot resolve. So the credentials stay in
         frontend/demo-build-flag.ts -- a file no handler can serve, because
-        the @welcome handler rewrites every request to /welcome.html and
-        @ogimage matches three exact filenames (both pinned above).
+        the @welcome handler rewrites every request to /welcome.html, the
+        @source handler rewrites every request to /source.html and
+        @ogimage matches three exact filenames (all pinned above).
 
         This test therefore pins that the flag file is the ONLY place in the
         served tree that holds them.
@@ -213,6 +266,81 @@ class TestTheServedDirectoryHoldsNothingElse:
                     "sits in the directory Caddy serves from; the only file that "
                     "may hold it is frontend/demo-build-flag.ts"
                 )
+
+
+class TestTheRewriteTargetIsAnchoredToTheEndOfTheLine:
+    """A pinned file is a pinned file, not a PREFIX of one.
+
+    MEASURED 2026-11-07 (Copilot, panel #3): the pinned-rewrite rule used to
+    end in a negative lookahead that rejected only an ALPHANUMERIC suffix.
+    It therefore accepted "/source.html/../demo-build-flag.ts", and the
+    companion substring assertion accepted it too -- so a caddy.config that
+    rewrote to the file holding the demo credentials would have PASSED this
+    whole test file. The live config rewrites to exactly "/source.html", so
+    this was a regression-TEST gap, not a live exposure.
+    """
+
+    @pytest.mark.parametrize(
+        "target",
+        ["/welcome.html", "/source.html"],
+    )
+    def test_the_pinned_targets_are_recognised(self, target):
+        assert PINNED_REWRITE_RE.search(f"rewrite * {target}\n"), (
+            f"{target} is a pinned file and must be recognised as one"
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "/source.html.bak",
+            "/source.html/../demo-build-flag.ts",
+            "/source.html/../demo-build-flag.ts?x=1",
+            "/source.html/anything",
+            "/source.html%2f..%2fdemo-build-flag.ts",
+            "/welcome.html/../demo-build-flag.ts",
+            "/source.htmlx",
+        ],
+    )
+    def test_a_target_that_merely_starts_with_a_pinned_file_is_not_pinned(self, target):
+        assert not PINNED_REWRITE_RE.search(f"rewrite * {target}\n"), (
+            f"{target} is not a pinned file, so a rewrite to it must not be "
+            "accepted as pinned -- it would serve a file out of the mounted "
+            "frontend/ directory"
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "/source.html.bak",
+            "/source.html/../demo-build-flag.ts",
+            "/source.html/anything",
+        ],
+    )
+    def test_the_rewrite_target_extractor_reports_the_whole_target(self, target):
+        """The extractor must not stop at the pinned prefix either."""
+        body = (
+            "\n        root * /srv/frontend\n"
+            f"        rewrite * {target}\n"
+            "        file_server\n    "
+        )
+        assert _rewrite_targets(body) == {target}, (
+            "the extractor must report the whole target, not just the pinned "
+            f"prefix of it ({target})"
+        )
+
+    def test_the_source_handler_assertion_rejects_a_traversal_target(self):
+        """The production assertion itself must fail on the bad config."""
+        bad_config = (
+            "    @source path /source\n"
+            "    handle @source {\n"
+            "        root * /srv/frontend\n"
+            "        rewrite * /source.html/../demo-build-flag.ts\n"
+            "        file_server\n"
+            "    }\n"
+        )
+        body = _handle_body(bad_config, "@source")
+        with pytest.raises(AssertionError):
+            assert _rewrite_targets(body) == {"/source.html"}
 
 
 class TestTheCatchAllStillRunsLast:

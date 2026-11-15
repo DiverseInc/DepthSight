@@ -1,10 +1,14 @@
 FROM alpine:3.19
 
 # Minimal deps - just bash + postgresql client + curl + jq
+# ca-certificates is REQUIRED, not optional: the smoke test checks that the
+# AGPL source offer is served over a certificate that VERIFIES, and curl
+# cannot do that without a CA bundle in the image.
 RUN apk add --no-cache \
         bash \
         postgresql15-client \
         curl \
+        ca-certificates \
         jq \
     && rm -rf /var/cache/apk/* \
     && mkdir -p /opt/ops/state /backups

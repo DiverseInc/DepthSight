@@ -80,18 +80,101 @@ There is no Python linter configured. `pytest.ini` sets `pythonpath = .` and
 The maintainer has no SSH; they paste into the Elestio web terminal.
 
 ```bash
+set -e
 cd /opt/app/depthsight
 git config --global url."https://github.com/".insteadOf "git@github.com:"
 git remote set-url origin https://github.com/DiverseInc/DepthSight.git
 git pull origin main
 git log -1 --oneline          # MUST show the expected commit, else the pull no-opped
-docker compose build --no-cache <changed services>
-docker compose up -d --no-deps <changed services>
+bash ops/scripts/record_deployed_commit.sh   # stamps the commit; REFUSES a dirty checkout
+docker compose build --no-cache mcp-memory api websocket bot market_data celery_worker frontend pwa ops
+docker compose up -d --no-deps mcp-memory api websocket bot market_data celery_worker frontend pwa ops
+docker compose up -d --no-deps --force-recreate api   # the stamp lives in the api's environment
+docker compose restart caddy                           # caddy.config is bind-mounted; caddy reads it only at startup
+docker compose exec -T api printenv DEPLOYED_COMMIT || echo "STAMP NOT READABLE -- CHECK IT"
 ```
 
-- Services: `api bot market_data celery_worker websocket frontend pwa ops`;
-  infra is `postgres redis redis-market caddy`. **Rebuild only the services whose
-  files changed** — a `bot_module/` change means `bot`, not all five.
+- **The sequence FAILS FAST (`set -e`), and that is not a style choice.** The
+  stamp is written BEFORE the build, so if the build fails and the sequence
+  carries on anyway, `--force-recreate api` re-creates the api from the OLD
+  image with the NEW stamp already in its environment: the running service
+  would then publish a commit whose code it is not running, and the offer at
+  `/source` would name an archive that is not the running build. With
+  `set -e` the FIRST failed step stops the sequence and nothing after it
+  runs. MEASURED 2026-11-11 on this box: `set -e` DOES exit an INTERACTIVE
+  shell (which is what the Elestio web terminal is), so the guard holds
+  whether the block is pasted whole or one line at a time.
+- **The last line reads the stamp back out of the RUNNING container.** It is
+  the value the service publishes as the `commit` field of
+  `GET /api/v1/status`, and it is what the offer points a reader at. Print it
+  and compare it with `git rev-parse HEAD`: they must be the same commit.
+- **`deploy.sh` is NOT this repository's deploy path.** It is the one-click
+  installer for UPSTREAM's code: it clones
+  `https://github.com/DepthSight-Pro/DepthSight.git` (`deploy.sh:97`) and its
+  cron runs THAT checkout's `update.sh` (`deploy.sh:232`). MEASURED 2026-11-11
+  against upstream's `main`: that `update.sh` has NO stamp step (no
+  `record_deployed_commit`, no `DEPLOYED_COMMIT` anywhere in it) and upstream
+  has no `ops/scripts/record_deployed_commit.sh` at all -- so that deployment
+  publishes no commit and has no archive to name. A host deployed from THIS
+  repository runs THIS repository's `update.sh`, whose stamp refuses unless
+  the DECLARED origin is this repository's public one
+  (`ops/scripts/record_deployed_commit.sh:117-160`). **The origin the stamp
+  checks and the origin `deploy.sh` clones are two different deployments, not
+  one.**
+
+- **`bash ops/scripts/record_deployed_commit.sh` is not optional.** It writes
+  `DEPLOYED_COMMIT=<sha>` into `.env`, which `docker-compose.yml` hands to the
+  `api` service as `env_file`; the running service publishes it as the
+  `commit` field of `GET /api/v1/status`, and the AGPL-3.0 section 13 offer at
+  `/source` points a reader at the archive of exactly that commit. **Run it
+  AFTER the pull and BEFORE the build**: the value travels with the container,
+  so a failed build leaves the old container reporting the old commit, which
+  is the truth.
+- **The `api` service is ALWAYS recreated, even when nothing in it changed.**
+  `env_file` is read when the container is CREATED, so a container that is left
+  running keeps the environment it was created with. On a bot-only deploy the
+  `api` would otherwise keep publishing the PREVIOUS commit while the `bot`
+  already runs the new code -- and the archive the offer points at would not
+  contain the running bot. `--force-recreate` rebuilds nothing; it re-creates
+  the container so it picks up the stamp that was just written.
+- **The deployment has to be ONE COMMIT, so the service list is explicit.**
+  The AGPL-3.0 section 13 offer names ONE commit — the `commit` field of
+  `GET /api/v1/status` — and promises that its archive is the exact tree of
+  the running build. That promise is only true when the WHOLE deployment is
+  that one commit, so a placeholder for "the services that changed" is not
+  allowed here. Six services build from the ROOT context (`docker-compose.yml`:
+  `mcp-memory`, `api`, `websocket`, `bot`, `market_data`, `celery_worker`)
+  and the `api` IMPORTS `bot_module` (`api/depthsight_api.py`), so on a
+  `bot_module/` change a deploy that rebuilds only `bot` leaves the api,
+  the market-data service, the celery worker and the mcp-memory server
+  running the OLD code while the api publishes the NEW commit — and the
+  archive the offer names does not contain the code those services are
+  running. `frontend`, `pwa` and `ops` build from their own contexts and
+  are rebuilt from that same commit. Rebuilding everything is slower; a
+  deployment on two commits is a broken promise.
+- **`caddy` is ALWAYS restarted.** `caddy.config` is bind-mounted
+  (`docker-compose.yml:283`), and caddy reads its Caddyfile only at startup,
+  so `docker compose up -d` does not activate a changed route. `frontend/` is
+  bind-mounted too (`docker-compose.yml:289`), so `welcome.html` goes live the
+  moment the pull lands. Without the restart the site advertises the source
+  offer while `/source` still falls through to the app shell. It is restarted
+  LAST on purpose: the route appears at the same moment the published commit
+  becomes correct, never before.
+- It also **refuses to continue when the checkout is not the committed tree**
+  (a modified or untracked file). The image is built from the Docker build
+  context while the published source is the committed tree, so a dirty
+  checkout would put code in the running containers that is not in the
+  published source. It deletes nothing — it prints the offending paths and
+  stops. Park them with `git stash -u` and deploy again.
+
+- Services built from THIS repository: `mcp-memory api websocket bot
+  market_data celery_worker frontend pwa ops`; infra is `postgres redis
+  redis-market caddy`. **The deploy rebuilds and re-creates every service
+  in that first list, and the list is written out on purpose.**
+- `update.sh` (the auto-updater the cron runs) accepts BOTH install
+  locations: `/opt/app/depthsight` and `/opt/depthsight`, the latter being
+  where the one-click `deploy.sh` installer clones the project. If neither
+  exists it stops and names both paths it looked at.
 - The SSH remote resets between sessions; the `insteadOf` rewrite in step 2 is the
   permanent fix. Run it first, every time.
 - `docker compose up -d` will NOT recreate a container for a bind-mounted file's

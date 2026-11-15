@@ -51,6 +51,12 @@ def _load_app_version() -> str:
 
 APP_VERSION = os.getenv("APP_VERSION", _load_app_version())
 
+# The commit the running deployment was built from. The deploy script records
+# it in .env, which docker-compose.yml hands to the api service as env_file,
+# so the value travels with the container and is published here -- unauthenticated
+# -- for the AGPL-3.0 section 13 offer to point at.
+APP_COMMIT = (os.getenv("DEPLOYED_COMMIT") or "").strip() or None
+
 logger = logging.getLogger(__name__)
 
 diagnostics_router = APIRouter(
@@ -162,6 +168,7 @@ async def get_system_status_endpoint(
     dynamic_system_state = {
         "status": overall_status,
         "version": APP_VERSION,  # Dynamic version
+        "commit": APP_COMMIT,
         "timestamp_utc": datetime.now(timezone.utc),
         "components": components,
     }
