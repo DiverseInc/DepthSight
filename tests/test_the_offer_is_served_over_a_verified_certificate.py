@@ -496,3 +496,335 @@ class TestTheDeployGateCertificateCheckRunsForReal:
             "as one of them succeeds"
         )
         assert "[!]" not in result["output"], result["output"]
+
+
+# --------------------------------------------------------------------------
+# The smoke test's certificate check, RUN
+# --------------------------------------------------------------------------
+
+# The name of the smoke test's certificate check. It has to be DISTINCT from
+# the deploy gate's (verify_offer_certificate): the two scripts are checked
+# separately, and a test that found the wrong function would prove nothing.
+SMOKE_CERT_FUNCTION = "check_offer_certificate"
+
+
+def _run_smoke_certificate_check(fail_times: int = 0, fail_status: int = 0) -> dict:
+    """The REAL check, lifted out of smoke-test.sh and run under bash.
+
+    The stub `curl` COUNTS its calls -- so the retry bound is MEASURED, not
+    assumed -- and returns a chosen exit status, so the 60-vs-other
+    distinction is measured too. The stub `sleep` returns immediately, so
+    the retry test does not spend ten real seconds.
+
+    `fail_times` is how many of the FIRST calls fail; the calls after that
+    succeed. `fail_status` is the curl exit code those calls return.
+
+    The smoke test runs under `set -u` and NOT `set -e`, and that is what is
+    reproduced here: `set -e` would abort the snippet on the check's own
+    non-zero return and hide the failure message it had just printed.
+    """
+    function = _extract_function(
+        SMOKE_TEST.read_text(encoding="utf-8"), SMOKE_CERT_FUNCTION
+    )
+    body = (
+        "set -u\n"
+        "FAIL=0\n"
+        "DOMAIN='https://offer.example.test'\n"
+        + function
+        + "\n"
+        + "CURL_CALLS=0\n"
+        + "curl() {\n"
+        + "    echo CURL_CALL\n"
+        + "    CURL_CALLS=$((CURL_CALLS+1))\n"
+        + f"    if [ {fail_times} -gt 0 ] && "
+        + f"[ \"$CURL_CALLS\" -le {fail_times} ]; then\n"
+        + f"        return {fail_status}\n"
+        + "    fi\n"
+        + "    return 0\n"
+        + "}\n"
+        + "sleep() { :; }\n"
+        # The check is called the way the smoke test calls it -- as the
+        # CONDITION of an `if`, and its RETURN VALUE is read afterwards.
+        # An `exit` inside the function would kill the snippet before these
+        # two lines ran, so their presence proves the function returns.
+        + "if check_offer_certificate; then\n"
+        + "    RC=0\n"
+        + "else\n"
+        + "    RC=1\n"
+        + "fi\n"
+        + 'echo "RC=$RC"\n'
+        + 'echo "FAIL=$FAIL"\n'
+    )
+    result = _run_bash_raw(body)
+    result["calls"] = result["stdout"].count("CURL_CALL")
+    result["output"] = result["stdout"] + result["stderr"]
+    return result
+
+
+class TestTheSmokeTestCertificateCheckRunsForReal:
+    """The check as the smoke test runs it, not as this file imagines it.
+
+    MEASURED DEFECT (FINDING H, 2026-11-15): the smoke test's certificate
+    check was `if ! curl ...; then`, which (a) cannot read curl's exit
+    status at all -- inside `if ! cmd` the `$?` is the status of the
+    NEGATION (0), not of the command -- so EVERY failure was reported as
+    "the TLS certificate did not verify", and (b) made ONE request with no
+    retry, while the check it was modelled on (update.sh's
+    verify_offer_certificate) and both of that script's siblings use a
+    bounded three attempts.
+
+    The false failure it produced: the smoke test runs every five minutes
+    from ops/loop.sh, so a caddy that was briefly unavailable (curl exit 7,
+    connection refused) was reported as a broken certificate and sent the
+    operator to fix a certificate that was perfectly fine.
+
+    Every test below runs the REAL function out of smoke-test.sh (AGENTS.md:
+    "Verify against the real function, not a reimplementation").
+    """
+
+    def test_a_certificate_that_verifies_passes_silently(self):
+        result = _run_smoke_certificate_check()
+        assert result["rc"] == 0, result["output"]
+        assert "RC=0" in result["stdout"], result["output"]
+        assert result["calls"] == 1, (
+            f"the check made {result['calls']} requests although the first one "
+            "succeeded; a check that passes must not keep asking"
+        )
+        assert "[FAIL]" not in result["output"], (
+            "the check passed and still printed an error: " + result["output"]
+        )
+
+    def test_a_certificate_that_does_not_verify_is_reported_as_such(self):
+        """curl exit 60 IS a certificate failure, and it says so."""
+        result = _run_smoke_certificate_check(fail_times=3, fail_status=60)
+        assert result["rc"] == 0, result["output"]
+        assert "RC=1" in result["stdout"], result["output"]
+        assert "did not verify" in result["output"], (
+            "curl failed with 60 (the certificate does not verify) and the "
+            "check did not say so: " + result["output"]
+        )
+        assert "did not answer" not in result["output"], (
+            "a certificate failure was also reported as the site not "
+            "answering: " + result["output"]
+        )
+
+    def test_a_site_that_does_not_answer_is_not_a_certificate_failure(self):
+        """curl exit 7 is "connection refused", NOT a broken certificate.
+
+        This is the false failure the defect produced: a caddy that was
+        briefly unavailable was reported as a certificate that did not
+        verify, which sent the operator to fix a certificate that was fine.
+        """
+        result = _run_smoke_certificate_check(fail_times=3, fail_status=7)
+        assert result["rc"] == 0, result["output"]
+        assert "RC=1" in result["stdout"], result["output"]
+        assert "did not answer" in result["output"], (
+            "curl failed with 7 (connection refused) and the check did not "
+            "say the site did not answer: " + result["output"]
+        )
+        assert "did not verify" not in result["output"], (
+            "curl failed with 7 (connection refused) and the check reported "
+            "it as a CERTIFICATE failure, which sends the operator to fix a "
+            "certificate that is fine: " + result["output"]
+        )
+
+    def test_a_timeout_is_not_a_certificate_failure(self):
+        """curl exit 28 is a timeout -- also not the certificate."""
+        result = _run_smoke_certificate_check(fail_times=3, fail_status=28)
+        assert result["rc"] == 0, result["output"]
+        assert "RC=1" in result["stdout"], result["output"]
+        assert "did not answer" in result["output"], result["output"]
+        assert "did not verify" not in result["output"], result["output"]
+
+    def test_the_check_retries_a_bounded_number_of_times(self):
+        """Bounded: exactly three attempts, like the sibling checks.
+
+        Not ">1": a check that asked a hundred times would hang the smoke
+        test instead of failing it.
+        """
+        result = _run_smoke_certificate_check(fail_times=3, fail_status=60)
+        assert result["calls"] == 3, (
+            f"the check made {result['calls']} requests; it must make exactly "
+            "three -- one attempt would report a caddy that was still coming "
+            "up as a failure, and more would hang the smoke test"
+        )
+
+    def test_a_caddy_that_was_still_coming_up_is_rescued_by_the_retry(self):
+        """The first request fails, the second answers: that is a SUCCESS."""
+        result = _run_smoke_certificate_check(fail_times=1, fail_status=7)
+        assert result["rc"] == 0, result["output"]
+        assert "RC=0" in result["stdout"], result["output"]
+        assert result["calls"] == 2, (
+            f"the check made {result['calls']} requests; it must stop as soon "
+            "as one of them succeeds"
+        )
+        assert "[FAIL]" not in result["output"], result["output"]
+
+    def test_the_check_sets_the_failure_counter_and_does_not_exit(self):
+        """It sets FAIL=1 and RETURNS -- it must not exit the smoke test.
+
+        The smoke test has more checks after this one, and the alert file is
+        only written when the script runs to the end.
+        """
+        result = _run_smoke_certificate_check(fail_times=3, fail_status=60)
+        assert "FAIL=1" in result["stdout"], (
+            "the check failed but did not set the smoke test's own FAIL "
+            "counter, so the smoke test would carry on as a success: "
+            + result["output"]
+        )
+        assert "RC=1" in result["stdout"], (
+            "the check did not RETURN a non-zero status, so the caller "
+            "cannot act on it: " + result["output"]
+        )
+
+
+def test_the_smoke_test_certificate_check_is_a_function():
+    """The check has to be a function, and it has to be the REAL one.
+
+    A copy of the logic in this file would prove nothing about the script
+    (AGENTS.md: "Verify against the real function, not a reimplementation"),
+    so the name is looked up in the script itself.
+    """
+    text = SMOKE_TEST.read_text(encoding="utf-8")
+    assert text.count(f"{SMOKE_CERT_FUNCTION}() {{") == 1, (
+        f"smoke-test.sh must define exactly one {SMOKE_CERT_FUNCTION}() "
+        f"function; it has {text.count(f'{SMOKE_CERT_FUNCTION}() {{')}"
+    )
+    assert text.count(f"if {SMOKE_CERT_FUNCTION}; then") == 1, (
+        f"smoke-test.sh must call {SMOKE_CERT_FUNCTION}() exactly once, in a "
+        "condition, or the check cannot fail the smoke test"
+    )
+
+
+def test_the_smoke_test_does_not_read_the_status_inside_a_negation():
+    """`if ! curl` cannot report WHICH failure it was.
+
+    Inside `if ! cmd` the `$?` is the status of the NEGATION (0) and not of
+    the command, so the exit code of curl -- the thing that tells a
+    certificate failure (60) apart from a site that is not answering (7,
+    28) -- cannot be read from there at all. The old check was exactly this
+    shape, and it reported every failure as a certificate failure.
+    """
+    text = SMOKE_TEST.read_text(encoding="utf-8")
+    assert 'if ! curl -s -o /dev/null --max-time 10 "$DOMAIN/source"' not in text, (
+        "the smoke test still reads its certificate check as `if ! curl ...`: "
+        "inside a negation $? is the status of the negation (0), not of "
+        "curl, so a site that is not answering is reported as a certificate "
+        "failure"
+    )
+
+
+def _run_the_whole_smoke_test(cert_status: int = 60) -> dict:
+    """The REAL smoke test, end to end, with the network stubbed out.
+
+    The script is fed to bash verbatim over stdin (the same way the deploy
+    gate's script is exercised), with the network commands stubbed: psql
+    succeeds, and curl answers with a status code for the liveness checks
+    and with the CHOSEN exit status for the certificate request against
+    /source.
+
+    This is what proves the smoke test still finishes: it has to run its
+    remaining checks and write its alert file after the certificate check
+    has failed.
+    """
+    script = SMOKE_TEST.read_text(encoding="utf-8")
+    prelude = (
+        "STATE_DIR=$(mktemp -d)\n"
+        "export STATE_DIR\n"
+        "export PUBLIC_BASE_URL='https://offer.example.test'\n"
+        "export POSTGRES_PASSWORD='stub'\n"
+        "export DEPLOY_ENV_FILE=\"$STATE_DIR/there-is-no.env\"\n"
+        "psql() { return 0; }\n"
+        "curl() {\n"
+        "    url=''\n"
+        "    for a in \"$@\"; do\n"
+        "        case \"$a\" in http*) url=\"$a\" ;; esac\n"
+        "    done\n"
+        "    for a in \"$@\"; do\n"
+        "        if [ \"$a\" = '-w' ]; then\n"
+        "            case \"$url\" in\n"
+        "                */ws) echo -n '404' ;;\n"
+        "                *) echo -n '200' ;;\n"
+        "            esac\n"
+        "            return 0\n"
+        "        fi\n"
+        "    done\n"
+        "    case \"$url\" in\n"
+        f"        *'/source') return {cert_status} ;;\n"
+        "    esac\n"
+        "    return 0\n"
+        "}\n"
+        "sleep() { :; }\n"
+    )
+    after = (
+        'echo "SCRIPT_RC=$SCRIPT_RC"\n'
+        'if [ -f "$STATE_DIR/alert" ]; then\n'
+        '    echo "ALERT_EXISTS=1"\n'
+        '    echo "---ALERT---"\n'
+        '    cat "$STATE_DIR/alert"\n'
+        'else\n'
+        '    echo "ALERT_EXISTS=0"\n'
+        'fi\n'
+        'echo "---LOG---"\n'
+        'cat "$STATE_DIR/smoke.log" 2>/dev/null\n'
+    )
+    body = (
+        prelude
+        + "(\n"
+        + script
+        + "\n)\n"
+        + "SCRIPT_RC=$?\n"
+        + after
+    )
+    result = _run_bash_raw(body)
+    result["output"] = result["stdout"] + result["stderr"]
+    return result
+
+
+@pytest.mark.parametrize(
+    "cert_status,expected,forbidden",
+    [
+        (60, "the TLS certificate did not verify", "did not answer"),
+        (7, "did not answer", "did not verify"),
+    ],
+    ids=["certificate-does-not-verify", "site-does-not-answer"],
+)
+def test_the_smoke_test_keeps_running_and_writes_its_alert_after_a_certificate_failure(
+    cert_status, expected, forbidden
+):
+    """A failed certificate check must not stop the smoke test dead.
+
+    The smoke test has more checks after the certificate one, and the alert
+    file -- the thing the operator actually reads -- is only written when
+    the script runs to the end. A check that exited instead of returning
+    would leave the operator with no alert at all.
+
+    Both failure kinds are run: with the old `if ! curl` check, a site that
+    was not answering (7) was reported as a broken certificate, so the
+    message is asserted as well as the continuation.
+    """
+    result = _run_the_whole_smoke_test(cert_status=cert_status)
+    assert "SCRIPT_RC=1" in result["stdout"], (
+        "the smoke test did not report a failure even though the certificate "
+        "check failed: " + result["output"]
+    )
+    assert expected in result["output"], (
+        f"the smoke test did not report the failure as '{expected}': "
+        + result["output"]
+    )
+    assert forbidden not in result["output"], (
+        f"the smoke test reported the failure as '{forbidden}' as well: "
+        + result["output"]
+    )
+    assert "ALERT_EXISTS=1" in result["stdout"], (
+        "the smoke test did not write its alert file after the certificate "
+        "failure: " + result["output"]
+    )
+    assert "smoke test FAILED" in result["output"], result["output"]
+    assert "SKIP the source archive check" in result["output"], (
+        "the smoke test stopped at the certificate check instead of carrying "
+        "on to its remaining checks: " + result["output"]
+    )
+    assert "postgres reachable" in result["output"], (
+        "the checks before the certificate one no longer run: " + result["output"]
+    )

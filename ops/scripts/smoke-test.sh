@@ -29,6 +29,53 @@ PG_USER="${POSTGRES_USER:-depthsight_user}"
 API_URL="$DOMAIN/api/v1"
 
 FAIL=0
+
+# The source offer is a PUBLIC document, so it has to be served over a
+# certificate that verifies -- the liveness checks below use `curl -k` on
+# purpose, but this one must not.
+#
+# curl's exit codes are DISTINCT: 60 is "the certificate does not verify",
+# 7 is "connection refused", 28 is "timeout". ONLY 60 is a certificate
+# failure. So the status is CAPTURED, and it DECIDES the message: reporting
+# every failure as a certificate failure sends the operator to fix a
+# certificate that is perfectly fine.
+#
+# The status is captured in the ELSE branch of a plain `if curl`: inside
+# `if ! cmd` the `$?` is the status of the NEGATION (0), not of the command,
+# so the negation form cannot report WHICH failure it was.
+#
+# The request is retried a BOUNDED three times, with a pause between the
+# attempts, exactly like the sibling checks in update.sh: this smoke test
+# runs every five minutes from ops/loop.sh, and caddy may still be coming
+# up when it fires.
+#
+# It is a FUNCTION so that the REAL logic is what the tests exercise
+# (AGENTS.md: "Verify against the real function, not a reimplementation").
+# It sets the smoke test's own FAIL counter instead of exiting, so the
+# remaining checks still run and the alert file is still written.
+check_offer_certificate() {
+    local attempt status
+    status=0
+    for attempt in 1 2 3; do
+        if curl -s -o /dev/null --max-time 10 "$DOMAIN/source" 2>/dev/null; then
+            return 0
+        else
+            status=$?
+        fi
+        if [ "$attempt" -lt 3 ]; then
+            sleep 5
+        fi
+    done
+
+    if [ "$status" -eq 60 ]; then
+        echo "  [FAIL] GET $DOMAIN/source -> the TLS certificate did not verify"
+    else
+        echo "  [FAIL] GET $DOMAIN/source -> the site did not answer (curl exit status $status, which is not a certificate failure)"
+    fi
+    FAIL=1
+    return 1
+}
+
 {
     echo "=== smoke test @ $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 
@@ -98,10 +145,12 @@ FAIL=0
     #    verification cannot tell the real offer from one served through an
     #    impersonated certificate. So this one verifies, and a certificate
     #    failure is reported as itself rather than as "unreachable".
-    if ! curl -s -o /dev/null --max-time 10 "$DOMAIN/source" 2>/dev/null; then
-        echo "  [FAIL] GET $DOMAIN/source -> the TLS certificate did not verify"
-        FAIL=1
-    else
+    #
+    #    The verification itself is the FUNCTION check_offer_certificate
+    #    (above), because the exit status of curl has to be READ to tell a
+    #    certificate failure (60) from a site that is not answering (7, 28)
+    #    -- and inside `if ! curl` that status cannot be read at all.
+    if check_offer_certificate; then
         SOURCE_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$DOMAIN/source" 2>/dev/null || echo "000")
         if [ "$SOURCE_CODE" != "200" ]; then
             echo "  [FAIL] GET $DOMAIN/source -> $SOURCE_CODE (source offer unreachable)"
