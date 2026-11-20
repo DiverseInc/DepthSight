@@ -122,4 +122,7 @@ docker compose up -d --no-deps <changed services>
 ## Security
 
 - Never commit secrets — `.env` is gitignored.
-- Do not modify or redirect the `diverseinc.net` / `diverseindustriesinc.com` domains.
+- Do not modify or redirect the `diverseinc.net` / `diverseindustriesinc.com` domains without the owner's explicit approval.
+  - Owner decision 2026-11-19: `diverseinc.net` is a permanent redirect to `https://diverseindustriesinc.com` (Vercel project `diverseinc-redirect`, `prj_WJqtTapDlO3ACvx4lXKOUwIJlw1W`). `diverseindustriesinc.com` and `www.diverseindustriesinc.com` serve the corporate site (project `diverseindustriesinc`, `prj_pyfte6anTlCigqW06TBPoWPr06nw`).
+  - The two must never serve identical content again. On 2026-10-14 a 71-second window re-pointed `diverseinc.net` off the redirect onto the corporate build and left an orphan duplicate project behind; that is the damage the current split prevents.
+  - Any future change to a domain, alias, or project ownership on these properties: write the exact rollback command down first, change one thing, verify it live immediately, and confirm the rollback target is still READY. The alias is what routes - removing it makes the host 404.
