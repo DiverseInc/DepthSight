@@ -13,6 +13,7 @@ from .. import crud, schemas, security
 from ..database import get_db
 from ..audit_logger import audit_logger, get_client_ip, get_user_agent
 from ..gamification import check_and_grant_retroactive_achievements
+from .. import google_signin
 from ..plans import plans_config
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,11 @@ async def google_login(
             detail="Google Authentication is not configured on the server.",
         )
 
+    # The digest identifies this attempt without being usable as a
+    # credential. It is the ONLY thing about the token that is ever written
+    # to a log.
+    token_digest = google_signin.token_digest(payload.token)
+
     try:
         idinfo = id_token.verify_oauth2_token(
             payload.token, google_requests.Request(), google_client_id
@@ -225,9 +231,20 @@ async def google_login(
             raise ValueError("Email not found in Google token.")
 
     except Exception as e:
-        logger.warning(f"Failed to verify Google token: {e}")
+        # NEVER write the token to a log, and NEVER write any prefix of it.
+        #
+        # The exception message is NOT safe to log: google-auth raises
+        #   MalformedError("Wrong number of segments in token: b'<the token>'")
+        # (google/auth/jwt.py:_unverified_decode), so `e` carries the raw
+        # bearer credential. Only the exception TYPE and the truncated sha256
+        # digest are written.
+        logger.warning(
+            "Failed to verify Google token (sha256:%s): %s",
+            token_digest[:16],
+            type(e).__name__,
+        )
         audit_logger.login_failed(
-            username=f"google_{payload.token[:10]}...",
+            username=f"google_{token_digest[:12]}",
             ip_address=get_client_ip(request),
             user_agent=get_user_agent(request),
             reason="Invalid Google token",
@@ -235,6 +252,30 @@ async def google_login(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Google token",
+        )
+
+    # ONE redirect, ONE session.
+    #
+    # The one-time value the client generated is consumed here, exactly once.
+    # A second attempt with the same value -- a remount, a reload, a second
+    # tab that received the same redirect -- is refused instead of minting a
+    # second session. The credential is consumed by its digest as well, so a
+    # replayed credential is refused too, and so a client that sends no
+    # one-time value at all (the PWA popup flow) is covered as well.
+    consumed_values = [google_signin.credential_value(token_digest)]
+    if payload.signin_nonce:
+        consumed_values.append(google_signin.nonce_value(payload.signin_nonce))
+
+    if not await google_signin.consume_once(db, consumed_values):
+        audit_logger.login_failed(
+            username=f"google_{token_digest[:12]}",
+            ip_address=get_client_ip(request),
+            user_agent=get_user_agent(request),
+            reason="Google sign-in attempt already used",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This sign-in has already been used. Please sign in again.",
         )
 
     user_db = await crud.get_user_by_email(db, email=email)

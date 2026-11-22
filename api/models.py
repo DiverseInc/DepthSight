@@ -1149,3 +1149,31 @@ class HubNode(Base):
         default=lambda: datetime.now(timezone.utc),
         server_default=func.now(),
     )
+
+
+class GoogleSignInAttempt(Base):
+    """A Google sign-in attempt that has already been consumed.
+
+    One Google redirect must produce exactly ONE session. The client sends a
+    one-time value it generated with the credential; this table records the
+    values that have been consumed, and the UNIQUE constraint on `value` is
+    what makes "consume once" atomic.
+
+    It lives in the DATABASE rather than in the process memory because the
+    API runs under gunicorn with 5 workers (Dockerfile:32): an in-process
+    set would be per worker, so two workers would each accept the same
+    credential and mint two sessions.
+    """
+
+    __tablename__ = "google_signin_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Either the one-time value the client generated (prefix "state:") or the
+    # sha256 digest of the credential (prefix "cred:").
+    value = Column(String(160), unique=True, index=True, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+        index=True,
+    )

@@ -23,6 +23,7 @@ import { SymbolSelectionSettingsProvider } from "@/context/SymbolSelectionSettin
 import { ThemeProvider } from "@/context/ThemeProvider";
 import { WebSocketProvider } from "@/context/WebSocketProvider";
 import AdminRoute from "./components/auth/AdminRoute";
+import { GoogleRedirectHandler } from "./components/auth/GoogleRedirectHandler";
 import { GeneDiscoveryNotification } from "./components/genome/GeneDiscoveryNotification";
 import OnboardingTutorial from "./components/OnboardingTutorial";
 import OnboardingPage from "./pages/Onboarding";
@@ -119,6 +120,15 @@ function App() {
 				<QueryClientProvider client={queryClient}>
 					<BrowserRouter>
 						<AuthProvider>
+							{/*
+							 * Google sign-in completes on the SITE ROOT, because the
+							 * only registered redirect URI is the bare origin. This
+							 * handler therefore has to live above <Routes>, so it
+							 * runs on every route -- including the root -- and picks
+							 * the credential out of the URL fragment. See
+							 * src/lib/googleOAuth.ts.
+							 */}
+							<GoogleRedirectHandler />
 							<WebSocketProvider>
 								<TooltipProvider>
 									<ReferralTracker />
