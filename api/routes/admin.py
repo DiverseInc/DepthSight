@@ -15,6 +15,7 @@ from .. import crud, models, schemas, security
 from ..database import get_db
 from ..dependencies import require_admin_role
 from ..redis_client import get_redis_client
+from ..system_metrics import collect_system_metrics
 from ..plans import plans_config
 from ..audit_logger import audit_logger, get_client_ip
 
@@ -312,14 +313,14 @@ async def get_system_metrics(
     """
     Get system-wide performance and health metrics.
     Admin only.
+
+    Every number here is measured by this service, from counters it wrote
+    itself. A metric the platform could not measure is returned as null with
+    the reason in `notes` -- never as a placeholder, a default or an
+    estimate. If the metrics store cannot be read, everything is null: the
+    console would rather be blind than wrong.
     """
-    # TODO: Replace with real metric gathering logic
-    return {
-        "average_response_time_ms": 22.0,
-        "uptime_30_days_percent": 99.98,
-        "total_requests_24h": 1234567,
-        "error_rate_24h": 0.02,
-    }
+    return await collect_system_metrics(redis_client)
 
 
 @admin_router.post("/system/update")
