@@ -1,12 +1,28 @@
+#
+# THE DEPTH FORMS: every '**/name' rule below is the depth form of the
+# bare rule beside it. Docker compiles '*' to '[^/]*' and matches a
+# pattern against the WHOLE relative path, so a BARE pattern covers the
+# ROOT ONLY: '*.pkl' does NOT match 'sub/model.pkl'. Git does the
+# opposite -- a bare gitignore pattern matches at ANY depth -- so a bare
+# .dockerignore rule leaves every NESTED git-ignored file in the build
+# context. MEASURED with the real docker CLI (29.9.3): with the bare
+# forms only, 10 of 10 nested git-ignored files were copied into the
+# image by `COPY . .` -- invisible to `git status --porcelain`, so the
+# deploy stamp still called the checkout the committed tree while the
+# running image carried files the published archive does not.
+# '**/name' matches the name at ANY depth, including the root, so the
+# bare rule is kept beside it for readability.
 # .dockerignore
 
 # Git
 .git
 .gitignore
+**/.gitignore
 
 # Docker
 Dockerfile
 Dockerfile.*
+**/Dockerfile*
 docker-compose.yml
 
 # Secrets — these must NEVER be baked into an image layer.
@@ -20,6 +36,7 @@ docker-compose.yml
 **/.env
 **/.env.*
 !.env.example
+!**/.env.example
 gcp_key.json
 **/gcp_key.json
 *.key
@@ -59,32 +76,55 @@ secrets/
 
 # Python
 __pycache__/
+**/__pycache__/
 *.pyc
+**/*.pyc
 *.pyo
+**/*.pyo
 *.pyd
+**/*.pyd
 venv/
+**/venv/
 venv_bot/
+**/venv_bot/
 .venv/
+**/.venv/
 .pytest_cache/
+**/.pytest_cache/
 .mypy_cache/
+**/.mypy_cache/
 .ruff_cache/
+**/.ruff_cache/
 *.egg-info/
+**/*.egg-info/
 
 # Node.js (для бэкенд-контейнера они не нужны, фронтенд их обработает сам)
 # Если папка frontend в корне, то так:
 frontend/node_modules/
+**/frontend/node_modules/
 landing/
+**/landing/
 build
+**/build
 coverage
+**/coverage
 dist
+**/dist
 build.sh
+**/build.sh
 docker
+**/docker
 Makefile
+**/Makefile
 .vite
+**/.vite
 # IDE
 .idea/
+**/.idea/
 .vscode/
+**/.vscode/
 .opencode/
+**/.opencode/
 
 # Tests and docs are not needed at runtime: nothing in the image imports them
 # (alembic needs alembic/ + alembic.ini, not tests/ or docs/).
@@ -93,9 +133,129 @@ docs/
 
 # Другое
 *.log
+**/*.log
 logs/
+**/logs/
 data/
+**/data/
 *.db
+**/*.db
 *.sqlite3
+**/*.sqlite3
 *.csv
+**/*.csv
 data_storage/
+**/data_storage/
+
+# ---------------------------------------------------------------------------
+# THE RULE: nothing that .gitignore excludes may enter the image.
+#
+# The image is built from the Docker build CONTEXT (`COPY . .`), while the
+# AGPL-3.0 section 13 offer publishes the COMMITTED tree. Anything git
+# ignores is invisible to `git status --porcelain` -- so the deploy stamp's
+# dirty check passes -- but it is still copied into the image. That would
+# make the offer's promise ("the archive is the exact tree of the running
+# build") false, and it could bake a credential copy into an image layer.
+#
+# tests/test_dockerignore_covers_gitignore.py enforces the rule: every
+# pattern .gitignore excludes must also be excluded here.
+# ---------------------------------------------------------------------------
+# Credential copies: .gitignore closes .env, .env.*, .env_* and .env-* (all
+# three separators). .env.* alone was here, so a .env_backup or a
+# .env-backup was gitignored yet still visible to the build context.
+.env_*
+.env-*
+**/.env_*
+**/.env-*
+# Other credential-ish and data-ish artifacts.
+*.sqlite
+**/*.sqlite
+*.pkl
+**/*.pkl
+*.parquet
+**/*.parquet
+*.sql
+**/*.sql
+*.err
+**/*.err
+*.log*
+**/*.log*
+*.bak-*
+**/*.bak-*
+credentials*.json
+**/credentials*.json
+# Local scratch and tool output.
+scratch/
+**/scratch/
+.scratch/
+**/.scratch/
+md/
+**/md/
+extracted_strategies/
+**/extracted_strategies/
+found_strategies_mtf/
+**/found_strategies_mtf/
+.agent/
+**/.agent/
+.review/
+**/.review
+check.txt
+**/check.txt
+.prepush_pytest_output.txt
+**/.prepush_pytest_output.txt
+docker-compose.legacy.yml
+**/docker-compose.legacy.yml
+data_storage_old/
+**/data_storage_old/
+# Rust and ML working directories.
+depth_sight_hft/
+**/depth_sight_hft/
+catboost_info/
+**/catboost_info/
+perfomance_test/
+**/perfomance_test/
+performance_result/
+**/performance_result/
+# Node dependencies: the root context must not carry another service's
+# node_modules. (The pwa image builds from ./pwa, so this does not affect
+# the pwa build itself.)
+pwa/node_modules/
+**/pwa/node_modules/
+# ---------------------------------------------------------------------------
+# THE SUB-DIRECTORIES' OWN .gitignore RULES (added 2026-11-11).
+#
+# The root build context CONTAINS frontend/ and pwa/, and git consults the
+# NEAREST .gitignore -- so those directories' own rules apply inside the root
+# context too. The root Dockerfile does `COPY . .` for SIX services (api,
+# bot, celery_worker, market_data, mcp-memory, websocket), so a file such as
+# frontend/x.local was copied into all six images while being invisible to
+# `git status --porcelain` (git consults the nearest .gitignore, so the file
+# was ignored and therefore unreported) -- which breaks the offer's promise
+# that the archive of the stamped commit IS the exact tree of the running
+# build.
+#
+# Each rule is scoped to its sub-directory, so it cannot touch the repository
+# root's own alembic/versions/ -- whose migration files are TRACKED and are
+# needed by the api image. Measured: these rules exclude ZERO tracked files.
+#
+# The rule is pinned by tests/test_dockerignore_build_contexts.py.
+# ---------------------------------------------------------------------------
+**/frontend/**/node_modules
+**/frontend/**/dist-ssr
+**/frontend/**/*.local
+**/frontend/**/.DS_Store
+**/frontend/**/*.suo
+**/frontend/**/*.ntvs*
+**/frontend/**/*.njsproj
+**/frontend/**/*.sln
+**/frontend/**/*.sw?
+**/frontend/**/alembic/versions/*
+**/pwa/**/node_modules
+**/pwa/**/dist-ssr
+**/pwa/**/*.local
+**/pwa/**/.DS_Store
+**/pwa/**/*.suo
+**/pwa/**/*.ntvs*
+**/pwa/**/*.njsproj
+**/pwa/**/*.sln
+**/pwa/**/*.sw?
