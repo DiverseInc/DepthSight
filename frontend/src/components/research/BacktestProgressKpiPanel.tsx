@@ -12,6 +12,10 @@ import {
 } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
+import {
+	readDataWindowDisclosure,
+	sourceLabelKey,
+} from "@/lib/backtestDataWindow";
 import type { BacktestRunDetailsData, ProgressKpiData } from "@/types/api";
 
 interface BacktestProgressKpiPanelProps {
@@ -124,6 +128,30 @@ export const BacktestProgressKpiPanel: React.FC<
 	const pnlColor = displayKpis.pnl >= 0 ? "text-profit" : "text-loss";
 	const pnlPrefix = displayKpis.pnl >= 0 ? "+" : "";
 
+	// THE CUSTOMER IS TOLD WHICH WINDOW THE NUMBERS ARE ABOUT.  A backtest
+	// whose candles do not cover the whole window that was asked for is
+	// NOT a backtest of that window, and the numbers alone do not say so.
+	// The disclosure is built from the FACTS the backend recorded, so the
+	// sentence can be written in the language the customer reads.
+	const disclosure = useMemo(
+		() => readDataWindowDisclosure(finalKpis),
+		[finalKpis],
+	);
+	const missingDayLabels = useMemo(
+		() =>
+			(disclosure?.missingDays ?? []).map((day) =>
+				new Date(`${day}T00:00:00`).toLocaleDateString(currentLocale, {
+					month: "short",
+					day: "numeric",
+				}),
+			),
+		[disclosure, currentLocale],
+	);
+	const sourceKey = sourceLabelKey(disclosure?.source ?? null);
+	const sourceText = sourceKey
+		? t(`dataWindowDisclosure.${sourceKey}`)
+		: (disclosure?.source ?? "");
+
 	return (
 		<Card className="h-full">
 			<CardHeader>
@@ -144,6 +172,48 @@ export const BacktestProgressKpiPanel: React.FC<
 			</CardHeader>
 			<CardContent>
 				<div className="space-y-4">
+					{disclosure && (
+						<div
+							className={
+								disclosure.incomplete
+									? "rounded-md border border-amber-500/60 bg-amber-500/10 p-3 text-sm"
+									: "rounded-md border border-border bg-muted/40 p-3 text-sm"
+							}
+							data-testid="data-window-disclosure"
+						>
+							{disclosure.incomplete ? (
+								<>
+									<p className="font-medium text-amber-600 dark:text-amber-400">
+										{t("dataWindowDisclosure.incompleteTitle")}
+									</p>
+									<p className="mt-1 text-muted-foreground">
+										{t("dataWindowDisclosure.incompleteBody")}
+									</p>
+									<p className="mt-1 text-muted-foreground">
+										{missingDayLabels.length > 0
+											? t("dataWindowDisclosure.missingDaysLabel", {
+													days: missingDayLabels.join(", "),
+												})
+											: t("dataWindowDisclosure.missingDaysNone")}
+									</p>
+								</>
+							) : (
+								<p className="text-muted-foreground">
+									{t("dataWindowDisclosure.completeBody")}
+								</p>
+							)}
+							{sourceText && (
+								<p className="mt-1 text-muted-foreground">
+									{t("dataWindowDisclosure.sourceLabel", { source: sourceText })}
+								</p>
+							)}
+							{disclosure.differsFromRest && (
+								<p className="mt-1 text-muted-foreground">
+									{t("dataWindowDisclosure.differsFromRest")}
+								</p>
+							)}
+						</div>
+					)}
 					<div>
 						<div className="flex justify-between mb-1 text-sm">
 							<span className="text-muted-foreground">

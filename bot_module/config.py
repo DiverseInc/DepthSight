@@ -225,6 +225,112 @@ BINANCE_SPOT_DATA_API_URL_FOR_LOADER = "https://api.binance.com/api/v3"
 BINANCE_FUTURES_USDTM_DATA_API_URL_FOR_LOADER = "https://fapi.binance.com/fapi/v1"
 BINANCE_FUTURES_COINM_DATA_API_URL_FOR_LOADER = "https://dapi.binance.com/dapi/v1"
 
+
+def resolve_market_venue(market_type: str) -> str:
+    """Which Binance venue a loader ``market_type`` refers to.
+
+    ONE function, used by BOTH the REST market-data path and the bulk-archive
+    fallback, so the two can never answer for different venues.  Before this
+    existed the REST path compared ``market_type == "spot"`` and sent EVERY
+    other value -- including the COIN-M ones -- to the USDT-M host, while the
+    archive mirrored that by sending them to the USDT-M archive folder.  A
+    COIN-M request was therefore answered with USDT-M candles, which is the
+    same market under a different name: the numbers would change and nobody
+    would know why.
+
+    CORRECTION (2026-11-02): the sentence above is FACTUALLY WRONG, and its
+    wrongness is the whole reason this function exists.  USDT-M and COIN-M
+    are NOT "the same market under a different name" -- they are DIFFERENT
+    markets: BTCUSDT is USDT-margined and linear, BTCUSD_PERP is
+    coin-margined and inverse, they are quoted in different units, they carry
+    a different basis and a different funding rate, and their volume is
+    counted in different things.  MEASURED on 2026-11-02 against the live
+    Binance archives, the same hour of 2024-01-01 closed at 42503.50 on
+    futures/um/BTCUSDT and 42494.90 on futures/cm/BTCUSD_PERP, and the
+    volumes were 8459.477 (BTC) against 501936 (contracts).  The COIN-M
+    symbol is also a different STRING: the COIN-M archive folder answers 200
+    for BTCUSD_PERP and 404 for BTCUSDT.  The original wording is kept above
+    so the correction can be read against the words it corrects.  So the
+    numbers DO change when the venue changes -- that is the point: they change
+    because the MARKET changes, and before this function existed they changed
+    without anybody knowing why.
+
+    The venue is decided by the market type ALONE:
+
+    * ``spot`` -> the spot venue;
+    * ``futures_coinm`` / ``futures_cm`` / ``coinm`` -> the COIN-M futures
+      venue, which Binance serves from ``dapi.binance.com`` and publishes to
+      the ``futures/cm`` archive folder (measured: the folder answers 200 for
+      ``data/futures/cm/monthly/klines/BTCUSD_PERP/1h/...``);
+    * everything else -> the USDT-M futures venue.
+
+    A market type that merely CONTAINS "spot" ("spot_usdtm", "spot_perp") is
+    NOT the spot venue: it is an unknown type, and the unknown falls back to
+    the USDT-M venue, exactly as it did before.
+    """
+    mt = (market_type or "").strip().lower()
+    if mt == "spot":
+        return "spot"
+    if mt in ("futures_coinm", "futures_cm", "coinm"):
+        return "futures_coinm"
+    return "futures_usdtm"
+
+# Binance's public bulk-archive host. It serves the SAME klines as the REST
+# market-data endpoints above, but on a different host that stays reachable
+# when those are geo/IP-blocked (they answer HTTP 451 from some networks).
+# Used only as a FALLBACK; the REST path above is still tried first and is
+# unchanged.
+BINANCE_BULK_ARCHIVE_DATA_URL = "https://data.binance.vision/data"
+
+# The TOTAL time ONE bulk-archive fallback load may spend, across every
+# request it makes: the monthly archives plus the daily files of the
+# trailing month.  Without a cap, an unreachable archive host costs one
+# request timeout per file and the trailing month alone can need 31 of them
+# -- MINUTES of stall before the loader gives up.  The cap makes the
+# failure predictable and bounded: the fallback gives up, the load fails
+# loudly, and nothing partial is ever served.
+#
+# This is the BASE budget.  It is NOT the whole budget: a load also gets one
+# slice per request it makes (see
+# ``BULK_ARCHIVE_PER_REQUEST_BUDGET_SECONDS``), because a fixed budget
+# cannot serve a fixed-size window.  A two-year window is 24 monthly
+# archives plus up to 31 daily files, and on a normal link that is well
+# over the base budget -- so a fixed budget killed legitimate windows.
+BULK_ARCHIVE_TOTAL_TIMEOUT_SECONDS = 120.0
+
+# The slice of the budget ONE archive request is allowed to cost.  The
+# budget of a load is the base budget PLUS this slice for every request the
+# window can need, so a bigger window gets a bigger budget and a load is
+# never killed by its own size.  It is also granted again for every request
+# that is actually made, up to the ceiling below.
+#
+# 10s is the time one archive file costs on a normal link (the CDN answers
+# a monthly zip in one or two seconds); it is generous enough for a slow
+# link and small enough that an unreachable host is given up on quickly.
+BULK_ARCHIVE_PER_REQUEST_BUDGET_SECONDS = 10.0
+
+# The ceiling of the budget of ONE load, however big the window is.  It
+# bounds the worst case: a window that needs thousands of requests cannot
+# stall the loader for hours.
+BULK_ARCHIVE_MAX_TOTAL_TIMEOUT_SECONDS = 1800.0
+
+# How long Binance takes to PUBLISH an archive.  MEASURED on 2026-11-02
+# against the live archives: the newest published USDT-M 1d daily file was
+# 2026-10-31 (one day old) and the newest published monthly was 2026-09
+# (the month before, two days old).  Two days is the safe value for both.
+#
+# It decides what the absence of a file PROVES: a day that is older than
+# this lag would have a file if the symbol had traded, so its absence is
+# evidence that it did not trade.  A day inside the lag proves nothing.
+BULK_ARCHIVE_PUBLICATION_LAG_DAYS = 2
+
+# The cap on ONE archive request.  It is the same value the REST path uses
+# for its own requests (data_loader.py), and it is further bounded by the
+# total budget above: a request never gets more time than the load has
+# left, and a request that cannot finish inside the remaining budget is
+# not started at all.
+BULK_ARCHIVE_REQUEST_TIMEOUT_SECONDS = 30.0
+
 # These are already defined above, but we ensure they exist for clarity in DataLoader context
 # BINANCE_SPOT_TESTNET_API_URL_FOR_LOADER = "https://testnet.binance.vision/api/v3"
 # BINANCE_FUTURES_TESTNET_API_URL_FOR_LOADER = "https://testnet.binancefuture.com/fapi/v1"
@@ -269,9 +375,7 @@ REDIS_STATE_KEY_POSITIONS = os.environ.get(
 # REDIS_STATE_KEY_PORTFOLIO: that key is the PUBLISHED view of the account
 # and PR #25 fixed the API's reading of it, so its shape must not change.
 # This key is written and read only by the bot.
-REDIS_STATE_KEY_RISK = os.environ.get(
-    "REDIS_STATE_KEY_RISK", "depthsight:state:risk"
-)
+REDIS_STATE_KEY_RISK = os.environ.get("REDIS_STATE_KEY_RISK", "depthsight:state:risk")
 
 # Market-data specific Redis (separate instance for fan-out).
 MARKET_REDIS_HOST = os.environ.get("MARKET_REDIS_HOST", REDIS_HOST)
@@ -850,9 +954,7 @@ ML_CONFIRMATION_ENABLED = os.environ.get(
 ).strip().lower() in ("1", "true", "yes", "on")
 # Path to the model for confirmation (can be the same as ML_OFFLINE_TRAINED_MODEL_PATH)
 ML_CONFIRMATION_MODEL_PATH = Path(
-    os.environ.get(
-        "ML_CONFIRMATION_MODEL_PATH", "data/offline_trained_model.joblib"
-    )
+    os.environ.get("ML_CONFIRMATION_MODEL_PATH", "data/offline_trained_model.joblib")
 )
 # FIX 2026-10-07: what to do when a strategy asks for ML confirmation but the
 # model cannot run -- no model file, a failed load, or unavailable components.

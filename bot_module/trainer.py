@@ -31,6 +31,7 @@ try:
         download_klines,
         download_agg_trades,
         download_open_interest,
+        log_klines_window_coverage,
         _make_api_request,
     )
     from .utils import (
@@ -53,6 +54,7 @@ except ImportError as e:
     OnlineAgentStrategy = None
     download_klines = None
     download_agg_trades = None
+    log_klines_window_coverage = None
     _make_api_request = None
     get_strategy_instance = None
     download_open_interest = None
@@ -406,6 +408,11 @@ def _load_data_for_process(
                     df_loaded = download_klines(
                         symbol, tf, current_load_start_utc, current_load_end_utc
                     )
+                    # THE DISCLOSURE IS LOGGED WHERE THE FRAME IS LOADED.
+                    # A training window that does not cover the window it
+                    # asked for has to be visible in the log, or the model
+                    # is trained on data nobody can account for.
+                    log_klines_window_coverage(df_loaded, log_prefix=log_prefix)
                 except Exception as e:
                     logger.error(
                         f"{log_prefix} API download failed for {data_key}: {e}"
@@ -1634,6 +1641,10 @@ class Trainer:
                     logger.warning(
                         f"{log_prefix} 'bookDepth' data not found in local storage or is empty."
                     )
+                if key.startswith("kline_"):
+                    # THE SAME DISCLOSURE, ON THE SAME FRAME, FROM THE
+                    # OTHER TRAINER PATH.
+                    log_klines_window_coverage(result, log_prefix=log_prefix)
                 historical_data[key] = result
 
         # Step 2: Check if enrichment is needed for the main DataFrame (usually kline_1m)

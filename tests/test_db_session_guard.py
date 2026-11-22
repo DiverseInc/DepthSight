@@ -49,6 +49,7 @@ from tools.db_session_guard import (  # noqa: E402
     find_offenders,
     find_offenders_in_source,
     find_parse_failures,
+    is_skipped_dir,
     scanned_files,
 )
 
@@ -291,6 +292,20 @@ def test_the_guard_finds_no_unowned_db_sessions():
     )
 
 
+def _is_a_virtual_environment(directory: Path) -> bool:
+    """Is this directory an installed Python environment?
+
+    Written out HERE, and not shared with the guard, so that a guard
+    which starts skipping too much shows up as a SCOPE failure instead of
+    quietly narrowing what it reads.  The two rules are the same by
+    construction; if they ever drift apart, THIS test fails.
+    """
+    name = directory.name
+    if name == "venv" or name.startswith(".venv"):
+        return True
+    return (directory / "pyvenv.cfg").is_file()
+
+
 def test_the_guard_scans_every_python_file_in_the_repo():
     """GAP 1: the scope is the whole repo, not one package.
 
@@ -299,11 +314,18 @@ def test_the_guard_scans_every_python_file_in_the_repo():
     closed - and blind to `api/`, where the session factory is defined.
 
     The expected set is built here, independently of the scanner, so
-    narrowing the scanner's scope fails this test.
+    narrowing the scanner's scope fails this test.  A virtual environment
+    is not part of the repo's source, so it is excluded from BOTH sides -
+    see `_is_a_virtual_environment` above.
     """
     expected = set()
     for dirpath, dirnames, filenames in os.walk(REPO):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES]
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if d not in SKIP_DIR_NAMES
+            and not _is_a_virtual_environment(Path(dirpath) / d)
+        ]
         for name in filenames:
             if name.endswith(".py"):
                 expected.add(Path(dirpath, name).resolve())
@@ -316,6 +338,49 @@ def test_the_guard_scans_every_python_file_in_the_repo():
         f"missing {sorted(str(p) for p in expected - scanned)[:10]}, "
         f"extra {sorted(str(p) for p in scanned - expected)[:10]}"
     )
+
+
+def test_the_guard_does_not_scan_a_virtual_environment(tmp_path):
+    """A virtualenv in the worktree holds third-party source, not ours.
+
+    The repo skips ".venv" and "venv", but a directory is not always
+    called that - ".venv-test" is the name one of this repo's machines
+    has, and scanning it reported OTHER people's code as our leaks and
+    their non-UTF-8 test files as unreadable.  The whole class of them
+    is skipped by a rule, so the rule has to cover the name that is not
+    in the list - and a directory that is an environment whatever it is
+    called, which is what the `pyvenv.cfg` marker is for.
+    """
+    assert ".venv" in SKIP_DIR_NAMES and "venv" in SKIP_DIR_NAMES
+    assert is_skipped_dir(".venv-test"), "a virtualenv must not be scanned"
+    assert is_skipped_dir("venv"), "a virtualenv must not be scanned"
+    assert not is_skipped_dir("bot_module"), "our own package must be scanned"
+    assert not is_skipped_dir("tests"), "our own tests must be scanned"
+
+    env = tmp_path / ".venv-test"
+    env.mkdir()
+    (env / "leaky.py").write_text(LEAK_ASYNC_FOR, encoding="utf-8")
+    # A file the guard CANNOT read, of the kind a third-party test suite
+    # ships.  The guard must not report it: it never scans the
+    # environment, so it never meets the file.
+    (env / "unreadable.py").write_bytes(b"def oops(:\n\xff\xfe\x00")
+
+    # An environment that is called something else: the marker
+    # `python -m venv` writes is what identifies it, whatever the
+    # developer called it.
+    other = tmp_path / "env"
+    other.mkdir()
+    (other / "pyvenv.cfg").write_text("home = C:\\Python\n", encoding="utf-8")
+    (other / "leaky.py").write_text(LEAK_ASYNC_FOR, encoding="utf-8")
+
+    # The SAME file OUTSIDE the environment IS flagged: what is skipped
+    # is the environment, not the leak.
+    (tmp_path / "leaky.py").write_text(LEAK_ASYNC_FOR, encoding="utf-8")
+
+    offenders = find_offenders(tmp_path)
+    assert len(offenders) == 1, offenders
+    assert offenders[0].split(":")[0] == "leaky.py", offenders
+    assert find_parse_failures(tmp_path) == []
 
 
 def test_the_guard_scans_the_repo_root_the_api_package_and_the_tools():
