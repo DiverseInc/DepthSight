@@ -1,0 +1,43 @@
+{
+  "_comment": [
+    "Mutations that put the HOSTLESS-WebSocket-URL hole back.",
+    "",
+    "The shared guard (bot_module/screener_feed.py) checks the scheme with a",
+    "PREFIX test -- 'ws://' or 'wss://'. That accepts 'ws://' and",
+    "'ws:///ws/main': a WebSocket URL that names NO HOST at all. There is",
+    "nothing to connect to, so the feed reconnects forever against an empty",
+    "address while the deployment keeps looking healthy.",
+    "",
+    "The regime predicate (bot_module/regime_feed.py) had the same shape of",
+    "check, and it answers a DIFFERENT question -- 'can THIS deployment",
+    "deliver the regime data?' -- so a hostless URL made it answer YES: the",
+    "regime-change stop was armed against a feed that could never deliver.",
+    "",
+    "Both mutations are watched by DB-FREE tests only, because the mutation",
+    "harness runs pytest under WSL ($HOME/dstest/bin/python) and that",
+    "interpreter cannot reach the Postgres test DB on localhost:5432 (measured",
+    "2026-11-03: ConnectionRefusedError). A whole-file target would ERROR on",
+    "every DB-backed test, and the harness counts an error as a kill -- a false",
+    "kill that would prove nothing about these mutants.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/screener_ws_host_guard.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_fork_screener_ws_config.py::test_the_shared_rule_refuses_a_websocket_url_with_no_host tests/test_fork_screener_ws_config.py::test_a_hostless_websocket_url_makes_the_feed_undeliverable",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "H1: the shared guard accepts a ws:// URL with NO HOST again",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    if not ws_url_host(text):\n        return _no_host_message(text)\n",
+      "replace": "    if False:  # MUTANT: a WebSocket URL with no host is accepted\n        return _no_host_message(text)\n"
+    },
+    {
+      "label": "H2: the regime predicate accepts a ws:// URL with NO HOST again",
+      "file": "bot_module/regime_feed.py",
+      "needle": "    return bool(ws_url_host(ws_url))\n",
+      "replace": "    return True  # MUTANT: the host is not required\n"
+    }
+  ]
+}

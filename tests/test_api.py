@@ -59,6 +59,12 @@ async def test_strategies_workflow(
     config_payload = {
         "name": "Test Workflow Strategy",
         "config_data": {"strategy_name": "Test", "params": {}},
+        # The symbol mode is EXPLICIT.  This test is about the strategy
+        # lifecycle (start by config_id, list, stop), not about where the
+        # symbols come from: with the default DYNAMIC mode a launch needs a
+        # screener feed, and this deployment has none, so the API refuses it
+        # (503) for a reason that has nothing to do with this test.
+        "symbol_selection_mode": "STATIC",
     }
     # Use CRUD directly, as the created_strategy_config fixture may cause conflicts
     created_config = await crud.create_strategy_config(

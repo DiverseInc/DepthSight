@@ -42,12 +42,20 @@ logger = logging.getLogger(__name__)
 
 try:
     from bot_module import config as bot_config
+    from bot_module.screener_feed import (
+        is_fork_own_frontend_ws_url,
+        is_upstream_depthsight_url,
+        ws_url_host,
+    )
 except ImportError:  # pragma: no cover - the bot package is always present
     # The bot's config module could not be imported in this process. There is
     # then no screener WebSocket feed here either, so this deployment cannot
     # deliver the regime data. This is the same answer the API's own
     # MockConfig fallback produced before this module existed.
     bot_config = None  # type: ignore[assignment]
+    ws_url_host = None  # type: ignore[assignment]
+    is_upstream_depthsight_url = None  # type: ignore[assignment]
+    is_fork_own_frontend_ws_url = None  # type: ignore[assignment]
 
 __all__ = [
     "arms_breakeven_on_regime_change",
@@ -100,8 +108,13 @@ def screener_feed_can_deliver_regime_data() -> bool:
 
       1. SYMBOL_SOURCE_MODE == "MAIN_APP"   (data_consumer.py:453, 456)
       2. MAIN_APP_WS_ENABLED is true         (data_consumer.py:463)
-      3. MAIN_APP_WS_URL is a ws:// / wss:// URL
+      3. MAIN_APP_WS_URL is a ws:// / wss:// URL THAT NAMES A HOST
                                             (data_consumer.py:519-522)
+      4. MAIN_APP_WS_URL is not the UPSTREAM's reserved hostname, and not
+         THIS fork's own frontend socket (/ws or /ws/main).  Neither can
+         deliver the bot's 'active_pairs_update' message: the upstream
+         answers HTTP 525, and the fork's own route is the frontend's
+         token-authenticated socket (see bot_module/screener_feed.py).
 
     (The `websockets` import at data_consumer.py:520 is a packaging
     invariant -- `websockets>=10.0,<15.0` is a hard requirement in
@@ -114,8 +127,11 @@ def screener_feed_can_deliver_regime_data() -> bool:
     the regime data", NOT "the feed is down".
 
     It is deliberately NOT broader than the feed's own condition: a
-    deployment that satisfies all three keeps the protection, so this guard
-    can never refuse a stop that would have worked.
+    deployment that satisfies all four keeps the protection, so this guard
+    can never refuse a stop that would have worked. It DOES apply the same
+    special cases as the shared symbol guard
+    (bot_module/screener_feed.py), because AGENTS.md requires duplicated
+    predicates to handle the same special cases.
     """
     if bot_config is None:  # pragma: no cover - see the import guard above
         return False
@@ -129,4 +145,21 @@ def screener_feed_can_deliver_regime_data() -> bool:
     ws_url = getattr(bot_config, "MAIN_APP_WS_URL", "")
     if not isinstance(ws_url, str) or not ws_url:
         return False
-    return ws_url.startswith(("ws://", "wss://"))
+    if not ws_url.startswith(("ws://", "wss://")):
+        return False
+    # The UPSTREAM's reserved hostname is not this fork's deployment and
+    # answers HTTP 525, so it cannot deliver the regime data either.
+    if is_upstream_depthsight_url(ws_url):
+        return False
+    # THIS fork's own frontend socket (/ws, /ws/main) is the FRONTEND's
+    # token-authenticated route and speaks the frontend's messages, so it can
+    # never deliver the bot's 'active_pairs_update' message.  A regime stop
+    # armed against it would be inert from the first second.
+    if is_fork_own_frontend_ws_url(ws_url):
+        return False
+    # A ws:// URL that names NO HOST cannot deliver anything: there is
+    # no host to connect to, and the consumer refuses to start against
+    # it (bot_module/screener_feed.py rejects the same URL).  This is
+    # the SAME rule the shared guard applies, asked here so the two
+    # cannot drift apart.
+    return bool(ws_url_host(ws_url))

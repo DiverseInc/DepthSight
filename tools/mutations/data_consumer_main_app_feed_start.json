@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Mutation for the VACUOUS test in tests/test_data_consumer.py.",
+    "",
+    "test_data_consumer_start_stop used to assert only that `_running` was",
+    "True after start() and False after stop(). Both flags are set",
+    "UNCONDITIONALLY by those methods, so the test proved nothing about the",
+    "feed -- and the WebSocket scaffolding around it was dead code: this",
+    "branch ships MAIN_APP_WS_ENABLED defaulting to False, the test never",
+    "enabled it, so start() took the 'feed disabled by configuration' branch,",
+    "never created the WebSocket task, and the patched websockets.connect was",
+    "never called at all (measured: await_count == 0).",
+    "",
+    "The test now asserts that the consumer REALLY opened the configured",
+    "WebSocket, and that stop() released it. This mutant takes the opening",
+    "away again: the task is never created, so no connection is attempted, and",
+    "the test must go red.",
+    "",
+    "The target is DB-free on purpose: the mutation harness runs pytest under",
+    "WSL ($HOME/dstest/bin/python) and that interpreter cannot reach the",
+    "Postgres test DB on localhost:5432 (measured 2026-11-03:",
+    "ConnectionRefusedError). A wider target would ERROR on DB-backed tests,",
+    "and the harness counts an error as a kill -- a false kill that would",
+    "prove nothing about this mutant.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/data_consumer_main_app_feed_start.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_data_consumer.py::test_data_consumer_start_stop",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "F2: the consumer never opens the MAIN_APP WebSocket it was configured with",
+      "file": "bot_module/data_consumer.py",
+      "needle": "                self._main_app_ws_task = self.loop.create_task(\n                    self._main_app_ws_loop(), name=\"MainAppWSLoop\"\n                )\n",
+      "replace": "                pass  # MUTANT: the MAIN_APP WebSocket is never opened\n"
+    }
+  ]
+}

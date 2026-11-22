@@ -250,18 +250,58 @@ def patch_websockets_connect():
 
 @pytest.mark.asyncio
 async def test_data_consumer_start_stop(data_consumer_instance, monkeypatch):
+    """The consumer's MAIN_APP feed must REALLY connect, and stop must release it.
+
+    MEASURED DEFECT (2026-11-03, PR #54 review). This test used to assert
+    only that `_running` was True after `start()` and False after `stop()`.
+    Both flags are set UNCONDITIONALLY by those two methods, so the test
+    proved nothing about the feed -- and the WebSocket scaffolding around it
+    was dead code: this branch ships ``MAIN_APP_WS_ENABLED`` defaulting to
+    False, the test never enabled it, so ``start()`` took the "feed disabled
+    by configuration" branch, NEVER created the WebSocket task, and the
+    patched ``websockets.connect`` was never called at all (measured:
+    ``await_count == 0``). The mock URL "ws://mock-main-app-server:1234" was
+    never contacted.
+
+    So the test now asserts what it claims: the consumer opened the
+    configured WebSocket, and `stop()` released it.
+    """
     mock_main_app_ws = MockPersistentWebSocket()
     # We still need to patch connect to return our mock, but we use the patched_connect as base if needed
     # Actually, just mocking it to return our mock is enough for this test
     with patch("websockets.connect", new_callable=AsyncMock) as mock_connect:
         mock_connect.side_effect = mock_main_app_ws.mock_connect_method
         monkeypatch.setattr(global_config, "SYMBOL_SOURCE_MODE", "MAIN_APP")
+        # The feed must be ON for this test to exercise the feed at all.
+        # This branch ships MAIN_APP_WS_ENABLED defaulting to false (the
+        # upstream's safe default), so the precondition is stated explicitly
+        # here -- the same way the sibling test below states it.
+        monkeypatch.setattr(global_config, "MAIN_APP_WS_ENABLED", True)
         data_consumer_instance._main_app_ws_url = "ws://mock-main-app-server:1234"
         await data_consumer_instance.start()
         assert data_consumer_instance._running
         await asyncio.sleep(0.1)
+
+        # THE ASSERTION THAT WAS MISSING: the WebSocket was actually opened.
+        mock_connect.assert_awaited()
+        assert mock_connect.await_args_list[0].args[0] == (
+            "ws://mock-main-app-server:1234"
+        ), (
+            "the consumer must connect to the CONFIGURED feed URL, not to "
+            "something else"
+        )
+        assert data_consumer_instance._main_app_ws is mock_main_app_ws, (
+            "the consumer must hold the live connection it opened -- a "
+            "consumer that reports 'running' without a connection is exactly "
+            "the failure mode this guard exists to catch"
+        )
+
         await data_consumer_instance.stop()
         assert not data_consumer_instance._running
+        assert data_consumer_instance._main_app_ws is None, (
+            "stop() must release the WebSocket client, not leave a dead "
+            "connection behind"
+        )
 
 
 @pytest.mark.asyncio
@@ -269,6 +309,11 @@ async def test_active_pairs_update_from_main_app_ws(
     data_consumer_instance, simple_main_app_ws_server, monkeypatch
 ):
     monkeypatch.setattr(global_config, "SYMBOL_SOURCE_MODE", "MAIN_APP")
+    # This test exercises the main_app WebSocket, so the feed must be ON.
+    # It used to rely on MAIN_APP_WS_ENABLED defaulting to true; this branch
+    # flips that default to false (the upstream's safe default), so the
+    # precondition is stated explicitly here.
+    monkeypatch.setattr(global_config, "MAIN_APP_WS_ENABLED", True)
     monkeypatch.setattr(data_consumer, "BINANCE_WS_RECONNECT_DELAY_BASE", 0.1)
     data_consumer_instance._main_app_ws_url = simple_main_app_ws_server
 

@@ -434,10 +434,17 @@ class TestLiveStrategyEndpoints:
         pro_user: models.User,
     ):
         # Create the config on behalf of the same user
+        # The symbol mode is EXPLICIT: this test is about the command that
+        # reaches Redis, not about where the symbols come from.  With the
+        # default DYNAMIC mode a launch needs a screener feed, and this
+        # deployment has none, so the API refuses it (503) before it ever
+        # publishes anything.
         config = await crud.create_strategy_config(
             db_session,
             user_id=pro_user.id,
-            config_create=schemas.StrategyConfigCreate(name="test", config_data={}),
+            config_create=schemas.StrategyConfigCreate(
+                name="test", config_data={}, symbol_selection_mode="STATIC"
+            ),
         )
         await db_session.commit()
 

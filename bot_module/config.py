@@ -463,7 +463,11 @@ logger.info("Genetic Algorithm default parameters and GENE_POOL defined.")
 # "MAIN_APP" - via WebSocket from the main application (ws://localhost:8765)
 # "STATIC_LIST" - from the static list below (SYMBOL_SOURCE_STATIC_LIST)
 # "JSON_FILE" - from file (SYMBOL_SOURCE_JSON_FILE_PATH)
-SYMBOL_SOURCE_MODE = "MAIN_APP"  # Default is 'MAIN_APP'
+#
+# The env override was LOST when this repo was forked from DepthSight-Pro and
+# has been restored: the source mode is a deployment setting, and a fork must
+# be able to change it without editing source. Default stays 'MAIN_APP'.
+SYMBOL_SOURCE_MODE = os.environ.get("SYMBOL_SOURCE_MODE", "MAIN_APP").strip()
 
 # Whether DYNAMIC symbol selection may be used at all.
 #
@@ -489,7 +493,14 @@ SYMBOL_SELECTION_ALLOW_DYNAMIC = os.environ.get(
 # Whether the Main_app_ws screener loop runs at all. Set false to stop the
 # reconnect storm against an unreachable screener when nothing can use it
 # (i.e. when SYMBOL_SELECTION_ALLOW_DYNAMIC is false).
-MAIN_APP_WS_ENABLED = os.environ.get("MAIN_APP_WS_ENABLED", "true").strip().lower() in (
+#
+# The default is FALSE, matching the upstream project's safe default
+# (ENABLE_MAIN_APP_WS defaults to "false" there). The fork had it inverted to
+# "true", which made every deployment start a reconnect loop against a feed
+# that could never work -- the HTTP 525 storm recorded on 2026-09-23. The
+# loop is opt-in: an operator who configures MAIN_APP_WS_URL turns it on
+# deliberately.
+MAIN_APP_WS_ENABLED = os.environ.get("MAIN_APP_WS_ENABLED", "false").strip().lower() in (
     "1",
     "true",
     "yes",
@@ -512,7 +523,22 @@ SYMBOL_SOURCE_JSON_FILE_PATH = "data/static_symbols.json"
 # Path to the file with filtered pairs (if a static list is used) - OLD, CAN BE KEPT OR REMOVED
 FILTERED_PAIRS_FILE = "data/filtered_pairs.json"
 # WebSocket URL of the main application that provides market data and the list of active pairs
-MAIN_APP_WS_URL = "wss://screener.depthsight.pro/ws/bot/"
+#
+# The env override was LOST when this repo was forked from DepthSight-Pro, and
+# with it the fork could not be configured to use a working feed at all --
+# the only way to change the URL was to edit source. It is restored here.
+#
+# The default is EMPTY, on purpose. The upstream's default,
+# "wss://screener.depthsight.pro/ws/bot/", points at the UPSTREAM's reserved
+# hostname: this fork never controlled that DNS, that host is not this fork's
+# deployment, and it answers HTTP 525. A fork must never ship a URL that
+# points at the upstream project's deployment -- an inherited default is a
+# footgun (the same rule the vault records for PUBLIC_BASE_URL, which was
+# applied to PUBLIC_BASE_URL and missed here).
+#
+# The bot refuses to start the screener consumer and refuses to start a
+# DYNAMIC-mode strategy while this is empty; see bot_module/screener_feed.py.
+MAIN_APP_WS_URL = os.environ.get("MAIN_APP_WS_URL", "").strip()
 # Consecutive Main_app_ws failures after which the outage is escalated from a
 # throttled WARNING to a CRITICAL trading-outage notice. There is no automatic
 # fallback to SYMBOL_SOURCE_STATIC_LIST, so while this feed is down every

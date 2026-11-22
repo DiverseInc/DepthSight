@@ -1,0 +1,121 @@
+{
+  "_comment": [
+    "Mutations for the two follow-ups on the fork-screener-ws-config branch.",
+    "",
+    "3b -- the hardcoded 'Origin: https://screener.depthsight.pro'.",
+    "O1-O6 break the shared rule (bot_module/screener_feed.py::ws_origin_header).",
+    "O7-O9 break the client that uses it (bot_module/data_consumer.py).",
+    "",
+    "3a -- docker-startup.sh swallowing a failed database migration.",
+    "S1-S5 break the CRITICAL report or change the container's behaviour.",
+    "",
+    "NOTE on the target: the 3b tests live in tests/test_fork_screener_ws_config.py",
+    "and the 3a tests live in tests/test_docker_startup_migration_failure.py, so",
+    "BOTH are named. The 3a test needs bash and is skipped on native Windows;",
+    "this harness runs pytest under WSL, where it executes.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/fork_ws_origin_and_startup_loudness.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "pytest_target": "tests/test_fork_screener_ws_config.py tests/test_docker_startup_migration_failure.py",
+  "timeout_s": 1800,
+  "mutations": [
+    {
+      "label": "O1: the Origin falls back to the UPSTREAM's reserved hostname",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    fallback = f\"https://{FORK_OWN_DOMAIN}\"\n",
+      "replace": "    fallback = \"https://screener.depthsight.pro\"  # MUTANT: the upstream's host\n"
+    },
+    {
+      "label": "O2: the Origin ignores the CONFIGURED host and always names this fork's own domain",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    host = (parsed.hostname or \"\").strip().lower().rstrip(\".\")\n",
+      "replace": "    host = FORK_OWN_DOMAIN  # MUTANT: the configured host is ignored\n"
+    },
+    {
+      "label": "O3: the scheme is not mapped the way a browser maps it (ws:// stays ws://)",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    http_scheme = \"https\" if scheme == \"wss\" else \"http\"\n",
+      "replace": "    http_scheme = \"https\" if scheme == \"wss\" else \"ws\"  # MUTANT: not mapped\n"
+    },
+    {
+      "label": "O4: a DEFAULT port is kept in the Origin (https://host:443)",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    if port is not None and port != default_port:\n",
+      "replace": "    if port is not None:  # MUTANT: a default port is kept\n"
+    },
+    {
+      "label": "O5: a NON-default port is dropped from the Origin",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    if port is not None and port != default_port:\n",
+      "replace": "    if False:  # MUTANT: the port is always dropped\n"
+    },
+    {
+      "label": "O6: a URL that is not a WebSocket URL is accepted as the Origin",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    if scheme not in (\"ws\", \"wss\"):\n        return fallback\n",
+      "replace": "    if False:  # MUTANT: a non-WebSocket URL is accepted\n        return fallback\n"
+    },
+    {
+      "label": "O7: the client hardcodes the UPSTREAM's Origin again",
+      "file": "bot_module/data_consumer.py",
+      "needle": "                        \"Origin\": ws_origin_header(self._main_app_ws_url),\n",
+      "replace": "                        \"Origin\": \"https://screener.depthsight.pro\",  # MUTANT: hardcoded again\n"
+    },
+    {
+      "label": "O8: the client sends a CONSTANT Origin instead of a derived one",
+      "file": "bot_module/data_consumer.py",
+      "needle": "                        \"Origin\": ws_origin_header(self._main_app_ws_url),\n",
+      "replace": "                        \"Origin\": \"https://depthsight.diverseinc.net\",  # MUTANT: a constant\n"
+    },
+    {
+      "label": "O9: the client derives the Origin from the UPSTREAM's URL",
+      "file": "bot_module/data_consumer.py",
+      "needle": "                        \"Origin\": ws_origin_header(self._main_app_ws_url),\n",
+      "replace": "                        \"Origin\": ws_origin_header(\"wss://screener.depthsight.pro/ws/bot/\"),  # MUTANT\n"
+    },
+    {
+      "label": "S1: the failed migration is reported as a WARNING again",
+      "file": "docker-startup.sh",
+      "needle": "    echo \"CRITICAL: the database migration FAILED (the 'alembic upgrade head' step exit code ${migration_status}).\" >&2\n",
+      "replace": "    echo \"WARNING: the database migration FAILED (alembic upgrade head exit code ${migration_status}).\" >&2\n"
+    },
+    {
+      "label": "S2: the CRITICAL report no longer names the migration's exit code",
+      "file": "docker-startup.sh",
+      "needle": "    echo \"CRITICAL: the database migration FAILED (the 'alembic upgrade head' step exit code ${migration_status}).\" >&2\n",
+      "replace": "    echo \"CRITICAL: the database migration FAILED.\" >&2\n"
+    },
+    {
+      "label": "S3: the CRITICAL report goes to stdout instead of stderr",
+      "file": "docker-startup.sh",
+      "needle": "    echo \"CRITICAL: the database migration FAILED (the 'alembic upgrade head' step exit code ${migration_status}).\" >&2\n",
+      "replace": "    echo \"CRITICAL: the database migration FAILED (alembic upgrade head exit code ${migration_status}).\"\n"
+    },
+    {
+      "label": "S4: the failed migration now STOPS the container from starting the application",
+      "file": "docker-startup.sh",
+      "needle": "    echo \"CRITICAL: check the migration output above, fix the migration, and restart this container.\" >&2\nfi\n",
+      "replace": "    echo \"CRITICAL: check the migration output above, fix the migration, and restart this container.\" >&2\n    exit 1\nfi\n"
+    },
+    {
+      "label": "S5: the failed migration is swallowed completely (no report at all)",
+      "file": "docker-startup.sh",
+      "needle": "    migration_status=$?\n    echo \"CRITICAL: the database migration FAILED (the 'alembic upgrade head' step exit code ${migration_status}).\" >&2\n",
+      "replace": "    migration_status=$?\n"
+    },
+    {
+      "label": "O10: an IPv6 literal is not bracketed, so the Origin is not a URL",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    authority = f\"[{host}]\" if \":\" in host else host\n",
+      "replace": "    authority = host  # MUTANT: an IPv6 literal is not bracketed\n"
+    },
+    {
+      "label": "O11: the Origin names the UPSTREAM when the operator points the feed at it",
+      "file": "bot_module/screener_feed.py",
+      "needle": "    if not host:\n        return fallback\n    if is_upstream_depthsight_url(text):\n",
+      "replace": "    if not host:\n        return fallback\n    if False:  # MUTANT: the upstream's hostname is named\n"
+    }
+  ]
+}
