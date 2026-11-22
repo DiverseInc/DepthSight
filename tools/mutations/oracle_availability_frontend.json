@@ -1,0 +1,115 @@
+{
+  "_comment": [
+    "Mutations that re-introduce the FABRICATED ORACLE in the two places whose",
+    "tests are NOT pytest, one at a time.",
+    "",
+    "This spec has no pytest target: the code it mutates is TypeScript, and its",
+    "tests are run by vitest. The harness accepts a 'command' for exactly that",
+    "case and keeps every other guarantee it already had -- snapshot before and",
+    "SHA-256 revert verification after.",
+    "",
+    "THE SKIP RULE, PRECISELY (this comment used to overclaim):",
+    "",
+    "  * A NEEDLE that is not found in the file is a SKIPPED MUTANT. A skipped",
+    "    mutant is a FAILURE -- the run exits non-zero -- so a spec that has",
+    "    drifted can never be mistaken for a clean run. That rule IS kept on",
+    "    this path.",
+    "",
+    "  * A vitest run in which EVERY TEST IS SKIPPED is a different thing, and",
+    "    it used to be reported as 'mutant SURVIVED': vitest exits 0, the",
+    "    harness found the 'Tests N skipped' summary and read it as a pass.",
+    "    That was a false green. The harness now reports an all-skipped run as",
+    "    BROKEN and aborts (rc=3), so the run exits 2. The rule lives in",
+    "    tools/mutation_harness.py:summary_ran_no_test() and is pinned by",
+    "    tests/test_mutation_harness_skip.py.",
+    "",
+    "What is covered here and NOT in oracle_availability_truth.json:",
+    "  * pwa/lib/oracleCapability.ts -- the PWA's own decision function. The PWA",
+    "    has NO test runner of its own (pwa/package.json declares no test script,",
+    "    no vitest/jest dependency and no vitest/jest config), so this module is",
+    "    exercised by the repository's only frontend runner. That is a real",
+    "    behavioural test of the PWA's decision, not a grep of its source.",
+    "  * frontend/src/features/hft-dashboard/* -- the HFT dashboard equivalents.",
+    "  * pwa/lib/useOracleAvailability.ts -- the PWA's own hook. It used to ask",
+    "    the server ONCE per mount and never again, so its answer could DRIFT",
+    "    from the server: an open screen could not light up on the day a model",
+    "    was deployed. The hook now re-asks on an interval and on foreground, and",
+    "    src/__tests__/pwaOracleAvailability.test.tsx is what proves it -- by",
+    "    mounting the REAL hook and watching the fake clock pass.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/oracle_availability_frontend.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist.",
+    "",
+    "RUN IT WITH PYTHONUTF8=1 ON WINDOWS.",
+    "The harness's `run_command` calls subprocess.run(..., text=True) with no",
+    "encoding, so it decodes the child's output with the LOCALE encoding --",
+    "cp1252 on a default Windows box. vitest writes UTF-8 (its box-drawing and",
+    "check glyphs) and cp1252 cannot decode byte 0x9d, so the reader thread",
+    "raised UnicodeDecodeError, no output was captured, the harness found no",
+    "test summary and ABORTED with rc=3. MEASURED: with PYTHONUTF8=1 the same",
+    "command decodes the output intact and the 'Test Files' summary is read.",
+    "That is why the harness file is NOT patched for this: the environment",
+    "setting fixes it, so the harness stays byte-identical to the commit it",
+    "was taken from.",
+    "",
+    "    $env:PYTHONUTF8='1'",
+    "    python tools/mutation_harness.py tools/mutations/oracle_availability_frontend.json"
+  ],
+  "command": [
+    "npm",
+    "--prefix",
+    "frontend",
+    "run",
+    "test",
+    "--",
+    "src/__tests__/oracleAvailability.test.tsx",
+    "src/__tests__/pwaOracleCapability.test.ts",
+    "src/__tests__/pwaOracleAvailability.test.tsx"
+  ],
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "K: the PWA's decision function always says the oracle is usable",
+      "file": "pwa/lib/oracleCapability.ts",
+      "needle": "\treturn capability?.oracleAvailable === true;\n",
+      "replace": "\treturn true; // MUTANT: the oracle is always usable\n"
+    },
+    {
+      "label": "L: the PWA's decision function always says the oracle is UNusable",
+      "file": "pwa/lib/oracleCapability.ts",
+      "needle": "\treturn capability?.oracleAvailable === true;\n",
+      "replace": "\treturn capability?.oracleAvailable !== true; // MUTANT\n"
+    },
+    {
+      "label": "M: the HFT dashboard believes the oracle is always available",
+      "file": "frontend/src/features/hft-dashboard/components/StrategyControls.tsx",
+      "needle": "\tconst oracleAvailable = capabilities?.oracleAvailable === true;\n",
+      "replace": "\tconst oracleAvailable = true; // MUTANT: always available\n"
+    },
+    {
+      "label": "N: the HFT dashboard keeps the Oracle filter ON with no oracle model",
+      "file": "frontend/src/features/hft-dashboard/lib/oracleConfig.ts",
+      "needle": "\treturn { ...config, use_oracle: false };",
+      "replace": "\treturn { ...config, use_oracle: true };"
+    },
+    {
+      "label": "O: the Oracle scanner claims 'Active' whatever it can see",
+      "file": "frontend/src/features/hft-dashboard/components/OracleScanner.tsx",
+      "needle": "oracleSymbols.length > 0 ? \"Receiving\" : \"No signal\"",
+      "replace": "oracleSymbols.length > 0 ? \"Active\" : \"Active\""
+    },
+    {
+      "label": "P: the PWA stops re-asking the server, so its answer drifts again",
+      "file": "pwa/lib/useOracleAvailability.ts",
+      "needle": "\t\trefetchInterval: ORACLE_AVAILABILITY_REFRESH_MS,\n",
+      "replace": "\t\trefetchInterval: false, // MUTANT: never ask again\n"
+    },
+    {
+      "label": "Q: the PWA stops re-asking when the app comes back to the foreground",
+      "file": "pwa/lib/useOracleAvailability.ts",
+      "needle": "\t\trefetchOnWindowFocus: true,\n",
+      "replace": "\t\trefetchOnWindowFocus: false, // MUTANT: never re-ask\n"
+    }
+  ]
+}

@@ -24,7 +24,9 @@ import {
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { useAuth } from "../../../context/AuthContext";
+import { useOracleAvailability } from "../../../lib/api";
 import { useHftStore } from "../hooks/useHftStore";
+import { applyOracleAvailability } from "../lib/oracleConfig";
 import type { HftConfig, PartialTakeProfitConfig } from "../types/hft.types";
 
 const apiBase = import.meta.env.VITE_PUBLIC_API_URL || "";
@@ -50,7 +52,10 @@ export const StrategyControls: React.FC = () => {
 		max_leverage: 20.0,
 		max_hold_minutes: 15,
 		use_screener: true,
-		use_oracle: true,
+		// The oracle is not a thing the client may switch on by itself:
+		// it is only real when the SERVER has a model loaded. Until the
+		// server says otherwise, the honest default is OFF.
+		use_oracle: false,
 		use_maker_mode: true,
 		max_analyzed_symbols: 10,
 		max_concurrent_trades: 3,
@@ -79,6 +84,25 @@ export const StrategyControls: React.FC = () => {
 		},
 	});
 	const [configLocked, setConfigLocked] = useState(true);
+
+	// What this deployment can actually do. The oracle exists only when a
+	// REAL model is loaded on the server -- and it is not today: the api
+	// container logs "Oracle model not found at
+	// /app/data/oracle_model.joblib" once per worker.
+	//
+	// The toggle used to read `use_oracle: true` out of thin air, which
+	// told the customer a regime filter was running when nothing could
+	// produce a regime to filter on.
+	const { data: capabilities } = useOracleAvailability();
+	const oracleAvailable = capabilities?.oracleAvailable === true;
+
+	// DERIVED, not stored: whatever the saved config says, an unavailable
+	// oracle means the oracle filter is OFF. Storing it would let a
+	// re-fetch of the saved config switch the fiction back on.
+	const effectiveConfig: HftConfig = applyOracleAvailability(
+		localConfig,
+		oracleAvailable,
+	);
 
 	const fetchConfig = useCallback(async () => {
 		const token = authToken;
@@ -125,10 +149,10 @@ export const StrategyControls: React.FC = () => {
 					Authorization: `Bearer ${token}`,
 					"Content-Type": "application/json",
 				},
-				body: JSON.stringify(localConfig),
+				body: JSON.stringify(effectiveConfig),
 			});
 			if (res.ok) {
-				setConfig(localConfig);
+				setConfig(effectiveConfig);
 				toast.success("Configuration synced successfully");
 			} else {
 				toast.error("Failed to sync configuration");
@@ -363,12 +387,21 @@ export const StrategyControls: React.FC = () => {
 								<label className="text-[10px] font-medium uppercase">
 									Oracle
 								</label>
-								<Switch
-									checked={localConfig.use_oracle}
-									onCheckedChange={(checked) =>
-										handleChange("use_oracle", checked)
-									}
-								/>
+								{oracleAvailable ? (
+									<Switch
+										checked={effectiveConfig.use_oracle}
+										onCheckedChange={(checked) =>
+											handleChange("use_oracle", checked)
+										}
+									/>
+								) : (
+									<span
+										className="text-[10px] uppercase font-bold text-muted-foreground/70"
+										title="No oracle model is deployed on this server."
+									>
+										Unavailable
+									</span>
+								)}
 							</div>
 						</div>
 

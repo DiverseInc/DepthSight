@@ -1016,11 +1016,36 @@ export interface UserAchievement {
 
 export type RarityTier = "COMMON" | "RARE" | "EPIC" | "LEGENDARY";
 
+/**
+ * What this deployment can actually do, as reported by the server
+ * (`GET /api/v1/capabilities`).
+ *
+ * `oracleAvailable` is the honest answer to "is there an oracle model?".
+ * It is FALSE until a real `oracle_model.joblib` is deployed -- and it is
+ * not a plan, a role, or a promise. A client that shows an oracle regime
+ * or an oracle confidence while this is false is showing a number that no
+ * model produced.
+ */
+export interface Capabilities {
+	oracleAvailable: boolean;
+	/**
+	 * The minimum oracle confidence this deployment applies, in percent,
+	 * when a strategy has no confidence of its own. It is the server's
+	 * own declaration -- the client must not make a threshold up.
+	 */
+	oracleDefaultConfidence?: number | null;
+}
+
 export interface SymbolSelectionConfig {
 	mode: "STATIC" | "DYNAMIC_NATR" | "DYNAMIC_ORACLE";
 	min_natr?: number;
 	oracle_regime?: 0 | 1 | 2;
-	oracle_confidence?: number;
+	/**
+	 * Absent (or null) when there is no oracle model to produce one. There
+	 * is no default confidence: the server declares its own default, and a
+	 * value invented by the client would be a measurement nobody made.
+	 */
+	oracle_confidence?: number | null;
 	max_concurrent_symbols: number;
 }
 

@@ -41,7 +41,11 @@ from bot_module.regime_feed import (
     arms_breakeven_on_regime_change,
     screener_feed_can_deliver_regime_data,
 )
-from bot_module.symbol_selection import SymbolSelectionConfig
+from bot_module.symbol_selection import (
+    SymbolSelectionConfig,
+    effective_oracle_confidence_fraction,
+    filter_symbols_by_oracle,
+)
 from bot_module.strategy import (
     StrategySignal,
     get_strategy_instance,
@@ -5745,23 +5749,25 @@ class TradingController:
                             required_regime = self.symbol_selection_config.oracle_regime
                             # IMPORTANT: oracle_confidence in settings is in percent (0-100),
                             # and from the screener it comes in fractions (0-1). Normalizing!
-                            min_confidence_raw = (
-                                self.symbol_selection_config.oracle_confidence or 0.0
-                            )
-                            min_confidence = (
-                                min_confidence_raw / 100.0
-                                if min_confidence_raw > 1
-                                else min_confidence_raw
+                            #
+                            # The threshold must never VANISH. An absent or zero
+                            # setting means "not chosen", and it falls back to the
+                            # declared default (95% = 0.95) -- the threshold the
+                            # clients used to send. Reading it as 0.0 would make
+                            # `>= min_confidence` true for EVERY symbol and would
+                            # silently disable the regime/confidence filter.
+                            min_confidence_raw = self.symbol_selection_config.oracle_confidence
+                            min_confidence = effective_oracle_confidence_fraction(
+                                min_confidence_raw
                             )
                             logger.debug(
                                 f"{log_prefix} Mode is DYNAMIC_ORACLE. Filtering by regime={required_regime}, confidence>={min_confidence} (raw: {min_confidence_raw})"
                             )
-                            filtered_and_sorted_symbols = [
-                                s
-                                for s in self.full_screener_list
-                                if s.get("oracle_regime") == required_regime
-                                and s.get("oracle_confidence", 0.0) >= min_confidence
-                            ]
+                            filtered_and_sorted_symbols = filter_symbols_by_oracle(
+                                self.full_screener_list,
+                                required_regime,
+                                min_confidence,
+                            )
                             # Sort by NATR (volatility) to select the most active coins within the mode
                             filtered_and_sorted_symbols.sort(
                                 key=lambda x: x.get("NATR 1/30 (1m)", 0.0), reverse=True

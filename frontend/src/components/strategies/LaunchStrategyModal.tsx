@@ -32,7 +32,18 @@ import {
 } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { useAuth } from "@/context/AuthContext";
-import { useConfig, useMultiAccountBalances } from "@/lib/api";
+import {
+	useConfig,
+	useMultiAccountBalances,
+	useOracleAvailability,
+} from "@/lib/api";
+import {
+	effectiveOracleConfidence,
+	oracleDefaultConfidencePercent,
+	oracleLaunchRefusal,
+	parseOracleRegime,
+	savedDynamicMode,
+} from "@/lib/oracleCapability";
 import type { CombinedStrategy } from "@/types/api";
 
 interface LaunchStrategyModalProps {
@@ -80,7 +91,35 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 	const { data: balances } = useMultiAccountBalances();
 	const isAdmin = user?.role === "admin";
 	const isPro = user?.plan === "pro";
-	const canUseOracle = isAdmin || isPro; // Oracle is available to admins and Pro users
+
+	// TWO DIFFERENT AXES, and they must not be conflated.
+	//
+	// The ENTITLEMENT says whether this CUSTOMER may use the oracle at
+	// all: it is a paid feature, so admins and Pro users have it and
+	// others do not.
+	//
+	// The AVAILABILITY says whether this DEPLOYMENT has a model to filter
+	// with, and only the SERVER knows that. It used to read:
+	//
+	//     const canUseOracle = isAdmin || isPro; // Oracle is available to
+	//                                            // admins and Pro users
+	//
+	// which is an entitlement check wearing the label of an availability
+	// check. On a deployment whose api container logs, once per worker:
+	//
+	//     WARNING [api.simulation_router:122] - Oracle model not found at
+	//     /app/data/oracle_model.joblib
+	//
+	// an entitled customer was offered an oracle filter that could not
+	// exist, and was shown a regime and a 95% confidence that no model
+	// had ever produced.
+	const oracleEntitled = isAdmin || isPro;
+	const { data: capabilities } = useOracleAvailability();
+	const oracleAvailable = capabilities?.oracleAvailable === true;
+	const canUseOracle = oracleEntitled && oracleAvailable;
+	// The server's DECLARED confidence threshold, in percent. The client
+	// displays it and sends it back; it never makes a threshold up.
+	const defaultConfidence = oracleDefaultConfidencePercent(capabilities);
 
 	// Get active API keys for live trading
 	const activeApiKeys = useMemo(() => {
@@ -101,12 +140,22 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 
 	const initialMinNatr =
 		(strategy?.config_data?.natr_settings?.min_natr as number) || 1.5;
+	// The regime and the confidence the CUSTOMER'S OWN strategy carries.
+	//
+	// The old `?.toString() || "1"` and `|| 95` INVENTED both when the
+	// strategy had neither: a regime and a 95% confidence that no model
+	// had ever produced, handed straight to the server. Nothing is
+	// invented here -- an unset regime stays unset (the customer picks
+	// one, and the server refuses a DYNAMIC_ORACLE strategy without one)
+	// and an unset confidence falls back to the server's declared
+	// threshold at the point it is DISPLAYED and SENT.
 	const initialOracleRegime =
 		(
 			strategy?.config_data?.oracle_settings?.regime as string | number
-		)?.toString() || "1";
+		)?.toString() || undefined;
 	const initialOracleConfidence =
-		(strategy?.config_data?.oracle_settings?.confidence as number) || 95;
+		(strategy?.config_data?.oracle_settings?.confidence as number) ||
+		undefined;
 	const initialMaxConcurrent =
 		(strategy?.config_data?.max_concurrent_symbols as number) || 5;
 	const initialUseMlConfirmation =
@@ -153,11 +202,12 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 				"oracleRegime",
 				(
 					strategy.config_data?.oracle_settings?.regime as string | number
-				)?.toString() || "1",
+				)?.toString() || undefined,
 			);
 			setValue(
 				"oracleConfidence",
-				(strategy.config_data?.oracle_settings?.confidence as number) || 95,
+				(strategy.config_data?.oracle_settings?.confidence as number) ||
+					undefined,
 			);
 			setValue(
 				"maxConcurrentSymbols",
@@ -191,6 +241,15 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 	});
 	const dynamicMode = useWatch({ control, name: "dynamicMode" });
 	const oracleConfidence = useWatch({ control, name: "oracleConfidence" });
+	// The confidence the customer SEES, and the one that is SENT: their
+	// own choice when they made one, otherwise the server's DECLARED
+	// threshold. The old `field.value || 95` was a constant the client
+	// made up, shown on a deployment whose api container logged
+	// "Oracle model not found at /app/data/oracle_model.joblib".
+	const shownConfidence = effectiveOracleConfidence(
+		oracleConfidence,
+		defaultConfidence,
+	);
 
 	// Auto-select API key if only one is active
 	useEffect(() => {
@@ -200,7 +259,68 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 	}, [tradingMode, activeApiKeys, setValue]);
 
 	const onSubmit = (data: LaunchFormData) => {
-		onConfirm(data);
+		// A strategy the customer SAVED as an oracle strategy must not be
+		// relaunched under a different symbol-selection mode.
+		//
+		// The old code chose the mode like this:
+		//
+		//     const initialDynamicMode = strategy?.config_data?.natr_settings
+		//         ? "DYNAMIC_NATR"
+		//         : canUseOracle ? "DYNAMIC_ORACLE" : "DYNAMIC_NATR";
+		//
+		// so on a deployment with no oracle model a DYNAMIC_ORACLE
+		// strategy was quietly relaunched as a NATR one -- a DIFFERENT
+		// strategy from the one the customer chose, launched without a
+		// word. There is no oracle filter to run, so the launch now
+		// FAILS LOUDLY instead.
+		const savedMode = savedDynamicMode(strategy?.config_data);
+		if (
+			oracleLaunchRefusal(savedMode, oracleAvailable) === "ORACLE_UNAVAILABLE"
+		) {
+			alert(
+				t(
+					"launchModal.oracleUnavailableForSavedStrategy",
+					"This strategy was saved with the Oracle filter, and this server has no oracle model. It cannot be launched as it is.",
+				),
+			);
+			return;
+		}
+
+		// A regime filter needs a regime, and the regime is the CUSTOMER's
+		// to pick -- it is a measurement, not a default. The server's own
+		// contract refuses a DYNAMIC_ORACLE strategy without one
+		// (`bot_module/symbol_selection.py`: "oracle_regime must be
+		// provided for DYNAMIC_ORACLE mode"), so the client says it here
+		// rather than inventing a regime and letting the launch fail
+		// later with no explanation.
+		if (
+			data.symbolSelectionMode === "DYNAMIC" &&
+			data.dynamicMode === "DYNAMIC_ORACLE" &&
+			canUseOracle &&
+			parseOracleRegime(data.oracleRegime) === null
+		) {
+			alert(
+				t(
+					"launchModal.oracleRegimeRequired",
+					"Please select the regime to filter by.",
+				),
+			);
+			return;
+		}
+
+		onConfirm({
+			...data,
+			// The numbers that travel to the server: the regime the
+			// customer chose, and the confidence they chose or the
+			// server's DECLARED threshold -- the same number the slider
+			// showed. With no oracle there are no oracle numbers at all:
+			// an ABSENT value is honest, a made-up 95 is not.
+			oracleRegime: canUseOracle ? data.oracleRegime : undefined,
+			oracleConfidence: canUseOracle
+				? (effectiveOracleConfidence(data.oracleConfidence, defaultConfidence) ??
+					undefined)
+				: undefined,
+		});
 	};
 
 	return (
@@ -445,7 +565,20 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 								)}
 							/>
 
-							{/* ORACLE SPECIFIC */}
+							{/* THE ORACLE IS NOT AVAILABLE ON THIS DEPLOYMENT: say so,
+						    plainly. Hiding the option on its own reads as "the
+						    screen is broken" rather than "this server has no
+						    oracle model". */}
+						{oracleEntitled && !oracleAvailable && (
+							<p className="text-xs text-muted-foreground">
+								{t(
+									"launchModal.oracleUnavailable",
+									"Oracle filter unavailable: this server has no oracle model deployed.",
+								)}
+							</p>
+						)}
+
+						{/* ORACLE SPECIFIC */}
 							{dynamicMode === "DYNAMIC_ORACLE" && canUseOracle && (
 								<>
 									<div className="space-y-2">
@@ -457,10 +590,15 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 												<Select
 													onValueChange={field.onChange}
 													defaultValue={field.value}
-													value={field.value}
+													value={field.value ?? ""}
 												>
 													<SelectTrigger>
-														<SelectValue />
+														<SelectValue
+														placeholder={t(
+															"launchModal.oracleRegimeUnset",
+															"-- select a regime --",
+														)}
+													/>
 													</SelectTrigger>
 													<SelectContent>
 														<SelectItem value="0">
@@ -481,7 +619,7 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 										<div className="flex justify-between">
 											<Label className="text-xs">Min Confidence (%)</Label>
 											<span className="text-xs text-muted-foreground">
-												{oracleConfidence}%
+												{shownConfidence ?? 0}%
 											</span>
 										</div>
 										<Controller
@@ -489,8 +627,8 @@ export const LaunchStrategyModal: React.FC<LaunchStrategyModalProps> = ({
 											control={control}
 											render={({ field }) => (
 												<Slider
-													defaultValue={[field.value || 95]}
-													value={[field.value || 95]}
+													defaultValue={[field.value ?? 0]}
+													value={[shownConfidence ?? 0]}
 													max={100}
 													step={1}
 													onValueChange={(vals) => field.onChange(vals[0])}

@@ -28,6 +28,7 @@ import FoundationWeightsModal, {
 } from "../components/editor/FoundationWeightsModal";
 import InitializationBlock from "../components/editor/InitializationBlock";
 import { ICONS } from "../constants";
+import { useOracleAvailability } from "../lib/useOracleAvailability";
 import {
 	type StateKey,
 	useStrategyEditorStore,
@@ -73,6 +74,11 @@ const EditorScreen: React.FC<EditorScreenProps> = ({
 		setOracleConfidence,
 		setBreakevenOnRegimeChange,
 	} = useStrategyEditorStore();
+
+	// The oracle exists only when the SERVER has a real model loaded. The
+	// editor used to offer "Dynamic Filter by Oracle" unconditionally, on a
+	// server that logs "Oracle model not found" once per worker.
+	const { oracleAvailable: canUseOracle } = useOracleAvailability();
 
 	const [name, setName] = useState(storeName);
 	const [description, setDescription] = useState(storeDescription);
@@ -328,8 +334,25 @@ const EditorScreen: React.FC<EditorScreenProps> = ({
 						>
 							<option value="STATIC">Static List</option>
 							<option value="DYNAMIC_NATR">Dynamic Filter by NATR</option>
-							<option value="DYNAMIC_ORACLE">Dynamic Filter by Oracle</option>
+							{/* The option is ALWAYS rendered, so that a strategy
+							    already saved as DYNAMIC_ORACLE still shows its own
+							    mode instead of a select whose value matches no
+							    option. It cannot be CHOSEN while there is no
+							    oracle model. */}
+							<option value="DYNAMIC_ORACLE" disabled={!canUseOracle}>
+								{canUseOracle
+									? "Dynamic Filter by Oracle"
+									: "Dynamic Filter by Oracle (unavailable)"}
+							</option>
 						</select>
+						{!canUseOracle && (
+							<p className="text-xs text-[hsl(var(--muted-foreground))] mt-1">
+								{t(
+									"launchStrategyModal.oracleUnavailable",
+									"Oracle filter unavailable: this server has no oracle model deployed.",
+								)}
+							</p>
+						)}
 					</div>
 
 					{symbol_selection_mode === "DYNAMIC_NATR" && (
@@ -352,7 +375,11 @@ const EditorScreen: React.FC<EditorScreenProps> = ({
 						</div>
 					)}
 
-					{symbol_selection_mode === "DYNAMIC_ORACLE" && (
+					{/* With no oracle model there is no regime and no confidence
+					    to show: they are measurements, and nothing has made
+					    any. The strategy's own saved values stay in the store
+					    and are still saved unchanged. */}
+					{symbol_selection_mode === "DYNAMIC_ORACLE" && canUseOracle && (
 						<>
 							<div>
 								<label className="text-sm text-[hsl(var(--muted-foreground))] mb-2 block">
@@ -360,10 +387,25 @@ const EditorScreen: React.FC<EditorScreenProps> = ({
 								</label>
 								<select
 									className="w-full p-3 bg-[hsl(var(--secondary))] border border-[hsl(var(--border))] rounded-lg text-base text-[hsl(var(--foreground))] outline-none transition-all focus:border-[hsl(var(--primary))] focus:ring-1 focus:ring-[hsl(var(--primary))]"
-									value={oracleRegime !== null && oracleRegime !== undefined ? String(oracleRegime) : "1"}
-									onChange={(e) => setOracleRegime(Number(e.target.value))}
+									value={oracleRegime !== null && oracleRegime !== undefined ? String(oracleRegime) : ""}
+									onChange={(e) =>
+										setOracleRegime(
+											e.target.value === ""
+												? null
+												: Number(e.target.value),
+										)
+									}
 									disabled={isSaving}
 								>
+									{/* No regime is preselected: a preselected regime
+									    would claim a measurement that was never
+									    made. The customer picks one. */}
+									<option value="">
+										{t(
+											"launchStrategyModal.oracleRegimeUnset",
+											"-- select a regime --",
+										)}
+									</option>
 									<option value="0">
 										{t("launchStrategyModal.oracleRegimeParanoiaFull", "Paranoia")}
 									</option>
@@ -382,14 +424,14 @@ const EditorScreen: React.FC<EditorScreenProps> = ({
 										{t("launchStrategyModal.minConfidence", "Min Confidence (%)")}
 									</label>
 									<span className="text-sm text-[hsl(var(--foreground))] font-medium">
-										{oracleConfidence}%
+										{oracleConfidence ?? 0}%
 									</span>
 								</div>
 								<input
 									type="range"
 									min="0"
 									max="100"
-									value={oracleConfidence !== undefined ? oracleConfidence : 0}
+									value={oracleConfidence ?? 0}
 									onChange={(e) =>
 										setOracleConfidence(parseInt(e.target.value, 10))
 									}

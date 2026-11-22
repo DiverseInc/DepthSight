@@ -262,7 +262,13 @@ export interface StrategyState {
 	positionManagement: ManagementBlock[];
 	useFoundationWeights: boolean;
 	oracleRegime: number | null;
-	oracleConfidence: number;
+	/**
+	 * Absent (null) when there is no oracle model to produce one, and no
+	 * default to fall back on: a confidence invented by the client would be
+	 * a measurement nobody made. 0 is the server's own declared default
+	 * and means "no minimum", not "measured".
+	 */
+	oracleConfidence: number | null;
 	use_ml_confirmation: boolean;
 	breakeven_on_regime_change: boolean;
 	symbol_selection_mode: "STATIC" | "DYNAMIC_NATR" | "DYNAMIC_ORACLE";

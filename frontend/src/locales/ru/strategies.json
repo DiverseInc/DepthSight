@@ -79,6 +79,10 @@
 		"oracleRegimeParanoiaFull": "0: Паранойя (Trend-following/Sideways)",
 		"oracleRegimeAmnesiaFull": "1: Амнезия (News/Trend)",
 		"oracleRegimeSchizophreniaFull": "2: Шизофрения (Volatile)",
+		"oracleRegimeUnset": "-- выберите режим --",
+		"oracleRegimeRequired": "Пожалуйста, выберите режим для фильтрации.",
+		"oracleUnavailable": "Фильтр Oracle недоступен: на этом сервере не развёрнута модель Oracle.",
+		"oracleUnavailableForSavedStrategy": "Эта стратегия сохранена с фильтром Oracle, а на этом сервере нет модели Oracle. Запустить её как есть нельзя.",
 		"errors": {
 			"nameRequired": "Имя экземпляра обязательно.",
 			"modeRequired": "Пожалуйста, выберите режим выбора символов.",

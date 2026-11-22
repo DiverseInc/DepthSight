@@ -155,6 +155,7 @@
 		"oracleRegimeAmnesiaFull": "1: Амнезия",
 		"oracleRegimeParanoiaFull": "0: Паранойя",
 		"oracleRegimeSchizophreniaFull": "2: Шизофрения",
+		"oracleUnavailable": "Фильтр Oracle недоступен: на этом сервере не развёрнута модель Oracle.",
 		"signalSourceLabel": "Источник сигнала",
 		"signalSourceInternal": "Внутренняя логика",
 		"signalSourceTradingView": "TradingView Webhook",

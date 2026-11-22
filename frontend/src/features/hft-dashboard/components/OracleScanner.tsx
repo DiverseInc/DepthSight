@@ -18,8 +18,19 @@ export const OracleScanner: React.FC = () => {
 					Amnesia Pipeline
 				</CardTitle>
 				<div className="flex items-center gap-2 text-[10px] text-muted-foreground/50 uppercase font-bold">
-					<span>Active</span>
-					<div className="w-1.5 h-1.5 rounded-full bg-emerald-500"></div>
+					{/* NOT hard-coded "Active" with a green dot. The panel used
+					    to claim the pipeline was Active whether or not a single
+					    oracle signal had arrived -- a status line that could
+					    never go red. It now says what the client can actually
+					    see: signals arriving, or no signal. */}
+					<span>{oracleSymbols.length > 0 ? "Receiving" : "No signal"}</span>
+					<div
+						className={`w-1.5 h-1.5 rounded-full ${
+							oracleSymbols.length > 0
+								? "bg-emerald-500"
+								: "bg-muted-foreground/30"
+						}`}
+					></div>
 				</div>
 			</CardHeader>
 			<CardContent className="flex-1 p-0 overflow-hidden">

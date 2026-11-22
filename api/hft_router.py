@@ -11,7 +11,7 @@ from .redis_client import get_redis_client
 from .models import User
 from bot_module.exchanges.common import is_binance_exchange
 import redis.asyncio as redis
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,23 @@ CMD_CHANNEL = "hft:commands"
 
 def get_user_config_key(user_id: int) -> str:
     return f"hft:config:{user_id}"
+
+
+def _oracle_available_default() -> bool:
+    """Whether the oracle filter may default to ON. The SERVER'S answer.
+
+    A failed probe means NO: an unknown state is not an available oracle.
+    The import is lazy for the same reason it is in
+    `api/routes/capabilities.py` -- `api.simulation_router` pulls in the
+    backtester stack and must not be dragged into importing this router.
+    """
+    try:
+        from .simulation_router import oracle_model_available
+
+        return oracle_model_available()
+    except Exception as e:  # pragma: no cover - defensive
+        logger.error(f"HFT config: oracle availability probe failed: {e}")
+        return False
 
 
 class PartialTakeProfitConfig(BaseModel):
@@ -77,7 +94,16 @@ class HftConfig(BaseModel):
     max_leverage: float = 20.0
     max_hold_minutes: int = 0
     use_screener: bool = True
-    use_oracle: bool = True
+    # The oracle filter defaults to the SERVER'S OWN answer, not to a
+    # constant. It used to read `use_oracle: bool = True`, which claimed
+    # a regime filter was running on a deployment whose api container
+    # logs, once per worker:
+    #     WARNING [api.simulation_router:122] - Oracle model not found at
+    #     /app/data/oracle_model.joblib
+    # The client already derives its own availability from the same
+    # probe (`/api/v1/capabilities`), so the server's default said the
+    # opposite of the server's own capability report.
+    use_oracle: bool = Field(default_factory=_oracle_available_default)
 
     # Limits (new fields matching Rust)
     max_analyzed_symbols: int = 20

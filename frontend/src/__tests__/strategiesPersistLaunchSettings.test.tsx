@@ -67,6 +67,14 @@ const savedConfig = {
 };
 
 vi.mock("@/lib/api", () => ({
+	// The server's own answer about the oracle: there is no oracle
+	// model on this deployment, so the client must not offer one. The
+	// mock has to be COMPLETE: a component that calls a hook the mock
+	// does not define throws.
+	useOracleAvailability: () => ({
+		data: { oracleAvailable: false },
+		isLoading: false,
+	}),
 	useStrategies: () => ({
 		data: [],
 		isLoading: false,

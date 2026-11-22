@@ -31,6 +31,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -38,6 +41,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 WSL_PY = "$HOME/dstest/bin/python"
+
+# vitest colours its output, and the colour codes sit in front of the summary
+# lines this harness reads.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def sha256(p: Path) -> str:
@@ -100,6 +107,78 @@ def run_pytest(target: str, timeout: int = 1800) -> tuple[int, str]:
     return proc.returncode, summary
 
 
+def run_command(argv: list[str], timeout: int = 1800) -> tuple[int, str]:
+    """Run a test command that is not pytest (used by front-end specs).
+
+    The harness was written for pytest, but a front-end change has no pytest
+    target: its tests are run by vitest. A spec may therefore name the
+    command that runs its tests, and a non-zero exit code means the tests
+    failed -- which is exactly what "the mutant was caught" means.
+
+    The command is run from the repository root. It is handed to the shell so
+    that `npm` resolves to `npm.cmd` on Windows and to `npm` on Linux.
+    """
+    if os.name == "nt":
+        line = subprocess.list2cmdline(argv)
+    else:
+        line = " ".join(shlex.quote(arg) for arg in argv)
+    try:
+        proc = subprocess.run(
+            line,
+            shell=True,
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 3, f"COMMAND DID NOT RUN: {exc}"
+
+    out = (proc.stdout or "") + (proc.stderr or "")
+    summary = ""
+    for raw in reversed(out.splitlines()):
+        stripped = ANSI_RE.sub("", raw).strip()
+        if stripped.startswith("Test Files") or stripped.startswith("Tests "):
+            summary = stripped
+            break
+    if not summary:
+        # A missing summary means the command did not actually run the tests.
+        # Reporting this as "no failures" is the false green this harness
+        # exists to prevent.
+        tail = [
+            ANSI_RE.sub("", line).strip()
+            for line in out.splitlines()
+            if line.strip()
+        ][-3:]
+        return 3, "NO TEST SUMMARY -- the test command did not run. Output:\n" + "\n".join(tail)
+    if summary_ran_no_test(summary):
+        # Every test was SKIPPED. The command still exits 0, so this would
+        # be recorded as "the mutant SURVIVED" -- a false green, and the
+        # exact thing this harness exists to prevent. A run in which no
+        # test ran is a BROKEN run, not a passing one.
+        return 3, "ALL TESTS SKIPPED -- the test command ran no test: " + summary
+    return proc.returncode, summary
+
+
+def summary_ran_no_test(summary: str) -> bool:
+    """Did the summary say that NO test actually ran?
+
+    A vitest run in which every test is skipped still exits 0:
+
+        Tests  139 skipped (139)
+
+    That is not a pass. The harness would otherwise record the mutant as
+    SURVIVED, which is a false green.
+
+    A run that executed SOME tests is fine, however many were skipped:
+
+        Tests  2 failed | 137 passed | 1 skipped (140)
+    """
+    if "skipped" not in summary:
+        return False
+    return "passed" not in summary
+
+
 def eol_variants(text: str) -> list[bytes]:
     """The text in BOTH line-ending forms: CRLF first, then LF.
 
@@ -118,6 +197,11 @@ def eol_variants(text: str) -> list[bytes]:
 def apply(spec_path: Path) -> int:
     spec = load_spec(spec_path)
     test_target = spec.get("pytest_target", "tests/")
+    # A spec may name a test command instead of a pytest target. The harness
+    # was written for pytest; a front-end change has no pytest target, and
+    # this keeps those specs on the same tool (same snapshot, same SHA-256
+    # revert check, same SKIP-is-a-failure rule).
+    command = spec.get("command")
     timeout = spec.get("timeout_s", 1800)
 
     # Snapshot every file the spec touches BEFORE anything is modified.
@@ -126,6 +210,8 @@ def apply(spec_path: Path) -> int:
     digests = {f: hashlib.sha256(b).hexdigest() for f, b in originals.items()}
 
     print(f"spec: {spec_path.name}   pytest target: {test_target}")
+    if command:
+        print(f"  test command: {' '.join(command)}")
     for f in files:
         crlf_n = originals[f].count(b"\r\n")
         print(f"  snapshot {f.name}: {len(originals[f])} bytes, {crlf_n} CRLF")
@@ -153,20 +239,32 @@ def apply(spec_path: Path) -> int:
                 continue
 
             rel.write_bytes(originals[rel].replace(needle, repl, 1))
-            rc, summary = run_pytest(test_target, timeout)
+            if command:
+                rc, summary = run_command(command, timeout)
+                # A non-zero exit code means the test command reported a
+                # failure, which is what "the mutant was caught" means.
+                killed = rc != 0
+                broken = rc == 3
+                broken_message = (
+                    "ABORT: the test command did not produce a summary, so no "
+                    "mutation result is trustworthy."
+                )
+            else:
+                rc, summary = run_pytest(test_target, timeout)
+                killed = ("failed" in summary) or ("error" in summary)
+                broken = rc == 3
+                broken_message = (
+                    "ABORT: pytest did not produce a summary, so no mutation "
+                    "result is trustworthy."
+                )
 
-            if rc == 3:
+            if broken:
                 rel.write_bytes(originals[rel])
                 print(f"BROKEN  {label}")
                 print(f"          {summary}")
-                print(
-                    "ABORT: pytest did not produce a summary, so no mutation "
-                    "result is trustworthy.",
-                    file=sys.stderr,
-                )
+                print(broken_message, file=sys.stderr)
                 return 2
 
-            killed = ("failed" in summary) or ("error" in summary)
             if not killed:
                 if m.get("expected_survivor"):
                     expected.append(label)

@@ -1,0 +1,18 @@
+{
+  "pytest_target": "tests/test_dynamic_symbol_guard.py",
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "A: the guard matches the exact string \"DYNAMIC\" again",
+      "file": "api/routes/strategies.py",
+      "needle": "    if _is_dynamic_symbol_selection_mode(_resolved_mode) and not getattr(\n        bot_config, \"SYMBOL_SELECTION_ALLOW_DYNAMIC\", False\n    ):",
+      "replace": "    if _resolved_mode == \"DYNAMIC\" and not getattr(\n        bot_config, \"SYMBOL_SELECTION_ALLOW_DYNAMIC\", False\n    ):"
+    },
+    {
+      "label": "B: the operator escape hatch is inverted",
+      "file": "api/routes/strategies.py",
+      "needle": "    if _is_dynamic_symbol_selection_mode(_resolved_mode) and not getattr(\n        bot_config, \"SYMBOL_SELECTION_ALLOW_DYNAMIC\", False\n    ):",
+      "replace": "    if _is_dynamic_symbol_selection_mode(_resolved_mode) and getattr(\n        bot_config, \"SYMBOL_SELECTION_ALLOW_DYNAMIC\", False\n    ):"
+    }
+  ]
+}

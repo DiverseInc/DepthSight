@@ -13,6 +13,7 @@ import type {
 	BacktestRun,
 	BacktestRunListItem,
 	BinanceKline,
+	Capabilities,
 	CreatePaymentResponse,
 	GeneStatsResponse,
 	Message,
@@ -310,7 +311,7 @@ export const api = {
 		use_ml_confirmation?: boolean;
 		foundation_weights?: Record<string, number> | null;
 		oracle_regime?: number | null;
-		oracle_confidence?: number;
+		oracle_confidence?: number | null;
 		symbol_selection_mode?: "DYNAMIC" | "STATIC";
 		symbols?: string[] | null;
 	}): Promise<StrategyConfigDB> =>
@@ -327,7 +328,7 @@ export const api = {
 			use_ml_confirmation?: boolean;
 			foundation_weights?: Record<string, number> | null;
 			oracle_regime?: number | null;
-			oracle_confidence?: number;
+			oracle_confidence?: number | null;
 			symbol_selection_mode?: "DYNAMIC" | "STATIC";
 			symbols?: string[] | null;
 		},
@@ -381,6 +382,19 @@ export const api = {
 
 	// --- Config ---
 	getConfig: (): Promise<AppConfig> => apiFetch<AppConfig>("/config"),
+
+	/**
+	 * What this deployment can actually do -- read from the SERVER, never
+	 * assumed by the client.
+	 *
+	 * `oracleAvailable` is true only when a real oracle model is loaded on
+	 * the server. It used to be a client-side constant
+	 * (`const canUseOracle = true; // Oracle is available to everyone`)
+	 * on a deployment whose api container logged, once per worker:
+	 * "Oracle model not found at /app/data/oracle_model.joblib".
+	 */
+	getCapabilities: (): Promise<Capabilities> =>
+		apiFetch<Capabilities>("/capabilities"),
 	updateConfig: (data: Partial<AppConfig>): Promise<AppConfig> =>
 		apiFetch<AppConfig>("/config", {
 			method: "PUT",

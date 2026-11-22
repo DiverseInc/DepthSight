@@ -157,6 +157,7 @@
 		"oracleRegimeAmnesiaFull": "1: Amnesia",
 		"oracleRegimeParanoiaFull": "0: Paranoia",
 		"oracleRegimeSchizophreniaFull": "2: Schizophrenia",
+		"oracleUnavailable": "Oracle filter unavailable: this server has no oracle model deployed.",
 		"signalSourceLabel": "Signal Source",
 		"signalSourceInternal": "Internal Rules Engine",
 		"signalSourceTradingView": "TradingView Webhook",
