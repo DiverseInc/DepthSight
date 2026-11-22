@@ -53,15 +53,16 @@
       "offers": [
         { "@type": "Offer", "name": "Free", "price": "0", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/register", "description": "20 fast backtests per day, 10 AI Assistant queries per day, paper trading" },
         { "@type": "Offer", "name": "Standard", "price": "30", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/welcome#pricing", "description": "50 fast backtests per day, 20 AI Assistant queries per day, 10 live trading strategies" },
-        { "@type": "Offer", "name": "Professional", "price": "100", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/welcome#pricing", "description": "Unlimited backtests, PRO blocks, genetic strategy search, 30 live trading strategies" }
+        { "@type": "Offer", "name": "Professional", "price": "100", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/welcome#pricing", "description": "Unlimited backtests, PRO blocks, genetic strategy search, 30 live trading strategies" },
+        { "@type": "Offer", "name": "Managed", "price": "499", "priceCurrency": "USD", "url": "https://depthsight.diverseinc.net/welcome#pricing", "description": "Unlimited backtests, PRO blocks, genetic strategy search, 100 live trading strategies" }
       ],
       "featureList": [
         "Paper trading against real candles",
         "Live trading on 6 exchanges for paid plans (Bybit only on Free)",
         "Strategy templates you can import",
         "Visual no-code strategy builder",
-        "Genetic strategy search (Professional plan only)",
-        "ML model laboratory (Professional plan only)",
+        "Genetic strategy search (Professional and Managed plans)",
+        "ML model laboratory (Professional and Managed plans)",
         "TradingView webhooks"
       ]
     }
@@ -153,7 +154,7 @@
     .timeline-item .meta{font-family:var(--mono);font-size:12px;color:var(--brand);margin-top:8px}
 
     /* ───────── Pricing ───────── */
-    .price-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}
+    .price-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
     @media (max-width:880px){.price-grid{grid-template-columns:1fr}}
     .price{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:30px;display:flex;flex-direction:column}
     .price.featured{border-color:var(--brand);box-shadow:0 0 0 2px rgba(34,211,238,.18),var(--shadow);position:relative}
@@ -255,7 +256,7 @@
       <div class="card">
         <div class="icon">⟲</div>
         <h3>Backtest first</h3>
-        <p>Vectorized historical engine runs years of 1m candles in seconds. Optimization runs and genetic strategy search on the Professional plan.</p>
+        <p>Vectorized historical engine runs years of 1m candles in seconds. Optimization runs and genetic strategy search on the Professional and Managed plans.</p>
         <div class="tag-row"><span class="tag">vector_backtester</span><span class="tag">optuna</span></div>
       </div>
 
@@ -414,7 +415,6 @@
         <p class="notinc-title">Not included</p>
         <ul class="notinc">
           <li>Kline backtests</li>
-          <li>Portfolio backtesting</li>
           <li>Live trading on other venues</li>
           <li>PRO blocks (Tape, Book, Open Interest)</li>
           <li>Optimization runs</li>
@@ -433,7 +433,6 @@
           <li>50 fast backtests per day</li>
           <li>20 AI Assistant queries per day</li>
           <li>Strategy backtesting</li>
-          <li>Portfolio backtesting</li>
           <li>Saved strategies</li>
           <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>
           <li>10 live trading strategies</li>
@@ -466,7 +465,6 @@
           <li>30 dataset generations per month</li>
           <li>15 model trainings per month</li>
           <li>Strategy backtesting</li>
-          <li>Portfolio backtesting</li>
           <li>Strategy optimization</li>
           <li>Genetic strategy search</li>
           <li>Portfolio simulation</li>
@@ -483,9 +481,25 @@
         <a class="btn btn-ghost" href="/register?plan=pro">Choose Professional</a>
         <p class="fineprint">Registration starts you on the Free plan. We activate the paid tier for you — tell us which plan you want after you sign up.</p>
       </div>
+
+      <div class="price" data-plan-key="managed">
+        <h3>Managed</h3>
+        <div class="amt">$499<small> /month</small></div>
+        <p class="desc">We deploy, monitor and adjust your strategies inside the risk limits you set.</p>
+        <ul>
+          <li>Everything in Professional</li>
+          <li>We deploy, monitor and adjust your strategies within your risk limits</li>
+          <li>Unlimited optimization runs, genetic searches and model trainings</li>
+          <li>100 live strategies (Professional has 30)</li>
+          <li>Highest queue priority, 20 concurrent tasks</li>
+          <li>Live trading on all six exchanges (OKX, Binance, Bybit, Bitget, Gate.io, BingX)</li>
+        </ul>
+        <a class="btn btn-ghost" href="/register?plan=managed">Choose Managed</a>
+        <p class="fineprint">Registration starts you on the Free plan. We activate the paid tier for you — tell us which plan you want after you sign up.</p>
+      </div>
     </div>
 
-    <p class="fineprint">New accounts start on the Free plan. Standard and Professional are $30 and $100 per month — sign up, then tell us which plan you want and we will set it up for your account. Prices are monthly, in USD. Source available under AGPL v3.</p>
+    <p class="fineprint">New accounts start on the Free plan. Standard, Professional and Managed are $30, $100 and $499 per month — sign up, then tell us which plan you want and we will set it up for your account. Prices are monthly, in USD. Source available under AGPL v3.</p>
   </div>
 </section>
 
@@ -512,9 +526,9 @@
             <option value="">What interests you most? (optional)</option>
             <option>Standard plan ($30/month)</option>
             <option>Professional plan ($100/month)</option>
+            <option>Managed plan ($499/month)</option>
             <option>Paper trading</option>
             <option>Live trading</option>
-            <option>Portfolio backtesting</option>
             <option>Custom strategy</option>
             <option>Just curious</option>
           </select>

@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "Mutations that remove the guarantee added by the fix for the $499",
+    "'Managed' tier: a customer on the TOP tier must never be shown an",
+    "upgrade prompt.",
+    "",
+    "The chrome used to ask `user.plan !== \"pro\"` to decide whether to show",
+    "the upgrade affordances. That was correct while 'pro' was the top tier;",
+    "the $499 tier sits ABOVE it, so the question became wrong and a customer",
+    "who paid $499 was told to upgrade four times (the 'Upgrade to PRO' entry",
+    "in the user menu, the amber crown, the amber styling and the 'Upgrade",
+    "plan' tooltip).",
+    "",
+    "The frontend receives the RAW plan key: `/users/me` returns the ORM user",
+    "(api/depthsight_api.py:1874) and the login response is",
+    "`schemas.User.model_validate(user_db)` (api/routes/auth.py:187). The",
+    "server resolves the legacy `premium` key onto `managed` at READ time",
+    "(api/plans.py `resolve_plan_key`) and the rows are NOT migrated, so",
+    "'premium' is a key the frontend really sees -- B mutants cover it.",
+    "",
+    "A is the tier list: without 'managed' in it, a Managed customer is",
+    "nagged again. B is the legacy alias: without it, a legacy `premium`",
+    "customer is nagged again. C is the decision itself: with it, the upsell",
+    "for a customer who CAN still upgrade is gone -- the other half of the",
+    "guarantee. D, E, F and G are the four places the decision is used, each",
+    "one re-spelled as the old `user.plan !== \"pro\"`.",
+    "",
+    "Run with:  python tools/mutation_harness.py tools/mutations/managed_upgrade_prompt.json",
+    "NEVER run concurrently with a test run or tools/review_fanout.py -- both will",
+    "read a file that is mid-mutation and report on code that does not exist."
+  ],
+  "vitest_target": "src/__tests__/managedUpgradePrompt.test.tsx",
+  "timeout_s": 900,
+  "mutations": [
+    {
+      "label": "A: the Managed tier is no longer a top tier",
+      "file": "frontend/src/lib/plans.ts",
+      "needle": "export const PROFESSIONAL_TIER_KEYS = [\"pro\", \"managed\"] as const;",
+      "replace": "export const PROFESSIONAL_TIER_KEYS = [\"pro\"] as const;"
+    },
+    {
+      "label": "B: the legacy premium key no longer resolves onto managed",
+      "file": "frontend/src/lib/plans.ts",
+      "needle": "export const PLAN_ALIASES: Record<string, string> = {\n\tpremium: \"managed\",\n};",
+      "replace": "export const PLAN_ALIASES: Record<string, string> = {\n\tpremium: \"premium\",\n};"
+    },
+    {
+      "label": "C: nobody is ever shown an upgrade prompt again",
+      "file": "frontend/src/lib/plans.ts",
+      "needle": "export const showsUpgradePrompt = (plan?: string | null): boolean =>\n\t!hasProfessionalTierAccess(plan);",
+      "replace": "export const showsUpgradePrompt = (plan?: string | null): boolean =>\n\tfalse;"
+    },
+    {
+      "label": "D: the user menu nags a Managed customer again",
+      "file": "frontend/src/components/UserNav.tsx",
+      "needle": "{!isLoading && showsUpgradePrompt(user.plan) && (",
+      "replace": "{!isLoading && user.plan !== \"pro\" && ("
+    },
+    {
+      "label": "E: the plan badge shows the upgrade crown to a Managed customer again",
+      "file": "frontend/src/components/AppSidebar.tsx",
+      "needle": "{showsUpgradePrompt(user.plan) && (",
+      "replace": "{user.plan !== \"pro\" && ("
+    },
+    {
+      "label": "F: the plan badge tooltip says 'Upgrade plan' to a Managed customer again",
+      "file": "frontend/src/components/AppSidebar.tsx",
+      "needle": "{showsUpgradePrompt(user.plan)\n",
+      "replace": "{user.plan !== \"pro\"\n"
+    },
+    {
+      "label": "G: the plan badge is styled as an upgrade target for a Managed customer again",
+      "file": "frontend/src/components/AppSidebar.tsx",
+      "needle": "showsUpgradePrompt(user.plan) &&\n",
+      "replace": "user.plan !== \"pro\" &&\n"
+    }
+  ]
+}

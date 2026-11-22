@@ -45,6 +45,28 @@ export default defineConfig({
 		alias: {
 			"@": path.resolve(__dirname, "./src"),
 		},
+		// The PWA has NO test runner of its own, so the tests that pin its
+		// behaviour live in this runner and import the PWA code across the
+		// project boundary (`../../pwa/...`). That is a test-only dependency.
+		//
+		// The PWA has its OWN node_modules, so a bare import inside a PWA
+		// file ("react", "zustand", ...) would resolve to the PWA's copy --
+		// or fail outright, because the PWA's dependencies are not installed
+		// in this worktree. `dedupe` forces every one of them to the copy in
+		// THIS project, so a PWA component and a frontend component run
+		// against one React and one React Query.
+		dedupe: [
+			"react",
+			"react-dom",
+			"react-i18next",
+			"i18next",
+			"i18next-browser-languagedetector",
+			"@tanstack/react-query",
+			"lucide-react",
+			"zustand",
+			"immer",
+			"uuid",
+		],
 	},
 	test: {
 		environment: "node",

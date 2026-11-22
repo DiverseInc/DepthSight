@@ -597,7 +597,7 @@ export interface User {
 	username: string;
 	email: string;
 	created_at: string;
-	plan: "free" | "standard" | "pro";
+	plan: "free" | "standard" | "pro" | "managed" | "premium";
 	referralCode?: string;
 	role: "admin" | "user" | "affiliate";
 	xp: number;
@@ -1024,9 +1024,55 @@ export interface SymbolSelectionConfig {
 	max_concurrent_symbols: number;
 }
 
-export const hasProPlanAccess = (plan?: string | null): boolean => {
-	return plan === "pro" || plan === "institutional";
+/**
+ * The plan keys the PWA has to understand.
+ *
+ * The backend is the source of truth (api/plans_config.yml); this mirrors the
+ * parts the PWA cannot read from the catalog: the canonical key of a tier and
+ * the legacy key that is still stored on real rows. The web client asks the
+ * same question in frontend/src/lib/plans.ts, and the two must agree.
+ */
+
+/**
+ * Legacy plan keys that are still stored on real rows (user accounts).
+ * Each one points at the canonical plan that carries the tier today.
+ * Mirrors `plan_aliases` in api/plans_config.yml.
+ */
+const PLAN_ALIASES: Record<string, string> = {
+	premium: "managed",
 };
+
+/**
+ * The canonical key for a plan. A legacy alias resolves to the plan that
+ * carries the tier today; an unknown key is returned unchanged so the caller
+ * can fail closed on it.
+ */
+const canonicalPlanKey = (plan?: string | null): string => {
+	const key = (plan ?? "").trim().toLowerCase();
+	return PLAN_ALIASES[key] ?? key;
+};
+
+/**
+ * The tiers that may use the `pro_only` strategy blocks and the precision
+ * (Kline) backtest engine.
+ *
+ * Mirrors `_PRO_BLOCK_PLANS` in api/plans.py and `PRO_BLOCK_TIER_KEYS` in
+ * frontend/src/lib/plans.ts. The $499 "Managed" tier sits ABOVE Professional
+ * and includes everything Professional includes, so it is in here too.
+ */
+const PRO_BLOCK_TIER_KEYS = ["pro", "managed", "institutional"] as const;
+
+/**
+ * True when this plan may use the `pro_only` blocks and the precision engine.
+ *
+ * The key is resolved FIRST: the client receives the RAW plan key
+ * (api/depthsight_api.py returns the ORM user unchanged and `User.plan` is a
+ * plain string), so the legacy `premium` key -- the old spelling of the
+ * Managed tier -- has to resolve onto `managed` before the answer is given.
+ * Without that, a legacy customer is locked out of a tier they already have.
+ */
+export const hasProPlanAccess = (plan?: string | null): boolean =>
+	(PRO_BLOCK_TIER_KEYS as readonly string[]).includes(canonicalPlanKey(plan));
 
 export interface Token {
 	access_token: string;

@@ -373,12 +373,15 @@ async def register_user(
     # `free`. A paid tier is never granted at signup.
     if user.plan:
         requested_plan = user.plan.strip().lower()
-        if requested_plan not in plans_config.get_all_plans():
+        # A legacy key (e.g. `premium`) is accepted and normalised onto the
+        # plan that carries the tier today. An unknown key is still a 400.
+        resolved_plan = plans_config.resolve_plan_key(requested_plan)
+        if resolved_plan not in plans_config.get_all_plans():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Unknown plan requested.",
             )
-        user.plan = requested_plan
+        user.plan = resolved_plan
 
     db_user = await crud.get_user_by_username(db, username=user.username)
     if db_user:

@@ -32,6 +32,7 @@ import {
 	TableRow,
 } from "@/components/ui/table";
 import { useToast } from "@/components/ui/use-toast";
+import { canonicalPlanKey } from "@/lib/plans";
 import {
 	useAdminIssueBonus,
 	useAdminUpdateUser,
@@ -69,7 +70,12 @@ const AdminUserDetailPage: React.FC = () => {
 
 	const handleSave = async () => {
 		try {
-			const payloadToSave = { ...editData };
+			// A legacy plan key is saved as the canonical key of the tier it
+			// now belongs to, so the row stops carrying a key nobody sells.
+			const payloadToSave = {
+				...editData,
+				...(editData.plan ? { plan: canonicalPlanKey(editData.plan) } : {}),
+			};
 			await updateUserMutation.mutateAsync({ userId, payload: payloadToSave });
 			toast({
 				title: t("userUpdateSuccessTitle"),
@@ -219,7 +225,9 @@ const AdminUserDetailPage: React.FC = () => {
 								<div className="space-y-2">
 									<Label>Plan</Label>
 									<Select
-										value={editData.plan}
+										value={
+											editData.plan ? canonicalPlanKey(editData.plan) : undefined
+										}
 										onValueChange={(value) =>
 											setEditData({ ...editData, plan: value })
 										}
@@ -231,6 +239,7 @@ const AdminUserDetailPage: React.FC = () => {
 											<SelectItem value="free">Free</SelectItem>
 											<SelectItem value="standard">Standard</SelectItem>
 											<SelectItem value="pro">Pro</SelectItem>
+										<SelectItem value="managed">Managed</SelectItem>
 										</SelectContent>
 									</Select>
 								</div>

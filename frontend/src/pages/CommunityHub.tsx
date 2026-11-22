@@ -77,6 +77,7 @@ import {
 } from "@/lib/strategyIdeas";
 import { cn } from "@/lib/utils";
 import { resolveHubApiUrl } from "@/lib/hubApi";
+import { PLAN_DISPLAY_NAMES } from "@/lib/plans";
 
 interface NewsItem {
 	id?: number;
@@ -835,13 +836,26 @@ const CommunityHub = () => {
 		return headers;
 	}, [token]);
 
-	// Tier hierarchy: free < standard < pro < premium.
+	// Tier hierarchy: free < standard < pro < managed.
 	// Used to gate which verified templates the user can import.
+	// `premium` is the legacy spelling of the $499 Managed tier: the seeded
+	// templates still ask for it, so it keeps its own rung on the ladder.
 	const TIER_ORDINAL: Record<string, number> = {
 		free: 0,
 		standard: 1,
 		pro: 2,
+		managed: 3,
 		premium: 3,
+	};
+
+	// The name a tier is sold under. A template that still asks for the
+	// legacy `premium` tier must show the customer the name of the tier they
+	// would actually buy, never the raw key.
+	const tierDisplayName = (tier?: string | null) => {
+		const key = (tier ?? "pro").trim().toLowerCase();
+		return t(`account:plans.${key}`, {
+			defaultValue: PLAN_DISPLAY_NAMES[key] ?? key,
+		});
 	};
 	const userTier = user?.plan ? TIER_ORDINAL[user.plan] ?? 0 : 0;
 	const canUseTemplate = (requiredTier: string) =>
@@ -2407,13 +2421,13 @@ const CommunityHub = () => {
 																	className="flex-1 gap-2 text-xs h-8"
 																	variant="outline"
 																	disabled
-																	title={`Requires ${strategy.tier_required ?? "higher"} plan`}
-																>
+																	title={`Requires ${tierDisplayName(strategy.tier_required)} plan`}
+																	>
 																	<Lock className="w-3.5 h-3.5" />
-																	{t(
-																		"community:verified.upgradeRequired",
-																		`Upgrade to ${strategy.tier_required ?? "Pro"}`,
-																	)}
+																	{t("community:verified.upgradeRequired", {
+																		tier: tierDisplayName(strategy.tier_required),
+																		defaultValue: `Upgrade to ${tierDisplayName(strategy.tier_required)}`,
+																	})}
 																</Button>
 															)}
 															{adminKey && strategy.id !== undefined && (

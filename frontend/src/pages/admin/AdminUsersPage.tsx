@@ -74,6 +74,7 @@ const AdminUsersPage: React.FC = () => {
 						<SelectItem value="free">Free</SelectItem>
 						<SelectItem value="standard">Standard</SelectItem>
 						<SelectItem value="pro">Pro</SelectItem>
+								<SelectItem value="managed">Managed</SelectItem>
 					</SelectContent>
 				</Select>
 			</div>

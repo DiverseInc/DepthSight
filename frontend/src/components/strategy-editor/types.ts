@@ -234,6 +234,8 @@ export type PlanTier =
 	| "standard"
 	| "researcher"
 	| "pro"
+	| "managed"
+	| "premium"
 	| "institutional";
 
 // NEW, CENTRAL STATE STRUCTURE

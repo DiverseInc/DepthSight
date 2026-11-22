@@ -43,6 +43,14 @@ async def get_plans(db: AsyncSession = Depends(get_db)):
             key = plan["key"]
             config = all_plans.get(key, {})
             plan_billing = plans_config.get_plan_billing(key, billing_mode)
+            # A tier the catalog does not sell in this billing mode is not
+            # OFFERED. This is the SAME rule the purchase endpoint enforces
+            # (`plans_config.is_billing_mode_available`), so the billing page
+            # can never offer a tier the server will refuse: the $499 Managed
+            # tier is a monthly service and its one-off block is switched
+            # off (`billing.lifetime.enabled: false`).
+            if not plans_config.is_billing_mode_available(key, billing_mode):
+                continue
             is_lifetime_offer = billing_mode == "lifetime" and plan_billing.get(
                 "enabled", False
             )
@@ -94,6 +102,25 @@ async def create_payment(
         raise HTTPException(status_code=400, detail="Plan not found or is not active.")
 
     billing_mode = plans_config.get_billing_mode()
+
+    # The catalog declares, per billing mode, whether a tier is sold at all
+    # (`billing.<mode>.enabled`). A mode that is switched off must never be
+    # purchasable: `get_effective_plan_price` falls back to the MONTHLY
+    # price when the mode carries no price of its own, so a purchase in the
+    # switched-off mode would create a ONE-OFF invoice for a tier that has
+    # no one-off price, and the customer would be granted the monthly
+    # period for it. The $499 Managed tier is the case in point: it is a
+    # monthly service and its one-off block is switched off, so it must not
+    # be sold as a one-off at all.
+    if not plans_config.is_billing_mode_available(plan_name, billing_mode):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"The {plan_config.get('name', plan_name)} plan is not "
+                f"available for {billing_mode} billing."
+            ),
+        )
+
     price_usd = plans_config.get_effective_plan_price(plan_name)
     if billing_mode == "lifetime":
         lifetime_slots = await _get_lifetime_slots_for_plan(db, plan_name, plan_config)

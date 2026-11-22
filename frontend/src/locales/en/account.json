@@ -33,7 +33,9 @@
 	"plans": {
 		"free": "Free",
 		"standard": "Standard",
-		"pro": "Professional"
+		"pro": "Professional",
+		"managed": "Managed",
+		"premium": "Managed"
 	},
 	"quotas": {
 		"run_backtest_per_day": "Backtests per day",

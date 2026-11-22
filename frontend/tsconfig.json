@@ -22,5 +22,18 @@
 		"ignoreDeprecations": "6.0"
 	},
 	"include": ["src"],
+	// The PWA is a SEPARATE app: it has its own tsconfig, its own
+	// node_modules and its own (non-strict) settings. The frontend's program
+	// cannot typecheck it -- the PWA's dependencies do not resolve from the
+	// PWA's own directory, and the frontend's `strict` settings reject the
+	// PWA's code. The test that mounts the REAL PWA components therefore runs
+	// in the frontend's runner (vitest, see vitest.config.ts `resolve.dedupe`)
+	// but is deliberately NOT part of the frontend's typecheck program: adding
+	// it there would add ~99 errors, none of them in this file.
+	"exclude": [
+		"node_modules",
+		"dist",
+		"src/__tests__/pwaProPlanAccess.test.tsx"
+	],
 	"references": [{ "path": "./tsconfig.node.json" }]
 }
